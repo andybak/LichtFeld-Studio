@@ -43,6 +43,16 @@ FORMAT_INFO = (
     (ExportFormat.HTML_VIEWER, "export.format.html_viewer"),
 )
 
+EXPORT_PROGRESS_FORMAT_NAMES = {
+    ExportFormat.PLY: "PLY",
+    ExportFormat.SOG: "SOG",
+    ExportFormat.SPZ: "SPZ",
+    ExportFormat.HTML_VIEWER: "HTML",
+    ExportFormat.USD: "USD",
+    ExportFormat.NUREC_USDZ: "USDZ",
+    ExportFormat.RAD: "RAD",
+}
+
 SCRUB_FIELD_DEFS = {
     "sh_degree": ScrubFieldSpec(0.0, 3.0, 1.0, "%d", data_type=int),
 }
@@ -50,6 +60,10 @@ SCRUB_FIELD_DEFS = {
 
 def _xml_unescape(text):
     return html.unescape(text or "")
+
+
+def _progress_format_name(fmt):
+    return EXPORT_PROGRESS_FORMAT_NAMES.get(fmt, "file")
 
 
 class ExportPanel(Panel):
@@ -65,7 +79,9 @@ class ExportPanel(Panel):
     def __init__(self):
         self._format = ExportFormat.PLY
         self._selected_nodes: Set[str] = set()
+        self._max_export_sh_degree = 3
         self._export_sh_degree = 3
+        self._pinned_sh_degree = True
         self._selection_seeded = False
         self._handle = None
         self._last_node_key = None
@@ -142,15 +158,59 @@ class ExportPanel(Panel):
 
     def _set_sh_degree(self, v):
         try:
-            degree = max(0, min(3, int(float(v))))
+            degree = max(0, min(self._max_export_sh_degree, int(float(v))))
         except (ValueError, TypeError):
             return
+
+        self._pinned_sh_degree = (degree == self._max_export_sh_degree)
 
         if degree == self._export_sh_degree:
             return
 
         self._export_sh_degree = degree
         self._dirty_model("sh_degree")
+
+    def _compute_max_export_sh_degree(self, nodes) -> int:
+        """Lowest max_sh_degree across selected splats (caps the export to a value all selected splats can produce)."""
+        selected = [n for n in nodes if n.name in self._selected_nodes]
+        if not selected:
+            return 3
+        degrees = []
+        for node in selected:
+            try:
+                data = node.splat_data()
+            except Exception:
+                data = None
+            if data is None:
+                continue
+            try:
+                degrees.append(int(data.max_sh_degree))
+            except Exception:
+                pass
+        if not degrees:
+            return 3
+        return max(0, min(3, min(degrees)))
+
+    def _refresh_sh_degree_bounds(self, nodes):
+        new_max = self._compute_max_export_sh_degree(nodes)
+
+        spec_changed = new_max != self._max_export_sh_degree
+        self._max_export_sh_degree = new_max
+
+        if spec_changed:
+            self._scrub_fields.set_spec(
+                "sh_degree",
+                ScrubFieldSpec(0.0, float(new_max), 1.0, "%d", data_type=int),
+            )
+
+        if self._pinned_sh_degree:
+            new_value = new_max
+        else:
+            new_value = max(0, min(new_max, self._export_sh_degree))
+
+        if new_value != self._export_sh_degree:
+            self._export_sh_degree = new_value
+            self._dirty_model("sh_degree")
 
     def _set_rad_new_lod_str(self, v):
         self._rad_new_lod_str = v if v else ""
@@ -412,11 +472,12 @@ class ExportPanel(Panel):
             changed = bool(self._selected_nodes) or self._selection_seeded
             self._selected_nodes.clear()
             self._selection_seeded = False
+            self._pinned_sh_degree = True
             return changed
 
         if not self._selection_seeded:
             self._selected_nodes = node_names
-            self._export_sh_degree = 3
+            self._pinned_sh_degree = True
             self._selection_seeded = True
             self._dirty_model("sh_degree")
             return True
@@ -470,20 +531,20 @@ class ExportPanel(Panel):
         )
 
     def _rebuild_model_records(self, nodes):
-        if not self._handle:
-            return
-        self._handle.update_record_list(
-            "models",
-            [
-                {
-                    "name": node.name,
-                    "selected": node.name in self._selected_nodes,
-                    "count_text": f"({node.gaussian_count})",
-                }
-                for node in nodes
-            ],
-        )
+        if self._handle:
+            self._handle.update_record_list(
+                "models",
+                [
+                    {
+                        "name": node.name,
+                        "selected": node.name in self._selected_nodes,
+                        "count_text": f"({node.gaussian_count})",
+                    }
+                    for node in nodes
+                ],
+            )
         self._has_models = bool(nodes)
+        self._refresh_sh_degree_bounds(nodes)
 
     # ── Event handlers ────────────────────────────────────────
 
@@ -623,6 +684,12 @@ class ExportPanel(Panel):
             self._exporting = True
             self._last_progress = -1.0
             self._progress_value = "0"
+            self._cached_export_state = {
+                "active": True,
+                "progress": 0.0,
+                "stage": "Starting",
+                "format": _progress_format_name(self._format),
+            }
             self._dirty_model(
                 "show_form",
                 "show_progress",
@@ -646,6 +713,8 @@ class ExportPanel(Panel):
 
     def _update_export_progress(self):
         state = lf.ui.get_export_state()
+        previous_format = self._cached_export_state.get("format")
+        previous_stage = self._cached_export_state.get("stage")
         self._cached_export_state = state
         if not state.get("active", False):
             self._exporting = False
@@ -659,10 +728,16 @@ class ExportPanel(Panel):
             return True
 
         progress = state.get("progress", 0.0)
-        if progress != self._last_progress:
+        current_format = state.get("format", "file")
+        current_stage = state.get("stage", "")
+        if (
+            progress != self._last_progress
+            or current_format != previous_format
+            or current_stage != previous_stage
+        ):
             self._last_progress = progress
             self._progress_value = str(progress)
-            self._dirty_model("progress_value", "progress_pct", "progress_stage")
+            self._dirty_model("progress_value", "progress_title", "progress_pct", "progress_stage")
             return True
 
         return False

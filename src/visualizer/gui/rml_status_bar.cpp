@@ -2,19 +2,16 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-// clang-format off
-#include <glad/glad.h>
-// clang-format on
-
 #include "gui/rml_status_bar.hpp"
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/events.hpp"
 #include "core/logger.hpp"
 #include "gui/gpu_memory_query.hpp"
+#include "gui/panel_layout.hpp"
 #include "gui/rmlui/rml_document_utils.hpp"
 #include "gui/rmlui/rml_theme.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
-#include "gui/rmlui/rmlui_render_interface.hpp"
+#include "gui/rmlui/sdl_rml_key_mapping.hpp"
 #include "gui/string_keys.hpp"
 #include "gui/ui_context.hpp"
 #include "internal/resource_paths.hpp"
@@ -26,6 +23,7 @@
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Element.h>
+#include <SDL3/SDL_clipboard.h>
 #include <SDL3/SDL_video.h>
 #include <algorithm>
 #include <cassert>
@@ -41,6 +39,21 @@ namespace lfs::vis::gui {
     using rml_theme::colorToRmlAlpha;
 
     namespace {
+        class GitCommitClickListener final : public Rml::EventListener {
+        public:
+            explicit GitCommitClickListener(const std::string* commit) : commit_(commit) {}
+
+            void ProcessEvent(Rml::Event& /*event*/) override {
+                if (commit_->empty())
+                    return;
+                SDL_SetClipboardText(commit_->c_str());
+                LOG_INFO("Copied commit {} to clipboard", *commit_);
+            }
+
+        private:
+            const std::string* commit_;
+        };
+
         std::string fmtCount(int64_t n) {
             if (n >= 1'000'000)
                 return std::format("{:.2f}M", n / 1e6);
@@ -220,6 +233,8 @@ namespace lfs::vis::gui {
             return;
         }
 
+        attachGitCommitListener();
+
         if (!speed_events_initialized_) {
             lfs::core::events::ui::SpeedChanged::when([this](const auto& e) {
                 speed_state_.showWasd(e.current_speed);
@@ -239,11 +254,12 @@ namespace lfs::vis::gui {
 
     void RmlStatusBar::shutdown() {
         model_handle_ = {};
-        fbo_.destroy();
         if (rml_context_ && rml_manager_)
             rml_manager_->destroyContext("status_bar");
         rml_context_ = nullptr;
         document_ = nullptr;
+        delete git_commit_listener_;
+        git_commit_listener_ = nullptr;
     }
 
     void RmlStatusBar::reloadResources() {
@@ -278,6 +294,8 @@ namespace lfs::vis::gui {
             return;
         }
 
+        attachGitCommitListener();
+
         updateTheme();
     }
 
@@ -297,6 +315,15 @@ namespace lfs::vis::gui {
         rml_theme::applyTheme(document_, base_rcss_, rml_theme::loadBaseRCSS("rmlui/statusbar.theme.rcss"));
         model_dirty_ = true;
         return true;
+    }
+
+    void RmlStatusBar::attachGitCommitListener() {
+        if (!document_)
+            return;
+        if (!git_commit_listener_)
+            git_commit_listener_ = new GitCommitClickListener(&model_.git_commit);
+        if (auto* el = document_->GetElementById("git-commit"))
+            el->AddEventListener(Rml::EventId::Click, git_commit_listener_);
     }
 
     void RmlStatusBar::setModelString(const char* name, std::string& field, std::string value) {
@@ -571,6 +598,28 @@ namespace lfs::vis::gui {
         return model_dirty_;
     }
 
+    void RmlStatusBar::processInput(const PanelInputState& input, const float bar_x, const float bar_y,
+                                    const float bar_w, const float bar_h) {
+        if (!rml_context_ || !document_)
+            return;
+
+        const float local_x = input.mouse_x - bar_x;
+        const float local_y = input.mouse_y - bar_y;
+        const bool is_inside = local_x >= 0.0f && local_x < bar_w &&
+                               local_y >= 0.0f && local_y < bar_h;
+        if (!is_inside && !input.mouse_released[0])
+            return;
+
+        const int mods = sdlModsToRml(input.key_ctrl, input.key_shift,
+                                      input.key_alt, input.key_super);
+        rml_context_->ProcessMouseMove(static_cast<int>(local_x), static_cast<int>(local_y), mods);
+
+        if (is_inside && input.mouse_clicked[0])
+            rml_context_->ProcessMouseButtonDown(0, mods);
+        if (input.mouse_released[0])
+            rml_context_->ProcessMouseButtonUp(0, mods);
+    }
+
     void RmlStatusBar::render(const PanelDrawContext& ctx, const float x, const float y,
                               const float w_px, const float h_px,
                               const int screen_w, const int screen_h) {
@@ -596,14 +645,8 @@ namespace lfs::vis::gui {
         const bool needs_render = size_changed || theme_changed || had_pending_model_dirty ||
                                   content_changed ||
                                   (animation_active_ && refresh_due);
-        if (rml_manager_->shouldDeferFboUpdate(fbo_)) {
-            if (needs_render)
-                model_dirty_ = true;
-            if (fbo_.valid())
-                fbo_.blitToScreen(blit_rect.x, blit_rect.y, blit_rect.w, blit_rect.h,
-                                  blit_rect.screen_w, blit_rect.screen_h);
+        if (!rml_manager_ || !rml_manager_->getVulkanRenderInterface())
             return;
-        }
 
         if (needs_render) {
             rml_context_->SetDimensions(Rml::Vector2i(render_w, render_h));
@@ -613,33 +656,18 @@ namespace lfs::vis::gui {
             }
             rml_context_->Update();
 
-            fbo_.ensure(render_w, render_h);
-            if (!fbo_.valid())
-                return;
-
-            auto* render = rml_manager_->getRenderInterface();
-            assert(render);
-            render->SetViewport(render_w, render_h);
-
-            GLint prev_fbo = 0;
-            fbo_.bind(&prev_fbo);
-            render->SetTargetFramebuffer(fbo_.fbo());
-
-            render->BeginFrame();
-            rml_context_->Render();
-            render->EndFrame();
-
-            render->SetTargetFramebuffer(0);
-            fbo_.unbind(prev_fbo);
-
             animation_active_ = animation_active_ || (rml_context_->GetNextUpdateDelay() == 0);
             last_render_w_ = render_w;
             last_render_h_ = render_h;
         }
 
-        if (fbo_.valid())
-            fbo_.blitToScreen(blit_rect.x, blit_rect.y, blit_rect.w, blit_rect.h,
-                              blit_rect.screen_w, blit_rect.screen_h);
+        rml_manager_->queueVulkanContext(rml_context_, blit_rect.x, blit_rect.y,
+                                         false,
+                                         true,
+                                         blit_rect.x,
+                                         blit_rect.y,
+                                         blit_rect.x + blit_rect.w,
+                                         blit_rect.y + blit_rect.h);
     }
 
 } // namespace lfs::vis::gui

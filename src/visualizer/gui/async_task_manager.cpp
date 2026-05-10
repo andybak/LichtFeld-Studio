@@ -9,6 +9,7 @@
 #include "core/parameters.hpp"
 #include "core/path_utils.hpp"
 #include "core/scene.hpp"
+#include "core/services.hpp"
 #include "gui/gui_manager.hpp"
 #include "gui/html_viewer_export.hpp"
 #include "gui/panel_registry.hpp"
@@ -16,8 +17,6 @@
 #include "gui/video_export_utils.hpp"
 #include "internal/resource_paths.hpp"
 #include "io/exporter.hpp"
-#include "rendering/environment_renderer.hpp"
-#include "rendering/framebuffer.hpp"
 #include "rendering/image_layout.hpp"
 #include "rendering/mesh2splat.hpp"
 #include "rendering/rendering.hpp"
@@ -29,12 +28,14 @@
 #include "visualizer/gui/video_widget_interface.hpp"
 #include "visualizer/scene_coordinate_utils.hpp"
 #include "visualizer_impl.hpp"
+#include "window/window_manager.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <format>
 #include <functional>
 #include <future>
+#include <shared_mutex>
 #include <type_traits>
 
 namespace lfs::vis::gui {
@@ -72,6 +73,38 @@ namespace lfs::vis::gui {
 
     void truncateSHDegree(lfs::core::SplatData& splat, const int target_degree) {
         splat.set_sh_degree(target_degree);
+    }
+
+    struct BorrowExportPlan {
+        core::Scene::MergeStorageMode storage_mode = core::Scene::MergeStorageMode::Clone;
+        std::shared_mutex* model_mutex = nullptr;
+    };
+
+    [[nodiscard]] BorrowExportPlan makeBorrowSingleIdentityExportPlan(const lfs::vis::SceneManager& scene_manager,
+                                                                      const std::vector<std::string>& node_names) {
+        BorrowExportPlan plan;
+        if (node_names.size() != 1)
+            return plan;
+
+        const auto& scene = scene_manager.getScene();
+        const auto* const node = scene.getNode(node_names.front());
+        if (!node || node->type != core::NodeType::SPLAT || !node->model)
+            return plan;
+
+        if (node->model->has_deleted_mask())
+            return plan;
+
+        if (node->name == scene.getTrainingModelNodeName()) {
+            const auto* const trainer_manager = scene_manager.getTrainerManager();
+            const auto* const trainer = trainer_manager ? trainer_manager->getTrainer() : nullptr;
+            if (trainer && trainer->is_running() && !trainer->is_paused())
+                return plan;
+            if (trainer)
+                plan.model_mutex = &trainer->getRenderMutex();
+        }
+
+        plan.storage_mode = core::Scene::MergeStorageMode::BorrowSingleIdentity;
+        return plan;
     }
 
     template <typename F>
@@ -168,10 +201,8 @@ namespace lfs::vis::gui {
     }
 
     struct VideoExportEnvironmentState {
-        lfs::rendering::EnvironmentRenderer renderer;
         std::string cached_environment_path_value;
         std::filesystem::path cached_environment_resolved_path;
-        std::string last_environment_error;
     };
 
     [[nodiscard]] std::filesystem::path resolveVideoExportEnvironmentPath(
@@ -196,38 +227,6 @@ namespace lfs::vis::gui {
         return state.cached_environment_resolved_path;
     }
 
-    void renderVideoExportBackground(VideoExportEnvironmentState& environment_state,
-                                     const RenderSettings& render_settings,
-                                     const rendering::FrameView& frame_view) {
-        glClearColor(render_settings.background_color.r,
-                     render_settings.background_color.g,
-                     render_settings.background_color.b,
-                     1.0f);
-        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-        if (!environmentBackgroundEnabled(render_settings)) {
-            return;
-        }
-
-        const auto environment_path = resolveVideoExportEnvironmentPath(
-            environment_state, render_settings.environment_map_path);
-        if (auto render_result = environment_state.renderer.render(
-                frame_view,
-                environment_path,
-                render_settings.environment_exposure,
-                render_settings.environment_rotation_degrees,
-                render_settings.equirectangular);
-            !render_result) {
-            if (render_result.error() != environment_state.last_environment_error) {
-                environment_state.last_environment_error = render_result.error();
-                LOG_DEBUG("Video export environment background fallback: {}",
-                          environment_state.last_environment_error);
-            }
-        } else {
-            environment_state.last_environment_error.clear();
-        }
-    }
-
     lfs::core::Tensor orientVideoExportFrameForEncoder(const lfs::core::Tensor& image) {
         if (!image.is_valid() || image.ndim() != 3) {
             return image;
@@ -238,8 +237,8 @@ namespace lfs::vis::gui {
             return image.contiguous();
         }
 
-        // Match the viewport preview path, which presents textures through OpenGL's
-        // bottom-left texture origin before the user sees them.
+        // Match the viewport preview path, which presents rendered frames through
+        // a bottom-left texture origin before the user sees them.
         return lfs::rendering::flipImageVertical(image, layout);
     }
 
@@ -358,7 +357,8 @@ namespace lfs::vis::gui {
                          .equirectangular = render_settings.equirectangular},
                     .scene =
                         {.model_transforms = &snapshot.model_transforms,
-                         .transform_indices = snapshot.transform_indices},
+                         .transform_indices = snapshot.transform_indices,
+                         .node_visibility_mask = snapshot.node_visibility_mask},
                     .filters = {},
                     .transparent_background = render_environment};
                 applyVideoExportPointCloudFilters(request.filters, snapshot, render_settings);
@@ -385,7 +385,9 @@ namespace lfs::vis::gui {
                     .antialiasing = render_settings.antialiasing,
                     .mip_filter = render_settings.mip_filter,
                     .sh_degree = render_settings.sh_degree,
-                    .gut = render_settings.gut,
+                    .raster_backend = render_settings.raster_backend,
+                    .gut = render_settings.gut ||
+                           lfs::rendering::isGutBackend(render_settings.raster_backend),
                     .equirectangular = render_settings.equirectangular,
                     .scene =
                         {.model_transforms = &snapshot.model_transforms,
@@ -436,7 +438,8 @@ namespace lfs::vis::gui {
                      .equirectangular = render_settings.equirectangular},
                 .scene =
                     {.model_transforms = &point_cloud_transforms,
-                     .transform_indices = nullptr},
+                     .transform_indices = nullptr,
+                     .node_visibility_mask = {}},
                 .filters = {},
                 .transparent_background = render_environment};
             applyVideoExportPointCloudFilters(request.filters, snapshot, render_settings);
@@ -463,87 +466,41 @@ namespace lfs::vis::gui {
             return std::unexpected("No rendered image produced for video export");
         }
 
-        GLint saved_draw_fbo = 0;
-        GLint saved_read_fbo = 0;
-        GLint saved_viewport[4] = {0, 0, 0, 0};
-        const GLboolean scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
-        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &saved_draw_fbo);
-        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &saved_read_fbo);
-        glGetIntegerv(GL_VIEWPORT, saved_viewport);
-
-        rendering::FrameBuffer composite_fbo;
-        composite_fbo.resize(width, height);
-        composite_fbo.bind();
-        glDisable(GL_SCISSOR_TEST);
-        glViewport(0, 0, width, height);
-        renderVideoExportBackground(environment_state, render_settings, frame_view);
-
-        auto restore_state = [&]() {
-            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(saved_draw_fbo));
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(saved_read_fbo));
-            glViewport(saved_viewport[0], saved_viewport[1], saved_viewport[2], saved_viewport[3]);
-            if (scissor_was_enabled) {
-                glEnable(GL_SCISSOR_TEST);
-            } else {
-                glDisable(GL_SCISSOR_TEST);
-            }
-        };
-
         const bool any_selected = std::any_of(snapshot.meshes.begin(), snapshot.meshes.end(),
                                               [](const auto& mesh) { return mesh.is_selected; }) ||
                                   std::any_of(snapshot.selected_node_mask.begin(),
                                               snapshot.selected_node_mask.end(),
                                               [](const bool selected) { return selected; });
 
-        engine.resetMeshFrameState();
+        std::vector<rendering::MeshFrameItem> mesh_items;
+        mesh_items.reserve(snapshot.meshes.size());
         for (const auto& mesh_snapshot : snapshot.meshes) {
             if (!mesh_snapshot.mesh)
                 continue;
-            const auto mesh_options = makeVideoExportMeshOptions(
-                render_settings, any_selected, mesh_snapshot.is_selected);
-            auto mesh_result = engine.renderMesh(
-                *mesh_snapshot.mesh,
-                viewport,
-                mesh_snapshot.transform,
-                mesh_options,
-                primary_frame.has_value());
-            if (!mesh_result) {
-                restore_state();
-                return std::unexpected(mesh_result.error());
-            }
+            mesh_items.push_back(rendering::MeshFrameItem{
+                .mesh = mesh_snapshot.mesh.get(),
+                .transform = mesh_snapshot.transform,
+                .options = makeVideoExportMeshOptions(
+                    render_settings, any_selected, mesh_snapshot.is_selected),
+            });
         }
 
-        if (engine.hasMeshRender()) {
-            if (primary_frame.has_value()) {
-                if (auto composite_result = engine.compositeMeshAndGpuFrame(*primary_frame, {width, height});
-                    !composite_result) {
-                    restore_state();
-                    return std::unexpected(composite_result.error());
-                }
-            } else {
-                if (auto present_result = engine.presentMeshOnly(); !present_result) {
-                    restore_state();
-                    return std::unexpected(present_result.error());
-                }
-            }
-        } else if (primary_frame.has_value()) {
-            if (auto present_result = engine.presentGpuFrame(*primary_frame, {0, 0}, {width, height});
-                !present_result) {
-                restore_state();
-                return std::unexpected(present_result.error());
-            }
-        }
-
-        std::vector<float> pixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 3);
-        glReadPixels(0, 0, width, height, GL_RGB, GL_FLOAT, pixels.data());
-
-        restore_state();
-
-        const auto image_cpu = lfs::core::Tensor::from_vector(
-            pixels,
-            {static_cast<size_t>(height), static_cast<size_t>(width), size_t{3}},
-            lfs::core::Device::CPU);
-        return image_cpu.permute({2, 0, 1}).cuda();
+        rendering::VideoCompositeFrameRequest composite_request{
+            .viewport = viewport,
+            .frame_view = frame_view,
+            .background_color = render_settings.background_color,
+            .environment =
+                {.enabled = render_environment,
+                 .map_path = render_environment
+                                 ? resolveVideoExportEnvironmentPath(
+                                       environment_state, render_settings.environment_map_path)
+                                 : std::filesystem::path{},
+                 .exposure = render_settings.environment_exposure,
+                 .rotation_degrees = render_settings.environment_rotation_degrees,
+                 .equirectangular = render_settings.equirectangular},
+            .meshes = std::move(mesh_items),
+        };
+        return engine.renderVideoCompositeFrame(primary_frame, composite_request);
     }
 
     AsyncTaskManager::AsyncTaskManager(VisualizerImpl* viewer)
@@ -612,6 +569,7 @@ namespace lfs::vis::gui {
                 params.dataset.centralize_dataset = cmd.centralize_dataset;
             if (cmd.max_width.has_value() && *cmd.max_width >= 0)
                 params.dataset.max_width = *cmd.max_width;
+            import_state_.apply_auto_crop.store(cmd.apply_auto_crop);
             startAsyncImport(cmd.path, params);
         });
 
@@ -637,6 +595,13 @@ namespace lfs::vis::gui {
         });
 
         state::DatasetLoadCompleted::when([this](const auto& e) {
+            // Consume the flag exchange-style so the auto-crop fires at most
+            // once per load — DatasetLoadCompleted is also emitted from the
+            // scene_manager path, which bypasses the import_state_ updates
+            // below.
+            if (e.success && import_state_.apply_auto_crop.exchange(false))
+                applyAutoCropToLoadedScene();
+
             if (import_state_.show_completion.load())
                 return;
             {
@@ -683,39 +648,39 @@ namespace lfs::vis::gui {
             return;
 
         const auto& scene = scene_manager->getScene();
-        std::vector<std::pair<const lfs::core::SplatData*, glm::mat4>> splats;
+        std::vector<ExportSplatSource> splats;
         splats.reserve(node_names.size());
         for (const auto& name : node_names) {
             const auto* node = scene.getNode(name);
             if (node && node->type == core::NodeType::SPLAT && node->model) {
-                splats.emplace_back(node->model.get(), scene_coords::nodeDataWorldTransform(scene, node->id));
+                splats.push_back(ExportSplatSource{
+                    .data = node->model.get(),
+                    .transform = scene_coords::nodeDataWorldTransform(scene, node->id)});
             }
         }
         if (splats.empty())
             return;
 
-        auto merged = core::Scene::mergeSplatsWithTransforms(splats);
-        if (!merged)
-            return;
-
-        if (sh_degree < merged->get_max_sh_degree()) {
-            truncateSHDegree(*merged, sh_degree);
-        }
-
-        // Store RAD LOD ratios and flip_y for use during export
-        {
-            const std::lock_guard lock(export_state_.mutex);
-            export_state_.rad_lod_ratios = rad_lod_ratios;
-            export_state_.rad_flip_y = rad_flip_y;
-        }
-
-        startAsyncExport(format, path, std::move(merged));
+        auto borrow_plan = makeBorrowSingleIdentityExportPlan(*scene_manager, node_names);
+        startAsyncExport(format,
+                         path,
+                         std::move(splats),
+                         sh_degree,
+                         borrow_plan.storage_mode == core::Scene::MergeStorageMode::BorrowSingleIdentity,
+                         borrow_plan.model_mutex,
+                         rad_lod_ratios,
+                         rad_flip_y);
     }
 
     void AsyncTaskManager::startAsyncExport(ExportFormat format,
                                             const std::filesystem::path& path,
-                                            std::unique_ptr<lfs::core::SplatData> data) {
-        if (!data) {
+                                            std::vector<ExportSplatSource> splats,
+                                            int sh_degree,
+                                            bool borrow_single_identity,
+                                            std::shared_mutex* model_mutex,
+                                            std::vector<float> rad_lod_ratios,
+                                            bool rad_flip_y) {
+        if (splats.empty()) {
             LOG_ERROR("No splat data to export");
             return;
         }
@@ -731,135 +696,194 @@ namespace lfs::vis::gui {
             export_state_.path = path;
         }
 
-        auto splat_data = std::shared_ptr<lfs::core::SplatData>(std::move(data));
         LOG_INFO("Export started: {} (format: {})", lfs::core::path_to_utf8(path), static_cast<int>(format));
 
         export_state_.thread.emplace(
-            [this, format, path, splat_data](std::stop_token stop_token) {
-                auto update_progress = [this, &stop_token](float progress, const std::string& stage) -> bool {
+            [this,
+             format,
+             path,
+             splats = std::move(splats),
+             sh_degree,
+             borrow_single_identity,
+             model_mutex,
+             rad_lod_ratios = std::move(rad_lod_ratios),
+             rad_flip_y](
+                std::stop_token stop_token) mutable {
+                bool cancellation_logged = false;
+                auto update_progress = [this, &stop_token, &cancellation_logged](float progress, const std::string& stage) -> bool {
+                    if (stop_token.stop_requested() || export_state_.cancel_requested.load()) {
+                        if (!cancellation_logged) {
+                            LOG_INFO("Export cancelled");
+                            cancellation_logged = true;
+                        }
+                        {
+                            const std::lock_guard lock(export_state_.mutex);
+                            export_state_.stage = "Cancelled";
+                        }
+                        if (auto* window_manager = services().windowOrNull()) {
+                            window_manager->wakeEventLoop();
+                        }
+                        return false;
+                    }
                     export_state_.progress.store(progress);
                     {
                         const std::lock_guard lock(export_state_.mutex);
                         export_state_.stage = stage;
                     }
-                    if (stop_token.stop_requested() || export_state_.cancel_requested.load()) {
-                        LOG_INFO("Export cancelled");
-                        return false;
+                    if (auto* window_manager = services().windowOrNull()) {
+                        window_manager->wakeEventLoop();
                     }
                     return true;
                 };
 
                 bool success = false;
+                bool cancelled = false;
                 std::string error_msg;
+                std::unique_ptr<lfs::core::SplatData> splat_data;
+                std::optional<std::shared_lock<std::shared_mutex>> model_lock;
 
                 try {
+                    if (!update_progress(0.0f, "Preparing export data")) {
+                        cancelled = true;
+                        error_msg = "Export cancelled by user";
+                    }
 
-                    switch (format) {
-                    case ExportFormat::PLY: {
-                        update_progress(0.1f, "Writing PLY");
-                        const lfs::io::PlySaveOptions options{
-                            .output_path = path,
-                            .binary = true,
-                            .async = false,
-                            .extra_attributes = {}};
-                        if (auto result = lfs::io::save_ply(*splat_data, options); result) {
-                            success = true;
-                            update_progress(1.0f, "Complete");
-                        } else {
-                            error_msg = result.error().message;
-                            if (result.error().code == lfs::io::ErrorCode::INSUFFICIENT_DISK_SPACE) {
-                                lfs::core::events::state::DiskSpaceSaveFailed{
-                                    .iteration = 0,
-                                    .path = path,
-                                    .error = result.error().message,
-                                    .required_bytes = result.error().required_bytes,
-                                    .available_bytes = result.error().available_bytes,
-                                    .is_disk_space_error = true,
-                                    .is_checkpoint = false}
-                                    .emit();
+                    if (!cancelled && model_mutex) {
+                        model_lock.emplace(*model_mutex);
+                    }
+
+                    if (!cancelled) {
+                        std::vector<std::pair<const lfs::core::SplatData*, glm::mat4>> merge_inputs;
+                        merge_inputs.reserve(splats.size());
+                        for (const auto& source : splats) {
+                            if (source.data) {
+                                merge_inputs.emplace_back(source.data, source.transform);
                             }
                         }
-                        break;
-                    }
-                    case ExportFormat::SOG: {
-                        const lfs::io::SogSaveOptions options{
-                            .output_path = path,
-                            .kmeans_iterations = 10,
-                            .progress_callback = update_progress};
-                        if (auto result = lfs::io::save_sog(*splat_data, options); result) {
-                            success = true;
-                        } else {
-                            error_msg = result.error().message;
+
+                        const auto storage_mode = borrow_single_identity
+                                                      ? core::Scene::MergeStorageMode::BorrowSingleIdentity
+                                                      : core::Scene::MergeStorageMode::Clone;
+                        splat_data = core::Scene::mergeSplatsWithTransforms(merge_inputs, storage_mode);
+                        if (!splat_data) {
+                            error_msg = "No splat data to export";
+                        } else if (sh_degree < splat_data->get_max_sh_degree()) {
+                            truncateSHDegree(*splat_data, sh_degree);
                         }
-                        break;
+                        model_lock.reset();
                     }
-                    case ExportFormat::SPZ: {
-                        update_progress(0.1f, "Writing SPZ");
-                        const lfs::io::SpzSaveOptions options{.output_path = path};
-                        if (auto result = lfs::io::save_spz(*splat_data, options); result) {
-                            success = true;
-                            update_progress(1.0f, "Complete");
-                        } else {
-                            error_msg = result.error().message;
-                        }
-                        break;
+
+                    if (!cancelled && splat_data && !update_progress(0.0f, "Export data prepared")) {
+                        cancelled = true;
+                        error_msg = "Export cancelled by user";
                     }
-                    case ExportFormat::HTML_VIEWER: {
-                        const HtmlViewerExportOptions options{
-                            .output_path = path,
-                            .progress_callback = [&update_progress](float p, const std::string& s) {
-                                update_progress(p, s);
-                            }};
-                        if (auto result = export_html_viewer(*splat_data, options); result) {
-                            success = true;
-                        } else {
-                            error_msg = result.error();
+
+                    if (!cancelled && splat_data) {
+                        switch (format) {
+                        case ExportFormat::PLY: {
+                            const lfs::io::PlySaveOptions options{
+                                .output_path = path,
+                                .binary = true,
+                                .async = false,
+                                .progress_callback = update_progress,
+                                .extra_attributes = {}};
+                            if (auto result = lfs::io::save_ply(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                                if (result.error().code == lfs::io::ErrorCode::INSUFFICIENT_DISK_SPACE) {
+                                    lfs::core::events::state::DiskSpaceSaveFailed{
+                                        .iteration = 0,
+                                        .path = path,
+                                        .error = result.error().message,
+                                        .required_bytes = result.error().required_bytes,
+                                        .available_bytes = result.error().available_bytes,
+                                        .is_disk_space_error = true,
+                                        .is_checkpoint = false}
+                                        .emit();
+                                }
+                            }
+                            break;
                         }
-                        break;
-                    }
-                    case ExportFormat::USD: {
-                        update_progress(0.1f, "Writing USD");
-                        const lfs::io::UsdSaveOptions options{.output_path = path};
-                        if (auto result = lfs::io::save_usd(*splat_data, options); result) {
-                            success = true;
-                            update_progress(1.0f, "Complete");
-                        } else {
-                            error_msg = result.error().message;
+                        case ExportFormat::SOG: {
+                            const lfs::io::SogSaveOptions options{
+                                .output_path = path,
+                                .kmeans_iterations = 10,
+                                .progress_callback = update_progress};
+                            if (auto result = lfs::io::save_sog(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                            }
+                            break;
                         }
-                        break;
-                    }
-                    case ExportFormat::NUREC_USDZ: {
-                        update_progress(0.1f, "Writing USDZ");
-                        const lfs::io::NurecUsdzSaveOptions options{.output_path = path};
-                        if (auto result = lfs::io::save_nurec_usdz(*splat_data, options); result) {
-                            success = true;
-                            update_progress(1.0f, "Complete");
-                        } else {
-                            error_msg = result.error().message;
+                        case ExportFormat::SPZ: {
+                            const lfs::io::SpzSaveOptions options{
+                                .output_path = path,
+                                .progress_callback = update_progress};
+                            if (auto result = lfs::io::save_spz(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                            }
+                            break;
                         }
-                        break;
-                    }
-                    case ExportFormat::RAD: {
-                        std::vector<float> lod_ratios;
-                        bool flip_y = false;
-                        {
-                            const std::lock_guard lock(export_state_.mutex);
-                            lod_ratios = export_state_.rad_lod_ratios;
-                            flip_y = export_state_.rad_flip_y;
+                        case ExportFormat::HTML_VIEWER: {
+                            const lfs::io::HtmlExportOptions options{
+                                .output_path = path,
+                                .kmeans_iterations = 10,
+                                .progress_callback = update_progress};
+                            if (auto result = lfs::io::export_html(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                            }
+                            break;
                         }
-                        const lfs::io::RadSaveOptions options{
-                            .output_path = path,
-                            .compression_level = 6,
-                            .lod_ratios = lod_ratios,
-                            .flip_y = flip_y,
-                            .progress_callback = update_progress};
-                        if (auto result = lfs::io::save_rad(*splat_data, options); result) {
-                            success = true;
-                        } else {
-                            error_msg = result.error().message;
+                        case ExportFormat::USD: {
+                            const lfs::io::UsdSaveOptions options{
+                                .output_path = path,
+                                .progress_callback = update_progress};
+                            if (auto result = lfs::io::save_usd(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                            }
+                            break;
                         }
-                        break;
-                    }
+                        case ExportFormat::NUREC_USDZ: {
+                            const lfs::io::NurecUsdzSaveOptions options{
+                                .output_path = path,
+                                .progress_callback = update_progress};
+                            if (auto result = lfs::io::save_nurec_usdz(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                            }
+                            break;
+                        }
+                        case ExportFormat::RAD: {
+                            const lfs::io::RadSaveOptions options{
+                                .output_path = path,
+                                .compression_level = 6,
+                                .lod_ratios = rad_lod_ratios,
+                                .flip_y = rad_flip_y,
+                                .progress_callback = update_progress};
+                            if (auto result = lfs::io::save_rad(*splat_data, options); result) {
+                                success = true;
+                            } else {
+                                error_msg = result.error().message;
+                                cancelled = result.error().code == lfs::io::ErrorCode::CANCELLED;
+                            }
+                            break;
+                        }
+                        }
                     }
 
                 } catch (const std::exception& e) {
@@ -868,6 +892,12 @@ namespace lfs::vis::gui {
                 } catch (...) {
                     error_msg = "Export crashed with unknown exception";
                     LOG_ERROR("{}", error_msg);
+                }
+
+                if (success && (stop_token.stop_requested() || export_state_.cancel_requested.load())) {
+                    success = false;
+                    cancelled = true;
+                    error_msg = "Export cancelled by user";
                 }
 
                 if (success) {
@@ -879,6 +909,16 @@ namespace lfs::vis::gui {
                     lfs::core::events::state::ExportCompleted{
                         .path = path,
                         .format = format}
+                        .emit();
+                } else if (cancelled) {
+                    LOG_INFO("Export cancelled: {}", lfs::core::path_to_utf8(path));
+                    {
+                        const std::lock_guard lock(export_state_.mutex);
+                        export_state_.error = error_msg;
+                        export_state_.stage = "Cancelled";
+                    }
+                    lfs::core::events::state::ExportFailed{
+                        .error = error_msg}
                         .emit();
                 } else {
                     LOG_ERROR("Export failed: {}", error_msg);
@@ -892,6 +932,8 @@ namespace lfs::vis::gui {
                         .emit();
                 }
 
+                splat_data.reset();
+                lfs::core::Tensor::trim_memory_pool();
                 export_state_.active.store(false);
             });
     }
@@ -901,6 +943,10 @@ namespace lfs::vis::gui {
             return;
         LOG_INFO("Cancelling export");
         export_state_.cancel_requested.store(true);
+        {
+            const std::lock_guard lock(export_state_.mutex);
+            export_state_.stage = "Cancelling";
+        }
         if (export_state_.thread && export_state_.thread->joinable()) {
             export_state_.thread->request_stop();
         }
@@ -1131,6 +1177,30 @@ namespace lfs::vis::gui {
             .num_images = num_images_val,
             .num_points = num_points_val}
             .emit();
+    }
+
+    void AsyncTaskManager::applyAutoCropToLoadedScene() {
+        auto* const scene_manager = viewer_->getSceneManager();
+        if (!scene_manager)
+            return;
+
+        // Highest-id pointcloud/splat root = the one the import just produced.
+        const core::SceneNode* target = nullptr;
+        for (const auto* node : scene_manager->getScene().getNodes()) {
+            if (node->type != core::NodeType::POINTCLOUD && node->type != core::NodeType::SPLAT)
+                continue;
+            if (!target || node->id > target->id)
+                target = node;
+        }
+        if (!target) {
+            LOG_WARN("Auto-crop requested but no pointcloud/splat node was found after load");
+            return;
+        }
+
+        // AddCropBox selects the new node; FitCropBoxToScene then operates
+        // on that selection. Both handlers run synchronously inside emit().
+        lfs::core::events::cmd::AddCropBox{.node_name = target->name}.emit();
+        lfs::core::events::cmd::FitCropBoxToScene{.use_percentile = true}.emit();
     }
 
     void AsyncTaskManager::cancelVideoExport() {
@@ -1440,7 +1510,7 @@ namespace lfs::vis::gui {
             return;
         mesh2splat_state_.pending.store(false);
 
-        executeMesh2SplatOnGlThread();
+        executeMesh2SplatOnGraphicsThread();
 
         bool has_result;
         {
@@ -1467,7 +1537,7 @@ namespace lfs::vis::gui {
         mesh2splat_state_.progress.store(has_result ? 1.0f : 0.0f);
     }
 
-    void AsyncTaskManager::executeMesh2SplatOnGlThread() {
+    void AsyncTaskManager::executeMesh2SplatOnGraphicsThread() {
         std::shared_ptr<lfs::core::MeshData> mesh;
         lfs::core::Mesh2SplatOptions options;
         {
@@ -1479,27 +1549,26 @@ namespace lfs::vis::gui {
         if (!mesh)
             return;
 
-        auto progress_cb = [this](float progress, const std::string& stage) -> bool {
-            mesh2splat_state_.progress.store(progress);
-            {
+        auto result = lfs::rendering::mesh_to_splat(
+            *mesh,
+            options,
+            [this](const float progress, const std::string& stage) {
+                mesh2splat_state_.progress.store(progress);
                 const std::lock_guard lock(mesh2splat_state_.mutex);
                 mesh2splat_state_.stage = stage;
-            }
-            return true;
-        };
-
-        auto result = lfs::rendering::mesh_to_splat(*mesh, options, progress_cb);
+                return mesh2splat_state_.active.load();
+            });
 
         const std::lock_guard lock(mesh2splat_state_.mutex);
         if (result) {
             mesh2splat_state_.result = std::move(*result);
-            mesh2splat_state_.stage = "Applying...";
-            LOG_INFO("Mesh2Splat conversion produced {} gaussians",
-                     mesh2splat_state_.result->size());
+            mesh2splat_state_.error.clear();
+            mesh2splat_state_.stage = "Complete";
         } else {
+            mesh2splat_state_.result.reset();
             mesh2splat_state_.error = result.error();
             mesh2splat_state_.stage = "Failed";
-            LOG_ERROR("Mesh2Splat conversion failed: {}", result.error());
+            LOG_ERROR("Mesh2Splat conversion failed: {}", mesh2splat_state_.error);
         }
     }
 
@@ -1529,24 +1598,29 @@ namespace lfs::vis::gui {
         if (scene.getNode(node_name))
             scene.removeNode(node_name);
 
-        scene.addSplat(node_name, std::move(splat_data));
+        const std::string added_name =
+            scene_manager->addGeneratedSplatNode(std::move(splat_data), source_name, node_name, true);
+        if (added_name.empty()) {
+            LOG_ERROR("Mesh2Splat: failed to add splat node '{}'", node_name);
+            return;
+        }
 
         {
             const std::lock_guard lock(mesh2splat_state_.mutex);
             mesh2splat_state_.stage = "Complete";
         }
 
-        const auto* const added_node = scene.getNode(node_name);
+        const auto* const added_node = scene.getNode(added_name);
         const size_t num_gaussians =
             added_node && added_node->model ? added_node->model->size() : 0;
 
         lfs::core::events::state::Mesh2SplatCompleted{
             .source_name = source_name,
-            .node_name = node_name,
+            .node_name = added_name,
             .num_gaussians = num_gaussians}
             .emit();
 
-        LOG_INFO("Mesh2Splat: added splat node '{}'", node_name);
+        LOG_INFO("Mesh2Splat: added splat node '{}'", added_name);
     }
 
     void AsyncTaskManager::startSplatSimplify(const std::string& source_name,

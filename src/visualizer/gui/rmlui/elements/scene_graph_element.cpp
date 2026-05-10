@@ -8,6 +8,7 @@
 #include "core/events.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
+#include "core/tensor.hpp"
 #include "gui/global_context_menu.hpp"
 #include "gui/gui_manager.hpp"
 #include "gui/panel_registry.hpp"
@@ -21,6 +22,7 @@
 #include "visualizer/gui_capabilities.hpp"
 
 #include <RmlUi/Core.h>
+#include <RmlUi/Core/Context.h>
 #include <RmlUi/Core/Event.h>
 #include <RmlUi/Core/Input.h>
 #include <SDL3/SDL_keyboard.h>
@@ -99,6 +101,11 @@ namespace lfs::vis::gui {
 
         [[nodiscard]] std::string formatDp(const int value) {
             return std::to_string(value) + "dp";
+        }
+
+        [[nodiscard]] float currentDpRatio(const Rml::Element* element) {
+            const Rml::Context* context = element ? element->GetContext() : nullptr;
+            return context ? std::max(context->GetDensityIndependentPixelRatio(), 0.01f) : 1.0f;
         }
 
         [[nodiscard]] std::string cacheAttrName(std::string_view kind, std::string_view name) {
@@ -231,19 +238,7 @@ namespace lfs::vis::gui {
                    !parent_is_dataset;
         }
 
-        [[nodiscard]] bool isTransformHelperGroupName(const std::string& name) {
-            constexpr std::string_view suffix = "_transform";
-            return name.size() > suffix.size() && name.ends_with(suffix);
-        }
-
-        [[nodiscard]] bool isTransformHelperNode(const core::SceneNode& node) {
-            return node.type == core::NodeType::GROUP && isTransformHelperGroupName(node.name);
-        }
-
         [[nodiscard]] bool canSaveAsAsset(const core::SceneNode& node) {
-            if (isTransformHelperNode(node))
-                return false;
-
             switch (node.type) {
             case core::NodeType::SPLAT:
             case core::NodeType::POINTCLOUD:
@@ -335,6 +330,8 @@ namespace lfs::vis::gui {
             default:
                 return;
             }
+
+            lfs::core::Tensor::trim_memory_pool();
 
             if (!result) {
                 LOG_ERROR("Failed to save '{}' to {}: {}",
@@ -564,6 +561,7 @@ namespace lfs::vis::gui {
         last_selection_generation_ = std::numeric_limits<uint32_t>::max();
         last_visible_start_ = kUnsetVisibleRange;
         last_visible_end_ = kUnsetVisibleRange;
+        last_bound_dp_ratio_ = -1.0f;
         tree_rebuild_needed_ = false;
         markStateDirty();
     }
@@ -709,6 +707,7 @@ namespace lfs::vis::gui {
             return;
 
         const NodeSnapshot& snapshot = it->second;
+
         std::vector<FlatRow> child_rows;
         for (const core::NodeId child_id : snapshot.children)
             appendSnapshotRows(child_id, depth + 1, child_rows, filter_text_lower);
@@ -748,6 +747,7 @@ namespace lfs::vis::gui {
             return;
 
         const NodeSnapshot& snapshot = it->second;
+
         rows.push_back(FlatRow{
             .id = snapshot.id,
             .type = snapshot.type,
@@ -873,6 +873,12 @@ namespace lfs::vis::gui {
                                       : false;
 
         bool changed = false;
+        const float dp_ratio = currentDpRatio(this);
+        if (std::abs(dp_ratio - last_bound_dp_ratio_) > 0.001f) {
+            markStateDirty();
+            changed = true;
+        }
+
         if (invert_masks != invert_masks_) {
             invert_masks_ = invert_masks;
             markStateDirty();
@@ -1033,15 +1039,10 @@ namespace lfs::vis::gui {
         setCachedAttribute(slot.delete_icon, "data-node-id", row.node_id_text);
         setCachedProperty(slot.delete_icon, "display", row.deletable ? "inline" : "none");
 
-        // Check if this is a transform node (GROUP node with name ending in "_transform")
-        const bool is_transform_node = (row.type == core::NodeType::GROUP) &&
-                                       isTransformHelperGroupName(row.name);
-
-        const std::string_view icon_sprite = is_transform_node ? "icon-cropbox" : typeIconSprite(row.type);
-        const std::string_view type_class = is_transform_node ? "transform" : typeClass(row.type);
+        const std::string_view icon_sprite = typeIconSprite(row.type);
         const std::string_view unicode = unicodeIcon(row.type);
-        setCachedTypeClass(slot.type_icon, type_class);
-        setCachedTypeClass(slot.unicode_icon, type_class);
+        setCachedTypeClass(slot.type_icon, typeClass(row.type));
+        setCachedTypeClass(slot.unicode_icon, typeClass(row.type));
 
         if (!icon_sprite.empty()) {
             setCachedAttribute(slot.type_icon, "sprite", std::string(icon_sprite));
@@ -1097,9 +1098,10 @@ namespace lfs::vis::gui {
         updateHeader();
         updateContentHeight();
 
-        // Rml scroll metrics already use the same logical units as our row heights.
-        const float row_height = kRowHeightDp;
-        const float header_height = kHeaderHeightDp;
+        const float dp_ratio = currentDpRatio(this);
+        const bool dp_ratio_changed = std::abs(dp_ratio - last_bound_dp_ratio_) > 0.001f;
+        const float row_height = kRowHeightDp * dp_ratio;
+        const float header_height = kHeaderHeightDp * dp_ratio;
         const float client_height = GetClientHeight();
         const float scroll_top = GetScrollTop();
         const bool has_prev_window =
@@ -1114,6 +1116,7 @@ namespace lfs::vis::gui {
             last_visible_start_ = 0;
             last_visible_end_ = 0;
             last_bound_revision_ = state_revision_;
+            last_bound_dp_ratio_ = dp_ratio;
             last_client_height_ = client_height;
             return;
         }
@@ -1129,6 +1132,7 @@ namespace lfs::vis::gui {
             last_visible_start_ == start &&
             last_visible_end_ == end &&
             std::abs(client_height - last_client_height_) < 0.5f &&
+            !dp_ratio_changed &&
             !dom_dirty_) {
             return;
         }
@@ -1139,7 +1143,8 @@ namespace lfs::vis::gui {
         const size_t next_count = end - start;
         const bool state_unchanged =
             !force && last_bound_revision_ == state_revision_ && !dom_dirty_ &&
-            std::abs(client_height - last_client_height_) < 0.5f;
+            std::abs(client_height - last_client_height_) < 0.5f &&
+            !dp_ratio_changed;
         if (state_unchanged && prev_count == next_count && prev_count > 0) {
             const ptrdiff_t delta =
                 static_cast<ptrdiff_t>(start) - static_cast<ptrdiff_t>(prev_start);
@@ -1182,6 +1187,7 @@ namespace lfs::vis::gui {
         last_visible_start_ = start;
         last_visible_end_ = end;
         last_bound_revision_ = state_revision_;
+        last_bound_dp_ratio_ = dp_ratio;
         last_client_height_ = client_height;
         dom_dirty_ = false;
     }
@@ -1191,8 +1197,11 @@ namespace lfs::vis::gui {
         if (it == flat_index_by_id_.end())
             return;
 
-        const float row_top = kHeaderHeightDp + static_cast<float>(it->second) * kRowHeightDp;
-        const float row_bottom = row_top + kRowHeightDp;
+        const float dp_ratio = currentDpRatio(this);
+        const float row_height = kRowHeightDp * dp_ratio;
+        const float header_height = kHeaderHeightDp * dp_ratio;
+        const float row_top = header_height + static_cast<float>(it->second) * row_height;
+        const float row_bottom = row_top + row_height;
         const float scroll_top = GetScrollTop();
         const float view_h = GetClientHeight();
 
@@ -1213,10 +1222,13 @@ namespace lfs::vis::gui {
             return;
         }
 
-        const float row_top = kHeaderHeightDp + static_cast<float>(it->second) * kRowHeightDp;
-        const float content_h = kHeaderHeightDp + static_cast<float>(flat_rows_.size()) * kRowHeightDp;
+        const float dp_ratio = currentDpRatio(this);
+        const float row_height = kRowHeightDp * dp_ratio;
+        const float header_height = kHeaderHeightDp * dp_ratio;
+        const float row_top = header_height + static_cast<float>(it->second) * row_height;
+        const float content_h = header_height + static_cast<float>(flat_rows_.size()) * row_height;
         const float max_scroll = std::max(0.0f, content_h - view_h);
-        const float desired = row_top + 0.5f * kRowHeightDp - 0.5f * view_h;
+        const float desired = row_top + 0.5f * row_height - 0.5f * view_h;
         SetScrollTop(std::clamp(desired, 0.0f, max_scroll));
     }
 
@@ -1728,11 +1740,6 @@ namespace lfs::vis::gui {
                 items.push_back(makeAction(
                     tr("scene.merge_to_single_ply"),
                     prefixedAction(std::format("merge_group:{}", node_id))));
-                if (isTransformHelperNode(*node)) {
-                    items.push_back(makeAction(
-                        tr(string_keys::Transform::RESET_TRANSFORM),
-                        prefixedAction(std::format("reset_transform:{}", node_id))));
-                }
             }
 
             if (node->type == core::NodeType::SPLAT || node->type == core::NodeType::POINTCLOUD) {
@@ -1916,15 +1923,6 @@ namespace lfs::vis::gui {
             }
         } else if (kind == "add_group_root") {
             cmd::AddGroup{.name = tr("scene.new_group_name"), .parent_name = ""}.emit();
-        } else if (kind == "reset_transform" && parts.size() >= 2) {
-            core::NodeId node_id = core::NULL_NODE;
-            if (!parseNodeId(parts[1], node_id))
-                return;
-            if (const auto* node = scene->getNodeById(node_id)) {
-                if (isTransformHelperNode(*node)) {
-                    scene_manager->setNodeTransform(node->name, glm::mat4(1.0f));
-                }
-            }
         } else if ((kind == "add_cropbox" || kind == "add_ellipsoid" || kind == "save_node") && parts.size() >= 2) {
             core::NodeId node_id = core::NULL_NODE;
             if (!parseNodeId(parts[1], node_id))
