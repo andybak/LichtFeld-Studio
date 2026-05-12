@@ -106,28 +106,78 @@ function Join-CmdArguments {
     return ($quoted -join ' ')
 }
 
+function Test-CudaRequiresVs2022OrEarlier {
+    param([string]$CudaPath)
+
+    if ([string]::IsNullOrWhiteSpace($CudaPath)) {
+        return $false
+    }
+
+    $hostConfigPath = Join-Path $CudaPath 'include\crt\host_config.h'
+    if (-not (Test-Path $hostConfigPath)) {
+        return $false
+    }
+
+    return Select-String -Path $hostConfigPath -Pattern 'Only the versions between 2017 and 2022 \(inclusive\) are supported' -Quiet
+}
+
+function Get-VcpkgPlatformToolsetForVcVarsPath {
+    param([string]$VcVarsPath)
+
+    if ($VcVarsPath -match '\\2022\\') {
+        return 'v143'
+    }
+
+    if ($VcVarsPath -match '\\18\\') {
+        return 'v145'
+    }
+
+    return $null
+}
+
 function Get-VcVarsPath {
-    $vsWherePath = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-    if (-not (Test-Path $vsWherePath)) {
-        throw "vswhere.exe not found at $vsWherePath"
+    param([string]$CudaPath)
+
+    $candidateRoots = @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio'),
+        (Join-Path $env:ProgramFiles 'Microsoft Visual Studio')
+    ) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and (Test-Path $_) } |
+        Select-Object -Unique
+
+    $vcVarsCandidates = foreach ($root in $candidateRoots) {
+        Get-ChildItem -Path (Join-Path $root '*\*\VC\Auxiliary\Build\vcvars64.bat') -File -ErrorAction SilentlyContinue
     }
 
-    $installationPath = & $vsWherePath `
-        -latest `
-        -products * `
-        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-        -property installationPath
-
-    if ([string]::IsNullOrWhiteSpace($installationPath)) {
-        throw "No Visual Studio installation with MSVC x64 tools was found."
+    if ($null -eq $vcVarsCandidates -or $vcVarsCandidates.Count -eq 0) {
+        throw "No Visual Studio installation with vcvars64.bat was found under: $($candidateRoots -join ', ')"
     }
 
-    $vcVarsPath = Join-Path $installationPath 'VC\Auxiliary\Build\vcvars64.bat'
-    if (-not (Test-Path $vcVarsPath)) {
-        throw "vcvars64.bat not found at $vcVarsPath"
+    $resolvedCandidates = $vcVarsCandidates |
+        ForEach-Object {
+            [pscustomobject]@{
+                Path = $_.FullName
+                ToolsetVersion = Get-LatestMsvcToolsetVersion -VcVarsPath $_.FullName
+            }
+        } |
+        Sort-Object { [version]$_.ToolsetVersion } -Descending
+
+    $bestCandidate = $null
+    if (Test-CudaRequiresVs2022OrEarlier -CudaPath $CudaPath) {
+        $bestCandidate = $resolvedCandidates |
+            Where-Object { $_.Path -match '\\2022\\' } |
+            Select-Object -First 1
     }
 
-    return $vcVarsPath
+    if ($null -eq $bestCandidate) {
+        $bestCandidate = $resolvedCandidates | Select-Object -First 1
+    }
+
+    if ($null -eq $bestCandidate -or [string]::IsNullOrWhiteSpace($bestCandidate.Path)) {
+        throw 'Failed to resolve a Visual Studio vcvars64.bat path.'
+    }
+
+    return $bestCandidate.Path
 }
 
 function Get-LatestMsvcToolsetVersion {
@@ -150,12 +200,84 @@ function Get-LatestMsvcToolsetVersion {
     return $latestDir.Name
 }
 
+function Get-LatestWindowsSdkInfo {
+    $sdkRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+    $includeRoot = Join-Path $sdkRoot 'Include'
+    $libRoot = Join-Path $sdkRoot 'Lib'
+
+    if (-not (Test-Path $includeRoot) -or -not (Test-Path $libRoot)) {
+        throw "Windows 10 SDK include/lib roots were not found under $sdkRoot"
+    }
+
+    $latestSdk = Get-ChildItem $includeRoot -Directory |
+        Where-Object {
+            (Test-Path (Join-Path $_.FullName 'ucrt\corecrt.h')) -and
+            (Test-Path (Join-Path $libRoot "$($_.Name)\ucrt\x64\ucrt.lib")) -and
+            (Test-Path (Join-Path $libRoot "$($_.Name)\um\x64\kernel32.lib"))
+        } |
+        Sort-Object { [version]$_.Name } -Descending |
+        Select-Object -First 1
+
+    if ($null -eq $latestSdk) {
+        throw "No Windows 10 SDK with UCRT and UM x64 libraries was found under $sdkRoot"
+    }
+
+    $sdkVersion = $latestSdk.Name
+    return [pscustomobject]@{
+        Root = $sdkRoot
+        Version = $sdkVersion
+        IncludePaths = @(
+            (Join-Path $includeRoot "$sdkVersion\ucrt"),
+            (Join-Path $includeRoot "$sdkVersion\um"),
+            (Join-Path $includeRoot "$sdkVersion\shared"),
+            (Join-Path $includeRoot "$sdkVersion\winrt"),
+            (Join-Path $includeRoot "$sdkVersion\cppwinrt")
+        )
+        LibPaths = @(
+            (Join-Path $libRoot "$sdkVersion\ucrt\x64"),
+            (Join-Path $libRoot "$sdkVersion\um\x64")
+        )
+    }
+}
+
+function New-CmdSetCommand {
+    param(
+        [string]$Name,
+        [string]$Value
+    )
+
+    return 'set "' + $Name + '=' + $Value + '"'
+}
+
+function Get-WindowsSdkCmdSetup {
+    param([pscustomobject]$WindowsSdkInfo)
+
+    $sdkRootWithSlash = if ($WindowsSdkInfo.Root.EndsWith('\')) {
+        $WindowsSdkInfo.Root
+    } else {
+        $WindowsSdkInfo.Root + '\'
+    }
+    $sdkVersionWithSlash = $WindowsSdkInfo.Version + '\'
+    $includeValue = ($WindowsSdkInfo.IncludePaths -join ';') + ';!INCLUDE!'
+    $libValue = ($WindowsSdkInfo.LibPaths -join ';') + ';!LIB!'
+
+    return @(
+        (New-CmdSetCommand -Name 'WindowsSdkDir' -Value $sdkRootWithSlash),
+        (New-CmdSetCommand -Name 'WindowsSDKVersion' -Value $sdkVersionWithSlash),
+        (New-CmdSetCommand -Name 'WindowsSDKLibVersion' -Value $sdkVersionWithSlash),
+        (New-CmdSetCommand -Name 'UCRTVersion' -Value $sdkVersionWithSlash),
+        (New-CmdSetCommand -Name 'INCLUDE' -Value $includeValue),
+        (New-CmdSetCommand -Name 'LIB' -Value $libValue)
+    ) -join ' && '
+}
+
 function Invoke-VcCommand {
     param(
         [string]$VcVarsPath,
         [string]$WorkingDirectory,
         [string]$Command,
-        [string]$ToolsetVersion
+        [string]$ToolsetVersion,
+        [pscustomobject]$WindowsSdkInfo
     )
 
     $cmdPath = $env:ComSpec
@@ -173,8 +295,14 @@ function Invoke-VcCommand {
     } else {
         " -vcvars_ver=$ToolsetVersion"
     }
-    $cmdLine = "call ""$VcVarsPath""$vcVarsArgs && cd /d ""$WorkingDirectory"" && $Command"
-    & $cmdPath /d /s /c $cmdLine
+    $windowsSdkSetup = if ($null -eq $WindowsSdkInfo) {
+        ''
+    } else {
+        (Get-WindowsSdkCmdSetup -WindowsSdkInfo $WindowsSdkInfo) + ' && '
+    }
+    $cmdLine = "call ""$VcVarsPath""$vcVarsArgs && $windowsSdkSetup" +
+        "cd /d ""$WorkingDirectory"" && $Command"
+    & $cmdPath /v:on /d /s /c $cmdLine
     if ($LASTEXITCODE -ne 0) {
         throw "Command failed with exit code ${LASTEXITCODE}: $Command"
     }
@@ -228,6 +356,42 @@ function Resolve-ToolPath {
             Add-ToPathIfMissing -Entry (Split-Path -Parent $candidatePath)
             return $candidatePath
         }
+    }
+
+    return $null
+}
+
+function Get-CMakeCacheCompilerPath {
+    param(
+        [string]$BuildDirectory,
+        [string]$CacheVariable
+    )
+
+    $cachePath = Join-Path $BuildDirectory 'CMakeCache.txt'
+    if (-not (Test-Path $cachePath)) {
+        return $null
+    }
+
+    $match = Select-String -Path $cachePath -Pattern "^$([regex]::Escape($CacheVariable)):FILEPATH=(.+)$" |
+        Select-Object -First 1
+
+    if ($null -eq $match) {
+        return $null
+    }
+
+    return $match.Matches[0].Groups[1].Value
+}
+
+function Get-MsvcToolsetVersionFromCompilerPath {
+    param([string]$CompilerPath)
+
+    if ([string]::IsNullOrWhiteSpace($CompilerPath)) {
+        return $null
+    }
+
+    $normalizedPath = $CompilerPath.Replace('\', '/')
+    if ($normalizedPath -match '/VC/Tools/MSVC/([^/]+)/bin/') {
+        return $Matches[1]
     }
 
     return $null
@@ -313,6 +477,7 @@ $BuildDirectory = Resolve-AbsolutePath -BasePath $ProjectRoot -Path $BuildDirect
 $InstallDirectory = Resolve-AbsolutePath -BasePath $ProjectRoot -Path $InstallDirectory
 $PackageOutputDirectory = Resolve-AbsolutePath -BasePath $ProjectRoot -Path $PackageOutputDirectory
 $VcpkgRoot = Resolve-AbsolutePath -BasePath $ProjectRoot -Path $VcpkgRoot
+$resolvedCudaPath = Get-ConfiguredCudaPath -RequestedCudaPath $CudaPath
 
 Write-Section 'Environment'
 Write-Host "Project root: $ProjectRoot"
@@ -323,10 +488,33 @@ Write-Host "Install directory: $InstallDirectory"
 Write-Host "Package output directory: $PackageOutputDirectory"
 Write-Host "VCPKG_ROOT: $VcpkgRoot"
 
-$vcVarsPath = Get-VcVarsPath
+$vcVarsPath = Get-VcVarsPath -CudaPath $resolvedCudaPath
 $msvcToolsetVersion = Get-LatestMsvcToolsetVersion -VcVarsPath $vcVarsPath
+$vcpkgPlatformToolset = Get-VcpkgPlatformToolsetForVcVarsPath -VcVarsPath $vcVarsPath
+$windowsSdkInfo = Get-LatestWindowsSdkInfo
 Write-Host "MSVC environment: $vcVarsPath"
 Write-Host "MSVC toolset: $msvcToolsetVersion"
+if (-not [string]::IsNullOrWhiteSpace($vcpkgPlatformToolset)) {
+    Write-Host "vcpkg platform toolset: $vcpkgPlatformToolset"
+}
+Write-Host "Windows SDK: $($windowsSdkInfo.Version)"
+Write-Host "CUDA_PATH_V12_8: $resolvedCudaPath"
+
+if ($Clean) {
+    Write-Section 'Clean'
+    foreach ($path in @($BuildDirectory, $InstallDirectory)) {
+        if (Test-Path $path) {
+            Write-Host "Removing $path"
+            Remove-Item -LiteralPath $path -Recurse -Force
+        }
+    }
+}
+
+$cachedCompilerPath = Get-CMakeCacheCompilerPath -BuildDirectory $BuildDirectory -CacheVariable 'CMAKE_CXX_COMPILER'
+$cachedToolsetVersion = Get-MsvcToolsetVersionFromCompilerPath -CompilerPath $cachedCompilerPath
+if (-not [string]::IsNullOrWhiteSpace($cachedToolsetVersion) -and $cachedToolsetVersion -ne $msvcToolsetVersion) {
+    throw "Build directory '$BuildDirectory' is configured for MSVC toolset $cachedToolsetVersion, but the selected toolset is $msvcToolsetVersion. Re-run with -Clean or remove the build directory so CMake can reconfigure."
+}
 
 $cmakePath = Resolve-ToolPath -ToolName 'cmake' -CandidatePaths @(
     'C:\Program Files\CMake\bin\cmake.exe',
@@ -361,7 +549,6 @@ if ([string]::IsNullOrWhiteSpace($ninjaPath)) {
 }
 Write-Host "ninja: $ninjaPath"
 
-$resolvedCudaPath = Get-ConfiguredCudaPath -RequestedCudaPath $CudaPath
 if (-not (Test-Path $resolvedCudaPath)) {
     throw "CUDA path does not exist: $resolvedCudaPath"
 }
@@ -369,7 +556,6 @@ if (-not (Test-Path $resolvedCudaPath)) {
 $env:CUDA_PATH_V12_8 = $resolvedCudaPath
 Add-ToPathIfMissing -Entry (Join-Path $resolvedCudaPath 'bin')
 Add-ToPathIfMissing -Entry (Join-Path $resolvedCudaPath 'libnvvp')
-Write-Host "CUDA_PATH_V12_8: $resolvedCudaPath"
 
 if (-not (Test-Path $VcpkgRoot)) {
     throw "VCPKG_ROOT does not exist: $VcpkgRoot"
@@ -394,13 +580,21 @@ if (-not (Select-String -Path $tripletFile -Pattern 'VCPKG_MAX_CONCURRENCY' -Qui
     Add-Content -Path $tripletFile -Value 'set(VCPKG_MAX_CONCURRENCY 2)'
 }
 
-if ($Clean) {
-    Write-Section 'Clean'
-    foreach ($path in @($BuildDirectory, $InstallDirectory)) {
-        if (Test-Path $path) {
-            Write-Host "Removing $path"
-            Remove-Item -LiteralPath $path -Recurse -Force
+if (-not [string]::IsNullOrWhiteSpace($vcpkgPlatformToolset)) {
+    $tripletContent = Get-Content -Path $tripletFile -Raw
+    $toolsetLine = "set(VCPKG_PLATFORM_TOOLSET $vcpkgPlatformToolset)"
+
+    if ($tripletContent -match 'set\(VCPKG_PLATFORM_TOOLSET\s+([^)]+)\)') {
+        if ($Matches[1].Trim() -ne $vcpkgPlatformToolset) {
+            $updatedTripletContent = [regex]::Replace(
+                $tripletContent,
+                'set\(VCPKG_PLATFORM_TOOLSET\s+([^)]+)\)',
+                $toolsetLine
+            )
+            Set-Content -Path $tripletFile -Value $updatedTripletContent
         }
+    } else {
+        Add-Content -Path $tripletFile -Value $toolsetLine
     }
 }
 
@@ -433,7 +627,7 @@ Write-Section 'Configure'
 for ($attempt = 1; $attempt -le 3; $attempt++) {
     try {
         Write-Host "Configure attempt $attempt/3"
-        Invoke-VcCommand -VcVarsPath $vcVarsPath -WorkingDirectory $ProjectRoot -Command $configureCommand -ToolsetVersion $msvcToolsetVersion
+        Invoke-VcCommand -VcVarsPath $vcVarsPath -WorkingDirectory $ProjectRoot -Command $configureCommand -ToolsetVersion $msvcToolsetVersion -WindowsSdkInfo $windowsSdkInfo
         break
     } catch {
         $logPath = Join-Path $BuildDirectory 'vcpkg-manifest-install.log'
@@ -463,12 +657,12 @@ for ($attempt = 1; $attempt -le 3; $attempt++) {
 Write-Section 'Build'
 $buildArguments = @('--build', $BuildDirectory, '-j', '%NUMBER_OF_PROCESSORS%')
 $buildCommand = 'cmake ' + (Join-CmdArguments -Arguments $buildArguments)
-Invoke-VcCommand -VcVarsPath $vcVarsPath -WorkingDirectory $ProjectRoot -Command $buildCommand -ToolsetVersion $msvcToolsetVersion
+Invoke-VcCommand -VcVarsPath $vcVarsPath -WorkingDirectory $ProjectRoot -Command $buildCommand -ToolsetVersion $msvcToolsetVersion -WindowsSdkInfo $windowsSdkInfo
 
 Write-Section 'Install'
 $installArguments = @('--install', $BuildDirectory, '--prefix', $InstallDirectory)
 $installCommand = 'cmake ' + (Join-CmdArguments -Arguments $installArguments)
-Invoke-VcCommand -VcVarsPath $vcVarsPath -WorkingDirectory $ProjectRoot -Command $installCommand -ToolsetVersion $msvcToolsetVersion
+Invoke-VcCommand -VcVarsPath $vcVarsPath -WorkingDirectory $ProjectRoot -Command $installCommand -ToolsetVersion $msvcToolsetVersion -WindowsSdkInfo $windowsSdkInfo
 
 $packagePath = $null
 $checksumPath = $null
