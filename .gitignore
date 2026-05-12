@@ -53,3 +53,4 @@ lib/
 !external/tree-sitter/lib/src/query.c
 generatedSchema.usda
 plugInfo.json
+/dist
