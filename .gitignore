@@ -31,6 +31,8 @@ test.py
 testdata
 vcpkg/
 vcpkg/**
+.vcpkg/
+.vcpkg/**
 vcpkg_*/**
 vcpkg_*/
 build*/
