@@ -26,7 +26,7 @@ Usage: .\build_windows_ci.ps1 [options]
 CI-aligned local Windows build script for LichtFeld Studio.
 It mirrors the GitHub nightly packaging workflow locally:
   1. Verifies CUDA, CMake, Ninja, Git, and MSVC
-  2. Uses VCPKG_ROOT (default: ..\vcpkg)
+  2. Uses -VcpkgRoot or VCPKG_ROOT, otherwise bootstraps ..\vcpkg
   3. Configures with CMake + Ninja
   4. Builds with vcvars64.bat loaded
   5. Installs to dist
@@ -41,7 +41,7 @@ Options:
   -BuildDirectory <path>              Build directory (default: build)
   -InstallDirectory <path>            Install directory (default: dist)
   -PackageOutputDirectory <path>      Zip output directory (default: repo root)
-  -VcpkgRoot <path>                   Override VCPKG_ROOT (default: ..\vcpkg)
+  -VcpkgRoot <path>                   Override VCPKG_ROOT (default: VCPKG_ROOT env var or ..\vcpkg)
   -CudaPath <path>                    Override CUDA root path
   -Clean                              Remove build and dist before building
   -SkipPackage                        Build and install only; do not create zip
@@ -361,6 +361,67 @@ function Resolve-ToolPath {
     return $null
 }
 
+function Get-EffectiveVcpkgRoot {
+    param(
+        [string]$ProjectRoot,
+        [string]$RequestedVcpkgRoot
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedVcpkgRoot)) {
+        return Resolve-AbsolutePath -BasePath $ProjectRoot -Path $RequestedVcpkgRoot
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:VCPKG_ROOT)) {
+        return [System.IO.Path]::GetFullPath($env:VCPKG_ROOT)
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $ProjectRoot) 'vcpkg'))
+}
+
+function Initialize-VcpkgRoot {
+    param(
+        [string]$VcpkgRoot,
+        [string]$GitPath
+    )
+
+    $bootstrapScript = Join-Path $VcpkgRoot 'bootstrap-vcpkg.bat'
+    $vcpkgExe = Join-Path $VcpkgRoot 'vcpkg.exe'
+
+    if (-not (Test-Path $VcpkgRoot)) {
+        Write-Section 'Setup vcpkg'
+        Write-Host "Cloning vcpkg into $VcpkgRoot"
+
+        $vcpkgParent = Split-Path -Parent $VcpkgRoot
+        if (-not [string]::IsNullOrWhiteSpace($vcpkgParent)) {
+            New-Item -ItemType Directory -Force -Path $vcpkgParent | Out-Null
+        }
+
+        & $GitPath clone https://github.com/microsoft/vcpkg.git $VcpkgRoot
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to clone vcpkg into $VcpkgRoot"
+        }
+    }
+
+    if (-not (Test-Path $bootstrapScript)) {
+        throw "VCPKG_ROOT does not look like a vcpkg checkout: $VcpkgRoot"
+    }
+
+    if (-not (Test-Path $vcpkgExe)) {
+        Write-Section 'Bootstrap vcpkg'
+        Write-Host "Bootstrapping vcpkg at $VcpkgRoot"
+
+        Push-Location $VcpkgRoot
+        try {
+            & $bootstrapScript -disableMetrics
+            if ($LASTEXITCODE -ne 0) {
+                throw "bootstrap-vcpkg.bat failed at $VcpkgRoot"
+            }
+        } finally {
+            Pop-Location
+        }
+    }
+}
+
 function Get-CMakeCacheCompilerPath {
     param(
         [string]$BuildDirectory,
@@ -462,21 +523,10 @@ function Get-PackageVersionValue {
 $script:ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 
-if ([string]::IsNullOrWhiteSpace($VcpkgRoot)) {
-    $repoLocalVcpkgRoot = Join-Path $ProjectRoot '.vcpkg'
-    $parentVcpkgRoot = Join-Path (Split-Path -Parent $ProjectRoot) 'vcpkg'
-
-    if (Test-Path $repoLocalVcpkgRoot) {
-        $VcpkgRoot = $repoLocalVcpkgRoot
-    } else {
-        $VcpkgRoot = $parentVcpkgRoot
-    }
-}
-
 $BuildDirectory = Resolve-AbsolutePath -BasePath $ProjectRoot -Path $BuildDirectory
 $InstallDirectory = Resolve-AbsolutePath -BasePath $ProjectRoot -Path $InstallDirectory
 $PackageOutputDirectory = Resolve-AbsolutePath -BasePath $ProjectRoot -Path $PackageOutputDirectory
-$VcpkgRoot = Resolve-AbsolutePath -BasePath $ProjectRoot -Path $VcpkgRoot
+$VcpkgRoot = Get-EffectiveVcpkgRoot -ProjectRoot $ProjectRoot -RequestedVcpkgRoot $VcpkgRoot
 $resolvedCudaPath = Get-ConfiguredCudaPath -RequestedCudaPath $CudaPath
 
 Write-Section 'Environment'
@@ -557,8 +607,11 @@ $env:CUDA_PATH_V12_8 = $resolvedCudaPath
 Add-ToPathIfMissing -Entry (Join-Path $resolvedCudaPath 'bin')
 Add-ToPathIfMissing -Entry (Join-Path $resolvedCudaPath 'libnvvp')
 
-if (-not (Test-Path $VcpkgRoot)) {
-    throw "VCPKG_ROOT does not exist: $VcpkgRoot"
+Initialize-VcpkgRoot -VcpkgRoot $VcpkgRoot -GitPath $gitPath
+
+$repoLocalVcpkgRoot = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot '.vcpkg'))
+if ((Test-Path $repoLocalVcpkgRoot) -and ($repoLocalVcpkgRoot -ne $VcpkgRoot)) {
+    Write-Host "Note: repo-local .vcpkg exists but is not being used: $repoLocalVcpkgRoot" -ForegroundColor Yellow
 }
 
 $vcpkgExe = Join-Path $VcpkgRoot 'vcpkg.exe'
