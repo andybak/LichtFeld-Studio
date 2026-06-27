@@ -6,6 +6,7 @@
 
 #include "core/export.hpp"
 #include "input/key_codes.hpp"
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -13,6 +14,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -20,16 +22,25 @@ namespace lfs::vis::input {
 
     enum class ToolMode {
         GLOBAL = 0,
-        SELECTION,
-        BRUSH,
-        TRANSLATE,
-        ROTATE,
-        SCALE,
-        ALIGN,
-        CROP_BOX,
+        SELECTION = 1,
+        TRANSLATE = 3,
+        ROTATE = 4,
+        SCALE = 5,
+        ALIGN = 6,
+        CROP_BOX = 7,
     };
 
+    // Highest persisted ToolMode value plus one. Value 2 was the removed brush tool mode.
     inline constexpr size_t kToolModeCount = 8;
+    inline constexpr std::array<ToolMode, 7> kAllToolModes = {
+        ToolMode::GLOBAL,
+        ToolMode::SELECTION,
+        ToolMode::ALIGN,
+        ToolMode::CROP_BOX,
+        ToolMode::TRANSLATE,
+        ToolMode::ROTATE,
+        ToolMode::SCALE,
+    };
 
     enum class Action {
         NONE = 0,
@@ -44,7 +55,7 @@ namespace lfs::vis::input {
         CAMERA_MOVE_RIGHT,
         CAMERA_MOVE_UP,
         CAMERA_MOVE_DOWN,
-        CAMERA_RESET_HOME,
+        CAMERA_SET_HOME,
         CAMERA_FOCUS_SELECTION,
         CAMERA_SET_PIVOT,
         CAMERA_NEXT_VIEW,
@@ -76,8 +87,7 @@ namespace lfs::vis::input {
         TOGGLE_SELECTION_CROP_FILTER,
         // Tools
         BRUSH_RESIZE,
-        CYCLE_BRUSH_MODE,
-        CONFIRM_POLYGON,
+        CONFIRM_POLYGON = 40,
         CANCEL_POLYGON,
         UNDO_POLYGON_VERTEX,
         CYCLE_SELECTION_VIS,
@@ -109,11 +119,19 @@ namespace lfs::vis::input {
         TOOL_ROTATE,
         TOOL_SCALE,
         TOOL_MIRROR,
-        TOOL_BRUSH,
-        TOOL_ALIGN,
+        TOOL_ALIGN = 67,
         // Pie menu
         PIE_MENU,
         DEPTH_ADJUST_NEAR, // Deprecated: migrated to DEPTH_ADJUST_FAR on load
+        CAMERA_RESET_HOME,
+        HISTOGRAM_ZOOM_MARKED,
+        TOGGLE_CAMERA_FRUSTUMS,
+        SELECTION_INTERSECT,
+        // Appended to avoid renumbering existing persisted action ids.
+        SELECT_MODE_BOX,
+        SELECT_MODE_SPHERE,
+        CUT_SELECTION,
+
     };
 
     enum class ShortcutScope : uint8_t {
@@ -191,7 +209,6 @@ namespace lfs::vis::input {
         Selection,
         SelectionGlobal,
         Depth,
-        Brush,
         CropBox,
         Editing,
         ViewGlobal,
@@ -258,6 +275,7 @@ namespace lfs::vis::input {
         bool saveProfileToFile(const std::filesystem::path& path) const;
         std::vector<std::string> getAvailableProfiles() const;
         const std::string& getCurrentProfileName() const { return current_profile_name_; }
+        std::uint64_t getBindingsRevision() const { return bindings_revision_; }
 
         static std::filesystem::path getConfigDir();
 
@@ -274,6 +292,8 @@ namespace lfs::vis::input {
         std::optional<InputTrigger> getTriggerForAction(Action action, ToolMode mode = ToolMode::GLOBAL) const;
         std::optional<InputTrigger> getEffectiveTriggerForAction(Action action, ToolMode mode = ToolMode::GLOBAL) const;
         std::string getTriggerDescription(Action action, ToolMode mode = ToolMode::GLOBAL) const;
+        [[nodiscard]] std::string getLocalizedTriggerDescription(
+            Action action, ToolMode mode = ToolMode::GLOBAL) const;
 
         // Get the key code for a continuous action (returns -1 if not a key binding)
         int getKeyForAction(Action action, ToolMode mode = ToolMode::GLOBAL) const;
@@ -317,6 +337,7 @@ namespace lfs::vis::input {
 
         std::string current_profile_name_;
         std::vector<Binding> bindings_;
+        std::uint64_t bindings_revision_ = 0;
 
         using KeyMapKey = std::tuple<ToolMode, int, int>;
         using MouseMapKey = std::tuple<ToolMode, MouseButton, int, bool>;
@@ -348,5 +369,11 @@ namespace lfs::vis::input {
     LFS_VIS_API std::string getMouseButtonName(MouseButton button);
     LFS_VIS_API std::string getModifierString(int modifiers);
     [[nodiscard]] LFS_VIS_API ShortcutScope shortcutScopeForAction(Action action);
+
+    [[nodiscard]] LFS_VIS_API std::string_view actionNameKey(Action action);
+    [[nodiscard]] LFS_VIS_API std::optional<Action> actionFromName(std::string_view name);
+    [[nodiscard]] LFS_VIS_API std::string getLocalizedActionName(Action action);
+    [[nodiscard]] LFS_VIS_API std::string getLocalizedToolModeName(ToolMode mode);
+    [[nodiscard]] LFS_VIS_API std::string localizeTriggerDescription(std::string description);
 
 } // namespace lfs::vis::input

@@ -41,18 +41,19 @@ namespace lfs::vis {
         Rotate,
         Scale,
         Mirror,
-        Brush,
         Align
     };
 
     // Selection sub-modes (for selection tool)
     enum class SelectionSubMode : uint8_t {
-        Centers,
-        Rectangle,
-        Polygon,
-        Lasso,
-        Rings,
-        Color
+        Centers = 0,
+        Rectangle = 1,
+        Polygon = 2,
+        Lasso = 3,
+        Rings = 4,
+        Color = 5,
+        Box = 6,
+        Sphere = 7
     };
 
     // Transform coordinate space

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/tensor/internal/tensor_generic_ops.cuh"
+#include "diagnostics/vram_profiler.hpp"
 #include "mrnf_kernels.hpp"
 #include <algorithm>
 #include <cassert>
@@ -16,6 +17,8 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
+
+#include "kernel_stream.hpp"
 
 namespace lfs::training::mrnf_strategy {
 
@@ -41,6 +44,8 @@ namespace lfs::training::mrnf_strategy {
         float* __restrict__ means,
         const float* __restrict__ raw_opacities,
         const float* __restrict__ vis_count,
+        const bool* __restrict__ frozen_mask,
+        size_t frozen_mask_size,
         float lr_mean,
         float noise_weight,
         float median_scale,
@@ -49,6 +54,8 @@ namespace lfs::training::mrnf_strategy {
 
         const size_t idx = threadIdx.x + blockIdx.x * static_cast<size_t>(blockDim.x);
         if (idx >= N)
+            return;
+        if (frozen_mask != nullptr && idx < frozen_mask_size && frozen_mask[idx])
             return;
 
         if (vis_count[idx] <= 0.0f)
@@ -75,6 +82,8 @@ namespace lfs::training::mrnf_strategy {
         float* means,
         const float* raw_opacities,
         const float* vis_count,
+        const bool* frozen_mask,
+        size_t frozen_mask_size,
         float lr_mean,
         float noise_weight,
         float median_scale,
@@ -87,16 +96,19 @@ namespace lfs::training::mrnf_strategy {
 
         constexpr int threads = 256;
         const int blocks = static_cast<int>((N + threads - 1) / threads);
-        cudaStream_t s = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t s = resolve_stream(stream);
 
         mrnf_noise_injection_kernel<<<blocks, threads, 0, s>>>(
             means, raw_opacities, vis_count,
+            frozen_mask, frozen_mask_size,
             lr_mean, noise_weight, median_scale, N, seed);
     }
 
     __global__ void mrnf_decay_kernel(
         float* __restrict__ raw_opacities,
         float* __restrict__ log_scales,
+        const bool* __restrict__ frozen_mask,
+        size_t frozen_mask_size,
         float opacity_decay,
         float scale_decay,
         float train_t,
@@ -104,6 +116,8 @@ namespace lfs::training::mrnf_strategy {
 
         const size_t idx = threadIdx.x + blockIdx.x * static_cast<size_t>(blockDim.x);
         if (idx >= N)
+            return;
+        if (frozen_mask != nullptr && idx < frozen_mask_size && frozen_mask[idx])
             return;
 
         const float t_shrink = 1.0f - train_t;
@@ -122,6 +136,8 @@ namespace lfs::training::mrnf_strategy {
     void launch_mrnf_decay(
         float* raw_opacities,
         float* log_scales,
+        const bool* frozen_mask,
+        size_t frozen_mask_size,
         float opacity_decay,
         float scale_decay,
         float train_t,
@@ -133,10 +149,11 @@ namespace lfs::training::mrnf_strategy {
 
         constexpr int threads = 256;
         const int blocks = static_cast<int>((N + threads - 1) / threads);
-        cudaStream_t s = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t s = resolve_stream(stream);
 
         mrnf_decay_kernel<<<blocks, threads, 0, s>>>(
-            raw_opacities, log_scales, opacity_decay, scale_decay, train_t, N);
+            raw_opacities, log_scales, frozen_mask, frozen_mask_size,
+            opacity_decay, scale_decay, train_t, N);
     }
 
     __global__ void elementwise_add_inplace_kernel(
@@ -157,7 +174,7 @@ namespace lfs::training::mrnf_strategy {
             return;
         constexpr int threads = 256;
         const int blocks = static_cast<int>((N + threads - 1) / threads);
-        cudaStream_t s = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t s = resolve_stream(stream);
         elementwise_add_inplace_kernel<<<blocks, threads, 0, s>>>(a, b, N);
     }
 
@@ -181,7 +198,7 @@ namespace lfs::training::mrnf_strategy {
         assert(N > 0);
         assert(bounds != nullptr);
 
-        cudaStream_t s = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t s = resolve_stream(stream);
 
         const float low_pct = (1.0f - percentile) / 2.0f;
         const float high_pct = 1.0f - low_pct;
@@ -193,12 +210,24 @@ namespace lfs::training::mrnf_strategy {
         float* d_input = nullptr;
         float* d_sorted = nullptr;
         cudaMallocAsync(&d_input, N * sizeof(float), s);
+        lfs::diagnostics::VramProfiler::instance().recordAllocation(
+            d_input, N * sizeof(float),
+            lfs::diagnostics::VramAllocationMethod::Async,
+            "mrnf.percentile.input");
         cudaMallocAsync(&d_sorted, N * sizeof(float), s);
+        lfs::diagnostics::VramProfiler::instance().recordAllocation(
+            d_sorted, N * sizeof(float),
+            lfs::diagnostics::VramAllocationMethod::Async,
+            "mrnf.percentile.sorted");
 
         size_t temp_bytes = 0;
         cub::DeviceRadixSort::SortKeys(nullptr, temp_bytes, d_input, d_sorted, n_int, 0, 32, s);
         char* d_temp = nullptr;
         cudaMallocAsync(&d_temp, temp_bytes, s);
+        lfs::diagnostics::VramProfiler::instance().recordAllocation(
+            d_temp, temp_bytes,
+            lfs::diagnostics::VramAllocationMethod::Async,
+            "mrnf.percentile.cub_temp");
 
         constexpr int threads = 256;
         const int blocks = static_cast<int>((N + threads - 1) / threads);
@@ -217,8 +246,11 @@ namespace lfs::training::mrnf_strategy {
             extents[axis] = (h_high - h_low) * 0.5f;
         }
 
+        lfs::diagnostics::VramProfiler::instance().recordDeallocation(d_input);
         cudaFreeAsync(d_input, s);
+        lfs::diagnostics::VramProfiler::instance().recordDeallocation(d_sorted);
         cudaFreeAsync(d_sorted, s);
+        lfs::diagnostics::VramProfiler::instance().recordDeallocation(d_temp);
         cudaFreeAsync(d_temp, s);
 
         for (int i = 0; i < 3; ++i) {
@@ -292,7 +324,7 @@ namespace lfs::training::mrnf_strategy {
         if (K == 0)
             return;
 
-        cudaStream_t s = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+        cudaStream_t s = resolve_stream(stream);
 
         if (K == N) {
             auto out_ptr = thrust::device_pointer_cast(output_indices);
@@ -317,9 +349,25 @@ namespace lfs::training::mrnf_strategy {
         float* d_keys_sorted = nullptr;
         int64_t* d_indices_sorted = nullptr;
         cudaMallocAsync(&d_keys, sort_count * sizeof(float), s);
+        lfs::diagnostics::VramProfiler::instance().recordAllocation(
+            d_keys, sort_count * sizeof(float),
+            lfs::diagnostics::VramAllocationMethod::Async,
+            "mrnf.gumbel.keys");
         cudaMallocAsync(&d_indices, sort_count * sizeof(int64_t), s);
+        lfs::diagnostics::VramProfiler::instance().recordAllocation(
+            d_indices, sort_count * sizeof(int64_t),
+            lfs::diagnostics::VramAllocationMethod::Async,
+            "mrnf.gumbel.indices");
         cudaMallocAsync(&d_keys_sorted, sort_count * sizeof(float), s);
+        lfs::diagnostics::VramProfiler::instance().recordAllocation(
+            d_keys_sorted, sort_count * sizeof(float),
+            lfs::diagnostics::VramAllocationMethod::Async,
+            "mrnf.gumbel.keys_sorted");
         cudaMallocAsync(&d_indices_sorted, sort_count * sizeof(int64_t), s);
+        lfs::diagnostics::VramProfiler::instance().recordAllocation(
+            d_indices_sorted, sort_count * sizeof(int64_t),
+            lfs::diagnostics::VramAllocationMethod::Async,
+            "mrnf.gumbel.indices_sorted");
 
         constexpr int threads = 256;
         const int blocks = static_cast<int>((sort_count + threads - 1) / threads);
@@ -355,6 +403,10 @@ namespace lfs::training::mrnf_strategy {
             sort_count_int, 0, 32, s);
         char* d_temp = nullptr;
         cudaMallocAsync(&d_temp, temp_bytes, s);
+        lfs::diagnostics::VramProfiler::instance().recordAllocation(
+            d_temp, temp_bytes,
+            lfs::diagnostics::VramAllocationMethod::Async,
+            "mrnf.gumbel.cub_temp");
         cub::DeviceRadixSort::SortPairsDescending(
             d_temp, temp_bytes,
             d_keys, d_keys_sorted,
@@ -363,10 +415,15 @@ namespace lfs::training::mrnf_strategy {
 
         cudaMemcpyAsync(output_indices, d_indices_sorted, K * sizeof(int64_t), cudaMemcpyDeviceToDevice, s);
 
+        lfs::diagnostics::VramProfiler::instance().recordDeallocation(d_temp);
         cudaFreeAsync(d_temp, s);
+        lfs::diagnostics::VramProfiler::instance().recordDeallocation(d_keys);
         cudaFreeAsync(d_keys, s);
+        lfs::diagnostics::VramProfiler::instance().recordDeallocation(d_indices);
         cudaFreeAsync(d_indices, s);
+        lfs::diagnostics::VramProfiler::instance().recordDeallocation(d_keys_sorted);
         cudaFreeAsync(d_keys_sorted, s);
+        lfs::diagnostics::VramProfiler::instance().recordDeallocation(d_indices_sorted);
         cudaFreeAsync(d_indices_sorted, s);
     }
 

@@ -43,12 +43,13 @@ namespace lfs::vis {
     class DataLoadingService;
 
     namespace tools {
-        class BrushTool;
         class AlignTool;
         class SelectionTool;
     } // namespace tools
 
     class LFS_VIS_API VisualizerImpl : public Visualizer {
+        friend class gui::GuiManager;
+
     public:
         explicit VisualizerImpl(const ViewerOptions& options);
         ~VisualizerImpl() override;
@@ -102,14 +103,6 @@ namespace lfs::vis {
         // Antialiasing state
         bool isAntiAliasingEnabled() const {
             return rendering_manager_ ? rendering_manager_->getSettings().antialiasing : false;
-        }
-
-        tools::BrushTool* getBrushTool() {
-            return brush_tool_.get();
-        }
-
-        const tools::BrushTool* getBrushTool() const {
-            return brush_tool_.get();
         }
 
         tools::AlignTool* getAlignTool() {
@@ -180,6 +173,51 @@ namespace lfs::vis {
         void setupViewContextBridge();
         void beginShutdown(std::string_view reason = "Viewer is shutting down");
         void processRenderWorkQueue();
+        [[nodiscard]] bool hasPendingRenderWork();
+        [[nodiscard]] bool inputFrameRequestsRender() const;
+
+        struct FrameDemand {
+            bool viewport_export_locked = false;
+            bool scene_dirty = false;
+            bool continuous_input = false;
+            bool python_animation = false;
+            bool python_overlay = false;
+            bool python_redraw = false;
+            bool gui_animation = false;
+            bool input_event = false;
+            bool posted_work = false;
+            bool render_work = false;
+            bool store_dirty = false;
+            bool swapchain_resize_pending = false;
+            bool swapchain_resize_ready = false;
+            bool window_resize_paint_pending = false;
+            bool viewport_resize_deferring = false;
+            bool viewport_resize_settle_ready = false;
+
+            [[nodiscard]] bool shouldRenderFrame() const {
+                return viewport_export_locked || scene_dirty || continuous_input ||
+                       python_animation || python_overlay || python_redraw ||
+                       gui_animation || input_event || posted_work || render_work ||
+                       store_dirty || swapchain_resize_ready || window_resize_paint_pending ||
+                       viewport_resize_settle_ready;
+            }
+
+            [[nodiscard]] bool needsContinuousLoop() const {
+                const bool resize_deferral_throttles_animation =
+                    viewport_resize_deferring ||
+                    (swapchain_resize_pending && !swapchain_resize_ready);
+                return scene_dirty || continuous_input || python_animation ||
+                       python_overlay || python_redraw ||
+                       (gui_animation && !resize_deferral_throttles_animation) ||
+                       render_work || viewport_export_locked || store_dirty ||
+                       swapchain_resize_ready || window_resize_paint_pending ||
+                       viewport_resize_settle_ready;
+            }
+        };
+
+        [[nodiscard]] FrameDemand collectFrameDemand(bool viewport_export_locked,
+                                                     bool drained_store_dirty = false);
+        void waitForNextEvent(bool is_training);
 
         class CallbackCleanup {
             std::vector<std::function<void()>> cleanups_;
@@ -212,7 +250,6 @@ namespace lfs::vis {
         std::unique_ptr<MainLoop> main_loop_;
 
         // Tools
-        std::shared_ptr<tools::BrushTool> brush_tool_;
         std::shared_ptr<tools::AlignTool> align_tool_;
         std::shared_ptr<tools::SelectionTool> selection_tool_;
         std::unique_ptr<ToolContext> tool_context_;
@@ -242,7 +279,10 @@ namespace lfs::vis {
         bool pending_auto_train_ = false;
         bool pending_new_project_ = false;
         bool pending_reset_ = false;
+        int pending_training_completion_refresh_frames_ = 0;
         bool gui_frame_rendered_ = false;
+        bool startup_plugin_preload_started_ = false;
+        bool update_work_processed_ = false;
         std::chrono::high_resolution_clock::time_point last_frame_time_ = std::chrono::high_resolution_clock::now();
         bool sequencer_ui_initialized_ = false;
         std::unique_ptr<python::SequencerUIStateData> sequencer_ui_state_;

@@ -6,6 +6,8 @@
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/events.hpp"
 #include "core/logger.hpp"
+#include "core/services.hpp"
+#include "diagnostics/vram_profiler.hpp"
 #include "gui/gpu_memory_query.hpp"
 #include "gui/panel_layout.hpp"
 #include "gui/rmlui/rml_document_utils.hpp"
@@ -19,6 +21,7 @@
 #include "scene/scene_manager.hpp"
 #include "theme/theme.hpp"
 #include "training/training_manager.hpp"
+#include "visualizer/app_store.hpp"
 #include "visualizer_impl.hpp"
 
 #include <RmlUi/Core.h>
@@ -30,6 +33,8 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <optional>
+#include <vector>
 
 #include "git_version.h"
 
@@ -52,6 +57,16 @@ namespace lfs::vis::gui {
 
         private:
             const std::string* commit_;
+        };
+
+        // Clicking the GPU icon opens/closes the VRAM diagnostics HUD by toggling the
+        // profiler that gates it.
+        class VramHudToggleListener final : public Rml::EventListener {
+        public:
+            void ProcessEvent(Rml::Event& /*event*/) override {
+                auto& profiler = lfs::diagnostics::VramProfiler::instance();
+                profiler.setEnabled(!profiler.enabled());
+            }
         };
 
         std::string fmtCount(int64_t n) {
@@ -79,6 +94,81 @@ namespace lfs::vis::gui {
             if (end == std::string::npos)
                 return s;
             return s.substr(0, end + 1);
+        }
+
+        std::string formatStepLabel(const size_t step) {
+            return std::format("{} {}", stripColon(LOC(lichtfeld::Strings::Status::STEP)), step);
+        }
+
+        struct ProgressMarkerRenderState {
+            bool dragging = false;
+            bool adding = false;
+            size_t original_step = 0;
+            size_t preview_step = 0;
+            size_t hover_step = 0;
+        };
+
+        void appendProgressMarkerRml(std::string& markers,
+                                     const size_t step,
+                                     const int total_iterations,
+                                     const bool past,
+                                     const bool hovered,
+                                     const bool preview) {
+            const float left_pct = std::clamp(
+                100.0f * static_cast<float>(step) / static_cast<float>(total_iterations),
+                0.5f,
+                99.5f);
+
+            std::string classes = "progress-marker";
+            if (past)
+                classes += " is-past";
+            if (hovered)
+                classes += " is-hovered";
+            if (preview)
+                classes += " is-preview";
+
+            markers += std::format(
+                "<div class=\"{}\" style=\"left:{:.3f}%;\"></div>",
+                classes,
+                left_pct);
+        }
+
+        std::string buildProgressMarkersRml(std::vector<size_t> save_steps,
+                                            const int total_iterations,
+                                            const int current_iteration,
+                                            const ProgressMarkerRenderState& state) {
+            if (total_iterations <= 0)
+                return {};
+
+            std::ranges::sort(save_steps);
+            save_steps.erase(std::ranges::unique(save_steps).begin(), save_steps.end());
+
+            std::string markers;
+            markers.reserve((save_steps.size() + 1) * 136);
+            for (const size_t save_step : save_steps) {
+                if (save_step == 0 || save_step > static_cast<size_t>(total_iterations))
+                    continue;
+                if (state.dragging && !state.adding && save_step == state.original_step)
+                    continue;
+
+                appendProgressMarkerRml(markers,
+                                        save_step,
+                                        total_iterations,
+                                        save_step <= static_cast<size_t>(std::max(0, current_iteration)),
+                                        !state.dragging && save_step == state.hover_step,
+                                        false);
+            }
+
+            if (state.dragging && state.preview_step > 0 &&
+                state.preview_step <= static_cast<size_t>(total_iterations)) {
+                appendProgressMarkerRml(markers,
+                                        state.preview_step,
+                                        total_iterations,
+                                        false,
+                                        true,
+                                        true);
+            }
+            return markers;
         }
 
         struct FramebufferBlitRect {
@@ -211,6 +301,7 @@ namespace lfs::vis::gui {
         ctor.Bind("lfs_mem_text", &model_.lfs_mem_text);
         ctor.Bind("lfs_mem_color", &model_.lfs_mem_color);
         ctor.Bind("show_gpu_model", &model_.show_gpu_model);
+        ctor.Bind("gpu_panel_active", &model_.gpu_panel_active);
         ctor.Bind("gpu_model_text", &model_.gpu_model_text);
         ctor.Bind("gpu_mem_text", &model_.gpu_mem_text);
         ctor.Bind("gpu_mem_color", &model_.gpu_mem_color);
@@ -233,18 +324,21 @@ namespace lfs::vis::gui {
             return;
         }
 
-        attachGitCommitListener();
+        attachElementListeners();
+        bindReactiveStore();
 
         if (!speed_events_initialized_) {
             lfs::core::events::ui::SpeedChanged::when([this](const auto& e) {
                 speed_state_.showWasd(e.current_speed);
                 animation_active_ = true;
                 next_refresh_at_ = {};
+                markModelDirty();
             });
             lfs::core::events::ui::ZoomSpeedChanged::when([this](const auto& e) {
                 speed_state_.showZoom(e.zoom_speed);
                 animation_active_ = true;
                 next_refresh_at_ = {};
+                markModelDirty();
             });
             speed_events_initialized_ = true;
         }
@@ -253,18 +347,35 @@ namespace lfs::vis::gui {
     }
 
     void RmlStatusBar::shutdown() {
+        if (pending_gpu_mem_.valid()) {
+            pending_gpu_mem_.wait();
+            try {
+                cached_gpu_mem_ = pending_gpu_mem_.get();
+            } catch (const std::exception& e) {
+                LOG_WARN("RmlStatusBar: GPU memory query failed during shutdown: {}", e.what());
+            }
+        }
+
+        subscriptions_.clear();
         model_handle_ = {};
+        if (rml_manager_)
+            rml_manager_->releaseCachedVulkanContext(direct_cache_);
         if (rml_context_ && rml_manager_)
             rml_manager_->destroyContext("status_bar");
         rml_context_ = nullptr;
         document_ = nullptr;
         delete git_commit_listener_;
         git_commit_listener_ = nullptr;
+        delete gpu_icon_listener_;
+        gpu_icon_listener_ = nullptr;
     }
 
     void RmlStatusBar::reloadResources() {
         if (!rml_context_)
             return;
+
+        if (rml_manager_)
+            rml_manager_->releaseCachedVulkanContext(direct_cache_);
 
         if (document_) {
             rml_context_->UnloadDocument(document_);
@@ -274,6 +385,7 @@ namespace lfs::vis::gui {
         document_ = nullptr;
         base_rcss_.clear();
         has_theme_signature_ = false;
+        model_.progress_markers_rml.clear();
         model_dirty_ = true;
         animation_active_ = true;
         last_render_w_ = 0;
@@ -294,9 +406,44 @@ namespace lfs::vis::gui {
             return;
         }
 
-        attachGitCommitListener();
+        attachElementListeners();
+        bindReactiveStore();
 
         updateTheme();
+    }
+
+    void RmlStatusBar::bindReactiveStore() {
+        subscriptions_.clear();
+        auto& store = lfs::vis::app_store();
+        const auto bind = [this](auto& observable) {
+            subscriptions_.push_back(observable.subscribe([this](const auto&) {
+                markModelDirty();
+            }));
+        };
+
+        bind(store.iteration);
+        bind(store.total_iterations);
+        bind(store.loss);
+        bind(store.num_gaussians);
+        bind(store.max_gaussians);
+        bind(store.training_running);
+        bind(store.training_state);
+        bind(store.trainer_loaded);
+        bind(store.eval_psnr);
+        bind(store.eval_ssim);
+        bind(store.scene_generation);
+        bind(store.selection_generation);
+        subscriptions_.push_back(store.fps.subscribe([this](const float& fps) {
+            reactive_fps_available_ = true;
+            reactive_fps_value_ = fps;
+            markModelDirty();
+        }));
+        bind(store.mode_text);
+    }
+
+    void RmlStatusBar::markModelDirty() {
+        model_dirty_ = true;
+        next_refresh_at_ = {};
     }
 
     bool RmlStatusBar::updateTheme() {
@@ -317,13 +464,43 @@ namespace lfs::vis::gui {
         return true;
     }
 
-    void RmlStatusBar::attachGitCommitListener() {
+    void RmlStatusBar::pollGpuMemoryQuery(const std::chrono::steady_clock::time_point now) {
+        if (pending_gpu_mem_.valid() &&
+            pending_gpu_mem_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            try {
+                cached_gpu_mem_ = pending_gpu_mem_.get();
+            } catch (const std::exception& e) {
+                LOG_WARN("RmlStatusBar: GPU memory query failed: {}", e.what());
+            }
+        }
+
+        if (pending_gpu_mem_.valid())
+            return;
+
+        if (next_gpu_refresh_at_ != std::chrono::steady_clock::time_point{} &&
+            now < next_gpu_refresh_at_) {
+            return;
+        }
+
+        next_gpu_refresh_at_ = now + kGpuRefreshInterval;
+        pending_gpu_mem_ = std::async(std::launch::async, [] {
+            return queryGpuMemory();
+        });
+    }
+
+    void RmlStatusBar::attachElementListeners() {
         if (!document_)
             return;
+
         if (!git_commit_listener_)
             git_commit_listener_ = new GitCommitClickListener(&model_.git_commit);
         if (auto* el = document_->GetElementById("git-commit"))
             el->AddEventListener(Rml::EventId::Click, git_commit_listener_);
+
+        if (!gpu_icon_listener_)
+            gpu_icon_listener_ = new VramHudToggleListener();
+        if (auto* el = document_->GetElementById("gpu-icon"))
+            el->AddEventListener(Rml::EventId::Click, gpu_icon_listener_);
     }
 
     void RmlStatusBar::setModelString(const char* name, std::string& field, std::string value) {
@@ -340,6 +517,211 @@ namespace lfs::vis::gui {
         field = value;
         model_handle_.DirtyVariable(name);
         model_dirty_ = true;
+    }
+
+    void RmlStatusBar::setProgressMarkersRml(std::string value) {
+        if (model_.progress_markers_rml == value)
+            return;
+
+        model_.progress_markers_rml = std::move(value);
+        if (document_) {
+            if (auto* el = document_->GetElementById("progress-markers"))
+                el->SetInnerRML(model_.progress_markers_rml);
+        }
+        model_dirty_ = true;
+    }
+
+    std::optional<RmlStatusBar::ProgressBarGeometry> RmlStatusBar::progressBarGeometry() const {
+        if (!document_)
+            return std::nullopt;
+
+        auto* el = document_->GetElementById("progress-container");
+        if (!el)
+            return std::nullopt;
+
+        const auto offset = el->GetAbsoluteOffset(Rml::BoxArea::Border);
+        const float width = el->GetOffsetWidth();
+        const float height = el->GetOffsetHeight();
+        if (width <= 0.0f || height <= 0.0f)
+            return std::nullopt;
+
+        return ProgressBarGeometry{offset.x, offset.y, width, height};
+    }
+
+    void RmlStatusBar::resetSaveStepInteraction() {
+        if (!save_step_interaction_.dragging &&
+            !save_step_interaction_.adding &&
+            save_step_interaction_.original_step == 0 &&
+            save_step_interaction_.preview_step == 0 &&
+            save_step_interaction_.hover_step == 0) {
+            return;
+        }
+
+        save_step_interaction_ = {};
+        markModelDirty();
+    }
+
+    std::optional<size_t> RmlStatusBar::hitSaveStep(const float local_x, const float local_y,
+                                                    const ProgressBarGeometry& geom,
+                                                    const std::vector<size_t>& save_steps,
+                                                    const int total_iterations) const {
+        if (total_iterations <= 0 || save_steps.empty())
+            return std::nullopt;
+        if (local_y < geom.y - 4.0f || local_y > geom.y + geom.h + 4.0f)
+            return std::nullopt;
+
+        constexpr float kHitRadius = 8.0f;
+        float best_distance = kHitRadius + 1.0f;
+        std::optional<size_t> best_step;
+        for (const size_t step : save_steps) {
+            if (step == 0 || step > static_cast<size_t>(total_iterations))
+                continue;
+            const float x = geom.x + (static_cast<float>(step) / static_cast<float>(total_iterations)) * geom.w;
+            const float distance = std::abs(local_x - x);
+            if (distance <= kHitRadius && distance < best_distance) {
+                best_distance = distance;
+                best_step = step;
+            }
+        }
+        return best_step;
+    }
+
+    size_t RmlStatusBar::saveStepFromProgressX(const float local_x,
+                                               const ProgressBarGeometry& geom,
+                                               const int current_iteration,
+                                               const int total_iterations) const {
+        if (total_iterations <= 0)
+            return 0;
+
+        const float t = std::clamp((local_x - geom.x) / std::max(1.0f, geom.w), 0.0f, 1.0f);
+        size_t step = static_cast<size_t>(std::lround(t * static_cast<float>(total_iterations)));
+        const size_t min_step = current_iteration > 0
+                                    ? std::min(static_cast<size_t>(total_iterations),
+                                               static_cast<size_t>(current_iteration + 1))
+                                    : size_t{1};
+        step = std::clamp(step, min_step, static_cast<size_t>(total_iterations));
+        return step;
+    }
+
+    void RmlStatusBar::commitSaveStepEdit() {
+        auto* tm = lfs::vis::services().trainerOrNull();
+        if (!tm || !tm->canEditSaveSteps() || save_step_interaction_.preview_step == 0)
+            return;
+
+        auto steps = tm->getSaveSteps();
+        if (!save_step_interaction_.adding) {
+            const auto original = save_step_interaction_.original_step;
+            steps.erase(std::remove(steps.begin(), steps.end(), original), steps.end());
+        }
+        if (std::find(steps.begin(), steps.end(), save_step_interaction_.preview_step) == steps.end())
+            steps.push_back(save_step_interaction_.preview_step);
+        tm->setSaveSteps(std::move(steps));
+        markModelDirty();
+    }
+
+    void RmlStatusBar::removeSaveStep(const size_t step) {
+        auto* tm = lfs::vis::services().trainerOrNull();
+        if (!tm || !tm->canEditSaveSteps() || step == 0)
+            return;
+
+        auto steps = tm->getSaveSteps();
+        const auto old_size = steps.size();
+        steps.erase(std::remove(steps.begin(), steps.end(), step), steps.end());
+        if (steps.size() == old_size)
+            return;
+        tm->setSaveSteps(std::move(steps));
+        if (save_step_interaction_.hover_step == step)
+            save_step_interaction_.hover_step = 0;
+        markModelDirty();
+    }
+
+    void RmlStatusBar::clearSaveStepHover() {
+        if (save_step_interaction_.hover_step == 0)
+            return;
+        save_step_interaction_.hover_step = 0;
+        markModelDirty();
+    }
+
+    void RmlStatusBar::handleSaveStepInteraction(const PanelInputState& input,
+                                                 const float local_x,
+                                                 const float local_y) {
+        auto* tm = lfs::vis::services().trainerOrNull();
+        if (!tm || !tm->canEditSaveSteps() || tm->getTotalIterations() <= 0) {
+            resetSaveStepInteraction();
+            return;
+        }
+
+        const auto geom = progressBarGeometry();
+        if (!geom) {
+            clearSaveStepHover();
+            return;
+        }
+
+        const int total = tm->getTotalIterations();
+        const int current = tm->getCurrentIteration();
+        const auto save_steps = tm->getSaveSteps();
+        const bool inside_progress =
+            local_x >= geom->x && local_x <= geom->x + geom->w &&
+            local_y >= geom->y && local_y <= geom->y + geom->h;
+
+        if (save_step_interaction_.dragging) {
+            const size_t preview = saveStepFromProgressX(local_x, *geom, current, total);
+            if (preview != save_step_interaction_.preview_step) {
+                save_step_interaction_.preview_step = preview;
+                markModelDirty();
+            }
+            if (input.mouse_released[0] || !input.mouse_down[0]) {
+                commitSaveStepEdit();
+                save_step_interaction_.dragging = false;
+                save_step_interaction_.adding = false;
+                save_step_interaction_.original_step = 0;
+                save_step_interaction_.preview_step = 0;
+                markModelDirty();
+            }
+            return;
+        }
+
+        const auto hit_step = hitSaveStep(local_x, local_y, *geom, save_steps, total);
+        const bool hit_future_step = hit_step && static_cast<int>(*hit_step) > current;
+        if (input.mouse_clicked[1] && hit_step) {
+            removeSaveStep(*hit_step);
+            return;
+        }
+        if (input.mouse_clicked[0] && input.key_ctrl && hit_step) {
+            removeSaveStep(*hit_step);
+            return;
+        }
+
+        if (input.mouse_clicked[0]) {
+            if (hit_future_step) {
+                save_step_interaction_.dragging = true;
+                save_step_interaction_.adding = false;
+                save_step_interaction_.original_step = *hit_step;
+                save_step_interaction_.preview_step = *hit_step;
+                save_step_interaction_.hover_step = *hit_step;
+                markModelDirty();
+                return;
+            }
+            if (hit_step)
+                return;
+
+            if (inside_progress) {
+                const size_t step = saveStepFromProgressX(local_x, *geom, current, total);
+                save_step_interaction_.dragging = true;
+                save_step_interaction_.adding = true;
+                save_step_interaction_.original_step = 0;
+                save_step_interaction_.preview_step = step;
+                save_step_interaction_.hover_step = step;
+                markModelDirty();
+                return;
+            }
+        }
+
+        const size_t next_hover = hit_step.value_or(0);
+        if (next_hover != save_step_interaction_.hover_step) {
+            save_step_interaction_.hover_step = next_hover;
+            markModelDirty();
+        }
     }
 
     bool RmlStatusBar::updateContent(const PanelDrawContext& ctx, const bool force_refresh) {
@@ -450,9 +832,23 @@ namespace lfs::vis::gui {
             float eta = tm->getEstimatedRemainingSeconds();
             float progress = total > 0 ? static_cast<float>(cur) / static_cast<float>(total) : 0.0f;
             auto progress_pct = std::format("{:.0f}%", progress * 100.0f);
+            auto progress_text = progress_pct;
+            if (save_step_interaction_.dragging && save_step_interaction_.preview_step > 0) {
+                progress_text = formatStepLabel(save_step_interaction_.preview_step);
+            } else if (save_step_interaction_.hover_step > 0) {
+                progress_text = formatStepLabel(save_step_interaction_.hover_step);
+            }
 
             setModelString("progress_width", model_.progress_width, progress_pct);
-            setModelString("progress_text", model_.progress_text, progress_pct);
+            setModelString("progress_text", model_.progress_text, std::move(progress_text));
+            const ProgressMarkerRenderState marker_state{
+                .dragging = save_step_interaction_.dragging,
+                .adding = save_step_interaction_.adding,
+                .original_step = save_step_interaction_.original_step,
+                .preview_step = save_step_interaction_.preview_step,
+                .hover_step = save_step_interaction_.hover_step,
+            };
+            setProgressMarkersRml(buildProgressMarkersRml(tm->getSaveSteps(), total, cur, marker_state));
             setModelString("step_value", model_.step_value, std::format("{}/{}", cur, total));
             setModelString("loss_value", model_.loss_value, std::format("{:.4f}", loss));
             setModelString("gaussians_value", model_.gaussians_value,
@@ -473,8 +869,10 @@ namespace lfs::vis::gui {
                 setModelString("eval_metrics_value", model_.eval_metrics_value, "");
             }
         } else {
+            resetSaveStepInteraction();
             setModelString("progress_width", model_.progress_width, "0%");
             setModelString("progress_text", model_.progress_text, "");
+            setProgressMarkersRml("");
             setModelString("step_value", model_.step_value, "");
             setModelString("loss_value", model_.loss_value, "");
             setModelBool("show_eval_metrics", model_.show_eval_metrics, false);
@@ -551,7 +949,7 @@ namespace lfs::vis::gui {
         if (zoom_visible) {
             auto zoom_rml = std::format("{}: {:.0f}",
                                         stripColon(LOC(lichtfeld::Strings::Controls::ZOOM)),
-                                        zoom_speed * 10.0f);
+                                        zoom_speed);
             setModelBool("show_zoom", model_.show_zoom, true);
             setModelString("zoom_text", model_.zoom_text, std::move(zoom_rml));
             setModelString("zoom_color", model_.zoom_color, colorToRmlAlpha(p.info, zoom_alpha));
@@ -562,28 +960,28 @@ namespace lfs::vis::gui {
         }
 
         // Right section: GPU memory
-        if (next_gpu_refresh_at_ == std::chrono::steady_clock::time_point{} ||
-            now >= next_gpu_refresh_at_) {
-            cached_gpu_mem_ = queryGpuMemory();
-            next_gpu_refresh_at_ = now + kGpuRefreshInterval;
-        }
+        pollGpuMemoryQuery(now);
         const auto mem = cached_gpu_mem_;
-        float app_gb = mem.process_used / 1e9f;
-        float used_gb = mem.total_used / 1e9f;
-        float total_gb = mem.total / 1e9f;
-        float pct = total_gb > 0.0f ? (used_gb / total_gb) * 100.0f : 0.0f;
+        constexpr float gib = 1024.0f * 1024.0f * 1024.0f;
+        float app_gib = mem.process_used / gib;
+        float used_gib = mem.total_used / gib;
+        float total_gib = mem.total / gib;
+        float pct = total_gib > 0.0f ? (used_gib / total_gib) * 100.0f : 0.0f;
 
         ImVec4 mem_color = pct < 50.0f ? p.success : (pct < 75.0f ? p.warning : p.error);
-        setModelString("lfs_mem_text", model_.lfs_mem_text, std::format("LFS {:.1f}GB", app_gb));
+        setModelBool("gpu_panel_active", model_.gpu_panel_active,
+                     lfs::diagnostics::VramProfiler::instance().enabled());
+        setModelString("lfs_mem_text", model_.lfs_mem_text, std::format("LFS {:.2f} GiB", app_gib));
         setModelString("lfs_mem_color", model_.lfs_mem_color, colorToRml(p.info));
         setModelBool("show_gpu_model", model_.show_gpu_model, !mem.device_name.empty());
         setModelString("gpu_model_text", model_.gpu_model_text, mem.device_name);
         setModelString("gpu_mem_text", model_.gpu_mem_text,
-                       std::format("{} {:.1f}/{:.1f}GB", LOC("status_bar.gpu"), used_gb, total_gb));
+                       std::format("{} {:.2f}/{:.2f} GiB", LOC("status_bar.gpu"), used_gib, total_gib));
         setModelString("gpu_mem_color", model_.gpu_mem_color, colorToRml(mem_color));
 
         // FPS
-        float fps = rm ? rm->getAverageFPS() : 0.0f;
+        float fps = reactive_fps_available_ ? reactive_fps_value_
+                                            : (rm ? rm->getAverageFPS() : 0.0f);
         ImVec4 fps_col = fps >= 30.0f ? p.success : (fps >= 15.0f ? p.warning : p.error);
         setModelString("fps_value", model_.fps_value, std::format("{:.0f}", fps));
         setModelString("fps_color", model_.fps_color, colorToRml(fps_col));
@@ -607,8 +1005,13 @@ namespace lfs::vis::gui {
         const float local_y = input.mouse_y - bar_y;
         const bool is_inside = local_x >= 0.0f && local_x < bar_w &&
                                local_y >= 0.0f && local_y < bar_h;
-        if (!is_inside && !input.mouse_released[0])
+        if (!is_inside && !input.mouse_released[0] && !input.mouse_released[1] &&
+            !save_step_interaction_.dragging) {
+            clearSaveStepHover();
             return;
+        }
+
+        handleSaveStepInteraction(input, local_x, local_y);
 
         const int mods = sdlModsToRml(input.key_ctrl, input.key_shift,
                                       input.key_alt, input.key_super);
@@ -618,6 +1021,69 @@ namespace lfs::vis::gui {
             rml_context_->ProcessMouseButtonDown(0, mods);
         if (input.mouse_released[0])
             rml_context_->ProcessMouseButtonUp(0, mods);
+        if (is_inside && input.mouse_clicked[1])
+            rml_context_->ProcessMouseButtonDown(1, mods);
+        if (input.mouse_released[1])
+            rml_context_->ProcessMouseButtonUp(1, mods);
+    }
+
+    void RmlStatusBar::queueCachedVulkanContext(const float x, const float y,
+                                                const float w_px, const float h_px,
+                                                const int screen_w, const int screen_h,
+                                                const int render_w, const int render_h,
+                                                const bool refresh_cache) {
+        if (!rml_manager_ || !rml_manager_->getVulkanRenderInterface())
+            return;
+
+        const auto blit_rect = toFramebufferBlitRect(rml_manager_->getWindow(),
+                                                     x, y, w_px, h_px, screen_w, screen_h);
+        rml_manager_->queueCachedVulkanContext({
+            .context = rml_context_,
+            .cache = &direct_cache_,
+            .cache_width = render_w,
+            .cache_height = render_h,
+            .offset_x = blit_rect.x,
+            .offset_y = blit_rect.y,
+            .draw_width = blit_rect.w,
+            .draw_height = blit_rect.h,
+            .refresh = refresh_cache,
+            .foreground = false,
+            .clip_enabled = true,
+            .clip = {
+                .x1 = blit_rect.x,
+                .y1 = blit_rect.y,
+                .x2 = blit_rect.x + blit_rect.w,
+                .y2 = blit_rect.y + blit_rect.h,
+            },
+        });
+    }
+
+    void RmlStatusBar::renderCached(const PanelDrawContext& ctx, const float x, const float y,
+                                    const float w_px, const float h_px,
+                                    const int screen_w, const int screen_h) {
+        if (!rml_context_ || !document_)
+            return;
+        if (w_px <= 0.0f || h_px <= 0.0f || screen_w <= 0 || screen_h <= 0)
+            return;
+
+        const int render_w = static_cast<int>(w_px);
+        const int render_h = static_cast<int>(h_px);
+        const bool theme_current =
+            has_theme_signature_ && rml_theme::currentThemeSignature() == last_theme_signature_;
+        const auto now = std::chrono::steady_clock::now();
+        const bool refresh_due =
+            next_refresh_at_ == std::chrono::steady_clock::time_point{} ||
+            now >= next_refresh_at_;
+        const bool can_reuse = theme_current && !model_dirty_ && !animation_active_ &&
+                               !refresh_due && render_w == last_render_w_ &&
+                               render_h == last_render_h_;
+        if (!can_reuse) {
+            render(ctx, x, y, w_px, h_px, screen_w, screen_h);
+            return;
+        }
+
+        queueCachedVulkanContext(x, y, w_px, h_px, screen_w, screen_h,
+                                 render_w, render_h, direct_cache_.texture == 0);
     }
 
     void RmlStatusBar::render(const PanelDrawContext& ctx, const float x, const float y,
@@ -629,8 +1095,6 @@ namespace lfs::vis::gui {
         if (w_px <= 0.0f || h_px <= 0.0f || screen_w <= 0 || screen_h <= 0)
             return;
 
-        const auto blit_rect = toFramebufferBlitRect(rml_manager_ ? rml_manager_->getWindow() : nullptr,
-                                                     x, y, w_px, h_px, screen_w, screen_h);
         const int render_w = static_cast<int>(w_px);
         const int render_h = static_cast<int>(h_px);
         const bool size_changed = (render_w != last_render_w_ || render_h != last_render_h_);
@@ -661,13 +1125,8 @@ namespace lfs::vis::gui {
             last_render_h_ = render_h;
         }
 
-        rml_manager_->queueVulkanContext(rml_context_, blit_rect.x, blit_rect.y,
-                                         false,
-                                         true,
-                                         blit_rect.x,
-                                         blit_rect.y,
-                                         blit_rect.x + blit_rect.w,
-                                         blit_rect.y + blit_rect.h);
+        queueCachedVulkanContext(x, y, w_px, h_px, screen_w, screen_h,
+                                 render_w, render_h, true);
     }
 
 } // namespace lfs::vis::gui

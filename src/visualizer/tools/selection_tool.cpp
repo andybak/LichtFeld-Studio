@@ -31,12 +31,7 @@ namespace lfs::vis::tools {
 
         [[nodiscard]] lfs::rendering::ScreenOverlayRenderer* getOverlayRenderer(const ToolContext& ctx) {
             auto* const rm = ctx.getRenderingManager();
-            if (!rm)
-                return nullptr;
-            auto* const engine = rm->getRenderingEngineIfInitialized();
-            if (!engine)
-                return nullptr;
-            return engine->getScreenOverlayRenderer();
+            return rm ? rm->getScreenOverlayRenderer() : nullptr;
         }
 
         [[nodiscard]] float depthBoxHalfHeight(const ToolContext& ctx, const float half_width) {
@@ -53,6 +48,36 @@ namespace lfs::vis::tools {
                 return rm->resolveFocusedViewport(ctx.getViewport());
             }
             return ctx.getViewport();
+        }
+
+        [[nodiscard]] bool pointInViewportBounds(const ViewportBounds& bounds, const glm::vec2 point) {
+            return point.x >= bounds.x &&
+                   point.y >= bounds.y &&
+                   point.x < bounds.x + bounds.width &&
+                   point.y < bounds.y + bounds.height;
+        }
+
+        [[nodiscard]] lfs::vis::SelectionMode selectionModeFromModifiers(const SDL_Keymod kmods) {
+            if (kmods & SDL_KMOD_SHIFT) {
+                return lfs::vis::SelectionMode::Add;
+            }
+            if (kmods & SDL_KMOD_CTRL) {
+                return lfs::vis::SelectionMode::Remove;
+            }
+            if (kmods & SDL_KMOD_ALT) {
+                return lfs::vis::SelectionMode::Intersect;
+            }
+            return lfs::vis::SelectionMode::Replace;
+        }
+
+        [[nodiscard]] const char* selectionModeSuffixFromModifiers(const SDL_Keymod kmods) {
+            switch (selectionModeFromModifiers(kmods)) {
+            case lfs::vis::SelectionMode::Add: return " +";
+            case lfs::vis::SelectionMode::Remove: return " -";
+            case lfs::vis::SelectionMode::Intersect: return " &";
+            case lfs::vis::SelectionMode::Replace: return "";
+            }
+            return "";
         }
 
     } // namespace
@@ -74,7 +99,7 @@ namespace lfs::vis::tools {
         }
 
         float mx, my;
-        SDL_GetMouseState(&mx, &my);
+        const SDL_MouseButtonFlags mouse_buttons = SDL_GetMouseState(&mx, &my);
         last_mouse_pos_ = glm::vec2(mx, my);
 
         if (depth_filter_enabled_ || crop_filter_enabled_) {
@@ -83,6 +108,31 @@ namespace lfs::vis::tools {
 
         if (auto* const sm = ctx.getSceneManager()) {
             if (auto* const service = sm->getSelectionService()) {
+                auto* const rm = ctx.getRenderingManager();
+                const bool passive_ring_mode =
+                    rm &&
+                    rm->getSelectionPreviewMode() == lfs::vis::SelectionPreviewMode::Rings &&
+                    !service->isInteractiveSelectionActive();
+                if (passive_ring_mode) {
+                    const bool update_hover =
+                        mouse_buttons == 0 &&
+                        !gui::guiFocusState().want_capture_mouse &&
+                        pointInViewportBounds(ctx.getViewportBounds(), last_mouse_pos_);
+                    if (update_hover) {
+                        const SDL_Keymod kmods = SDL_GetModState();
+                        const auto mode = selectionModeFromModifiers(kmods);
+                        SelectionFilterState filters{};
+                        filters.crop_filter = crop_filter_enabled_;
+                        filters.depth_filter = depth_filter_enabled_;
+                        filters.restrict_to_selected_nodes = true;
+                        service->updatePassiveRingHoverPreview(last_mouse_pos_, mode, filters);
+                    } else {
+                        if (rm->isCursorPreviewActive()) {
+                            rm->clearCursorPreviewState();
+                        }
+                    }
+                    return;
+                }
                 service->refreshInteractivePreview();
             }
         }
@@ -101,7 +151,6 @@ namespace lfs::vis::tools {
         }
 
         if (enabled) {
-            syncDepthFilterRenderMode(*tool_context_);
             applySelectionFilterSettings(*tool_context_);
         } else {
             clearSelectionRenderState(*tool_context_);
@@ -118,7 +167,22 @@ namespace lfs::vis::tools {
             return;
         }
 
-        syncDepthFilterRenderMode(*tool_context_);
+        applySelectionFilterSettings(*tool_context_);
+    }
+
+    void SelectionTool::setDepthFilterRange(const bool enabled,
+                                            const float depth_near,
+                                            const float depth_far,
+                                            const float frustum_half_width) {
+        depth_near_ = std::clamp(depth_near, 0.0f, DEPTH_MAX - DEPTH_MIN);
+        depth_far_ = std::clamp(depth_far, depth_near_ + DEPTH_MIN, DEPTH_MAX);
+        frustum_half_width_ = std::max(frustum_half_width, 0.05f);
+
+        depth_filter_enabled_ = enabled;
+        if (!tool_context_ || !isEnabled()) {
+            return;
+        }
+
         applySelectionFilterSettings(*tool_context_);
     }
 
@@ -161,40 +225,6 @@ namespace lfs::vis::tools {
             return;
         }
         applySelectionFilterSettings(*tool_context_);
-    }
-
-    void SelectionTool::syncDepthFilterRenderMode(const ToolContext& ctx) {
-        auto* const rm = ctx.getRenderingManager();
-        if (!rm) {
-            return;
-        }
-
-        auto settings = rm->getSettings();
-
-        if (depth_filter_enabled_) {
-            if (!depth_filter_render_mode_snapshot_.valid) {
-                depth_filter_render_mode_snapshot_.valid = true;
-                depth_filter_render_mode_snapshot_.point_cloud_mode = settings.point_cloud_mode;
-                depth_filter_render_mode_snapshot_.show_rings = settings.show_rings;
-                depth_filter_render_mode_snapshot_.show_center_markers = settings.show_center_markers;
-            }
-
-            settings.point_cloud_mode = false;
-            settings.show_rings = false;
-            settings.show_center_markers = true;
-            rm->updateSettings(settings);
-            return;
-        }
-
-        if (!depth_filter_render_mode_snapshot_.valid) {
-            return;
-        }
-
-        settings.point_cloud_mode = depth_filter_render_mode_snapshot_.point_cloud_mode;
-        settings.show_rings = depth_filter_render_mode_snapshot_.show_rings;
-        settings.show_center_markers = depth_filter_render_mode_snapshot_.show_center_markers;
-        depth_filter_render_mode_snapshot_.valid = false;
-        rm->updateSettings(settings);
     }
 
     void SelectionTool::applySelectionFilterSettings(const ToolContext& ctx) const {
@@ -274,21 +304,12 @@ namespace lfs::vis::tools {
         const ImVec2 mouse_imv = ImGui::GetMousePos();
         const glm::vec2 mp{mouse_imv.x, mouse_imv.y};
         const auto& t = theme();
-        const auto sel_border = toOverlay(t.palette.primary, 0.85f);
 
-        // Cursor circle / cross is drawn by GuiManager in a late-stage pass so the
-        // sample-to-present path is as short as possible and the ring tracks the mouse
-        // without a visible frame trail. Labels stay here; their offset from the cursor
-        // makes any small drift much less perceptible than the ring itself.
-        (void)sel_border;
+        // Cursor outlines are drawn by GuiManager in a late-stage Vulkan overlay pass so
+        // their sample-to-present path stays as short as possible.
 
         const SDL_Keymod kmods = SDL_GetModState();
-        const char* op_suffix = "";
-        if (kmods & SDL_KMOD_CTRL) {
-            op_suffix = " -";
-        } else if (kmods & SDL_KMOD_SHIFT) {
-            op_suffix = " +";
-        }
+        const char* op_suffix = selectionModeSuffixFromModifiers(kmods);
 
         const char* mode_name = nullptr;
         float text_offset = 15.0f;
@@ -301,6 +322,8 @@ namespace lfs::vis::tools {
             case lfs::vis::SelectionPreviewMode::Rectangle: mode_name = "RECT"; break;
             case lfs::vis::SelectionPreviewMode::Polygon: mode_name = "POLY"; break;
             case lfs::vis::SelectionPreviewMode::Lasso: mode_name = "LASSO"; break;
+            case lfs::vis::SelectionPreviewMode::Box: mode_name = "BOX"; break;
+            case lfs::vis::SelectionPreviewMode::Sphere: mode_name = "SPHERE"; break;
             case lfs::vis::SelectionPreviewMode::Color: mode_name = "COLOR"; break;
             default: break;
             }

@@ -7,9 +7,13 @@
 #include "core/camera.hpp"
 #include "core/export.hpp"
 #include "core/parameters.hpp"
+#include "core/splat_exportable_storage.hpp"
 #include "training/trainer.hpp"
 #include "training_state.hpp"
 #include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -64,7 +68,13 @@ namespace lfs::vis {
         void requestSaveCheckpoint();
 
         // Temporary pause (for camera movement - doesn't change UI state)
+        struct TemporaryPauseResult {
+            bool synchronized = false;
+            bool resume_required = false;
+        };
+
         void pauseTrainingTemporary();
+        [[nodiscard]] TemporaryPauseResult pauseTrainingTemporaryAndWait(std::chrono::milliseconds timeout);
         void resumeTrainingTemporary();
 
         // State machine access
@@ -92,6 +102,9 @@ namespace lfs::vis {
         int getTotalIterations() const;
         int getNumSplats() const;
         int getMaxGaussians() const;
+        std::vector<size_t> getSaveSteps() const;
+        bool setSaveSteps(std::vector<size_t> save_steps);
+        bool canEditSaveSteps() const;
         const char* getStrategyType() const;
         bool isGutEnabled() const;
 
@@ -121,6 +134,13 @@ namespace lfs::vis {
         // Access to trainer (for rendering, etc.)
         lfs::training::Trainer* getTrainer() { return trainer_.get(); }
         const lfs::training::Trainer* getTrainer() const { return trainer_.get(); }
+
+        // Splat exportable storage — populated when training starts with a viewer
+        // active. The viewer's vksplat renderer imports the same physical block
+        // for zero-copy interop. nullptr if running headless or fallback.
+        const lfs::core::SplatExportableStorage* splatExportableStorage() const {
+            return splat_storage_.has_value() ? &*splat_storage_ : nullptr;
+        }
 
         // Wait for training to complete (blocking)
         void waitForCompletion();
@@ -156,12 +176,16 @@ namespace lfs::vis {
         // Resource cleanup (called by state machine)
         void cleanupTrainingResources(const TrainingResources& resources);
         void updateResourceTracking();
+        [[nodiscard]] lfs::core::SplatTensorAllocator createTrainingSplatTensorAllocator(
+            const lfs::core::param::TrainingParameters& params,
+            std::size_t min_capacity = 0);
 
         // Member variables
         std::unique_ptr<lfs::training::Trainer> trainer_;
         std::unique_ptr<std::jthread> training_thread_;
         VisualizerImpl* viewer_ = nullptr;
         core::Scene* scene_ = nullptr;
+        std::optional<lfs::core::SplatExportableStorage> splat_storage_;
 
         // State machine (single source of truth for state)
         TrainingStateMachine state_machine_;
@@ -182,6 +206,10 @@ namespace lfs::vis {
         std::deque<float> psnr_buffer_;
         mutable std::mutex psnr_buffer_mutex_;
         std::atomic<float> last_psnr_{0.0f};
+        std::mutex temporary_pause_mutex_;
+        std::uint32_t temporary_pause_depth_ = 0;
+        bool temporary_pause_initially_paused_ = false;
+        bool temporary_pause_resume_in_flight_ = false;
         std::optional<EvaluationMetricsSnapshot> last_eval_metrics_;
         mutable std::mutex eval_metrics_mutex_;
 

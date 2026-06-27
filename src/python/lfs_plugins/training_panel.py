@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Training Panel - RmlUI with native data binding."""
 
+from contextlib import contextmanager
 import os
 import re
+import threading
 import time
 from typing import Any, Optional
 
@@ -12,7 +14,7 @@ import lichtfeld as lf
 from . import rml_widgets as w
 from .scrub_fields import ScrubFieldController, ScrubFieldSpec
 from .types import Panel
-from .ui.state import AppState
+from .ui import RuntimeState, PanelStateBinding
 
 # Asset Manager integration (optional)
 try:
@@ -33,6 +35,22 @@ __lfs_panel_ids__ = ["lfs.training"]
 def tr(key):
     result = lf.ui.tr(key)
     return result if result else key
+
+
+def tr_fallback(key, fallback):
+    result = lf.ui.tr(key)
+    return result if result and result != key else fallback
+
+
+@contextmanager
+def _disabled_scope(layout, disabled):
+    if disabled:
+        layout.begin_disabled(True)
+    try:
+        yield
+    finally:
+        if disabled:
+            layout.end_disabled()
 
 
 class IterationRateTracker:
@@ -68,6 +86,15 @@ def _is_mrnf_strategy(strategy):
     return strategy in ("mrnf", "mnrf", "lfs")
 
 
+DEPTH_LOSS_MODE_VALUES = ("pearson", "adaptive-warped-l1")
+DEFAULT_DEPTH_LOSS_MODE = "adaptive-warped-l1"
+
+
+def _depth_loss_mode_or_default(mode):
+    mode = str(mode or "")
+    return mode if mode in DEPTH_LOSS_MODE_VALUES else DEFAULT_DEPTH_LOSS_MODE
+
+
 LOCALE_KEYS = {
     "hdr_basic_params": "training.section.basic_params",
     "hdr_advanced_params": "training.section.advanced_params",
@@ -93,6 +120,9 @@ LOCALE_KEYS = {
     "opacity_penalty_power": "training.masking.penalty_power",
     "mask_threshold": "training.masking.threshold",
     "use_alpha_as_mask": "training_params.use_alpha_as_mask",
+    "use_depth_loss": "training_params.use_depth_loss",
+    "depth_loss_mode": "training_params.depth_loss_mode",
+    "depth_loss_weight": "training_params.depth_loss_weight",
     "sparsity": "training_params.sparsity",
     "gut": "training_params.gut",
     "undistort": "training_params.undistort",
@@ -173,14 +203,14 @@ LOCALE_KEYS = {
     "mask_none": "training.options.mask.none",
     "mask_segment": "training.options.mask.segment",
     "mask_ignore": "training.options.mask.ignore",
+    "mask_segment_and_ignore": "training.options.mask.segment_and_ignore",
     "mask_alpha_consistent": "training.options.mask.alpha_consistent",
+    "depth_loss_pearson": "training.options.depth_loss.pearson",
+    "depth_loss_adaptive_warped_l1": "training.options.depth_loss.adaptive_warped_l1",
     "bg_option_color": "training.options.bg.color",
     "bg_option_modulation": "training.options.bg.modulation",
     "bg_option_image": "training.options.bg.image",
     "bg_option_random": "training.options.bg.random",
-    "bg_color_red_prefix": "training_panel.color_red_prefix",
-    "bg_color_green_prefix": "training_panel.color_green_prefix",
-    "bg_color_blue_prefix": "training_panel.color_blue_prefix",
     "enable_eval": "training_params.enable_eval",
     "test_every": "training.dataset.test_every",
 }
@@ -197,6 +227,7 @@ PARAM_BOOL_PROPS = [
     "use_bilateral_grid",
     "invert_masks",
     "use_alpha_as_mask",
+    "use_depth_loss",
     "enable_sparsity",
     "gut",
     "undistort",
@@ -237,6 +268,7 @@ NUM_PROP_DEFS = [
     ("mask_opacity_penalty_weight", float, "%.3f", 0, None, 0.1),
     ("mask_opacity_penalty_power", float, "%.3f", 0.5, None, 0.1),
     ("mask_threshold", float, "%.3f", 0, 1, 0.05),
+    ("depth_loss_weight", float, "%.3f", 0, 100, 0.1),
     ("opacity_reg", float, "%.4f", 0, None, 0.001),
     ("scale_reg", float, "%.4f", 0, None, 0.001),
     ("tv_loss_weight", float, "%.1f", 0, None, 0.5),
@@ -354,22 +386,16 @@ INITIALLY_COLLAPSED = {
 }
 
 
-def _color_to_hex(c):
-    return f"#{int(c[0] * 255):02x}{int(c[1] * 255):02x}{int(c[2] * 255):02x}"
-
-
-def _hex_to_color(h):
-    h = h.lstrip("#")
-    if len(h) != 6:
-        return None
-    try:
-        return (
-            int(h[0:2], 16) / 255.0,
-            int(h[2:4], 16) / 255.0,
-            int(h[4:6], 16) / 255.0,
-        )
-    except ValueError:
-        return None
+BG_COLOR_CHANNELS = (
+    ("bg_color_r", 0),
+    ("bg_color_g", 1),
+    ("bg_color_b", 2),
+)
+BG_COLOR_CHANNEL_INDEX = dict(BG_COLOR_CHANNELS)
+BG_COLOR_HEX_KEY = "bg_color_hex"
+BG_COLOR_TEXT_KEYS = tuple(key for key, _index in BG_COLOR_CHANNELS) + (
+    BG_COLOR_HEX_KEY,
+)
 
 
 class TrainingPanel(Panel):
@@ -379,13 +405,15 @@ class TrainingPanel(Panel):
     order = 20
     template = "rmlui/training.rml"
     height_mode = lf.ui.PanelHeightMode.CONTENT
-    update_interval_ms = 16
+    update_policy = "dirty"
 
     def __init__(self):
         self._handle = None
         self._checkpoint_saved_time = 0.0
         self._new_save_step = 7000
         self._auto_scaled_for_cameras = 0
+        self._auto_scale_steps_locked = True
+        self._auto_scale_scene_generation = RuntimeState.scene_generation.value
         self._last_state = ""
         self._last_save_steps = None
         self._color_edit_prop = None
@@ -417,6 +445,10 @@ class TrainingPanel(Panel):
         self._psnr_tick_mid = ""
         self._psnr_tick_min = ""
         self._last_panel_label = ""
+        self._reactive_binding = PanelStateBinding()
+        self._deferred_update_pending = False
+        self._deferred_update_deadline = None
+        self._deferred_update_generation = 0
         self._escape_revert = w.EscapeRevertController()
         self._scrub_fields = ScrubFieldController(
             SCRUB_FIELD_DEFS,
@@ -480,9 +512,19 @@ class TrainingPanel(Panel):
         model.bind_func("label_status_error", lambda: tr("status.error"))
         model.bind_func("label_status_stopping", lambda: tr("status.stopping"))
         model.bind_func("label_ppisp_sidecar_clear", lambda: tr("training_panel.clear"))
+        model.bind_func(
+            "steps_scaling_lock_label", self._step_scaling_lock_label
+        )
+        model.bind_func(
+            "steps_scaling_lock_tooltip", self._step_scaling_lock_tooltip
+        )
+        model.bind_func("steps_scaling_lock_icon", self._step_scaling_lock_icon)
+        model.bind_func(
+            "steps_scaling_lock_selected", lambda: self._auto_scale_steps_locked
+        )
 
         def _btn_start():
-            it = AppState.iteration.value
+            it = RuntimeState.iteration.value
             return (
                 tr("training_panel.resume_training")
                 if it > 0
@@ -493,19 +535,19 @@ class TrainingPanel(Panel):
 
     def _bind_visibility(self, model, p, d):
         def _state():
-            return AppState.trainer_state.value
+            return RuntimeState.trainer_state.value
 
         def _iteration():
-            return AppState.iteration.value
+            return RuntimeState.iteration.value
 
-        model.bind_func("show_no_trainer", lambda: not AppState.has_trainer.value)
+        model.bind_func("show_no_trainer", lambda: not RuntimeState.has_trainer.value)
         model.bind_func(
             "show_no_params",
-            lambda: AppState.has_trainer.value and not (p() and p().has_params()),
+            lambda: RuntimeState.has_trainer.value and not (p() and p().has_params()),
         )
         model.bind_func(
             "show_main",
-            lambda: AppState.has_trainer.value and p() is not None and p().has_params(),
+            lambda: RuntimeState.has_trainer.value and p() is not None and p().has_params(),
         )
 
         for state_name in [
@@ -539,7 +581,15 @@ class TrainingPanel(Panel):
         )
         model.bind_func(
             "dep_mask_segment",
-            lambda: p() is not None and p().has_params() and p().mask_mode.value == 1,
+            lambda: p() is not None and p().has_params() and (p().mask_mode.value == 1 or p().mask_mode.value == 3),
+        )
+        model.bind_func(
+            "dep_mask_threshold",
+            lambda: p() is not None and p().has_params() and p().mask_mode.value != 3,
+        )
+        model.bind_func(
+            "dep_depth_loss",
+            lambda: p() is not None and p().has_params() and p().use_depth_loss,
         )
         model.bind_func(
             "dep_ppisp", lambda: p() is not None and p().has_params() and p().ppisp
@@ -606,7 +656,7 @@ class TrainingPanel(Panel):
         )
         model.bind_func(
             "show_progress",
-            lambda: AppState.max_iterations.value > 0 and _iteration() > 0,
+            lambda: RuntimeState.max_iterations.value > 0 and _iteration() > 0,
         )
         model.bind_func("has_dataset", lambda: d() is not None and d().has_params())
         model.bind_func(
@@ -647,13 +697,17 @@ class TrainingPanel(Panel):
     def _bind_disabled(self, model, p):
         def _params_edit_locked():
             return not (
-                AppState.trainer_state.value == "ready"
-                and AppState.iteration.value == 0
+                RuntimeState.trainer_state.value == "ready"
+                and RuntimeState.iteration.value == 0
             )
 
         model.bind_func("struct_disabled", _params_edit_locked)
         model.bind_func("live_disabled", _params_edit_locked)
         model.bind_func("adv_disabled", _params_edit_locked)
+        model.bind_func(
+            "step_scaling_params_locked",
+            lambda: self._auto_scale_steps_locked,
+        )
         model.bind_func(
             "gut_disabled",
             lambda: p() is not None and p().has_params() and p().strategy == "igs+",
@@ -717,6 +771,15 @@ class TrainingPanel(Panel):
             "mask_mode_str",
             lambda: str(p().mask_mode.value) if p() and p().has_params() else "0",
             lambda v: self._set_mask_mode(v),
+        )
+        model.bind(
+            "depth_loss_mode_str",
+            lambda: (
+                _depth_loss_mode_or_default(p().depth_loss_mode)
+                if p() and p().has_params()
+                else DEFAULT_DEPTH_LOSS_MODE
+            ),
+            lambda v: self._set_depth_loss_mode(v),
         )
         model.bind(
             "bg_mode_str",
@@ -850,14 +913,10 @@ class TrainingPanel(Panel):
         return tuple(params.bg_color)
 
     def _restore_bg_color_snapshot(self, snapshot):
-        params = lf.optimization_params()
-        if not params or not params.has_params():
-            return
         color = tuple(snapshot or (0.0, 0.0, 0.0))
-        params.bg_color = color
-        rs = lf.get_render_settings()
-        if rs:
-            rs.set("background_color", color)
+        if not self._set_training_bg_color(color):
+            return
+        self._sync_bg_color_text_bufs()
         if self._handle:
             self._handle.dirty_all()
 
@@ -890,9 +949,21 @@ class TrainingPanel(Panel):
         if key == "new_step_str":
             return f"{self._new_save_step:,}"
 
+        if key == BG_COLOR_HEX_KEY:
+            if p and p.has_params():
+                return w.color_to_hex(p.bg_color)
+            return "#000000"
+
+        for channel_key, channel_index in BG_COLOR_CHANNELS:
+            if key == channel_key:
+                if p and p.has_params():
+                    return w.color_channel_text(p.bg_color, channel_index)
+                return "0"
+
         return None
 
     def _commit_number_input_key(self, key):
+        original = self._text_bufs.get(key)
         buf_val = self._text_bufs.get(key)
         if buf_val is not None and buf_val.strip() and key.endswith("_str"):
             prop = key[:-4]
@@ -912,8 +983,27 @@ class TrainingPanel(Panel):
         canonical = self._canonical_text_buf_value(key)
         if canonical is None:
             return
-        if self._text_bufs.get(key) != canonical:
+        if original != canonical:
             self._text_bufs[key] = canonical
+            self._mark_text_buf_dirty(key)
+
+    def _commit_bg_color_text_key(self, key):
+        buf_val = self._text_bufs.get(key)
+        updated = False
+        if buf_val is not None and str(buf_val).strip():
+            if key == BG_COLOR_HEX_KEY:
+                updated = self._set_bg_color_hex(buf_val)
+            elif key in BG_COLOR_CHANNEL_INDEX:
+                updated = self._set_bg_color_channel(key, buf_val)
+
+        canonical = self._canonical_text_buf_value(key)
+        if canonical is None:
+            return
+        self._text_bufs[key] = canonical
+        if updated:
+            self._sync_bg_color_text_bufs()
+            self._dirty_bg_color_bindings()
+        else:
             self._mark_text_buf_dirty(key)
 
     def _sync_text_bufs(self):
@@ -939,6 +1029,25 @@ class TrainingPanel(Panel):
             f"{d.test_every:,}" if d and d.has_params() else "8"
         )
         self._text_bufs["new_step_str"] = f"{self._new_save_step:,}"
+        self._sync_bg_color_text_bufs(p)
+
+    def _sync_bg_color_text_bufs(self, params=None):
+        if params is None:
+            params = lf.optimization_params()
+        color = (
+            params.bg_color
+            if params and params.has_params()
+            else (0.0, 0.0, 0.0)
+        )
+        for key, channel_index in BG_COLOR_CHANNELS:
+            self._text_bufs[key] = w.color_channel_text(color, channel_index)
+        self._text_bufs[BG_COLOR_HEX_KEY] = w.color_to_hex(color)
+
+    def _dirty_bg_color_bindings(self):
+        if not self._handle:
+            return
+        for key in BG_COLOR_TEXT_KEYS:
+            self._handle.dirty(key)
 
     def _bind_slider_props(self, model, p):
         for prop in SLIDER_PROPS:
@@ -958,26 +1067,33 @@ class TrainingPanel(Panel):
                 else (0, 0, 0)
             )
 
-        model.bind_func(
-            "bg_color_r",
-            lambda: f"{tr('training_panel.color_red_prefix')}{int(_bg()[0] * 255):>3d}",
-        )
-        model.bind_func(
-            "bg_color_g",
-            lambda: (
-                f"{tr('training_panel.color_green_prefix')}{int(_bg()[1] * 255):>3d}"
-            ),
-        )
-        model.bind_func(
-            "bg_color_b",
-            lambda: (
-                f"{tr('training_panel.color_blue_prefix')}{int(_bg()[2] * 255):>3d}"
-            ),
-        )
+        for key, channel_index in BG_COLOR_CHANNELS:
+            self._text_bufs[key] = None
+
+            def getter(k=key, idx=channel_index):
+                if self._text_bufs[k] is None:
+                    self._text_bufs[k] = w.color_channel_text(_bg(), idx)
+                return self._text_bufs[k]
+
+            def setter(v, k=key):
+                self._text_bufs[k] = str(v)
+
+            model.bind(key, getter, setter)
+
+        self._text_bufs[BG_COLOR_HEX_KEY] = None
+
+        def hex_getter():
+            if self._text_bufs[BG_COLOR_HEX_KEY] is None:
+                self._text_bufs[BG_COLOR_HEX_KEY] = w.color_to_hex(_bg())
+            return self._text_bufs[BG_COLOR_HEX_KEY]
+
+        def hex_setter(v):
+            self._text_bufs[BG_COLOR_HEX_KEY] = str(v)
+
         model.bind(
-            "bg_color_hex",
-            lambda: _color_to_hex(_bg()),
-            lambda v: self._set_bg_color_hex(v),
+            BG_COLOR_HEX_KEY,
+            hex_getter,
+            hex_setter,
         )
 
         model.bind_func(
@@ -992,8 +1108,8 @@ class TrainingPanel(Panel):
 
     def _bind_status(self, model, p):
         def _status_mode():
-            state = AppState.trainer_state.value
-            it = AppState.iteration.value
+            state = RuntimeState.trainer_state.value
+            it = RuntimeState.iteration.value
             labels = {
                 "idle": tr("training_panel.idle"),
                 "ready": tr("status.ready") if it == 0 else tr("training_panel.resume"),
@@ -1004,20 +1120,20 @@ class TrainingPanel(Panel):
                 "stopped": tr("status.stopped"),
                 "error": tr("status.error"),
             }
-            return f"{tr('status.mode')}: {labels.get(state, tr('status.unknown'))}"
+            return f"{tr('status.mode')} {labels.get(state, tr('status.unknown'))}"
 
         def _status_iteration():
-            it = AppState.iteration.value
+            it = RuntimeState.iteration.value
             _rate_tracker.add_sample(it)
             rate = _rate_tracker.get_rate()
             return f"{tr('status.iteration')} {it:,} ({rate:.1f} {tr('training_panel.iters_per_sec')})"
 
         def _status_gaussians():
-            return tr("progress.num_splats") % f"{AppState.num_gaussians.value:,}"
+            return tr("progress.num_splats") % f"{RuntimeState.num_gaussians.value:,}"
 
         def _progress_text():
-            it = AppState.iteration.value
-            mx = AppState.max_iterations.value
+            it = RuntimeState.iteration.value
+            mx = RuntimeState.max_iterations.value
             return f"{it:,}/{mx:,}" if mx > 0 else ""
 
         def _error_message():
@@ -1097,6 +1213,29 @@ class TrainingPanel(Panel):
         model.bind_event("action", self._on_action)
         model.bind_event("remove_step", self._on_remove_step_event)
         model.bind_event("num_step", self._on_num_step)
+        model.bind_event(
+            "toggle_step_scaling_lock", self._on_step_scaling_lock_toggle
+        )
+
+    def _step_scaling_lock_label(self):
+        if self._auto_scale_steps_locked:
+            return tr_fallback("training.step_scaling.locked", "Auto")
+        return tr_fallback("training.step_scaling.unlocked", "Manual")
+
+    def _step_scaling_lock_tooltip(self):
+        if self._auto_scale_steps_locked:
+            return tr_fallback(
+                "training.tooltip.step_scaling_locked",
+                "Auto-scales relevant training parameters.",
+            )
+        return tr_fallback(
+            "training.tooltip.step_scaling_unlocked",
+            "Manual: training parameters are not auto-scaled.",
+        )
+
+    def _step_scaling_lock_icon(self):
+        state = "locked" if self._auto_scale_steps_locked else "unlocked"
+        return f"../icon/scene/{state}.png"
 
     def on_mount(self, doc):
         self._doc = doc
@@ -1131,6 +1270,21 @@ class TrainingPanel(Panel):
                     self._capture_bg_color_snapshot,
                     self._restore_bg_color_snapshot,
                 )
+                el.add_event_listener("change", self._on_bg_color_hex_change)
+                el.add_event_listener("blur", self._on_bg_color_hex_blur)
+        for el in doc.query_selector_all("input.color-channel"):
+            key = el.get_attribute("data-value", "")
+            if key not in BG_COLOR_CHANNEL_INDEX:
+                continue
+            w.bind_select_all_on_focus(el)
+            self._escape_revert.bind(
+                el,
+                key,
+                self._capture_bg_color_snapshot,
+                self._restore_bg_color_snapshot,
+            )
+            el.add_event_listener("change", self._on_color_channel_input_change)
+            el.add_event_listener("blur", self._on_color_channel_input_blur)
         sidecar_input = doc.query_selector('input[data-value="ppisp_sidecar_path"]')
         if sidecar_input:
             w.bind_select_all_on_focus(sidecar_input)
@@ -1144,14 +1298,101 @@ class TrainingPanel(Panel):
         self._psnr_graph_el = doc.get_element_by_id("psnr-graph-el")
         self._scrub_fields.mount(doc)
         self._sync_section_states()
+        self._subscribe_reactive_state()
+        self._request_reactive_update()
+
+    def _subscribe_reactive_state(self):
+        if self._reactive_binding.active:
+            return
+
+        native_signals = (
+            RuntimeState.training_running,
+            RuntimeState.training_state,
+            RuntimeState.trainer_loaded,
+            RuntimeState.iteration,
+            RuntimeState.total_iterations,
+            RuntimeState.loss,
+            RuntimeState.eval_psnr,
+            RuntimeState.num_gaussians,
+            RuntimeState.scene_generation,
+            RuntimeState.language_generation,
+        )
+        self._reactive_binding.set_handle(self._handle).watch(*native_signals)
+
+    def _sync_auto_scale_scene_generation(self):
+        scene_generation = RuntimeState.scene_generation.value
+        if scene_generation == self._auto_scale_scene_generation:
+            return False
+        self._auto_scale_scene_generation = scene_generation
+        self._auto_scaled_for_cameras = 0
+        return True
+
+    def _unsubscribe_reactive_state(self):
+        self._reactive_binding.close()
+
+    def _request_reactive_update(self):
+        if self._handle:
+            w.request_model_update(self._handle)
+
+    def _schedule_deferred_update(self, delay_seconds):
+        delay_seconds = max(0.0, float(delay_seconds))
+        deadline = time.monotonic() + delay_seconds
+        if (
+            self._deferred_update_pending
+            and self._deferred_update_deadline is not None
+            and self._deferred_update_deadline <= deadline
+        ):
+            return
+        self._deferred_update_generation += 1
+        self._deferred_update_pending = True
+        self._deferred_update_deadline = deadline
+        generation = self._deferred_update_generation
+
+        def fire():
+            def request_on_ui_thread():
+                if generation != self._deferred_update_generation:
+                    return
+                self._deferred_update_pending = False
+                self._deferred_update_deadline = None
+                self._request_reactive_update()
+
+            try:
+                scheduler = getattr(lf.ui, "schedule_on_ui_thread", None)
+                if scheduler is None:
+                    scheduler = getattr(lf.ui, "_run_on_ui_thread", None)
+                if callable(scheduler):
+                    scheduler(request_on_ui_thread)
+                else:
+                    self._deferred_update_pending = False
+                    self._deferred_update_deadline = None
+            except Exception:
+                self._deferred_update_pending = False
+                self._deferred_update_deadline = None
+
+        timer = threading.Timer(delay_seconds, fire)
+        timer.daemon = True
+        timer.start()
+
+    def _cancel_deferred_updates(self):
+        self._deferred_update_generation += 1
+        self._deferred_update_pending = False
+        self._deferred_update_deadline = None
+
+    def _mark_checkpoint_saved(self):
+        self._checkpoint_saved_time = time.time()
+        self._last_checkpoint_saved_visible = True
+        if self._handle:
+            self._handle.dirty("show_checkpoint_saved")
+        self._schedule_deferred_update(2.05)
 
     def on_update(self, doc):
         if not self._handle:
             return False
         self._sync_panel_label()
+        self._sync_auto_scale_scene_generation()
 
         dirty = False
-        state = AppState.trainer_state.value
+        state = RuntimeState.trainer_state.value
         if state != self._last_state:
             self._last_state = state
             if state == "ready":
@@ -1160,7 +1401,7 @@ class TrainingPanel(Panel):
             self._handle.dirty_all()
             dirty = True
         else:
-            it = AppState.iteration.value
+            it = RuntimeState.iteration.value
             if it != self._last_iteration:
                 self._last_iteration = it
                 self._handle.dirty("status_iteration")
@@ -1168,7 +1409,7 @@ class TrainingPanel(Panel):
                 self._handle.dirty("show_progress")
                 dirty = True
 
-            ng = AppState.num_gaussians.value
+            ng = RuntimeState.num_gaussians.value
             if ng != self._last_num_gaussians:
                 self._last_num_gaussians = ng
                 self._handle.dirty("status_gaussians")
@@ -1183,7 +1424,7 @@ class TrainingPanel(Panel):
                 self._handle.dirty("show_checkpoint_saved")
                 dirty = True
 
-        if state == "ready" and AppState.iteration.value == 0:
+        if state == "ready" and RuntimeState.iteration.value == 0:
             params = lf.optimization_params()
             if params and params.has_params():
                 if self._try_auto_scale_steps(params):
@@ -1191,7 +1432,7 @@ class TrainingPanel(Panel):
                     self._handle.dirty_all()
                     dirty = True
 
-        self._update_step_repeat()
+        dirty |= self._update_step_repeat()
         dirty |= self._update_progress()
         dirty |= self._update_save_steps(doc)
         dirty |= self._update_color_swatch(doc)
@@ -1201,8 +1442,8 @@ class TrainingPanel(Panel):
         return dirty
 
     def _update_progress(self):
-        it = AppState.iteration.value
-        mx = AppState.max_iterations.value
+        it = RuntimeState.iteration.value
+        mx = RuntimeState.max_iterations.value
         frac = it / mx if mx > 0 and it > 0 else 0.0
         if frac != self._last_progress_frac:
             self._last_progress_frac = frac
@@ -1217,9 +1458,18 @@ class TrainingPanel(Panel):
         if not params or not params.has_params():
             return False
 
-        state = AppState.trainer_state.value
-        can_edit = state == "ready" and AppState.iteration.value == 0
+        state = RuntimeState.trainer_state.value
+        can_edit = state == "ready" and RuntimeState.iteration.value == 0
         if not can_edit:
+            return False
+
+        return self._refresh_save_steps_model(params)
+
+    def _refresh_save_steps_model(self, params=None):
+        if params is None:
+            params = lf.optimization_params()
+        if not self._handle or not params or not params.has_params():
+            self._last_save_steps = None
             return False
 
         steps = list(params.save_steps)
@@ -1242,18 +1492,27 @@ class TrainingPanel(Panel):
         if c == self._last_bg_color:
             return False
         self._last_bg_color = c
+        self._sync_render_background_to_training(params)
+        self._sync_bg_color_text_bufs(params)
         swatch = doc.get_element_by_id("swatch-bg_color")
         if swatch:
-            r, g, b = int(c[0] * 255), int(c[1] * 255), int(c[2] * 255)
+            r = w.color_channel_byte(c, 0)
+            g = w.color_channel_byte(c, 1)
+            b = w.color_channel_byte(c, 2)
             swatch.set_property("background-color", f"rgb({r},{g},{b})")
+        if self._handle:
+            self._dirty_bg_color_bindings()
         return True
 
     def on_scene_changed(self, doc):
+        self._sync_render_background_to_training()
         if self._handle:
             self._sync_text_bufs()
             self._handle.dirty_all()
 
     def on_unmount(self, doc):
+        self._unsubscribe_reactive_state()
+        self._cancel_deferred_updates()
         doc.remove_data_model("training")
         self._handle = None
         self._doc = None
@@ -1350,10 +1609,10 @@ class TrainingPanel(Panel):
         r = float(event.get_parameter("red", "0"))
         g = float(event.get_parameter("green", "0"))
         b = float(event.get_parameter("blue", "0"))
-        setattr(params, self._color_edit_prop, (r, g, b))
-        rs = lf.get_render_settings()
-        if rs and self._color_edit_prop == "bg_color":
-            rs.set("background_color", (r, g, b))
+        if self._color_edit_prop == "bg_color":
+            self._set_training_bg_color((r, g, b))
+        else:
+            setattr(params, self._color_edit_prop, (r, g, b))
         if self._handle:
             self._sync_text_bufs()
             self._handle.dirty_all()
@@ -1370,6 +1629,32 @@ class TrainingPanel(Panel):
             self._color_edit_prop = None
 
     # ── Setters ────────────────────────────────────────────
+
+    def _sync_render_setting(self, prop, val):
+        rs = lf.get_render_settings()
+        if not rs:
+            return
+        if prop == "gut":
+            rs.set("raster_backend", "3dgut" if val else "3dgs")
+            return
+        rs.set(prop, val)
+
+    def _set_training_bg_color(self, color):
+        params = lf.optimization_params()
+        if not params or not params.has_params():
+            return False
+        normalized = w.normalize_color(color)
+        params.bg_color = normalized
+        self._sync_render_setting("background_color", normalized)
+        return True
+
+    def _sync_render_background_to_training(self, params=None):
+        if params is None:
+            params = lf.optimization_params()
+        if not params or not params.has_params():
+            return False
+        self._sync_render_setting("background_color", w.normalize_color(params.bg_color))
+        return True
 
     def _set_bool_prop(self, prop, val):
         params = lf.optimization_params()
@@ -1390,9 +1675,8 @@ class TrainingPanel(Panel):
         setattr(params, prop, val)
         if prop == "enable_eval" and val:
             self._sync_eval_steps_with_save_steps(params)
-        rs = lf.get_render_settings()
-        if rs and prop in RENDER_SYNC:
-            rs.set(RENDER_SYNC[prop], val)
+        if prop in RENDER_SYNC:
+            self._sync_render_setting(RENDER_SYNC[prop], val)
         if self._handle:
             self._sync_text_bufs()
             self._handle.dirty_all()
@@ -1455,6 +1739,14 @@ class TrainingPanel(Panel):
             self._sync_text_bufs()
             self._handle.dirty_all()
 
+    def _set_depth_loss_mode(self, val_str):
+        params = lf.optimization_params()
+        if not params or not params.has_params():
+            return
+        params.depth_loss_mode = _depth_loss_mode_or_default(val_str)
+        if self._handle:
+            self._handle.dirty_all()
+
     def _set_bg_mode(self, val_str):
         params = lf.optimization_params()
         if not params or not params.has_params():
@@ -1495,10 +1787,34 @@ class TrainingPanel(Panel):
                 if self._handle:
                     self._sync_text_bufs()
                     self._handle.dirty_all()
+            elif prop == "iterations":
+                return self._set_iterations(params, val)
             else:
                 params.set(prop, val)
         except (ValueError, TypeError, RuntimeError):
             return False
+        return True
+
+    def _set_iterations(self, params, val):
+        if val <= 0:
+            return False
+        if not self._auto_scale_steps_locked:
+            params.iterations = val
+            return True
+
+        current = max(1, int(getattr(params, "iterations", 0)))
+        if current == val:
+            return True
+
+        current_scaler = float(getattr(params, "steps_scaler", 1.0))
+        if current_scaler <= 0.0:
+            current_scaler = 1.0
+        next_scaler = current_scaler * (float(val) / float(current))
+        params.apply_step_scaling(next_scaler)
+        params.iterations = val
+        if self._handle:
+            self._sync_text_bufs()
+            self._handle.dirty_all()
         return True
 
     def _set_ppisp_activation_step(self, val_str):
@@ -1621,18 +1937,24 @@ class TrainingPanel(Panel):
         self._set_slider_prop(prop, value)
 
     def _set_bg_color_hex(self, hex_val):
+        color = w.hex_to_color(hex_val)
+        if color is not None and self._set_training_bg_color(color):
+            return True
+        return False
+
+    def _set_bg_color_channel(self, key, val_str):
         params = lf.optimization_params()
         if not params or not params.has_params():
-            return
-        color = _hex_to_color(hex_val)
-        if color:
-            params.bg_color = color
-            rs = lf.get_render_settings()
-            if rs:
-                rs.set("background_color", color)
-            if self._handle:
-                self._sync_text_bufs()
-                self._handle.dirty_all()
+            return False
+        parsed = w.parse_color_channel(val_str)
+        if parsed is None:
+            return False
+        channel_index = BG_COLOR_CHANNEL_INDEX.get(key)
+        if channel_index is None:
+            return False
+        color = list(w.normalize_color(params.bg_color))
+        color[channel_index] = parsed
+        return self._set_training_bg_color(color)
 
     # ── Event handlers ─────────────────────────────────────
 
@@ -1647,6 +1969,7 @@ class TrainingPanel(Panel):
         self._step_repeat_dir = direction
         self._step_repeat_start = now
         self._step_repeat_last = now
+        self._schedule_deferred_update(0.15)
 
     def _on_number_input_change(self, event):
         if not event.get_bool_parameter("linebreak", False):
@@ -1661,6 +1984,31 @@ class TrainingPanel(Panel):
         if target is None:
             return
         self._commit_number_input_key(target.get_attribute("data-value", ""))
+
+    def _on_color_channel_input_change(self, event):
+        if not event.get_bool_parameter("linebreak", False):
+            return
+        target = event.current_target()
+        if target is None:
+            return
+        self._commit_bg_color_text_key(target.get_attribute("data-value", ""))
+
+    def _on_color_channel_input_blur(self, event):
+        target = event.current_target()
+        if target is None:
+            return
+        self._commit_bg_color_text_key(target.get_attribute("data-value", ""))
+
+    def _on_bg_color_hex_change(self, event):
+        if not event.get_bool_parameter("linebreak", False):
+            return
+        self._commit_bg_color_text_key(BG_COLOR_HEX_KEY)
+
+    def _on_bg_color_hex_blur(self, event):
+        self._commit_bg_color_text_key(BG_COLOR_HEX_KEY)
+
+    def _on_step_scaling_lock_toggle(self, *_args):
+        self._set_auto_scale_steps_locked(not self._auto_scale_steps_locked)
 
     def _apply_num_step(self, prop, direction):
         entry = _NUM_PROP_LOOKUP.get(prop)
@@ -1725,14 +2073,18 @@ class TrainingPanel(Panel):
 
     def _update_step_repeat(self):
         if not self._step_repeat_prop:
-            return
+            return False
         now = time.monotonic()
         if now - self._step_repeat_start < 0.15:
-            return
+            self._schedule_deferred_update(0.15 - (now - self._step_repeat_start))
+            return False
         if now - self._step_repeat_last < 0.01:
-            return
+            self._schedule_deferred_update(0.01 - (now - self._step_repeat_last))
+            return False
         self._step_repeat_last = now
         self._apply_num_step(self._step_repeat_prop, self._step_repeat_dir)
+        self._schedule_deferred_update(0.01)
+        return True
 
     def _get_section_elements(self, name):
         if not self._doc:
@@ -1809,9 +2161,9 @@ class TrainingPanel(Panel):
             lf.switch_to_edit_mode()
         elif action == "save_checkpoint":
             lf.save_checkpoint()
-            self._checkpoint_saved_time = time.time()
+            self._mark_checkpoint_saved()
         elif action == "browse_bg":
-            selected = lf.ui.open_image_file_dialog("")
+            selected = lf.ui.open_image_dialog("")
             if selected:
                 params = lf.optimization_params()
                 if params and params.has_params():
@@ -1850,7 +2202,7 @@ class TrainingPanel(Panel):
                 params.add_save_step(self._new_save_step)
                 if params.enable_eval:
                     self._sync_eval_steps_with_save_steps(params)
-                self._last_save_steps = None
+                self._refresh_save_steps_model(params)
 
     def _action_start(self):
         params = lf.optimization_params()
@@ -1939,9 +2291,9 @@ class TrainingPanel(Panel):
         if not ASSET_MANAGER_AVAILABLE:
             return
         try:
-            from pathlib import Path
+            from .asset_index import resolve_asset_manager_storage_path
 
-            storage_path = Path.home() / ".lichtfeld" / "asset_manager"
+            storage_path = resolve_asset_manager_storage_path()
             storage_path.mkdir(parents=True, exist_ok=True)
             self._asset_index = AssetIndex(library_path=storage_path / "library.json")
             self._asset_index.load()
@@ -1983,7 +2335,7 @@ class TrainingPanel(Panel):
             params.remove_save_step(step_to_remove)
             if params.enable_eval:
                 self._remove_from_eval_steps(params, step_to_remove)
-            self._last_save_steps = None
+            self._refresh_save_steps_model(params)
 
     def _sync_eval_steps_with_save_steps(self, params):
         if not params or not params.has_params():
@@ -1999,6 +2351,9 @@ class TrainingPanel(Panel):
         params.remove_eval_step(step)
 
     def _try_auto_scale_steps(self, params):
+        self._sync_auto_scale_scene_generation()
+        if not self._auto_scale_steps_locked:
+            return False
         scene = lf.get_scene()
         if scene is None:
             return False
@@ -2008,6 +2363,21 @@ class TrainingPanel(Panel):
         self._auto_scaled_for_cameras = camera_count
         params.auto_scale_steps(camera_count)
         return True
+
+    def _set_auto_scale_steps_locked(self, locked):
+        locked = bool(locked)
+        if self._auto_scale_steps_locked == locked:
+            return
+        self._auto_scale_steps_locked = locked
+
+        if locked:
+            self._auto_scaled_for_cameras = 0
+            params = lf.optimization_params()
+            if params and params.has_params() and self._try_auto_scale_steps(params):
+                self._sync_text_bufs()
+
+        if self._handle:
+            self._handle.dirty_all()
 
     def _draw_controls(self, layout, state, iteration):
         if state == "ready":
@@ -2098,7 +2468,7 @@ class TrainingPanel(Panel):
                 tr("training_panel.save_checkpoint"), "primary", FULL_WIDTH
             ):
                 lf.save_checkpoint()
-                self._checkpoint_saved_time = time.time()
+                self._mark_checkpoint_saved()
 
             if time.time() - self._checkpoint_saved_time < 2.0:
                 theme = lf.ui.theme()
@@ -2169,15 +2539,25 @@ class TrainingPanel(Panel):
             layout.table_next_column()
             layout.label(tr("training_params.iterations"))
             layout.table_next_column()
-            layout.push_item_width(-1)
+            layout.push_item_width(-64)
             changed, new_val = layout.input_int_formatted(
                 "##py_iterations", int(params.iterations), 1000, 5000
             )
             if changed and new_val > 0:
-                params.iterations = new_val
+                self._set_iterations(params, new_val)
             layout.pop_item_width()
             if layout.is_item_hovered():
                 layout.set_tooltip(tr("training.tooltip.iterations"))
+            layout.same_line()
+            lock_style = "primary" if self._auto_scale_steps_locked else "secondary"
+            if layout.button_styled(
+                self._step_scaling_lock_label() + "##py_step_scaling_lock",
+                lock_style,
+                (58, 0),
+            ):
+                self._set_auto_scale_steps_locked(not self._auto_scale_steps_locked)
+            if layout.is_item_hovered():
+                layout.set_tooltip(self._step_scaling_lock_tooltip())
 
             layout.table_next_row()
             layout.table_next_column()
@@ -2228,20 +2608,6 @@ class TrainingPanel(Panel):
                 if layout.is_item_hovered():
                     layout.set_tooltip(tr("training.tooltip.tile_mode"))
 
-            layout.table_next_row()
-            layout.table_next_column()
-            layout.label(tr("training_params.steps_scaler"))
-            layout.table_next_column()
-            layout.push_item_width(-1)
-            changed, new_val = layout.input_float(
-                "##py_steps_scaler", params.steps_scaler, 0.1, 0.5, "%.2f"
-            )
-            if changed:
-                params.apply_step_scaling(new_val)
-            layout.pop_item_width()
-            if layout.is_item_hovered():
-                layout.set_tooltip(tr("training.tooltip.steps_scaler"))
-
             layout.end_disabled()
 
             # -- Live-editable params (available during training) --
@@ -2269,6 +2635,7 @@ class TrainingPanel(Panel):
                 tr("training.options.mask.none"),
                 tr("training.options.mask.segment"),
                 tr("training.options.mask.ignore"),
+                tr("training.options.mask.segment_and_ignore"),
                 tr("training.options.mask.alpha_consistent"),
             ]
             changed, new_idx = layout.combo("##py_mask_mode", mask_idx, mask_mode_items)
@@ -2277,6 +2644,59 @@ class TrainingPanel(Panel):
             layout.pop_item_width()
             if layout.is_item_hovered():
                 layout.set_tooltip(tr("training.tooltip.mask_mode"))
+
+            layout.table_next_row()
+            layout.table_next_column()
+            layout.label(tr("training_params.use_depth_loss"))
+            layout.table_next_column()
+            changed, new_val = layout.checkbox(
+                "##py_use_depth_loss", params.use_depth_loss
+            )
+            if changed:
+                params.use_depth_loss = new_val
+            if layout.is_item_hovered():
+                layout.set_tooltip(tr("training.tooltip.use_depth_loss"))
+
+            if params.use_depth_loss:
+                layout.table_next_row()
+                layout.table_next_column()
+                layout.label(tr("training_params.depth_loss_mode"))
+                layout.table_next_column()
+                layout.push_item_width(-1)
+                depth_loss_mode = _depth_loss_mode_or_default(params.depth_loss_mode)
+                depth_loss_mode_idx = DEPTH_LOSS_MODE_VALUES.index(depth_loss_mode)
+                depth_loss_mode_items = [
+                    tr("training.options.depth_loss.pearson"),
+                    tr("training.options.depth_loss.adaptive_warped_l1"),
+                ]
+                changed, new_idx = layout.combo(
+                    "##py_depth_loss_mode",
+                    depth_loss_mode_idx,
+                    depth_loss_mode_items,
+                )
+                if changed and 0 <= new_idx < len(DEPTH_LOSS_MODE_VALUES):
+                    params.depth_loss_mode = DEPTH_LOSS_MODE_VALUES[new_idx]
+                layout.pop_item_width()
+                if layout.is_item_hovered():
+                    layout.set_tooltip(tr("training.tooltip.depth_loss_mode"))
+
+                layout.table_next_row()
+                layout.table_next_column()
+                layout.label(tr("training_params.depth_loss_weight"))
+                layout.table_next_column()
+                layout.push_item_width(-1)
+                changed, new_val = layout.input_float(
+                    "##py_depth_loss_weight",
+                    params.depth_loss_weight,
+                    0.1,
+                    0.5,
+                    "%.3f",
+                )
+                if changed:
+                    params.depth_loss_weight = max(0.0, new_val)
+                layout.pop_item_width()
+                if layout.is_item_hovered():
+                    layout.set_tooltip(tr("training.tooltip.depth_loss_weight"))
 
             if params.mask_mode.value != 0:
                 layout.table_next_row()
@@ -2467,8 +2887,7 @@ class TrainingPanel(Panel):
                     "##py_bg_color", params.bg_color
                 )
                 if changed:
-                    params.bg_color = new_color
-                    self._sync_render_setting("background_color", new_color)
+                    self._set_training_bg_color(new_color)
                 layout.pop_item_width()
 
             if bg_mode_val == 2:
@@ -2492,7 +2911,7 @@ class TrainingPanel(Panel):
                 if layout.button(
                     tr("training_params.bg_image_browse") + "##py_bg_browse"
                 ):
-                    selected = lf.ui.open_image_file_dialog("")
+                    selected = lf.ui.open_image_dialog("")
                     if selected:
                         params.bg_image_path = selected
                 layout.same_line()
@@ -2702,30 +3121,31 @@ class TrainingPanel(Panel):
                     )
                     layout.table_next_column()
 
-                    self._input_int_row(
-                        layout,
-                        tr("training.refinement.refine_every"),
-                        "refine_every",
-                        params,
-                        10,
-                        100,
-                    )
-                    self._input_int_row(
-                        layout,
-                        tr("training.refinement.start_refine"),
-                        "start_refine",
-                        params,
-                        100,
-                        500,
-                    )
-                    self._input_int_row(
-                        layout,
-                        tr("training.refinement.stop_refine"),
-                        "stop_refine",
-                        params,
-                        1000,
-                        5000,
-                    )
+                    with _disabled_scope(layout, self._auto_scale_steps_locked):
+                        self._input_int_row(
+                            layout,
+                            tr("training.refinement.refine_every"),
+                            "refine_every",
+                            params,
+                            10,
+                            100,
+                        )
+                        self._input_int_row(
+                            layout,
+                            tr("training.refinement.start_refine"),
+                            "start_refine",
+                            params,
+                            100,
+                            500,
+                        )
+                        self._input_int_row(
+                            layout,
+                            tr("training.refinement.stop_refine"),
+                            "stop_refine",
+                            params,
+                            1000,
+                            5000,
+                        )
                     self._input_float_prop_row(
                         layout,
                         tr("training.refinement.gradient_thr"),
@@ -2735,22 +3155,23 @@ class TrainingPanel(Panel):
                         0.0001,
                         "%.6f",
                     )
-                    self._input_int_row(
-                        layout,
-                        tr("training.refinement.reset_every"),
-                        "reset_every",
-                        params,
-                        100,
-                        1000,
-                    )
-                    self._input_int_row(
-                        layout,
-                        tr("training.refinement.sh_upgrade_every"),
-                        "sh_degree_interval",
-                        params,
-                        100,
-                        500,
-                    )
+                    with _disabled_scope(layout, self._auto_scale_steps_locked):
+                        self._input_int_row(
+                            layout,
+                            tr("training.refinement.reset_every"),
+                            "reset_every",
+                            params,
+                            100,
+                            1000,
+                        )
+                        self._input_int_row(
+                            layout,
+                            tr("training.refinement.sh_upgrade_every"),
+                            "sh_degree_interval",
+                            params,
+                            100,
+                            500,
+                        )
                     layout.end_disabled()
             finally:
                 if table_open:
@@ -3025,9 +3446,15 @@ class TrainingPanel(Panel):
                         min_val=0.0,
                         max_val=1.0,
                     )
-                    self._input_int_row(
-                        layout, "Grow Until Iter", "grow_until_iter", params, 1000, 5000
-                    )
+                    with _disabled_scope(layout, self._auto_scale_steps_locked):
+                        self._input_int_row(
+                            layout,
+                            "Grow Until Iter",
+                            "grow_until_iter",
+                            params,
+                            1000,
+                            5000,
+                        )
                     self._input_float_prop_row(
                         layout,
                         "Opacity Decay",
@@ -3148,38 +3575,39 @@ class TrainingPanel(Panel):
         steps = list(params.save_steps)
 
         if can_edit:
-            _, self._new_save_step = layout.input_int_formatted(
-                "##py_new_step", self._new_save_step, 100, 1000
-            )
-            layout.same_line()
-            if layout.button(tr("common.add") + "##py_add"):
-                if self._new_save_step > 0:
-                    params.add_save_step(self._new_save_step)
-                    if params.enable_eval:
-                        self._sync_eval_steps_with_save_steps(params)
-
-            layout.separator()
-
-            for i, step in enumerate(steps):
-                layout.push_id(f"py_step_{i}")
-                layout.set_next_item_width(100)
-                changed, new_val = layout.input_int_formatted("##step", step, 0, 0)
-                if changed and new_val > 0 and new_val != step:
-                    params.remove_save_step(step)
-                    params.add_save_step(new_val)
-                    if params.enable_eval:
-                        self._sync_eval_steps_with_save_steps(params)
-                layout.same_line()
-                if layout.button(tr("common.remove") + "##rm"):
-                    params.remove_save_step(step)
-                    if params.enable_eval:
-                        self._remove_from_eval_steps(params, step)
-                layout.pop_id()
-
-            if not steps:
-                layout.text_colored(
-                    tr("training_panel.no_save_steps"), theme.palette.text_dim
+            with _disabled_scope(layout, self._auto_scale_steps_locked):
+                _, self._new_save_step = layout.input_int_formatted(
+                    "##py_new_step", self._new_save_step, 100, 1000
                 )
+                layout.same_line()
+                if layout.button(tr("common.add") + "##py_add"):
+                    if self._new_save_step > 0:
+                        params.add_save_step(self._new_save_step)
+                        if params.enable_eval:
+                            self._sync_eval_steps_with_save_steps(params)
+
+                layout.separator()
+
+                for i, step in enumerate(steps):
+                    layout.push_id(f"py_step_{i}")
+                    layout.set_next_item_width(100)
+                    changed, new_val = layout.input_int_formatted("##step", step, 0, 0)
+                    if changed and new_val > 0 and new_val != step:
+                        params.remove_save_step(step)
+                        params.add_save_step(new_val)
+                        if params.enable_eval:
+                            self._sync_eval_steps_with_save_steps(params)
+                    layout.same_line()
+                    if layout.button(tr("common.remove") + "##rm"):
+                        params.remove_save_step(step)
+                        if params.enable_eval:
+                            self._remove_from_eval_steps(params, step)
+                    layout.pop_id()
+
+                if not steps:
+                    layout.text_colored(
+                        tr("training_panel.no_save_steps"), theme.palette.text_dim
+                    )
         else:
             if steps:
                 layout.label(", ".join(str(s) for s in steps))
@@ -3289,16 +3717,16 @@ class TrainingPanel(Panel):
             "error": tr("status.error"),
         }
         unknown_state = tr("status.unknown")
-        layout.label(f"{tr('status.mode')}: {state_labels.get(state, unknown_state)}")
+        layout.label(f"{tr('status.mode')} {state_labels.get(state, unknown_state)}")
 
         _rate_tracker.add_sample(iteration)
         rate = _rate_tracker.get_rate()
         layout.label(
             f"{tr('status.iteration')} {iteration:,} ({rate:.1f} {tr('training_panel.iters_per_sec')})"
         )
-        layout.label(tr("progress.num_splats") % f"{AppState.num_gaussians.value:,}")
+        layout.label(tr("progress.num_splats") % f"{RuntimeState.num_gaussians.value:,}")
 
-        max_iter = AppState.max_iterations.value
+        max_iter = RuntimeState.max_iterations.value
         if max_iter > 0 and iteration > 0:
             layout.progress_bar(iteration / max_iter, f"{iteration:,}/{max_iter:,}")
 

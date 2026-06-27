@@ -2,12 +2,14 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/tensor/internal/cuda_stream_context.hpp"
 #include "lfs/kernels/ssim.cuh"
 #include "lfs/kernels/ssim_reduction.cuh"
 #include <algorithm>
 #include <cassert>
 #include <cooperative_groups.h>
 #include <cstdint>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <type_traits>
 
@@ -460,9 +462,9 @@ namespace {
         float C2,
         const float* __restrict__ img1,
         const TargetT* __restrict__ img2,
-        float* __restrict__ dm_dmu1,
-        float* __restrict__ dm_dsigma1_sq,
-        float* __restrict__ dm_dsigma12,
+        __half* __restrict__ dm_dmu1,
+        __half* __restrict__ dm_dsigma1_sq,
+        __half* __restrict__ dm_dsigma12,
         float* __restrict__ ssim_map) {
 
         auto block = cg::this_thread_block();
@@ -653,7 +655,7 @@ namespace {
     }
 
     // Fused L1+SSIM Backward Kernel
-    template <typename TargetT>
+    template <typename TargetT, typename PartialT>
     __global__ void fusedL1SSIMBackwardCUDA(
         float ssim_weight,
         int H,
@@ -666,9 +668,9 @@ namespace {
         const float* __restrict__ img1,
         const TargetT* __restrict__ img2,
         float* __restrict__ dL_dimg1,
-        const float* __restrict__ dm_dmu1,
-        const float* __restrict__ dm_dsigma1_sq,
-        const float* __restrict__ dm_dsigma12) {
+        const PartialT* __restrict__ dm_dmu1,
+        const PartialT* __restrict__ dm_dsigma1_sq,
+        const PartialT* __restrict__ dm_dsigma12) {
 
         auto block = cg::this_thread_block();
         const int pix_y = block.group_index().y * BLOCK_Y + block.thread_index().y;
@@ -1465,7 +1467,7 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssimCUDA<TargetT><<<grid, block>>>(
+            fusedssimCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2,
                 img1.ptr<float>(),
                 img2_ptr,
@@ -1534,7 +1536,7 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssimCUDA<TargetT><<<grid, block>>>(
+            fusedssimCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2,
                 img1.ptr<float>(), img2_ptr,
                 ssim_map.ptr<float>(), dm_dmu1.ptr<float>(),
@@ -1590,7 +1592,7 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssimCUDA<TargetT><<<grid, block>>>(
+            fusedssimCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2,
                 img1.ptr<float>(), img2_ptr,
                 workspace.ssim_map.ptr<float>(),
@@ -1656,7 +1658,7 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(ctx.img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssim_backwardCUDA<TargetT><<<grid, block>>>(
+            fusedssim_backwardCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 ctx.original_h, ctx.original_w, static_cast<int>(C), C1, C2,
                 ctx.img1.ptr<float>(),
                 img2_ptr,
@@ -1686,7 +1688,7 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(ctx.img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssim_backwardCUDA<TargetT><<<grid, block>>>(
+            fusedssim_backwardCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 ctx.original_h, ctx.original_w, static_cast<int>(C), C1, C2,
                 ctx.img1.ptr<float>(), img2_ptr, dL_dmap.ptr<float>(),
                 dL_dimg1.ptr<float>(), ctx.dm_dmu1.ptr<float>(),
@@ -1739,7 +1741,7 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssimCUDA<TargetT><<<grid, block>>>(
+            fusedssimCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2,
                 img1.ptr<float>(),
                 img2_ptr,
@@ -1821,7 +1823,7 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(ctx.img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedssim_backwardCUDA<TargetT><<<grid, block>>>(
+            fusedssim_backwardCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 ctx.original_h, ctx.original_w, static_cast<int>(C), C1, C2,
                 ctx.img1.ptr<float>(),
                 img2_ptr,
@@ -1869,12 +1871,12 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedL1SSIMForwardCUDA<TargetT><<<grid, block>>>(
+            fusedL1SSIMForwardCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2,
                 img1.ptr<float>(), img2_ptr,
-                workspace.dm_dmu1.ptr<float>(),
-                workspace.dm_dsigma1_sq.ptr<float>(),
-                workspace.dm_dsigma12.ptr<float>(),
+                workspace.dm_dmu1.ptr<__half>(),
+                workspace.dm_dsigma1_sq.ptr<__half>(),
+                workspace.dm_dsigma12.ptr<__half>(),
                 workspace.ssim_map.ptr<float>());
 
             launch_fused_l1_ssim_mean_device(
@@ -1931,13 +1933,13 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(ctx.img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            fusedL1SSIMBackwardCUDA<TargetT><<<grid, block>>>(
+            fusedL1SSIMBackwardCUDA<TargetT, __half><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 ctx.ssim_weight, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
                 grad_per_pixel, ctx.apply_valid_padding,
                 ctx.img1.ptr<float>(), img2_ptr,
                 workspace.grad_img.ptr<float>(),
-                ctx.dm_dmu1.ptr<float>(), ctx.dm_dsigma1_sq.ptr<float>(),
-                ctx.dm_dsigma12.ptr<float>());
+                ctx.dm_dmu1.ptr<__half>(), ctx.dm_dsigma1_sq.ptr<__half>(),
+                ctx.dm_dsigma12.ptr<__half>());
         });
 
         return workspace.grad_img;
@@ -1984,7 +1986,7 @@ namespace lfs::training::kernels {
 
         dispatch_target_ptr(gt, [&](auto* gt_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
-            decoupledFusedL1SSIMForwardCUDA<TargetT><<<grid, block>>>(
+            decoupledFusedL1SSIMForwardCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2, ssim_weight,
                 corrected.ptr<float>(), raw.ptr<float>(), gt_ptr,
                 workspace.app_dm_dmu1.ptr<float>(),
@@ -2047,7 +2049,7 @@ namespace lfs::training::kernels {
         dispatch_target_ptr(ctx.gt_img, [&](auto* gt_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
             workspace.grad_corrected.zero_();
-            fusedL1SSIMBackwardCUDA<TargetT><<<grid, block>>>(
+            fusedL1SSIMBackwardCUDA<TargetT, float><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 ctx.ssim_weight, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
                 grad_per_pixel, ctx.apply_valid_padding,
                 ctx.corrected_img.ptr<float>(), gt_ptr,
@@ -2057,7 +2059,7 @@ namespace lfs::training::kernels {
                 workspace.zero_terms.ptr<float>());
 
             workspace.grad_raw.zero_();
-            fusedL1SSIMBackwardCUDA<TargetT><<<grid, block>>>(
+            fusedL1SSIMBackwardCUDA<TargetT, float><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 1.0f, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
                 grad_per_pixel, ctx.apply_valid_padding,
                 ctx.raw_img.ptr<float>(), gt_ptr,
@@ -2111,7 +2113,7 @@ namespace lfs::training::kernels {
         const auto stream = workspace.ssim_map.stream();
         dispatch_target_ptr(img2, [&](auto* img2_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
-            maskedFusedL1SSIMForwardCUDA<TargetT><<<grid, block>>>(
+            maskedFusedL1SSIMForwardCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2,
                 img1.ptr<float>(), img2_ptr,
                 workspace.dm_dmu1.ptr<float>(),
@@ -2172,7 +2174,7 @@ namespace lfs::training::kernels {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(img2_ptr)>>;
             dispatch_mask_ptr(ctx.mask, [&](auto* mask_ptr) {
                 using MaskT = std::remove_cv_t<std::remove_pointer_t<decltype(mask_ptr)>>;
-                maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT><<<grid, block>>>(
+                maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                     ctx.ssim_weight, inv_mask_sum, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
                     ctx.img1.ptr<float>(), img2_ptr, mask_ptr,
                     workspace.grad_img.ptr<float>(),
@@ -2225,7 +2227,7 @@ namespace lfs::training::kernels {
         const auto stream = workspace.ssim_map.stream();
         dispatch_target_ptr(gt, [&](auto* gt_ptr) {
             using TargetT = std::remove_cv_t<std::remove_pointer_t<decltype(gt_ptr)>>;
-            decoupledFusedL1SSIMForwardCUDA<TargetT><<<grid, block>>>(
+            decoupledFusedL1SSIMForwardCUDA<TargetT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                 H, W, C, C1, C2, ssim_weight,
                 corrected.ptr<float>(), raw.ptr<float>(), gt_ptr,
                 workspace.app_dm_dmu1.ptr<float>(),
@@ -2288,7 +2290,7 @@ namespace lfs::training::kernels {
             dispatch_mask_ptr(ctx.mask, [&](auto* mask_ptr) {
                 using MaskT = std::remove_cv_t<std::remove_pointer_t<decltype(mask_ptr)>>;
                 workspace.grad_corrected.zero_();
-                maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT><<<grid, block>>>(
+                maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                     ctx.ssim_weight, inv_mask_sum, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
                     ctx.corrected_img.ptr<float>(), gt_ptr, mask_ptr,
                     workspace.grad_corrected.ptr<float>(),
@@ -2297,7 +2299,7 @@ namespace lfs::training::kernels {
                     workspace.zero_terms.ptr<float>());
 
                 workspace.grad_raw.zero_();
-                maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT><<<grid, block>>>(
+                maskedFusedL1SSIMBackwardCUDA<TargetT, MaskT><<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
                     1.0f, inv_mask_sum, ctx.H, ctx.W, static_cast<int>(C), C1, C2,
                     ctx.raw_img.ptr<float>(), gt_ptr, mask_ptr,
                     workspace.grad_raw.ptr<float>(),
@@ -2355,7 +2357,7 @@ namespace lfs::training::kernels {
         dim3 grid((HW + THREADS - 1) / THREADS);
         dim3 block(THREADS);
 
-        ssim_to_error_map_kernel<<<grid, block>>>(
+        ssim_to_error_map_kernel<<<grid, block, 0, lfs::core::getCurrentCUDAStream()>>>(
             ssim_map.ptr<float>(),
             error_map.ptr<float>(),
             C, H, W);

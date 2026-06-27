@@ -6,6 +6,7 @@
 
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/logger.hpp"
+#include "core/parameter_manager.hpp"
 #include "core/path_utils.hpp"
 #include "gui/gui_manager.hpp"
 #include "gui/rmlui/elements/scene_graph_element.hpp"
@@ -14,6 +15,7 @@
 #include "gui/utils/native_file_dialog.hpp"
 #include "internal/resource_paths.hpp"
 #include "operation/undo_history.hpp"
+#include "visualizer/app_store.hpp"
 #include "visualizer/core/services.hpp"
 
 #include <RmlUi/Core.h>
@@ -23,10 +25,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <ctime>
 #include <format>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <string_view>
 
 namespace lfs::vis::gui {
@@ -324,6 +328,29 @@ namespace lfs::vis::gui {
                                level_label);
         }
 
+        [[nodiscard]] int optionalMetricMilli(const std::optional<float>& value) {
+            if (!value || !std::isfinite(*value))
+                return std::numeric_limits<int>::min();
+            return static_cast<int>(std::lround(*value * 1000.0f));
+        }
+
+        [[nodiscard]] bool hasDiscreteInputActivity(const PanelInputState* input) {
+            if (!input)
+                return false;
+
+            for (int i = 0; i < 3; ++i) {
+                if (input->mouse_clicked[i] || input->mouse_released[i] || input->mouse_down[i])
+                    return true;
+            }
+            return input->mouse_wheel != 0.0f ||
+                   !input->keys_pressed.empty() ||
+                   !input->keys_repeated.empty() ||
+                   !input->keys_released.empty() ||
+                   !input->text_codepoints.empty() ||
+                   !input->text_inputs.empty() ||
+                   input->has_text_editing;
+        }
+
         [[nodiscard]] std::string loggingRowsHtml(const std::vector<core::LogEntrySnapshot>& entries) {
             const size_t rendered_entry_count = std::min(entries.size(), MAX_RENDERED_LOG_ENTRIES);
             std::string html;
@@ -373,6 +400,7 @@ namespace lfs::vis::gui {
         scene_tab_el_ = nullptr;
         history_tab_el_ = nullptr;
         logging_tab_el_ = nullptr;
+        asset_manager_button_el_ = nullptr;
         chip_row_el_ = nullptr;
         summary_model_chip_el_ = nullptr;
         summary_node_chip_el_ = nullptr;
@@ -422,6 +450,7 @@ namespace lfs::vis::gui {
         last_history_generation_ = std::numeric_limits<uint64_t>::max();
         last_log_generation_ = std::numeric_limits<uint64_t>::max();
         last_prepare_frame_ = 0;
+        has_last_sync_stamp_ = false;
         logging_feedback_dirty_ = true;
     }
 
@@ -441,7 +470,8 @@ namespace lfs::vis::gui {
         if (!ensureInitialized())
             return;
 
-        syncPanel(ctx);
+        if (shouldSyncPanel(input))
+            syncPanel(ctx);
         last_prepare_frame_ = ctx.frame_serial;
         host_.prepareDirect(w, h);
     }
@@ -469,6 +499,38 @@ namespace lfs::vis::gui {
         host_.drawDirect(x, y, w, h);
     }
 
+    bool NativeScenePanel::drawDirectCached(const float x, const float y,
+                                            const float w, const float h,
+                                            const PanelDrawContext& ctx) {
+        if (!ensureInitialized())
+            return false;
+
+        if (tree_el_)
+            tree_el_->setPanelScreenOffset(x, y);
+
+        // A context-menu result is normally consumed in syncPanel(), which only
+        // runs on the live draw paths. Under render-on-demand an idle panel uses
+        // this cached path, so poll the result here too — otherwise a menu action
+        // (e.g. "Go to camera view") sits unconsumed until the panel next goes
+        // live, i.e. until the next mouse move (a multi-second perceived lag).
+        if (auto* gui = services().guiOrNull()) {
+            const std::string action = gui->globalContextMenu().pollResult();
+            if (!action.empty() && tree_el_ && tree_el_->executeContextMenuAction(action)) {
+                host_.markContentDirty();
+                host_.drawDirect(x, y, w, h);
+                return true;
+            }
+        }
+
+        if (shouldSyncPanel(nullptr)) {
+            syncPanel(ctx);
+            host_.drawDirect(x, y, w, h);
+            return true;
+        }
+
+        return host_.drawDirectCached(x, y, w, h);
+    }
+
     bool NativeScenePanel::ensureInitialized() {
         if (!host_.ensureDocumentLoaded())
             return false;
@@ -493,6 +555,7 @@ namespace lfs::vis::gui {
         scene_tab_el_ = document_->GetElementById("scene-tab");
         history_tab_el_ = document_->GetElementById("history-tab");
         logging_tab_el_ = document_->GetElementById("logging-tab");
+        asset_manager_button_el_ = document_->GetElementById("asset-manager-button");
         chip_row_el_ = document_->GetElementById("scene-chip-row");
         summary_model_chip_el_ = document_->GetElementById("summary-model-chip");
         summary_node_chip_el_ = document_->GetElementById("summary-node-chip");
@@ -545,8 +608,14 @@ namespace lfs::vis::gui {
                 clear_icon->SetAttribute("src", clear_icon_source);
         }
 
+        if (auto* asset_manager_icon = document_->GetElementById("asset-manager-icon")) {
+            const std::string asset_manager_icon_source = resolveRmlImageSource("icon/archive.png");
+            if (!asset_manager_icon_source.empty())
+                asset_manager_icon->SetAttribute("src", asset_manager_icon_source);
+        }
+
         if (!tree_el_ || !scene_tab_el_ || !history_tab_el_ || !logging_tab_el_ || !chip_row_el_ ||
-            !summary_model_chip_el_ || !summary_node_chip_el_ || !summary_selection_chip_el_ ||
+            !asset_manager_button_el_ || !summary_model_chip_el_ || !summary_node_chip_el_ || !summary_selection_chip_el_ ||
             !summary_filter_chip_el_ || !scene_view_el_ || !search_container_el_ ||
             !filter_input_el_ || !filter_clear_el_ || !empty_state_el_ || !empty_primary_el_ ||
             !empty_secondary_el_ || !history_container_el_ || !history_summary_label_el_ ||
@@ -565,6 +634,7 @@ namespace lfs::vis::gui {
         scene_tab_el_->AddEventListener(Rml::EventId::Click, &listener_);
         history_tab_el_->AddEventListener(Rml::EventId::Click, &listener_);
         logging_tab_el_->AddEventListener(Rml::EventId::Click, &listener_);
+        asset_manager_button_el_->AddEventListener(Rml::EventId::Click, &listener_);
         filter_clear_el_->AddEventListener(Rml::EventId::Click, &listener_);
         history_undo_btn_el_->AddEventListener(Rml::EventId::Click, &listener_);
         history_redo_btn_el_->AddEventListener(Rml::EventId::Click, &listener_);
@@ -601,6 +671,51 @@ namespace lfs::vis::gui {
 
         if (changed)
             host_.markContentDirty();
+
+        last_sync_stamp_ = makeSyncStamp();
+        has_last_sync_stamp_ = true;
+    }
+
+    bool NativeScenePanel::shouldSyncPanel(const PanelInputState* input) const {
+        if (!tree_el_ || !has_last_sync_stamp_)
+            return true;
+        if (logging_feedback_dirty_)
+            return true;
+        if (hasDiscreteInputActivity(input))
+            return true;
+        return makeSyncStamp() != last_sync_stamp_;
+    }
+
+    NativeScenePanel::SyncStamp NativeScenePanel::makeSyncStamp() const {
+        SyncStamp stamp;
+        stamp.active_tab = active_tab_;
+        auto& store = app_store();
+        stamp.language_generation = store.language_generation.get();
+        stamp.dp_ratio_milli = manager_
+                                   ? static_cast<int>(std::lround(manager_->getDpRatio() * 1000.0f))
+                                   : 1000;
+
+        if (active_tab_ == Tab::Scene) {
+            stamp.scene_generation = store.scene_generation.get();
+            stamp.selection_generation = store.selection_generation.get();
+            stamp.render_settings_generation = store.render_settings_generation.get();
+            if (auto* params = services().paramsOrNull())
+                stamp.invert_masks = params->getActiveParams().invert_masks;
+
+            stamp.num_gaussians = store.num_gaussians.get();
+            stamp.training_running = store.training_running.get();
+            stamp.training_state = store.training_state.get();
+            stamp.eval_psnr_milli = optionalMetricMilli(store.eval_psnr.get());
+            stamp.eval_ssim_milli = optionalMetricMilli(store.eval_ssim.get());
+        } else if (active_tab_ == Tab::History) {
+            stamp.history_generation = op::undoHistory().generation();
+        } else if (active_tab_ == Tab::Logging) {
+            auto& logger = core::Logger::get();
+            stamp.log_generation = logger.buffered_log_generation();
+            stamp.log_level = logger.level();
+        }
+
+        return stamp;
     }
 
     bool NativeScenePanel::syncSceneState(const PanelDrawContext& ctx) {
@@ -826,6 +941,13 @@ namespace lfs::vis::gui {
         }
         if (id == "logging-tab") {
             setTab(Tab::Logging);
+            event.StopPropagation();
+            return true;
+        }
+        if (id == "asset-manager-button" || id == "asset-manager-icon") {
+            auto& panel_registry = PanelRegistry::instance();
+            const bool currently_open = panel_registry.is_panel_enabled("lfs.asset_manager");
+            panel_registry.set_panel_enabled("lfs.asset_manager", !currently_open);
             event.StopPropagation();
             return true;
         }

@@ -207,7 +207,8 @@ namespace gsplat_lfs {
         const float* quats,
         const float* scales,
         const float* opacities,
-        const float* sh_coeffs,
+        const float* sh0,
+        const float* shN,
         uint32_t sh_degree,
         const float* backgrounds,
         const float* bg_images,
@@ -240,7 +241,7 @@ namespace gsplat_lfs {
         GSPLAT_CHECK_CUDA_PTR(quats, "quats");
         GSPLAT_CHECK_CUDA_PTR(scales, "scales");
         GSPLAT_CHECK_CUDA_PTR(opacities, "opacities");
-        GSPLAT_CHECK_CUDA_PTR(sh_coeffs, "sh_coeffs");
+        GSPLAT_CHECK_CUDA_PTR(sh0, "sh0");
 
         const uint32_t tile_width = (image_width + tile_size - 1) / tile_size;
         const uint32_t tile_height = (image_height + tile_size - 1) / tile_size;
@@ -290,9 +291,9 @@ namespace gsplat_lfs {
         if (render_mode == 0 || render_mode == 3 || render_mode == 4) {
             compute_view_dirs(means, viewmats0, C, N, result.dirs, stream);
 
-            spherical_harmonics_fwd(
-                sh_degree, result.dirs, sh_coeffs, nullptr,
-                static_cast<int64_t>(C) * N, K,
+            spherical_harmonics_swizzled_fwd(
+                sh_degree, result.dirs, sh0, shN, nullptr,
+                static_cast<int64_t>(C) * N,
                 result.colors, stream);
         }
 
@@ -319,7 +320,8 @@ namespace gsplat_lfs {
         const float* quats,
         const float* scales,
         const float* opacities,
-        const float* sh_coeffs,
+        const float* sh0,
+        const float* shN,
         uint32_t sh_degree,
         const float* backgrounds,
         const float* bg_images,
@@ -352,6 +354,7 @@ namespace gsplat_lfs {
         const int32_t* flatten_ids,
         uint32_t n_isects,
         const float* colors,
+        const float* dirs,
         const int32_t* radii,
         const float* means2d,
         const float* depths,
@@ -374,9 +377,15 @@ namespace gsplat_lfs {
             channels = 4;
         }
 
-        // Temporary buffers for gradients
+        // Temporary buffers for gradients — stream-ordered alloc/free so the
+        // scratch is ordered with the backward kernels that use it (a plain
+        // cudaMalloc/cudaFree only synchronizes against the legacy stream).
         float* v_colors = nullptr;
+#if CUDART_VERSION >= 11020
+        cudaMallocAsync(&v_colors, C * N * channels * sizeof(float), stream);
+#else
         cudaMalloc(&v_colors, C * N * channels * sizeof(float));
+#endif
         cudaMemsetAsync(v_colors, 0, C * N * channels * sizeof(float), stream);
 
         // Backward through rasterization
@@ -397,10 +406,11 @@ namespace gsplat_lfs {
 
         // Backward through SH
         if (render_mode == 0 || render_mode == 3 || render_mode == 4) {
-            spherical_harmonics_bwd(
+            spherical_harmonics_swizzled_bwd(
                 K, sh_degree,
-                nullptr, // dirs
-                sh_coeffs,
+                dirs,
+                sh0,
+                shN,
                 nullptr, // masks
                 v_colors,
                 static_cast<int64_t>(C) * N,
@@ -415,7 +425,11 @@ namespace gsplat_lfs {
             // TODO: Scale v_scales by scaling_modifier
         }
 
+#if CUDART_VERSION >= 11020
+        cudaFreeAsync(v_colors, stream);
+#else
         cudaFree(v_colors);
+#endif
     }
 
 } // namespace gsplat_lfs

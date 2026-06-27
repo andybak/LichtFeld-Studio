@@ -8,6 +8,7 @@
 #include "core/point_cloud.hpp"
 #include "core/splat_data.hpp"
 #include "io/error.hpp"
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <future>
@@ -140,12 +141,16 @@ namespace lfs::io {
     // RAD Export (Random Access Dataset format)
     // ============================================================================
 
+    inline constexpr std::uint32_t kRadNativeChunkSplats =
+        static_cast<std::uint32_t>(lfs::core::SplatLodTree::kChunkSplats);
+    inline constexpr std::uint32_t kRadStreamableChunkSplats = 65'536;
+
     struct RadSaveOptions {
         std::filesystem::path output_path;
-        int compression_level = 6;                          // gzip compression level (0-9, default 6)
-        std::vector<float> lod_ratios;                      // Custom LOD ratios (e.g., {0.2, 0.5, 1.0}), empty = use defaults
-        bool flip_y = true;                                 // Flip Y axis on export (enabled by default)
-        ExportProgressCallback progress_callback = nullptr; // Progress callback
+        int compression_level = 6;                            // gzip compression level (0-9, default 6)
+        bool flip_y = false;                                  // Flip Y axis on export
+        std::uint32_t chunk_size = kRadStreamableChunkSplats; // RAD splats per file chunk
+        ExportProgressCallback progress_callback = nullptr;   // Progress callback
     };
 
     /**

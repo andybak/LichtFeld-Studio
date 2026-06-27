@@ -5,6 +5,7 @@
 #include "gsplat_rasterizer.hpp"
 #include "core/cuda/memory_arena.hpp"
 #include "core/logger.hpp"
+#include "core/tensor/internal/cuda_stream_context.hpp"
 #include "gsplat/Ops.h"
 #include "training/kernels/grad_alpha.hpp"
 #include <array>
@@ -30,7 +31,7 @@ namespace lfs::training {
 
         // Begin arena frame for memory allocation
         auto& arena = core::GlobalArenaManager::instance().get_arena();
-        uint64_t frame_id = arena.begin_frame();
+        uint64_t frame_id = arena.begin_frame(core::getCurrentCUDAStream());
         auto arena_allocator = arena.get_allocator(frame_id);
         void* isect_ids_to_free = nullptr;
         void* flatten_ids_to_free = nullptr;
@@ -80,7 +81,8 @@ namespace lfs::training {
             auto opacities = ensure_contiguous(gaussian_model.get_opacity()); // [N] sigmoid applied
             auto scales = ensure_contiguous(gaussian_model.get_scaling());    // [N, 3] exp applied
             auto quats = ensure_contiguous(gaussian_model.get_rotation());    // [N, 4] normalized
-            auto sh_coeffs = ensure_contiguous(gaussian_model.get_shs());     // [N, K, 3]
+            auto sh0 = ensure_contiguous(gaussian_model.sh0());               // [N, 1, 3]
+            auto shN = ensure_contiguous(gaussian_model.shN());               // swizzled 1D SH-rest buffer
             const uint32_t sh_degree = static_cast<uint32_t>(gaussian_model.get_active_sh_degree());
 
             // Squeeze opacities if needed
@@ -91,7 +93,13 @@ namespace lfs::training {
                 }
             }
 
-            const cudaStream_t fwd_stream = means.stream();
+            // Current-stream-first (the caller's guard), tensor stream as
+            // fallback — matches the lib-wide rule and the begin_frame stream,
+            // so a metrics-thread render lands its kernels and consumers on the
+            // same stream as the arena frame.
+            const cudaStream_t fwd_stream = core::getCurrentCUDAStream()
+                                                ? core::getCurrentCUDAStream()
+                                                : means.stream();
 
             // Keep K tensor cached and update values in-place to avoid per-call allocations.
             thread_local core::Tensor cached_K_tensor;
@@ -116,7 +124,8 @@ namespace lfs::training {
             const float* opacities_ptr = opacities.ptr<float>();
             const float* scales_ptr = scales.ptr<float>();
             const float* quats_ptr = quats.ptr<float>();
-            const float* sh_coeffs_ptr = sh_coeffs.ptr<float>();
+            const float* sh0_ptr = sh0.ptr<float>();
+            const float* shN_ptr = (sh_degree > 0 && shN.is_valid() && shN.numel() > 0) ? shN.ptr<float>() : nullptr;
 
             // Background color and image pointers
             // bg_color and bg_image are mutually exclusive - use one or the other
@@ -191,10 +200,8 @@ namespace lfs::training {
 
             // Calculate buffer dimensions
             const uint32_t N = static_cast<uint32_t>(means.shape()[0]);
-            const uint32_t C = 1; // Single camera
-            const uint32_t K = (sh_coeffs.is_valid() && sh_coeffs.ndim() >= 2)
-                                   ? static_cast<uint32_t>(sh_coeffs.shape()[1])
-                                   : 0; // SH coefficients
+            const uint32_t C = 1;                                   // Single camera
+            const uint32_t K = (sh_degree + 1u) * (sh_degree + 1u); // active SH coefficients including sh0
             const uint32_t H = image_height;
             const uint32_t W = image_width;
             const uint32_t num_tiles_y = (H + tile_size - 1) / tile_size;
@@ -288,7 +295,8 @@ namespace lfs::training {
                 quats_ptr,
                 scales_ptr,
                 opacities_ptr,
-                sh_coeffs_ptr,
+                sh0_ptr,
+                shN_ptr,
                 sh_degree,
                 bg_color_ptr,
                 bg_image_ptr, // per-pixel background image
@@ -438,6 +446,7 @@ namespace lfs::training {
             ctx.means2d_ptr = means2d_ptr_out;
             ctx.depths_ptr = depths_ptr_out;
             ctx.colors_ptr = colors_ptr_out;
+            ctx.dirs_ptr = dirs_ptr_out;
             ctx.tile_offsets_ptr = tile_offsets_ptr_out;
             ctx.last_ids_ptr = last_ids_ptr_out;
             ctx.compensations_ptr = compensations_ptr_out;
@@ -452,7 +461,8 @@ namespace lfs::training {
             ctx.quats = quats;
             ctx.scales = scales;
             ctx.opacities = opacities;
-            ctx.sh_coeffs = sh_coeffs;
+            ctx.sh0 = sh0;
+            ctx.shN = shN;
 
             // Store camera pointers
             ctx.viewmat_ptr = viewmat_ptr;
@@ -488,6 +498,7 @@ namespace lfs::training {
             ctx.render_mode = render_mode;
             ctx.camera_model = camera_model;
             ctx.frame_id = frame_id;
+            ctx.stream = fwd_stream;
             ctx.render_tile_x_offset = tile_x_offset;
             ctx.render_tile_y_offset = tile_y_offset;
             ctx.render_tile_width = tile_width;
@@ -501,7 +512,10 @@ namespace lfs::training {
             if (flatten_ids_to_free != nullptr) {
                 cudaFree(flatten_ids_to_free);
             }
-            arena.end_frame(frame_id);
+            // End on the same stream begin_frame used (same guard → same value),
+            // not the streamless device-sync path, so the arena frame chain stays
+            // intact for the next frame instead of falling back to a full sync.
+            arena.end_frame(frame_id, core::getCurrentCUDAStream());
             throw;
         }
     }
@@ -517,6 +531,15 @@ namespace lfs::training {
         // Get arena for temporary allocations
         auto& arena = core::GlobalArenaManager::instance().get_arena();
         auto arena_allocator = arena.get_allocator(ctx.frame_id);
+        // Run the backward work + arena frame release on the exact stream the
+        // forward began the frame on (ctx.stream), so begin_frame and end_frame
+        // chain on the same stream rather than relying on the caller's guard
+        // matching. Falls back to the current/tensor stream only if unset.
+        const cudaStream_t stream = ctx.stream
+                                        ? ctx.stream
+                                        : (core::getCurrentCUDAStream()
+                                               ? core::getCurrentCUDAStream()
+                                               : ctx.means.stream());
         try {
 
             const uint32_t N = ctx.N;
@@ -524,7 +547,6 @@ namespace lfs::training {
             const uint32_t H = ctx.image_height;
             const uint32_t W = ctx.image_width;
             const uint32_t channels = ctx.channels;
-            const cudaStream_t stream = ctx.means.stream();
 
             // Calculate sizes for arena allocation
             auto align = [](size_t size, size_t alignment = 128) {
@@ -642,7 +664,8 @@ namespace lfs::training {
                 ctx.quats.ptr<float>(),
                 ctx.scales.ptr<float>(),
                 ctx.opacities.ptr<float>(),
-                ctx.sh_coeffs.ptr<float>(),
+                ctx.sh0.ptr<float>(),
+                (ctx.sh_degree > 0 && ctx.shN.is_valid() && ctx.shN.numel() > 0) ? ctx.shN.ptr<float>() : nullptr,
                 ctx.sh_degree,
                 bg_color_ptr,
                 bg_image_ptr, // per-pixel background image
@@ -675,6 +698,7 @@ namespace lfs::training {
                 ctx.flatten_ids_ptr,
                 ctx.n_isects,
                 ctx.colors_ptr,
+                ctx.dirs_ptr,
                 ctx.radii_ptr,
                 ctx.means2d_ptr,
                 ctx.depths_ptr,
@@ -718,56 +742,65 @@ namespace lfs::training {
             // This avoids any tensor operations that might allocate from memory pool
 
             // Means: [N, 3] -> [N, 3]
+            auto& means_grad = optimizer.get_grad(ParamType::Means);
+            means_grad.set_stream(stream);
             kernels::launch_grad_accumulate(
-                optimizer.get_grad(ParamType::Means).ptr<float>(),
+                means_grad.ptr<float>(),
                 v_means_ptr,
                 N * 3,
                 stream);
 
             // Scales: [N, 3] -> [N, 3]
+            auto& scaling_grad = optimizer.get_grad(ParamType::Scaling);
+            scaling_grad.set_stream(stream);
             kernels::launch_grad_accumulate(
-                optimizer.get_grad(ParamType::Scaling).ptr<float>(),
+                scaling_grad.ptr<float>(),
                 v_scales_ptr,
                 N * 3,
                 stream);
 
             // Rotations: [N, 4] -> [N, 4]
+            auto& rotation_grad = optimizer.get_grad(ParamType::Rotation);
+            rotation_grad.set_stream(stream);
             kernels::launch_grad_accumulate(
-                optimizer.get_grad(ParamType::Rotation).ptr<float>(),
+                rotation_grad.ptr<float>(),
                 v_quats_ptr,
                 N * 4,
                 stream);
 
             // Opacities: [N] -> [N, 1] (same memory layout)
+            auto& opacity_grad = optimizer.get_grad(ParamType::Opacity);
+            opacity_grad.set_stream(stream);
             kernels::launch_grad_accumulate_unsqueeze(
-                optimizer.get_grad(ParamType::Opacity).ptr<float>(),
+                opacity_grad.ptr<float>(),
                 v_opacities_ptr,
                 N,
                 stream);
 
-            // SH coefficients: [N, K, 3] -> sh0 [N, 1, 3] + shN [N, K_dst, 3]
-            // K is active SH coeffs, K_dst is the full buffer width (max_sh_degree^2 - 1)
+            // SH coefficients: [N, K, 3] -> sh0 [N, 1, 3] + swizzled shN.
             float* dst_shN = nullptr;
-            int64_t K_dst = 0;
             if (K > 1) {
-                auto shN_grad = optimizer.get_grad(ParamType::ShN);
-                if (shN_grad.is_valid() && shN_grad.numel() > 0 && shN_grad.ndim() >= 2) {
+                auto& shN_grad = optimizer.get_grad(ParamType::ShN);
+                if (shN_grad.is_valid() && shN_grad.numel() > 0) {
+                    shN_grad.set_stream(stream);
                     dst_shN = shN_grad.ptr<float>();
-                    K_dst = static_cast<int64_t>(shN_grad.shape()[1]); // [N, K_dst, 3]
                 }
             }
 
-            kernels::launch_grad_accumulate_sh(
-                optimizer.get_grad(ParamType::Sh0).ptr<float>(),
+            auto& sh0_grad = optimizer.get_grad(ParamType::Sh0);
+            sh0_grad.set_stream(stream);
+            kernels::launch_grad_accumulate_sh_swizzled(
+                sh0_grad.ptr<float>(),
                 dst_shN,
                 v_sh_coeffs_ptr,
                 N,
-                K,     // K_src: active SH coefficients
-                K_dst, // K_dst: destination buffer width
+                K,
+                static_cast<std::uint32_t>(gaussian_model.max_sh_coeffs_rest()),
                 stream);
 
             // Accumulate gradient norms when pixel-error map is not provided
             if (update_densification_info && pixel_error_map_ptr == nullptr) {
+                gaussian_model._densification_info.set_stream(stream);
                 kernels::launch_grad_norm_accumulate(
                     gaussian_model._densification_info.ptr<float>(),
                     v_means_ptr,
@@ -777,22 +810,24 @@ namespace lfs::training {
 
             // Free internally allocated buffers from forward
             if (ctx.isect_ids_ptr != nullptr) {
-                cudaFree(ctx.isect_ids_ptr);
+                cudaFreeAsync(ctx.isect_ids_ptr, stream);
             }
             if (ctx.flatten_ids_ptr != nullptr) {
-                cudaFree(ctx.flatten_ids_ptr);
+                cudaFreeAsync(ctx.flatten_ids_ptr, stream);
             }
 
-            // End arena frame to release memory from forward pass
-            arena.end_frame(ctx.frame_id);
+            // End arena frame to release memory from forward pass — on the
+            // backward's stream (where its kernels ran), not the re-derived
+            // current stream.
+            arena.end_frame(ctx.frame_id, stream);
         } catch (...) {
             if (ctx.isect_ids_ptr != nullptr) {
-                cudaFree(ctx.isect_ids_ptr);
+                cudaFreeAsync(ctx.isect_ids_ptr, stream);
             }
             if (ctx.flatten_ids_ptr != nullptr) {
-                cudaFree(ctx.flatten_ids_ptr);
+                cudaFreeAsync(ctx.flatten_ids_ptr, stream);
             }
-            arena.end_frame(ctx.frame_id);
+            arena.end_frame(ctx.frame_id, stream);
             throw;
         }
     }

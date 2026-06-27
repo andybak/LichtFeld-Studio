@@ -4,12 +4,17 @@
 
 #pragma once
 
+#include "core/reactive/store.hpp"
 #include "gui/gpu_memory_query.hpp"
 #include "gui/panel_registry.hpp"
+#include "gui/rmlui/rmlui_manager.hpp"
 #include <RmlUi/Core/DataModelHandle.h>
 #include <chrono>
 #include <cstddef>
+#include <future>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace Rml {
     class Context;
@@ -23,8 +28,6 @@ namespace lfs::vis {
 }
 namespace lfs::vis::gui {
 
-    class RmlUIManager;
-
     class RmlStatusBar {
     public:
         void init(RmlUIManager* mgr);
@@ -32,21 +35,51 @@ namespace lfs::vis::gui {
         void reloadResources();
         void render(const PanelDrawContext& ctx, float x, float y, float w, float h,
                     int screen_w, int screen_h);
+        void renderCached(const PanelDrawContext& ctx, float x, float y, float w, float h,
+                          int screen_w, int screen_h);
         void processInput(const PanelInputState& input, float bar_x, float bar_y,
                           float bar_w, float bar_h);
 
     private:
+        struct ProgressBarGeometry {
+            float x = 0.0f;
+            float y = 0.0f;
+            float w = 0.0f;
+            float h = 0.0f;
+        };
+
         bool updateContent(const PanelDrawContext& ctx, bool force_refresh);
         bool updateTheme();
+        void queueCachedVulkanContext(float x, float y, float w_px, float h_px,
+                                      int screen_w, int screen_h,
+                                      int render_w, int render_h,
+                                      bool refresh_cache);
+        void pollGpuMemoryQuery(std::chrono::steady_clock::time_point now);
         void setModelString(const char* name, std::string& field, std::string value);
         void setModelBool(const char* name, bool& field, bool value);
-        void attachGitCommitListener();
+        void setProgressMarkersRml(std::string value);
+        std::optional<ProgressBarGeometry> progressBarGeometry() const;
+        void resetSaveStepInteraction();
+        std::optional<size_t> hitSaveStep(float local_x, float local_y,
+                                          const ProgressBarGeometry& geom,
+                                          const std::vector<size_t>& save_steps,
+                                          int total_iterations) const;
+        size_t saveStepFromProgressX(float local_x, const ProgressBarGeometry& geom,
+                                     int current_iteration, int total_iterations) const;
+        void handleSaveStepInteraction(const PanelInputState& input, float local_x, float local_y);
+        void commitSaveStepEdit();
+        void removeSaveStep(size_t step);
+        void clearSaveStepHover();
+        void attachElementListeners();
+        void bindReactiveStore();
+        void markModelDirty();
 
         RmlUIManager* rml_manager_ = nullptr;
         Rml::Context* rml_context_ = nullptr;
         Rml::ElementDocument* document_ = nullptr;
         Rml::DataModelHandle model_handle_;
         Rml::EventListener* git_commit_listener_ = nullptr;
+        Rml::EventListener* gpu_icon_listener_ = nullptr;
 
         std::size_t last_theme_signature_ = 0;
         bool has_theme_signature_ = false;
@@ -71,12 +104,23 @@ namespace lfs::vis::gui {
         SpeedOverlayState speed_state_;
         bool speed_events_initialized_ = false;
 
+        struct SaveStepInteractionState {
+            bool dragging = false;
+            bool adding = false;
+            size_t original_step = 0;
+            size_t preview_step = 0;
+            size_t hover_step = 0;
+        };
+
+        SaveStepInteractionState save_step_interaction_;
+
         struct ModelState {
             std::string mode_text;
             std::string mode_color;
             bool show_training = false;
             std::string progress_width = "0%";
             std::string progress_text;
+            std::string progress_markers_rml;
             std::string step_label;
             std::string step_value;
             std::string loss_label;
@@ -106,6 +150,7 @@ namespace lfs::vis::gui {
             std::string lfs_mem_text;
             std::string lfs_mem_color;
             bool show_gpu_model = false;
+            bool gpu_panel_active = false;
             std::string gpu_model_text;
             std::string gpu_mem_text;
             std::string gpu_mem_color;
@@ -117,17 +162,22 @@ namespace lfs::vis::gui {
 
         ModelState model_;
         GpuMemoryInfo cached_gpu_mem_;
+        std::future<GpuMemoryInfo> pending_gpu_mem_;
         std::chrono::steady_clock::time_point next_refresh_at_{};
         std::chrono::steady_clock::time_point next_gpu_refresh_at_{};
         bool model_dirty_ = true;
         bool animation_active_ = false;
+        bool reactive_fps_available_ = false;
+        float reactive_fps_value_ = 0.0f;
+        std::vector<lfs::core::reactive::SubscriptionToken> subscriptions_;
         int last_render_w_ = 0;
         int last_render_h_ = 0;
         int last_document_h_ = 0;
+        CachedVulkanContextRender direct_cache_;
         static constexpr auto kIdleRefreshInterval = std::chrono::milliseconds(200);
         static constexpr auto kBusyRefreshInterval = std::chrono::milliseconds(100);
         static constexpr auto kAnimatedRefreshInterval = std::chrono::milliseconds(16);
-        static constexpr auto kGpuRefreshInterval = std::chrono::milliseconds(250);
+        static constexpr auto kGpuRefreshInterval = std::chrono::milliseconds(500);
     };
 
 } // namespace lfs::vis::gui

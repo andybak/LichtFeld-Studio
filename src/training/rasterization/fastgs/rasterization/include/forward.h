@@ -6,6 +6,7 @@
 
 #include "helper_math.h"
 #include <cstddef>
+#include <cuda_runtime.h>
 #include <functional>
 
 namespace fast_lfs::rasterization {
@@ -26,14 +27,15 @@ namespace fast_lfs::rasterization {
         const float4* rotations_raw,
         const float* opacities_raw,
         const float3* sh_coefficients_0,
-        const float3* sh_coefficients_rest,
+        const float4* sh_coefficients_rest, // compact float4-packed swizzled layout
         const float4* w2c,
         const float3* cam_position,
         float* image,
         float* alpha,
+        float* depth,
         const int n_primitives,
         const int active_sh_bases,
-        const int total_bases_sh_rest,
+        const int sh_layout_bases,
         const int width,
         const int height,
         const float fx,
@@ -42,6 +44,7 @@ namespace fast_lfs::rasterization {
         const float cy,
         const float near,
         const float far,
-        bool mip_filter);
+        bool mip_filter,
+        cudaStream_t stream);
 
 } // namespace fast_lfs::rasterization

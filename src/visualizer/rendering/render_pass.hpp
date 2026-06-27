@@ -40,9 +40,11 @@ namespace lfs::vis {
         bool cropbox_active = false;
         glm::vec3 cropbox_min{0}, cropbox_max{0};
         glm::mat4 cropbox_transform{1};
+        bool cropbox_affects_render = true;
         bool ellipsoid_active = false;
         glm::vec3 ellipsoid_radii{1};
         glm::mat4 ellipsoid_transform{1};
+        bool ellipsoid_affects_render = true;
     };
 
     struct FrameViewPanel {
@@ -72,6 +74,7 @@ namespace lfs::vis {
         glm::ivec2 render_size;
         glm::ivec2 viewport_pos;
         DirtyMask frame_dirty = 0;
+        bool training_active = false;
 
         CursorPreviewState cursor_preview;
         GizmoState gizmo;
@@ -101,7 +104,7 @@ namespace lfs::vis {
                     .far_plane = settings.depth_clip_enabled ? settings.depth_clip_far
                                                              : lfs::rendering::DEFAULT_FAR_PLANE,
                     .orthographic = settings.orthographic,
-                    .ortho_scale = settings.ortho_scale,
+                    .ortho_scale = source.ortho_scale_override.value_or(settings.ortho_scale),
                     .background_color = settings.background_color};
         }
 

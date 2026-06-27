@@ -3,26 +3,26 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "selection_ops.hpp"
-#include "core/cuda/selection_ops.hpp"
-#include "core/services.hpp"
 #include "input/key_codes.hpp"
-#include "operation/undo_entry.hpp"
-#include "operation/undo_history.hpp"
 #include "operator/operator_registry.hpp"
-#include "rendering/dirty_flags.hpp"
-#include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
+#include "visualizer/core/editor_context.hpp"
 
 namespace lfs::vis::op {
 
     namespace {
+        constexpr int kSelectionModeColor = static_cast<int>(lfs::vis::SelectionSubMode::Color);
 
         [[nodiscard]] lfs::vis::SelectionShape toSelectionShape(const int mode) {
-            switch (mode) {
-            case 1: return lfs::vis::SelectionShape::Rectangle;
-            case 2: return lfs::vis::SelectionShape::Polygon;
-            case 3: return lfs::vis::SelectionShape::Lasso;
-            case 4: return lfs::vis::SelectionShape::Rings;
+            switch (static_cast<lfs::vis::SelectionSubMode>(mode)) {
+            case lfs::vis::SelectionSubMode::Rectangle: return lfs::vis::SelectionShape::Rectangle;
+            case lfs::vis::SelectionSubMode::Polygon: return lfs::vis::SelectionShape::Polygon;
+            case lfs::vis::SelectionSubMode::Lasso: return lfs::vis::SelectionShape::Lasso;
+            case lfs::vis::SelectionSubMode::Rings: return lfs::vis::SelectionShape::Rings;
+            case lfs::vis::SelectionSubMode::Box: return lfs::vis::SelectionShape::Box;
+            case lfs::vis::SelectionSubMode::Sphere: return lfs::vis::SelectionShape::Sphere;
+            case lfs::vis::SelectionSubMode::Centers:
+            case lfs::vis::SelectionSubMode::Color:
             default: return lfs::vis::SelectionShape::Brush;
             }
         }
@@ -31,6 +31,7 @@ namespace lfs::vis::op {
             switch (mode) {
             case 1: return lfs::vis::SelectionMode::Add;
             case 2: return lfs::vis::SelectionMode::Remove;
+            case 3: return lfs::vis::SelectionMode::Intersect;
             default: return lfs::vis::SelectionMode::Replace;
             }
         }
@@ -41,6 +42,9 @@ namespace lfs::vis::op {
             }
             if (mods & input::KEYMOD_CTRL) {
                 return lfs::vis::SelectionMode::Remove;
+            }
+            if (mods & input::KEYMOD_ALT) {
+                return lfs::vis::SelectionMode::Intersect;
             }
             return lfs::vis::SelectionMode::Replace;
         }
@@ -78,56 +82,11 @@ namespace lfs::vis::op {
         filters_.depth_filter = props.get_or<bool>("use_depth_filter", false);
         filters_.restrict_to_selected_nodes = props.get_or<bool>("restrict_to_selected_nodes", true);
 
-        // Color selection mode (5): pick Gaussian under cursor and select by color similarity
-        if (mode_int == 5) {
+        if (mode_int == kSelectionModeColor) {
             const float click_x = static_cast<float>(props.get_or<double>("x", 0.0));
             const float click_y = static_cast<float>(props.get_or<double>("y", 0.0));
-
-            // GPU pick pass to find which Gaussian is under the cursor
-            const auto picked = service->pickGaussianAt(click_x, click_y);
-            if (!picked) {
-                return OperatorResult::CANCELLED;
-            }
-            const int hovered_id = *picked;
-
-            auto& scene = ctx.scene().getScene();
-            auto* model = scene.getCombinedModel();
-            if (!model) {
-                return OperatorResult::CANCELLED;
-            }
-
-            const auto& sh0 = model->sh0();
-            if (!sh0.is_valid() || static_cast<size_t>(hovered_id) >= sh0.size(0)) {
-                return OperatorResult::CANCELLED;
-            }
-
-            // Decode the reference Gaussian's SH DC color on CPU
-            auto sh0_cpu = sh0.cpu();
-            const float* sh0_data = sh0_cpu.ptr<float>();
-            if (!sh0_data) {
-                return OperatorResult::CANCELLED;
-            }
-
-            constexpr float SH_C0 = 0.28209479177387814f;
-            const float ref_r = std::clamp(0.5f + sh0_data[hovered_id * 3] * SH_C0, 0.0f, 1.0f);
-            const float ref_g = std::clamp(0.5f + sh0_data[hovered_id * 3 + 1] * SH_C0, 0.0f, 1.0f);
-            const float ref_b = std::clamp(0.5f + sh0_data[hovered_id * 3 + 2] * SH_C0, 0.0f, 1.0f);
-
-            constexpr float COLOR_THRESHOLD = 0.2f;
-            const auto group_id = scene.getActiveSelectionGroup();
-            auto mask = core::cuda::select_by_color(sh0, ref_r, ref_g, ref_b, COLOR_THRESHOLD, group_id);
-
-            // Apply with undo support (overwrite the ring selection with color selection)
-            auto snapshot = std::make_unique<op::SceneSnapshot>(ctx.scene(), "selection.by_color");
-            snapshot->captureSelection();
-            scene.setSelectionMask(std::make_shared<core::Tensor>(std::move(mask)));
-            snapshot->captureAfter();
-            op::pushSceneSnapshotIfChanged(std::move(snapshot));
-
-            if (auto* rm = services().renderingOrNull()) {
-                rm->markDirty(DirtyFlag::SELECTION);
-            }
-            return OperatorResult::FINISHED;
+            const auto result = service->selectByColorAt(click_x, click_y, mode_, filters_);
+            return result.success ? OperatorResult::FINISHED : OperatorResult::CANCELLED;
         }
 
         shape_ = toSelectionShape(mode_int);
@@ -157,6 +116,10 @@ namespace lfs::vis::op {
             }
 
             service->updateInteractiveSelection(glm::vec2(move->position));
+            if (shape_ == lfs::vis::SelectionShape::Box ||
+                shape_ == lfs::vis::SelectionShape::Sphere) {
+                service->refreshInteractivePreview();
+            }
             if (shape_ == lfs::vis::SelectionShape::Polygon) {
                 return service->isInteractivePolygonVertexDragActive()
                            ? OperatorResult::RUNNING_MODAL
@@ -208,8 +171,10 @@ namespace lfs::vis::op {
             }
         }
 
-        if (event->type == ModalEvent::Type::MOUSE_SCROLL &&
-            shape_ == lfs::vis::SelectionShape::Polygon) {
+        // Always let scroll events through so the user can resize the selection
+        // ring mid-stroke (BRUSH_RESIZE is bound to Ctrl/Shift+scroll). The
+        // shape doesn't matter — the operator never uses scroll input itself.
+        if (event->type == ModalEvent::Type::MOUSE_SCROLL) {
             return OperatorResult::PASS_THROUGH;
         }
 

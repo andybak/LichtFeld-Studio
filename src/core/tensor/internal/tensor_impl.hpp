@@ -20,6 +20,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -270,6 +271,8 @@ namespace lfs::core {
 
     struct StorageMeta {
         std::atomic<uint64_t> generation{0};
+        std::string external_kind;
+        std::shared_ptr<void> external_owner;
     };
 
 } // namespace lfs::core
@@ -290,8 +293,29 @@ namespace lfs::core {
             bool is_aligned_16 = false;  // 16-byte alignment for float4 vectorization
             bool is_aligned_128 = false; // 128-byte alignment for cache line optimization
 
-            // CUDA stream for async execution (assigned round-robin from StreamPool)
-            cudaStream_t stream = nullptr;
+            // Home stream: the stream the tensor's most recent enqueued write is
+            // ordered on. Atomic so cross-thread readers see untorn values;
+            // cross-thread *use* still requires host-side ordering plus
+            // sync_to_stream/record_stream for the allocator.
+            struct StreamHandle {
+                std::atomic<cudaStream_t> value{nullptr};
+
+                StreamHandle() = default;
+                StreamHandle(const StreamHandle& other)
+                    : value(other.value.load(std::memory_order_relaxed)) {}
+                StreamHandle& operator=(const StreamHandle& other) {
+                    value.store(other.value.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                    return *this;
+                }
+                StreamHandle& operator=(cudaStream_t stream) {
+                    value.store(stream, std::memory_order_relaxed);
+                    return *this;
+                }
+                operator cudaStream_t() const {
+                    return value.load(std::memory_order_relaxed);
+                }
+            };
+            StreamHandle stream;
 
             // Debug tracking - when true, operations on this tensor are logged
             bool tracked = false;
@@ -314,6 +338,11 @@ namespace lfs::core {
         Device device_ = Device::CPU;
         DataType dtype_ = DataType::Float32;
         bool is_view_ = false;
+
+        enum class StorageAccountingKind : uint8_t {
+            CudaDirect,
+            VulkanExternal,
+        };
 
         std::shared_ptr<StorageMeta> storage_meta_;
         uint64_t view_generation_snapshot_ = 0;
@@ -360,6 +389,16 @@ namespace lfs::core {
                 storage_meta_->generation.fetch_add(1, std::memory_order_relaxed);
             }
         }
+
+        bool has_external_storage() const {
+            return storage_meta_ && !storage_meta_->external_kind.empty();
+        }
+
+        static size_t storage_allocation_bytes(const TensorShape& shape,
+                                               size_t capacity,
+                                               DataType dtype);
+        static void record_storage_allocation(StorageAccountingKind kind, size_t bytes);
+        static void record_storage_deallocation(StorageAccountingKind kind, size_t bytes);
 
         void assert_view_not_stale() const {
             if (is_view_ && storage_meta_ &&
@@ -830,7 +869,8 @@ namespace lfs::core {
         static Tensor empty_unpinned(TensorShape shape, DataType dtype = DataType::Float32);
         static Tensor zeros(TensorShape shape, Device device = Device::CUDA,
                             DataType dtype = DataType::Float32);
-        static Tensor zeros_direct(TensorShape shape, size_t capacity, Device device = Device::CUDA);
+        static Tensor zeros_direct(TensorShape shape, size_t capacity, Device device = Device::CUDA,
+                                   DataType dtype = DataType::Float32);
         static Tensor ones(TensorShape shape, Device device = Device::CUDA,
                            DataType dtype = DataType::Float32);
         static Tensor full(TensorShape shape, float value, Device device = Device::CUDA,
@@ -862,6 +902,14 @@ namespace lfs::core {
         static Tensor from_blob(void* data, TensorShape shape, Device device, DataType dtype) {
             return Tensor(data, shape, device, dtype);
         }
+        static Tensor from_external_owner(void* data,
+                                          TensorShape shape,
+                                          Device device,
+                                          DataType dtype,
+                                          std::shared_ptr<void> owner,
+                                          size_t capacity = 0,
+                                          cudaStream_t stream = nullptr,
+                                          std::string external_kind = {});
 
         static Tensor from_vector(const std::vector<float>& data, TensorShape shape,
                                   Device device = Device::CUDA);
@@ -1014,6 +1062,7 @@ namespace lfs::core {
         DataType dtype() const { return dtype_; }
         bool owns_memory() const { return static_cast<bool>(data_owner_) && !is_view_; }
         bool is_view() const { return is_view_; }
+        bool is_external_storage() const { return has_external_storage(); }
         bool is_empty() const { return !is_valid() || numel() == 0; }
         bool has_lazy_expr() const {
             return (state_ && state_->has_deferred_expr) || internal::tensor_has_lazy_expr(*this);
@@ -1053,9 +1102,22 @@ namespace lfs::core {
         bool is_aligned_16() const { return state_->is_aligned_16; }
         bool is_aligned_128() const { return state_->is_aligned_128; }
 
-        // Stream accessor (for async CUDA operations)
+        // Home stream: where this tensor's pending writes are ordered. Frees route
+        // here; reads from other streams must be recorded (record_stream) or
+        // bridged + recorded (sync_to_stream).
         cudaStream_t stream() const { return state_->stream; }
-        void set_stream(cudaStream_t stream) { state_->stream = stream; }
+
+        // Declarative re-homing: future writes happen on `stream`. The old home
+        // becomes a recorded use so the eventual free stays ordered after it.
+        void set_stream(cudaStream_t stream);
+
+        // Marks a read of this tensor on `stream` (other than its home) so the
+        // allocator defers recycling until that stream passes the read.
+        void record_stream(cudaStream_t stream) const;
+
+        // Orders `execution_stream` after this tensor's pending work, then records
+        // the use. The standard prologue for consuming a tensor on another stream.
+        void sync_to_stream(cudaStream_t execution_stream) const;
 
         // Debug tracking - mark tensor to trace all operations it's involved in
         bool is_tracked() const { return state_->tracked; }
@@ -1066,13 +1128,19 @@ namespace lfs::core {
         Tensor& track() { return set_tracked(true); } // Convenience alias
         Tensor& untrack() { return set_tracked(false); }
 
-        // Optional name for identifying tensors in traces
+        // Optional name for identifying tensors in traces. Also forwarded to the
+        // VRAM profiler so the underlying allocation is labelled with this name.
         const std::string& name() const { return state_->name; }
         Tensor& set_name(std::string name) {
             state_->name = std::move(name);
+            relabel_allocation_for_profiler();
             return *this;
         }
 
+    private:
+        void relabel_allocation_for_profiler();
+
+    public:
         size_t size(size_t dim) const {
             if (!is_valid())
                 return 0;
@@ -1088,6 +1156,14 @@ namespace lfs::core {
         // logical_size() returns the logical size along dimension 0 (same as shape()[0])
         size_t capacity() const { return state_->capacity; }
         size_t logical_size() const { return state_->logical_size; }
+        std::string external_storage_kind() const {
+            return storage_meta_ ? storage_meta_->external_kind : std::string{};
+        }
+        std::shared_ptr<void> external_storage_owner() const {
+            return storage_meta_ ? storage_meta_->external_owner : nullptr;
+        }
+        static std::string storage_memory_summary();
+        static void log_storage_memory(std::string_view label = {});
 
         // reserve() pre-allocates memory for future growth along dimension 0
         // Supports multi-dimensional tensors: [N, D1, D2, ...] reserves N "rows"
@@ -1700,6 +1776,11 @@ namespace lfs::core {
             const char* data_ptr = static_cast<const char*>(data_) + storage_offset_ * dtype_size(dtype_);
 
             if (device_ == Device::CUDA) {
+                // A blocking memcpy only orders against the legacy stream; data
+                // produced on the tensor's home stream must be drained first.
+                if (const cudaStream_t home = state_->stream; home != nullptr) {
+                    cudaStreamSynchronize(home);
+                }
                 cudaMemcpy(&value, data_ptr, sizeof(T), cudaMemcpyDeviceToHost);
             } else {
                 value = *static_cast<const T*>(static_cast<const void*>(data_ptr));
@@ -1868,6 +1949,11 @@ namespace lfs::core {
         Tensor& index_put_(const std::vector<Tensor>& indices, const Tensor& values);
 
         Tensor index_select(int dim, const Tensor& indices, BoundaryMode mode) const;
+        // Gather rows along `dim` into a caller-provided output (no allocation),
+        // letting the caller control the output's storage (e.g. a Vulkan-external
+        // backing block). `out` must already be sized [..., indices.numel(), ...]
+        // and share this tensor's dtype/device; `indices` must be 1-D integer.
+        void index_select_into(Tensor& out, int dim, const Tensor& indices, BoundaryMode mode) const;
         Tensor gather(int dim, const Tensor& indices, BoundaryMode mode) const;
 
         TensorIndexer operator[](const Tensor& indices);
@@ -2113,6 +2199,11 @@ namespace lfs::core {
                 T value{};
                 size_t type_size = dtype_size(tensor_->dtype());
                 const void* src_ptr = static_cast<const char*>(tensor_->data_ptr()) + row_index_ * type_size;
+                // Blocking memcpy only orders against the legacy stream; drain
+                // the tensor's home stream first.
+                if (const cudaStream_t home = tensor_->stream(); home != nullptr) {
+                    cudaStreamSynchronize(home);
+                }
                 cudaError_t err = cudaMemcpy(&value, src_ptr, sizeof(T), cudaMemcpyDeviceToHost);
                 if (err != cudaSuccess) {
                     throw std::runtime_error(

@@ -119,6 +119,7 @@ namespace lfs::rendering {
         cudaArray_t cuda_array_ = nullptr;
         cudaSurfaceObject_t surface_ = 0;
         cudaExternalSemaphore_t cuda_timeline_ = nullptr;
+        mutable std::uint64_t last_signaled_ = 0;
         CudaVulkanExtent2D extent_{};
         CudaVulkanImageFormat format_ = CudaVulkanImageFormat::Rgba8Unorm;
         mutable lfs::core::Tensor staging_tensor_;
@@ -148,6 +149,10 @@ namespace lfs::rendering {
         [[nodiscard]] bool valid() const { return cuda_timeline_ != nullptr; }
         [[nodiscard]] const std::string& lastError() const { return last_error_; }
 
+        // Raw handle for consumers that enqueue waits themselves (the trainer's
+        // viewer-release fence). Lifetime stays owned by this object.
+        [[nodiscard]] cudaExternalSemaphore_t handle() const { return cuda_timeline_; }
+
         [[nodiscard]] bool cudaSignal(std::uint64_t value, cudaStream_t stream = nullptr) const;
         [[nodiscard]] bool cudaWait(std::uint64_t value, cudaStream_t stream = nullptr) const;
 
@@ -156,6 +161,7 @@ namespace lfs::rendering {
         [[nodiscard]] bool failCuda(const char* operation, cudaError_t status) const;
 
         cudaExternalSemaphore_t cuda_timeline_ = nullptr;
+        mutable std::uint64_t last_signaled_ = 0;
         mutable std::string last_error_;
     };
 

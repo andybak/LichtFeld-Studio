@@ -55,6 +55,7 @@ namespace lfs::vis {
         ui::SplitPositionChanged::when([this](const auto& event) { handleSplitPositionChanged(event.position); });
         ui::RenderSettingsChanged::when([this](const auto& event) { handleRenderSettingsChanged(event); });
         ui::WindowResized::when([this](const auto&) { handleWindowResized(); });
+        ui::WindowResizeInteraction::when([this](const auto& event) { setViewportResizeActive(event.active); });
         ui::GridSettingsChanged::when([this](const auto& event) { handleGridSettingsChanged(event); });
         ui::NodeSelected::when([this](const auto&) { triggerSelectionFlash(); });
         state::TrainingStarted::when([this](const auto&) { handleTrainingStarted(); });
@@ -127,7 +128,7 @@ namespace lfs::vis {
         std::lock_guard<std::mutex> lock(settings_mutex_);
         settings_.split_position = std::clamp(position, 0.0f, 1.0f);
         LOG_TRACE("Split position changed to: {}", position);
-        markDirty(DirtyFlag::SPLIT_VIEW | frame_lifecycle_service_.deferViewportRefresh());
+        markDirty(DirtyFlag::SPLIT_POSITION);
     }
 
     void RenderingManager::handleRenderSettingsChanged(const ui::RenderSettingsChanged& event) {
@@ -154,16 +155,15 @@ namespace lfs::vis {
         }
         if (event.equirectangular) {
             settings_.equirectangular = *event.equirectangular;
+            enforceProjectionBackend(settings_);
             LOG_TRACE("Equirectangular rendering: {}", settings_.equirectangular ? "enabled" : "disabled");
         }
         markDirty(DirtyFlag::SPLATS | DirtyFlag::CAMERA | DirtyFlag::BACKGROUND);
     }
 
     void RenderingManager::handleWindowResized() {
-        LOG_DEBUG("Window resized, clearing render cache");
-        markDirty(DirtyFlag::VIEWPORT | DirtyFlag::CAMERA);
-        viewport_artifact_service_.clearViewportOutput();
-        frame_lifecycle_service_.resetViewportSize();
+        LOG_DEBUG("RenderingManager window resize: deferring viewport refresh");
+        markDirty(frame_lifecycle_service_.deferViewportRefresh());
     }
 
     void RenderingManager::handleGridSettingsChanged(const ui::GridSettingsChanged& event) {
@@ -186,7 +186,7 @@ namespace lfs::vis {
     }
 
     void RenderingManager::handleTrainingCompleted() {
-        markDirty(DirtyFlag::OVERLAY);
+        markDirty(DirtyFlag::SPLATS | DirtyFlag::CAMERA | DirtyFlag::OVERLAY);
     }
 
     void RenderingManager::handleSceneLoaded() {
@@ -213,7 +213,7 @@ namespace lfs::vis {
     }
 
     void RenderingManager::handleSceneCleared() {
-        viewport_artifact_service_.clearViewportOutput();
+        releaseSceneRenderResources();
         invalidateCameraMetricsRequests(true);
         SplitViewService::ModeChangeResult result;
         {
@@ -223,7 +223,6 @@ namespace lfs::vis {
         }
         camera_interaction_service_.clearCurrentCamera();
         camera_interaction_service_.clearHoveredCamera();
-        frame_lifecycle_service_.resetModelTracking();
         applySplitModeChange(result);
         markDirty();
     }
