@@ -4,7 +4,7 @@
 
 - CUDA Toolkit 12.8+
 - CMake 3.30+
-- vcpkg (`VCPKG_ROOT` environment variable set)
+- vcpkg (`VCPKG_ROOT` set, or on Windows use `build_windows_ci.ps1` which bootstraps `../vcpkg` by default)
 - GCC 14+ (Linux) or Visual Studio 2022 v17.10+ (Windows)
 
 ## Linux Prerequisites
@@ -26,6 +26,17 @@ The configure step now fails early if neither a usable X11 stack nor a usable Wa
 If you intentionally want a headless or experimental build, pass `-DLFS_ENFORCE_LINUX_GUI_BACKENDS=OFF`.
 
 ## Build Options
+
+### Windows Local Build
+
+Use the CI-aligned helper when building on Windows:
+
+```powershell
+.\build_windows_ci.ps1
+```
+
+By default it uses `-VcpkgRoot`, then `VCPKG_ROOT`, and otherwise bootstraps `../vcpkg`.
+It does not auto-select a hidden repo-local `.vcpkg` checkout.
 
 ### 1. Native Build (Development)
 
