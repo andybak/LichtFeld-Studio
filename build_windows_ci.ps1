@@ -15,6 +15,7 @@ param(
     [string]$VcpkgRoot,
     [string]$CudaPath,
     [switch]$Clean,
+    [switch]$CleanDependencies,
     [switch]$SkipPackage,
     [switch]$Help
 )
@@ -43,7 +44,8 @@ Options:
   -PackageOutputDirectory <path>      Zip output directory (default: repo root)
   -VcpkgRoot <path>                   Override VCPKG_ROOT (default: VCPKG_ROOT env var or ..\vcpkg)
   -CudaPath <path>                    Override CUDA root path
-  -Clean                              Remove build and dist before building
+  -Clean                              Remove project build outputs and dist before building; preserves build\vcpkg_installed
+  -CleanDependencies                  With -Clean, also remove build\vcpkg_installed
   -SkipPackage                        Build and install only; do not create zip
   -Help                               Show this message
 
@@ -443,6 +445,30 @@ function Get-CMakeCacheCompilerPath {
     return $match.Matches[0].Groups[1].Value
 }
 
+function Clear-BuildDirectory {
+    param(
+        [string]$BuildDirectory,
+        [switch]$RemoveDependencies
+    )
+
+    if (-not (Test-Path $BuildDirectory)) {
+        return
+    }
+
+    if ($RemoveDependencies) {
+        Write-Host "Removing $BuildDirectory"
+        Remove-Item -LiteralPath $BuildDirectory -Recurse -Force
+        return
+    }
+
+    Write-Host "Removing project build outputs under $BuildDirectory"
+    Get-ChildItem -LiteralPath $BuildDirectory -Force |
+        Where-Object { $_.Name -ne 'vcpkg_installed' } |
+        ForEach-Object {
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force
+        }
+}
+
 function Get-MsvcToolsetVersionFromCompilerPath {
     param([string]$CompilerPath)
 
@@ -552,11 +578,10 @@ Write-Host "CUDA_PATH_V12_8: $resolvedCudaPath"
 
 if ($Clean) {
     Write-Section 'Clean'
-    foreach ($path in @($BuildDirectory, $InstallDirectory)) {
-        if (Test-Path $path) {
-            Write-Host "Removing $path"
-            Remove-Item -LiteralPath $path -Recurse -Force
-        }
+    Clear-BuildDirectory -BuildDirectory $BuildDirectory -RemoveDependencies:$CleanDependencies
+    if (Test-Path $InstallDirectory) {
+        Write-Host "Removing $InstallDirectory"
+        Remove-Item -LiteralPath $InstallDirectory -Recurse -Force
     }
 }
 
@@ -672,6 +697,8 @@ $retryablePatterns = @(
     'connection reset',
     'failed to connect',
     'temporarily unavailable',
+    'curl operation failed',
+    'Download failed',
     'tls',
     'ssl'
 )
@@ -699,10 +726,8 @@ for ($attempt = 1; $attempt -le 3; $attempt++) {
             throw
         }
 
-        Write-Host 'Retryable configure failure detected. Cleaning build directory before retry.' -ForegroundColor Yellow
-        if (Test-Path $BuildDirectory) {
-            Remove-Item -LiteralPath $BuildDirectory -Recurse -Force
-        }
+        Write-Host 'Retryable configure failure detected. Cleaning project build outputs before retry.' -ForegroundColor Yellow
+        Clear-BuildDirectory -BuildDirectory $BuildDirectory
         Start-Sleep -Seconds (15 * $attempt)
     }
 }

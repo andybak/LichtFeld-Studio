@@ -38,6 +38,10 @@ Use the CI-aligned helper when building on Windows:
 By default it uses `-VcpkgRoot`, then `VCPKG_ROOT`, and otherwise bootstraps `../vcpkg`.
 It does not auto-select a hidden repo-local `.vcpkg` checkout.
 
+`-Clean` removes CMake/project outputs and `dist`, but preserves `build/vcpkg_installed`
+so dependencies are not rebuilt after every clean app build. Use `-CleanDependencies`
+with `-Clean` only when the vcpkg installed tree itself needs to be discarded.
+
 ### 1. Native Build (Development)
 
 Builds for your GPU only. Fastest compile time.
