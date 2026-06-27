@@ -1154,6 +1154,7 @@ if(BUILD_PORTABLE)
             "${CMAKE_BINARY_DIR}/lib"
             "${CMAKE_BINARY_DIR}/external/nvImageCodec"
             "${CUDAToolkit_BIN_DIR}"
+            "${CUDAToolkit_BIN_DIR}/x64"
             "${CUDAToolkit_LIBRARY_DIR}")
     if(DEFINED VCPKG_TARGET_TRIPLET)
         list(APPEND _RUNTIME_SEARCH_DIRS

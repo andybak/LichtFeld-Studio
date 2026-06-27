@@ -630,6 +630,7 @@ if (-not (Test-Path $resolvedCudaPath)) {
 
 $env:CUDA_PATH_V12_8 = $resolvedCudaPath
 Add-ToPathIfMissing -Entry (Join-Path $resolvedCudaPath 'bin')
+Add-ToPathIfMissing -Entry (Join-Path $resolvedCudaPath 'bin\x64')
 Add-ToPathIfMissing -Entry (Join-Path $resolvedCudaPath 'libnvvp')
 
 Initialize-VcpkgRoot -VcpkgRoot $VcpkgRoot -GitPath $gitPath
