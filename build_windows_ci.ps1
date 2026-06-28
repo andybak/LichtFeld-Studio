@@ -13,6 +13,7 @@ param(
     [string]$InstallDirectory = 'dist',
     [string]$PackageOutputDirectory = '.',
     [string]$VcpkgRoot,
+    [string]$VcpkgInstalledDirectory,
     [string]$CudaPath,
     [switch]$Clean,
     [switch]$CleanDependencies,
@@ -43,9 +44,10 @@ Options:
   -InstallDirectory <path>            Install directory (default: dist)
   -PackageOutputDirectory <path>      Zip output directory (default: repo root)
   -VcpkgRoot <path>                   Override VCPKG_ROOT (default: VCPKG_ROOT env var or ..\vcpkg)
+  -VcpkgInstalledDirectory <path>     Override vcpkg installed tree (default: E:\LichtFeld-Studio\vcpkg_installed when E: exists)
   -CudaPath <path>                    Override CUDA root path
-  -Clean                              Remove project build outputs and dist before building; preserves build\vcpkg_installed
-  -CleanDependencies                  With -Clean, also remove build\vcpkg_installed
+  -Clean                              Remove project build outputs and dist before building; preserves VCPKG_INSTALLED_DIR
+  -CleanDependencies                  With -Clean, also remove VCPKG_INSTALLED_DIR
   -SkipPackage                        Build and install only; do not create zip
   -Help                               Show this message
 
@@ -380,6 +382,28 @@ function Get-EffectiveVcpkgRoot {
     return [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $ProjectRoot) 'vcpkg'))
 }
 
+function Get-EffectiveVcpkgInstalledDirectory {
+    param(
+        [string]$ProjectRoot,
+        [string]$BuildDirectory,
+        [string]$RequestedVcpkgInstalledDirectory
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedVcpkgInstalledDirectory)) {
+        return Resolve-AbsolutePath -BasePath $ProjectRoot -Path $RequestedVcpkgInstalledDirectory
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:VCPKG_INSTALLED_DIR)) {
+        return [System.IO.Path]::GetFullPath($env:VCPKG_INSTALLED_DIR)
+    }
+
+    if (Test-Path 'E:\') {
+        return 'E:\LichtFeld-Studio\vcpkg_installed'
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $BuildDirectory 'vcpkg_installed'))
+}
+
 function Initialize-VcpkgRoot {
     param(
         [string]$VcpkgRoot,
@@ -448,22 +472,32 @@ function Get-CMakeCacheCompilerPath {
 function Clear-BuildDirectory {
     param(
         [string]$BuildDirectory,
+        [string]$VcpkgInstalledDirectory,
         [switch]$RemoveDependencies
     )
 
     if (-not (Test-Path $BuildDirectory)) {
+        if ($RemoveDependencies -and -not [string]::IsNullOrWhiteSpace($VcpkgInstalledDirectory) -and (Test-Path $VcpkgInstalledDirectory)) {
+            Write-Host "Removing $VcpkgInstalledDirectory"
+            Remove-Item -LiteralPath $VcpkgInstalledDirectory -Recurse -Force
+        }
         return
     }
 
     if ($RemoveDependencies) {
         Write-Host "Removing $BuildDirectory"
         Remove-Item -LiteralPath $BuildDirectory -Recurse -Force
+        if (-not [string]::IsNullOrWhiteSpace($VcpkgInstalledDirectory) -and (Test-Path $VcpkgInstalledDirectory)) {
+            Write-Host "Removing $VcpkgInstalledDirectory"
+            Remove-Item -LiteralPath $VcpkgInstalledDirectory -Recurse -Force
+        }
         return
     }
 
     Write-Host "Removing project build outputs under $BuildDirectory"
+    $localVcpkgInstalledDirectory = Join-Path $BuildDirectory 'vcpkg_installed'
     Get-ChildItem -LiteralPath $BuildDirectory -Force |
-        Where-Object { $_.Name -ne 'vcpkg_installed' } |
+        Where-Object { $_.FullName -ne $localVcpkgInstalledDirectory } |
         ForEach-Object {
             Remove-Item -LiteralPath $_.FullName -Recurse -Force
         }
@@ -553,6 +587,7 @@ $BuildDirectory = Resolve-AbsolutePath -BasePath $ProjectRoot -Path $BuildDirect
 $InstallDirectory = Resolve-AbsolutePath -BasePath $ProjectRoot -Path $InstallDirectory
 $PackageOutputDirectory = Resolve-AbsolutePath -BasePath $ProjectRoot -Path $PackageOutputDirectory
 $VcpkgRoot = Get-EffectiveVcpkgRoot -ProjectRoot $ProjectRoot -RequestedVcpkgRoot $VcpkgRoot
+$VcpkgInstalledDirectory = Get-EffectiveVcpkgInstalledDirectory -ProjectRoot $ProjectRoot -BuildDirectory $BuildDirectory -RequestedVcpkgInstalledDirectory $VcpkgInstalledDirectory
 $resolvedCudaPath = Get-ConfiguredCudaPath -RequestedCudaPath $CudaPath
 
 Write-Section 'Environment'
@@ -563,6 +598,7 @@ Write-Host "Build directory: $BuildDirectory"
 Write-Host "Install directory: $InstallDirectory"
 Write-Host "Package output directory: $PackageOutputDirectory"
 Write-Host "VCPKG_ROOT: $VcpkgRoot"
+Write-Host "VCPKG_INSTALLED_DIR: $VcpkgInstalledDirectory"
 
 $vcVarsPath = Get-VcVarsPath -CudaPath $resolvedCudaPath
 $msvcToolsetVersion = Get-LatestMsvcToolsetVersion -VcVarsPath $vcVarsPath
@@ -578,7 +614,7 @@ Write-Host "CUDA_PATH_V12_8: $resolvedCudaPath"
 
 if ($Clean) {
     Write-Section 'Clean'
-    Clear-BuildDirectory -BuildDirectory $BuildDirectory -RemoveDependencies:$CleanDependencies
+    Clear-BuildDirectory -BuildDirectory $BuildDirectory -VcpkgInstalledDirectory $VcpkgInstalledDirectory -RemoveDependencies:$CleanDependencies
     if (Test-Path $InstallDirectory) {
         Write-Host "Removing $InstallDirectory"
         Remove-Item -LiteralPath $InstallDirectory -Recurse -Force
@@ -646,6 +682,7 @@ if (-not (Test-Path $vcpkgExe)) {
 }
 
 $env:VCPKG_ROOT = $VcpkgRoot
+$env:VCPKG_INSTALLED_DIR = $VcpkgInstalledDirectory
 $vcpkgToolchainFile = Join-Path $VcpkgRoot 'scripts\buildsystems\vcpkg.cmake'
 $tripletFile = Join-Path $VcpkgRoot 'triplets\x64-windows.cmake'
 if (-not (Test-Path $vcpkgToolchainFile)) {
@@ -684,6 +721,7 @@ $configureArguments = @(
     '-S', $ProjectRoot,
     '-G', 'Ninja',
     "-DCMAKE_TOOLCHAIN_FILE=$vcpkgToolchainFile",
+    "-DVCPKG_INSTALLED_DIR=$VcpkgInstalledDirectory",
     "-DCMAKE_BUILD_TYPE=$Configuration",
     '-DBUILD_PORTABLE=ON',
     '-DBUILD_PYTHON_STUBS=OFF',
@@ -728,7 +766,7 @@ for ($attempt = 1; $attempt -le 3; $attempt++) {
         }
 
         Write-Host 'Retryable configure failure detected. Cleaning project build outputs before retry.' -ForegroundColor Yellow
-        Clear-BuildDirectory -BuildDirectory $BuildDirectory
+        Clear-BuildDirectory -BuildDirectory $BuildDirectory -VcpkgInstalledDirectory $VcpkgInstalledDirectory
         Start-Sleep -Seconds (15 * $attempt)
     }
 }

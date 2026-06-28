@@ -32,6 +32,12 @@ endif()
 
 project(LichtFeld-Studio VERSION 0.5.3 LANGUAGES CUDA CXX C)
 
+if(DEFINED VCPKG_INSTALLED_DIR AND NOT "${VCPKG_INSTALLED_DIR}" STREQUAL "")
+    file(TO_CMAKE_PATH "${VCPKG_INSTALLED_DIR}" LFS_VCPKG_INSTALLED_DIR)
+else()
+    set(LFS_VCPKG_INSTALLED_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed")
+endif()
+
 # On Linux, hide symbols pulled in from third-party image / compression static
 # archives so they don't escape into the dynamic symbol tables of the binaries
 # we ship. Without this, every .so/exe we build re-exports e.g.
@@ -577,8 +583,8 @@ endif()
 # IMPORTANT: For Release builds, copy ONLY release DLLs to avoid loading debug CRT.
 # For Debug builds, copy both because some vcpkg packages (e.g., zlib) are release-only.
 if(WIN32 AND DEFINED VCPKG_TARGET_TRIPLET)
-    set(_vcpkg_debug_bin_dir "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin")
-    set(_vcpkg_release_bin_dir "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin")
+    set(_vcpkg_debug_bin_dir "${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/debug/bin")
+    set(_vcpkg_release_bin_dir "${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin")
     file(GLOB _vcpkg_release_dlls CONFIGURE_DEPENDS "${_vcpkg_release_bin_dir}/*.dll")
     file(GLOB _vcpkg_debug_dlls CONFIGURE_DEPENDS "${_vcpkg_debug_bin_dir}/*.dll")
     
@@ -775,8 +781,8 @@ add_dependencies(${PROJECT_NAME} copy_locale_files)
 # On Linux: copy to <exe>/../lib/usd/ (conventional layout).
 set(_USD_PLUGIN_SOURCE_DIR "")
 foreach(_candidate
-    "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib/usd"
-    "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/usd"
+    "${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/usd"
+    "${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin/usd"
     "${CMAKE_BINARY_DIR}/src/python/usd")
     # Require an actual plugin sub-directory (not just the root index).
     if(NOT _USD_PLUGIN_SOURCE_DIR AND EXISTS "${_candidate}/ar/resources/plugInfo.json")
@@ -786,8 +792,8 @@ endforeach()
 
 set(_USD_ROOT_INDEX "")
 foreach(_candidate
-    "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib/usd/plugInfo.json"
-    "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/usd/plugInfo.json"
+    "${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/usd/plugInfo.json"
+    "${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin/usd/plugInfo.json"
     "${CMAKE_BINARY_DIR}/src/python/usd/plugInfo.json")
     if(NOT _USD_ROOT_INDEX AND EXISTS "${_candidate}")
         set(_USD_ROOT_INDEX "${_candidate}")
@@ -854,13 +860,13 @@ if(UNIX)
         set(_lichtfeld_runtime_rpath_release "${_lichtfeld_runtime_rpath_common}")
         set(_lichtfeld_runtime_rpath_debug "${_lichtfeld_runtime_rpath_common}")
         if(DEFINED VCPKG_TARGET_TRIPLET)
-            set(_vcpkg_release_runtime_dir "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib")
+            set(_vcpkg_release_runtime_dir "${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib")
             if(EXISTS "${_vcpkg_release_runtime_dir}")
                 list(APPEND _lichtfeld_runtime_rpath_release "${_vcpkg_release_runtime_dir}")
                 list(APPEND _lichtfeld_runtime_rpath_debug "${_vcpkg_release_runtime_dir}")
             endif()
 
-            set(_vcpkg_debug_runtime_dir "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/lib")
+            set(_vcpkg_debug_runtime_dir "${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/debug/lib")
             if(EXISTS "${_vcpkg_debug_runtime_dir}")
                 list(APPEND _lichtfeld_runtime_rpath_debug "${_vcpkg_debug_runtime_dir}")
             endif()
@@ -1158,10 +1164,10 @@ if(BUILD_PORTABLE)
             "${CUDAToolkit_LIBRARY_DIR}")
     if(DEFINED VCPKG_TARGET_TRIPLET)
         list(APPEND _RUNTIME_SEARCH_DIRS
-                "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin"
-                "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib"
-                "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/bin"
-                "${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/debug/lib")
+                "${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin"
+                "${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib"
+                "${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/debug/bin"
+                "${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/debug/lib")
     endif()
 
     set(_SEARCH_DIRS_STR "")
@@ -1228,8 +1234,8 @@ if(BUILD_PORTABLE)
                 endif()
             endforeach()
             # Copy vcpkg DLLs
-            if(EXISTS \"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin\")
-                file(GLOB _vcpkg \"${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/bin/*.dll\")
+            if(EXISTS \"${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin\")
+                file(GLOB _vcpkg \"${LFS_VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin/*.dll\")
                 foreach(_v IN LISTS _vcpkg)
                     file(INSTALL \"\${_v}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\")
                 endforeach()
