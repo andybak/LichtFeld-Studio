@@ -119,7 +119,7 @@ groupshared float2 collected_xy_vs[TILE_SIZE];
 groupshared float4 collected_inv_cov_vs_opacity[TILE_SIZE];
 #endif
 
-groupshared uint32_t collected_idx[TILE_SIZE];
+groupshared uint32_t active_subgroups[TILE_SIZE / SUBGROUP_SIZE];
 groupshared uint32_t collected_gauss_idx[TILE_SIZE];
 
 #if SUBTILE_SIZE > 0
@@ -143,25 +143,27 @@ layout(binding=9) StructuredBuffer<float> opacity_raw;
 layout(binding=10) RWStructuredBuffer<float4> final_pixel_state;
 layout(binding=11) RWStructuredBuffer<float> final_pixel_depth;
 layout(binding=12) RWStructuredBuffer<int32_t> n_contributors;
+layout(binding=13) RWStructuredBuffer<float> pixel_depth_weight;
 #else
 layout(binding=6) RWStructuredBuffer<float4> final_pixel_state;
 layout(binding=7) RWStructuredBuffer<float> final_pixel_depth;
 layout(binding=8) RWStructuredBuffer<int32_t> n_contributors;
+layout(binding=9) RWStructuredBuffer<float> pixel_depth_weight;
 #endif
 #if LFS_3DGUT_RASTERIZE
-layout(binding=13) ByteAddressBuffer selection_mask;
-layout(binding=14) ByteAddressBuffer preview_mask;
-layout(binding=15) StructuredBuffer<float4> selection_colors;
-layout(binding=16) StructuredBuffer<uint> gaussian_overlay_flags;
-layout(binding=17) StructuredBuffer<float4> overlay_params;
-layout(binding=18) ByteAddressBuffer transform_indices;
-layout(binding=19) StructuredBuffer<float4> model_transforms;
+layout(binding=14) ByteAddressBuffer selection_mask;
+layout(binding=15) ByteAddressBuffer preview_mask;
+layout(binding=16) StructuredBuffer<float4> selection_colors;
+layout(binding=17) StructuredBuffer<uint> gaussian_overlay_flags;
+layout(binding=18) StructuredBuffer<float4> overlay_params;
+layout(binding=19) ByteAddressBuffer transform_indices;
+layout(binding=20) StructuredBuffer<float4> model_transforms;
 #else
-layout(binding=9) ByteAddressBuffer selection_mask;
-layout(binding=10) ByteAddressBuffer preview_mask;
-layout(binding=11) StructuredBuffer<float4> selection_colors;
-layout(binding=12) StructuredBuffer<uint> gaussian_overlay_flags;
-layout(binding=13) StructuredBuffer<float4> overlay_params;
+layout(binding=10) ByteAddressBuffer selection_mask;
+layout(binding=11) ByteAddressBuffer preview_mask;
+layout(binding=12) StructuredBuffer<float4> selection_colors;
+layout(binding=13) StructuredBuffer<uint> gaussian_overlay_flags;
+layout(binding=14) StructuredBuffer<float4> overlay_params;
 #endif
 
 #if LFS_3DGUT_RASTERIZE
@@ -273,12 +275,24 @@ void main(
         uint subgrid_idx, pixel_rank;
         decodeThreadToSubtiles(thread_rank, pix_coord, subgrid_idx, pixel_rank);
     #endif
+    bool is_inside = (pix_coord.x < W && pix_coord.y < H);
+    const uint pix_id = pix_coord.y * W + pix_coord.x;
     float4 curr_pixel_state = float4(0, 0, 0, 1);
     float median_depth = FAR_DEPTH;
     float weighted_depth = 0.0f;
     float weighted_alpha = 0.0f;
-    bool is_inside = (pix_coord.x < W && pix_coord.y < H);
-    bool thread_active = is_inside;
+    int32_t local_n_contrib = 0;
+    if (uniforms.depth_wave > 0u && is_inside) {
+        curr_pixel_state = final_pixel_state[pix_id];
+        local_n_contrib = n_contributors[pix_id];
+        if (uniforms.expected_far > 0.0f) {
+            weighted_depth = final_pixel_depth[pix_id];
+            weighted_alpha = pixel_depth_weight[pix_id];
+        } else {
+            median_depth = final_pixel_depth[pix_id];
+        }
+    }
+    bool thread_active = is_inside && curr_pixel_state.a >= 0.0001f;
 
     float2 center_pix_coord = pix_coord;
     const bool spark_rad_opacity_path = (uniforms.lod_enabled & 4u) != 0u;
@@ -300,27 +314,25 @@ void main(
     const int shared_memory_rounds = ((tile_idx_end - tile_idx_start + TILE_SIZE - 1) / TILE_SIZE);
 
     int32_t num_cull = 0;  // for visualization
-    int32_t local_n_contrib = 0;
     int splats_left_to_process = tile_idx_end - tile_idx_start;
     for (int i = 0; i < shared_memory_rounds; i++)
     {
         // break if thread_active is false for all, doesn't seem to speed up
         // equivalent to CUDA `if (__syncthreads_count(thread_active) == 0) break;`
-        uint subgroup_idx = thread_rank / SUBGROUP_SIZE;
-        uint32_t thread_active_u = uint32_t(WaveActiveAnyTrue(thread_active));
+        const uint subgroup_idx = thread_rank / SUBGROUP_SIZE;
+        const uint32_t subgroup_has_active_thread =
+            uint32_t(WaveActiveAnyTrue(thread_active));
         if (WaveIsFirstLane())
-            collected_idx[subgroup_idx] = thread_active_u;
+            active_subgroups[subgroup_idx] = subgroup_has_active_thread;
         GroupMemoryBarrierWithGroupSync();
-        for (int s = 1; s < TILE_SIZE/SUBGROUP_SIZE; s <<= 1) {
-            if (thread_rank < TILE_SIZE/SUBGROUP_SIZE) {
-                thread_active_u += collected_idx[(thread_rank+s)%TILE_SIZE];
-                collected_idx[thread_rank] = thread_active_u;
-            }
-            GroupMemoryBarrierWithGroupSync();
+        if (thread_rank == 0u) {
+            uint32_t any_active = 0u;
+            for (uint s = 0u; s < TILE_SIZE / SUBGROUP_SIZE; ++s)
+                any_active |= active_subgroups[s];
+            active_subgroups[0] = any_active;
         }
-        if (SUBGROUP_SIZE*SUBGROUP_SIZE >= TILE_SIZE)
-            GroupMemoryBarrierWithGroupSync();
-        if (collected_idx[0] == 0)
+        GroupMemoryBarrierWithGroupSync();
+        if (active_subgroups[0] == 0u)
             break;
 
         // Collectively fetch per-Gaussian data from global to shared
@@ -500,22 +512,20 @@ void main(
             }
         }
         splats_left_to_process -= TILE_SIZE;
+        GroupMemoryBarrierWithGroupSync();
     }
-    GroupMemoryBarrierWithGroupSync();
 
     if (is_inside) {
-        int pix_id = pix_coord.y*W+pix_coord.x;
         n_contributors[pix_id] = local_n_contrib;
         final_pixel_state[pix_id] = curr_pixel_state;
         if (uniforms.expected_far > 0.0f) {
-            // Alpha-weighted (expected) depth: Sum(alpha_i*T_i*depth_i) / Sum(alpha_i*T_i),
-            // over contributors within the far bound. Defined wherever any opacity
-            // accumulates, so it has no median holes. The denominator is accumulated
-            // alongside the numerator (not derived from the final transmittance) so the
-            // two stay consistent on the saturating-splat break path, where
-            // curr_pixel_state is not updated before the loop exits.
-            final_pixel_depth[pix_id] =
-                weighted_alpha > 1.0e-4f ? (weighted_depth / weighted_alpha) : FAR_DEPTH;
+            // Keep the expected-depth numerator and denominator raw across
+            // depth waves. A single post-loop finalize divides them once.
+            // The denominator is accumulated alongside the numerator (not
+            // derived from final transmittance), including the saturating-splat
+            // break path where curr_pixel_state is not updated before exit.
+            final_pixel_depth[pix_id] = weighted_depth;
+            pixel_depth_weight[pix_id] = weighted_alpha;
         } else {
             final_pixel_depth[pix_id] = median_depth;
         }

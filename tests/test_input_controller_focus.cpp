@@ -23,7 +23,6 @@
 #include <limits>
 #include <optional>
 #include <variant>
-#include <imgui.h>
 
 namespace lfs::vis {
 
@@ -34,14 +33,9 @@ namespace lfs::vis {
                 isolateInputProfileHome();
                 services().clear();
                 gui::guiFocusState().reset();
-
-                IMGUI_CHECKVERSION();
-                ImGui::CreateContext();
             }
 
             void TearDown() override {
-                ImGui::DestroyContext();
-
                 gui::guiFocusState().reset();
                 services().clear();
                 restoreHome();
@@ -120,7 +114,7 @@ namespace lfs::vis {
         EXPECT_FALSE(controller.getBindings().isCapturing());
     }
 
-    TEST_F(InputControllerFocusTest, ViewportViewHotkeysDoNotBypassGuiKeyboardFocus) {
+    TEST_F(InputControllerFocusTest, ViewportViewHotkeysBypassGuiKeyboardFocusWhenNotTextEditing) {
         Viewport viewport(200, 200);
         InputController controller(nullptr, viewport);
         input::InputRouter router;
@@ -142,8 +136,8 @@ namespace lfs::vis {
         controller.handleKey(input::KEY_G, input::ACTION_PRESS, input::KEYMOD_NONE);
         controller.handleKey(input::KEY_V, input::ACTION_PRESS, input::KEYMOD_NONE);
 
-        EXPECT_EQ(toggle_gt_count, 0);
-        EXPECT_EQ(toggle_split_count, 0);
+        EXPECT_EQ(toggle_gt_count, 1);
+        EXPECT_EQ(toggle_split_count, 1);
     }
 
     TEST_F(InputControllerFocusTest, ViewportViewHotkeysWorkAfterViewportFocus) {
@@ -221,6 +215,28 @@ namespace lfs::vis {
 
         EXPECT_EQ(toggle_gt_count, 0);
         EXPECT_EQ(toggle_split_count, 0);
+    }
+
+    TEST_F(InputControllerFocusTest, ViewportClickDuringTextEntryDoesNotStartCameraGesture) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+
+        auto& focus = gui::guiFocusState();
+        focus.want_capture_keyboard = true;
+        focus.want_text_input = true;
+        focus.any_item_active = true;
+
+        router.beginMouseButton(input::ACTION_PRESS, 40.0, 50.0);
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_PRESS, 40.0, 50.0);
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_RELEASE, 40.0, 50.0);
+        router.endMouseButton(input::ACTION_RELEASE);
+
+        EXPECT_FALSE(controller.isContinuousInputActive());
     }
 
     TEST_F(InputControllerFocusTest, GlobalShortcutsUseLogicalKeyWhileMovementUsesPhysicalKey) {
@@ -1040,7 +1056,7 @@ namespace lfs::vis {
                                                            input::MODIFIER_ALT),
                   input::Action::TOGGLE_CAMERA_FRUSTUMS);
         EXPECT_EQ(input::shortcutScopeForAction(input::Action::TOGGLE_CAMERA_FRUSTUMS),
-                  input::ShortcutScope::Viewport);
+                  input::ShortcutScope::GlobalWhenNotTextEditing);
 
         EXPECT_FALSE(rendering_manager.getSettings().show_camera_frustums);
         controller.handleKey(input::KEY_C, input::ACTION_PRESS, input::KEYMOD_ALT);
@@ -1179,10 +1195,10 @@ namespace lfs::vis {
                         .getTriggerForAction(input::Action::TOOL_MIRROR,
                                              input::ToolMode::SELECTION)
                         .has_value());
-        EXPECT_FALSE(controller.getBindings()
-                         .getTriggerForAction(input::Action::TOOL_MIRROR,
-                                              input::ToolMode::GLOBAL)
-                         .has_value());
+        EXPECT_TRUE(controller.getBindings()
+                        .getTriggerForAction(input::Action::TOOL_MIRROR,
+                                             input::ToolMode::GLOBAL)
+                        .has_value());
     }
 
     TEST_F(InputControllerFocusTest, ToolLocalOperationalShortcutsDoNotResolveAcrossModes) {

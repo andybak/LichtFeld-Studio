@@ -112,7 +112,7 @@
                         class="btn btn--secondary history-action"
                         type="button">Export .txt</button>
                 <button id="logging-copy-btn"
-                        class="btn btn--ghost history-action"
+                        class="btn btn--secondary history-action"
                         type="button">Copy</button>
             </div>
         </div>

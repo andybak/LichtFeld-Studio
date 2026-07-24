@@ -67,6 +67,8 @@ namespace gsplat_lfs {
         int32_t* tiles_per_gauss_out, // [C, N] pre-allocated output
         cudaStream_t stream = nullptr);
 
+    bool release_intersect_thread_local_cache() noexcept;
+
     void intersect_offset(
         const int64_t* isect_ids, // [n_isects]
         int32_t n_isects,
@@ -97,6 +99,7 @@ namespace gsplat_lfs {
         const float* binoms, // [n_max, n_max]
         int64_t N,
         int32_t n_max,
+        float min_opacity,
         cudaStream_t stream = nullptr);
 
     void add_noise(

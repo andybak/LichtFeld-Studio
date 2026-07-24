@@ -90,10 +90,6 @@ namespace lfs::vis::gui {
         }
 
         [[nodiscard]] std::filesystem::path plySequenceCacheRoot() {
-            if (const char* explicit_dir = std::getenv("LFS_PLY_SEQUENCE_CACHE_DIR");
-                explicit_dir && *explicit_dir) {
-                return lfs::core::utf8_to_path(explicit_dir);
-            }
 #ifdef _WIN32
             if (const char* local_app_data = std::getenv("LOCALAPPDATA");
                 local_app_data && *local_app_data) {
@@ -561,12 +557,6 @@ namespace lfs::vis::gui {
         return ply_stream_inflight_ ||
                !ply_stream_requests_.empty() ||
                !ply_stream_completed_.empty();
-    }
-
-    bool SequencerUIManager::isPlySequenceFrameResident(const size_t frame_index) const {
-        std::lock_guard lock(ply_stream_mutex_);
-        return frame_index < ply_stream_states_.size() &&
-               ply_stream_states_[frame_index] == PlyStreamFrameState::Resident;
     }
 
     size_t SequencerUIManager::plySequenceFrameDistance(const size_t lhs,
@@ -1585,7 +1575,7 @@ namespace lfs::vis::gui {
                    projected->y <= static_cast<float>(panel.render_size.y) + margin_y;
         };
 
-        const auto toColor = [](const ImVec4& c, const float alpha) -> glm::vec4 {
+        const auto toColor = [](const ThemeColor& c, const float alpha) -> glm::vec4 {
             return {c.x, c.y, c.z, alpha};
         };
 

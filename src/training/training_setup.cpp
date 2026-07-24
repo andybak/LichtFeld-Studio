@@ -32,6 +32,18 @@ namespace lfs::training {
             return std::make_shared<lfs::core::PointCloud>(positions, colors);
         }
 
+        int effectiveMinTrackLengthForLoad(const lfs::core::param::TrainingParameters& params) {
+            if (params.dataset.min_track_length > 0 &&
+                params.init_path.has_value() &&
+                !params.init_path->empty()) {
+                LOG_WARN(
+                    "min-track-length cannot be used with --init-ply; COLMAP sparse point filtering will not be applied because initialization uses '{}'",
+                    *params.init_path);
+                return 0;
+            }
+            return params.dataset.min_track_length;
+        }
+
         void randomChoosePointCloud(lfs::core::PointCloud& point_cloud,
                                     const int target_count,
                                     const int seed = 0) {
@@ -383,6 +395,7 @@ namespace lfs::training {
             .resize_factor = params.dataset.resize_factor,
             .max_width = params.dataset.max_width,
             .images_folder = params.dataset.images,
+            .min_track_length = effectiveMinTrackLengthForLoad(params),
             .validate_only = false,
             .centralize = parse_centralize(params.dataset.centralize_dataset),
             .progress = [&data_path](float percentage, const std::string& message) {
@@ -511,7 +524,7 @@ namespace lfs::training {
                 const auto cameras_group_id = scene.addGroup("Cameras", dataset_id);
 
                 const auto train_cameras_id = scene.addCameraGroup(
-                    std::format("Training ({})", train_count),
+                    "Training",
                     cameras_group_id,
                     train_count);
 
@@ -523,7 +536,7 @@ namespace lfs::training {
 
                 if (enable_eval && val_count > 0) {
                     const auto val_cameras_id = scene.addCameraGroup(
-                        std::format("Validation ({})", val_count),
+                        "Validation",
                         cameras_group_id,
                         val_count);
 
@@ -766,6 +779,7 @@ namespace lfs::training {
             .resize_factor = params.dataset.resize_factor,
             .max_width = params.dataset.max_width,
             .images_folder = params.dataset.images,
+            .min_track_length = params.dataset.min_track_length,
             .validate_only = true};
 
         auto result = data_loader->load(params.dataset.data_path, load_options);
@@ -871,7 +885,7 @@ namespace lfs::training {
 
                 const auto cameras_group_id = scene.addGroup("Cameras", dataset_id);
                 const auto train_cameras_id = scene.addCameraGroup(
-                    std::format("Training ({})", train_count), cameras_group_id, train_count);
+                    "Training", cameras_group_id, train_count);
 
                 for (size_t i = 0; i < cameras.size(); ++i) {
                     if (!enable_eval || (i % test_every) != 0) {
@@ -881,7 +895,7 @@ namespace lfs::training {
 
                 if (enable_eval && val_count > 0) {
                     const auto val_cameras_id = scene.addCameraGroup(
-                        std::format("Validation ({})", val_count), cameras_group_id, val_count);
+                        "Validation", cameras_group_id, val_count);
                     for (size_t i = 0; i < cameras.size(); ++i) {
                         if ((i % test_every) == 0) {
                             scene.addCamera(cameras[i]->image_name(), val_cameras_id, cameras[i]);

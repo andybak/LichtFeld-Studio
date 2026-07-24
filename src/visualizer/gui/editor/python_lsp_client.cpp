@@ -6,6 +6,7 @@
 
 #include "stdio_process.hpp"
 
+#include <core/environment.hpp>
 #include <core/logger.hpp>
 #include <core/path_utils.hpp>
 
@@ -249,10 +250,9 @@ namespace lfs::vis::editor {
             std::vector<ServerCommand> commands;
             std::unordered_set<std::string> seen;
 
-            if (const char* override_program = std::getenv("LFS_PYTHON_LSP");
-                override_program && *override_program) {
+            if (const auto override_program = lfs::core::environment::value("LFS_PYTHON_LSP")) {
                 append_candidate(commands, seen,
-                                 {.program = override_program,
+                                 {.program = std::string(*override_program),
                                   .args = {},
                                   .label = "custom Python language server"});
                 return commands;
@@ -334,9 +334,9 @@ namespace lfs::vis::editor {
         }
 
         fs::path get_lichtfeld_dir() {
-            if (const char* override_workspace = std::getenv("LFS_PYTHON_LSP_WORKSPACE");
-                override_workspace && *override_workspace) {
-                return fs::path(override_workspace);
+            if (const auto override_workspace =
+                    lfs::core::environment::value("LFS_PYTHON_LSP_WORKSPACE")) {
+                return fs::path(std::string(*override_workspace));
             }
 #ifdef _WIN32
             const char* const home = std::getenv("USERPROFILE");
@@ -585,11 +585,6 @@ namespace lfs::vis::editor {
         bool isAvailable() const {
             std::scoped_lock lock(mutex);
             return state != State::Failed;
-        }
-
-        std::string statusText() const {
-            std::scoped_lock lock(mutex);
-            return status;
         }
 
         std::chrono::milliseconds workerWaitDurationLocked() const {
@@ -1355,10 +1350,6 @@ namespace lfs::vis::editor {
 
     bool PythonLspClient::isAvailable() const {
         return impl_->isAvailable();
-    }
-
-    std::string PythonLspClient::statusText() const {
-        return impl_->statusText();
     }
 
 } // namespace lfs::vis::editor

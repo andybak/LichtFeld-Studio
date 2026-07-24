@@ -16,7 +16,7 @@ class NewProjectOperator(Operator):
     description = "Clear the scene to start a new project"
 
     def execute(self, context) -> set:
-        if lf.has_scene():
+        if lf.ui.get_content_type() != "empty":
             tr = lf.ui.tr
             new_project_label = tr("menu.file.new_project")
 

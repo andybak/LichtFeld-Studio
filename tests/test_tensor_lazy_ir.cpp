@@ -1,11 +1,14 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/cuda_error.hpp"
 #include "core/tensor.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
 #include "core/tensor/internal/lazy_config.hpp"
 #include "core/tensor/internal/lazy_executor.hpp"
 #include "core/tensor/internal/lazy_ir.hpp"
+#include "core/tensor/internal/memory_pool.hpp"
+#include <algorithm>
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
 #include <optional>
@@ -25,10 +28,10 @@ namespace {
             internal::lazy_executor_clear_registry_for_testing();
             internal::lazy_executor_reset_diagnostics_for_testing();
             internal::lazy_executor_set_debug_dump_override_for_testing(std::nullopt);
-            internal::lazy_executor_clear_debug_dump_cache_for_testing();
             internal::lazy_executor_set_pointwise_fusion_override_for_testing(std::nullopt);
             internal::lazy_executor_set_size_heuristic_override_for_testing(false);
             internal::lazy_executor_set_size_threshold_override_for_testing(std::nullopt);
+            internal::lazy_ir_set_node_limit_override_for_testing(std::nullopt);
             Tensor::reset_lazy_telemetry();
         }
 
@@ -37,10 +40,10 @@ namespace {
             internal::lazy_executor_clear_registry_for_testing();
             internal::lazy_executor_reset_diagnostics_for_testing();
             internal::lazy_executor_set_debug_dump_override_for_testing(std::nullopt);
-            internal::lazy_executor_clear_debug_dump_cache_for_testing();
             internal::lazy_executor_set_pointwise_fusion_override_for_testing(std::nullopt);
             internal::lazy_executor_set_size_heuristic_override_for_testing(std::nullopt);
             internal::lazy_executor_set_size_threshold_override_for_testing(std::nullopt);
+            internal::lazy_ir_set_node_limit_override_for_testing(std::nullopt);
             Tensor::reset_lazy_telemetry();
         }
     };
@@ -49,6 +52,11 @@ namespace {
         int device_count = 0;
         const auto status = cudaGetDeviceCount(&device_count);
         return status == cudaSuccess && device_count > 0;
+    }
+
+    void destroyStreamSafely(cudaStream_t stream) {
+        CudaMemoryPool::instance().release_stream(stream);
+        cudaStreamDestroy(stream);
     }
 
     torch::Tensor create_torch_cuda_tensor(const std::vector<float>& host, int64_t rows, int64_t cols) {
@@ -103,7 +111,7 @@ TEST(TensorLazyIrTest, OnModeDefersUntilBoundaryAndMaterializes) {
 
     const auto info = c.lazy_expr_info();
     ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->op_kind, internal::LazyOpKind::Deferred);
+    EXPECT_EQ(info->op_kind, internal::LazyOpKind::Binary);
 
     const auto before_boundary = Tensor::lazy_telemetry_snapshot();
     EXPECT_GE(before_boundary.expr_nodes_created, 1u);
@@ -452,6 +460,40 @@ TEST(TensorLazyIrTest, OnModeRegistryGrowthGuardrailInLongCreateDropLoop) {
     const auto diagnostics = internal::lazy_executor_diagnostics_snapshot_for_testing();
     EXPECT_GT(diagnostics.max_registry_entries, 0u);
     EXPECT_LE(diagnostics.max_registry_entries, 16u);
+
+    const auto telemetry = Tensor::lazy_telemetry_snapshot();
+    EXPECT_EQ(telemetry.expr_nodes_live, 0u);
+    EXPECT_EQ(telemetry.tensor_mappings_live, 0u);
+    EXPECT_GT(telemetry.expr_nodes_created, static_cast<uint64_t>(iterations));
+    EXPECT_GT(telemetry.expr_nodes_peak, 0u);
+    EXPECT_LE(telemetry.expr_nodes_peak, 8u);
+    EXPECT_LE(telemetry.tensor_mappings_peak, telemetry.expr_nodes_peak);
+    EXPECT_GT(telemetry.expr_node_limit, 0u);
+    EXPECT_LE(telemetry.expr_nodes_peak, telemetry.expr_node_limit);
+}
+
+TEST(TensorLazyIrTest, OnModeRegistryCapacityFallsBackWithoutChangingResults) {
+    LazyTestGuard guard;
+    internal::lazy_ir_set_node_limit_override_for_testing(1);
+    Tensor::reset_lazy_telemetry();
+
+    auto deferred = Tensor::ones({8}, Device::CPU, DataType::Float32)
+                        .add(1.0f)
+                        .mul(2.0f)
+                        .sub(3.0f);
+    ASSERT_TRUE(deferred.has_lazy_expr());
+
+    const auto values = deferred.to_vector();
+    ASSERT_EQ(values.size(), 8u);
+    for (const float value : values) {
+        EXPECT_FLOAT_EQ(value, 1.0f);
+    }
+
+    const auto telemetry = Tensor::lazy_telemetry_snapshot();
+    EXPECT_EQ(telemetry.expr_node_limit, 1u);
+    EXPECT_LE(telemetry.expr_nodes_live, 1u);
+    EXPECT_LE(telemetry.expr_nodes_peak, 1u);
+    EXPECT_GT(telemetry.expr_nodes_dropped, 0u);
 }
 
 TEST(TensorLazyIrTest, OnModeContextCacheGrowthGuardrailBoundedByPlannedNodes) {
@@ -469,6 +511,40 @@ TEST(TensorLazyIrTest, OnModeContextCacheGrowthGuardrailBoundedByPlannedNodes) {
     EXPECT_GT(diagnostics.planned_nodes, 0u);
     EXPECT_GT(diagnostics.max_context_cache_entries, 0u);
     EXPECT_LE(diagnostics.max_context_cache_entries, diagnostics.planned_nodes);
+}
+
+TEST(TensorLazyIrTest, OnModeContextCacheCollisionUsesFreshMaterialization) {
+    LazyTestGuard guard;
+
+    constexpr uint64_t COLLIDING_NODE_ID = 0xc0111de;
+    auto eager_root = Tensor::zeros({4}, Device::CPU, DataType::Float32);
+    auto stale = Tensor::full({4}, 1.0f, Device::CPU, DataType::Float32);
+    auto fresh = Tensor::full({4}, 9.0f, Device::CPU, DataType::Float32);
+
+    bool observed_active_context = false;
+    auto result = internal::lazy_planner_execute_plan_for_tensor(
+        eager_root,
+        [&]() {
+            observed_active_context = internal::lazy_executor_context_active();
+            internal::lazy_executor_cache_materialization(COLLIDING_NODE_ID, stale);
+
+            Tensor cached;
+            EXPECT_TRUE(internal::lazy_executor_lookup_cached_materialization(
+                COLLIDING_NODE_ID, cached));
+            EXPECT_FLOAT_EQ(cached.to_vector().front(), 1.0f);
+
+            internal::lazy_executor_cache_materialization(COLLIDING_NODE_ID, fresh);
+            EXPECT_TRUE(internal::lazy_executor_lookup_cached_materialization(
+                COLLIDING_NODE_ID, cached));
+            return cached;
+        });
+
+    EXPECT_TRUE(observed_active_context);
+    const auto values = result.to_vector();
+    ASSERT_EQ(values.size(), 4u);
+    for (const float value : values) {
+        EXPECT_FLOAT_EQ(value, 9.0f);
+    }
 }
 
 TEST(TensorLazyIrTest, OnModePlannerRegistryPrunesAfterMaterialization) {
@@ -645,11 +721,24 @@ TEST(TensorLazyIrTest, OnModeInteropPointerBoundaryMaterializes) {
 
     const auto before_boundary = Tensor::lazy_telemetry_snapshot();
 
+    reset_cuda_diagnostics_for_testing();
+    clear_cuda_breadcrumbs_for_testing();
+
     const void* storage = deferred.storage_ptr();
     const float* data = deferred.ptr<float>();
     ASSERT_NE(storage, nullptr);
     ASSERT_NE(data, nullptr);
     EXPECT_FLOAT_EQ(data[0], 3.0f);
+
+    const auto breadcrumbs = cuda_breadcrumbs_most_recent_first();
+    const auto storage_move = std::find_if(
+        breadcrumbs.begin(), breadcrumbs.end(), [](const CudaBreadcrumb& breadcrumb) {
+            return breadcrumb.tag != nullptr &&
+                   std::string_view(breadcrumb.tag) == "tensor.deferred.storage_move";
+        });
+    ASSERT_NE(storage_move, breadcrumbs.end());
+    EXPECT_EQ(storage_move->a1, reinterpret_cast<uintptr_t>(storage));
+    EXPECT_EQ(storage_move->a2, deferred.bytes());
 
     const auto after_boundary = Tensor::lazy_telemetry_snapshot();
     EXPECT_GE(after_boundary.materializations, before_boundary.materializations + 1);
@@ -875,7 +964,7 @@ TEST(TensorLazyIrTest, OnModeIndexPutMultiDimMismatchBoundaryMaterializes) {
 
     const auto before_boundary = Tensor::lazy_telemetry_snapshot();
 
-    deferred.index_put_({row_idx, col_idx}, values);
+    EXPECT_THROW(deferred.index_put_({row_idx, col_idx}, values), std::runtime_error);
     const auto result = deferred.to_vector();
 
     ASSERT_EQ(result.size(), 4u);
@@ -899,15 +988,15 @@ TEST(TensorLazyIrTest, OnModeIndexAddEdgeBoundaryMaterializes) {
 
     const auto before_boundary = Tensor::lazy_telemetry_snapshot();
 
-    deferred.index_add_(0, indices, src);
+    EXPECT_THROW(deferred.index_add_(0, indices, src), std::runtime_error);
     const auto result = deferred.to_vector();
 
     ASSERT_EQ(result.size(), 5u);
     EXPECT_FLOAT_EQ(result[0], 2.0f);
-    EXPECT_FLOAT_EQ(result[1], 8.0f);
+    EXPECT_FLOAT_EQ(result[1], 2.0f);
     EXPECT_FLOAT_EQ(result[2], 2.0f);
     EXPECT_FLOAT_EQ(result[3], 2.0f);
-    EXPECT_FLOAT_EQ(result[4], 6.0f);
+    EXPECT_FLOAT_EQ(result[4], 2.0f);
 
     const auto after_boundary = Tensor::lazy_telemetry_snapshot();
     EXPECT_GE(after_boundary.materializations, before_boundary.materializations + 1);
@@ -924,7 +1013,7 @@ TEST(TensorLazyIrTest, OnModeAppendGatherNon1DIndexBoundaryMaterializes) {
 
     const auto before_boundary = Tensor::lazy_telemetry_snapshot();
 
-    deferred.append_gather(indices);
+    EXPECT_THROW(deferred.append_gather(indices), std::runtime_error);
     const auto result = deferred.to_vector();
 
     ASSERT_EQ(result.size(), 4u);
@@ -947,7 +1036,7 @@ TEST(TensorLazyIrTest, OnModeAppendGatherEdgeBoundaryMaterializes) {
 
     const auto before_boundary = Tensor::lazy_telemetry_snapshot();
 
-    deferred.append_gather(indices);
+    EXPECT_THROW(deferred.append_gather(indices), std::runtime_error);
     const auto result = deferred.to_vector();
 
     ASSERT_EQ(result.size(), 4u);
@@ -1641,7 +1730,7 @@ TEST(TensorLazyRuntimeTest, ErankExpressionMatchesTorchOnInheritedStream) {
     auto torch_erank = torch_entropy.exp();
     expect_tensor_matches_torch_vector(actual_cpu, torch_erank);
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST(TensorLazyRuntimeTest, FusedSegmentedSquareSumMatchesTorchOnInheritedStream) {
@@ -1681,7 +1770,7 @@ TEST(TensorLazyRuntimeTest, FusedSegmentedSquareSumMatchesTorchOnInheritedStream
     auto torch_sum = torch_scaling.square().sum(1, true);
     expect_tensor_matches_torch_vector(actual_cpu, torch_sum);
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST(TensorLazyRuntimeTest, DeferredMaterializationKeepsActualExecutionStream) {
@@ -1720,8 +1809,8 @@ TEST(TensorLazyRuntimeTest, DeferredMaterializationKeepsActualExecutionStream) {
     EXPECT_FLOAT_EQ(values.front(), 3.0f);
     EXPECT_FLOAT_EQ(values.back(), 3.0f);
 
-    cudaStreamDestroy(consumer);
-    cudaStreamDestroy(producer);
+    destroyStreamSafely(consumer);
+    destroyStreamSafely(producer);
 }
 
 TEST(TensorLazyRuntimeTest, DeferredViewChainPreservesSourceStreamHint) {
@@ -1758,7 +1847,7 @@ TEST(TensorLazyRuntimeTest, DeferredViewChainPreservesSourceStreamHint) {
         EXPECT_FLOAT_EQ(value, 3.0f);
     }
 
-    cudaStreamDestroy(stream);
+    destroyStreamSafely(stream);
 }
 
 TEST(TensorLazyRuntimeTest, DeferredHintedChainWaitsForProducerWhenConsumedWithoutGuard) {
@@ -1813,8 +1902,8 @@ TEST(TensorLazyRuntimeTest, DeferredHintedChainWaitsForProducerWhenConsumedWitho
     EXPECT_FLOAT_EQ(values.back(), 9.0f);
 
     ASSERT_EQ(cudaEventDestroy(gate), cudaSuccess);
-    cudaStreamDestroy(hinted_consumer);
-    cudaStreamDestroy(producer);
+    destroyStreamSafely(hinted_consumer);
+    destroyStreamSafely(producer);
 }
 
 TEST(TensorLazyRuntimeTest, FusedSegmentedReduceMaxGPU) {

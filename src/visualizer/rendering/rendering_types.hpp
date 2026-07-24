@@ -39,6 +39,12 @@ namespace lfs::vis {
         IndependentDual
     };
 
+    enum class GTComparisonMode {
+        RGB = 0,
+        Normal = 1,
+        Depth = 2,
+    };
+
     enum class SplitViewPanelId : uint8_t {
         Left = 0,
         Right = 1
@@ -184,7 +190,7 @@ namespace lfs::vis {
         bool show_ellipsoid = false;
         bool use_ellipsoid = false;
         bool desaturate_unselected = false;     // Desaturate unselected PLYs when one is selected
-        bool desaturate_cropping = true;        // Desaturate outside crop box/ellipsoid instead of hiding
+        bool desaturate_cropping = false;       // Desaturate outside crop box/ellipsoid instead of hiding
         bool hide_outside_depth_box = false;    // Hide gaussians outside the selection depth box
         bool crop_filter_for_selection = false; // Use crop box/ellipsoid as selection filter
 
@@ -232,6 +238,7 @@ namespace lfs::vis {
 
         // Split view
         SplitViewMode split_view_mode = SplitViewMode::Disabled;
+        GTComparisonMode gt_comparison_mode = GTComparisonMode::RGB;
         float split_position = 0.5f;
         size_t split_view_offset = 0;
 
@@ -310,6 +317,18 @@ namespace lfs::vis {
             break;
         default:
             settings.depth_visualization_mode = lfs::rendering::DepthVisualizationMode::Palette;
+            break;
+        }
+    }
+
+    inline void sanitizeGTComparisonSettings(RenderSettings& settings) {
+        switch (settings.gt_comparison_mode) {
+        case GTComparisonMode::RGB:
+        case GTComparisonMode::Normal:
+        case GTComparisonMode::Depth:
+            break;
+        default:
+            settings.gt_comparison_mode = GTComparisonMode::RGB;
             break;
         }
     }

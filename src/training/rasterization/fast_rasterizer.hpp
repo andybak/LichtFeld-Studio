@@ -6,6 +6,7 @@
 
 #include "core/camera.hpp"
 #include "core/cuda/memory_arena.hpp"
+#include "core/error.hpp"
 #include "core/splat_data.hpp"
 #include "optimizer/adam_optimizer.hpp"
 #include "optimizer/render_output.hpp"
@@ -40,6 +41,7 @@ namespace lfs::training {
         lfs::core::Tensor image;
         lfs::core::Tensor alpha;
         lfs::core::Tensor depth;
+        lfs::core::Tensor normal;   // [3, H, W] camera-space accumulated normals, empty unless rendered
         lfs::core::Tensor bg_color; // Saved for alpha gradient computation
 
         // Gaussian parameters (saved to avoid re-fetching in backward)
@@ -102,6 +104,7 @@ namespace lfs::training {
             image = std::move(other.image);
             alpha = std::move(other.alpha);
             depth = std::move(other.depth);
+            normal = std::move(other.normal);
             bg_color = std::move(other.bg_color);
             means = std::move(other.means);
             raw_scales = std::move(other.raw_scales);
@@ -132,6 +135,7 @@ namespace lfs::training {
 
     struct FastGSFusedExtraGradients {
         float scale_reg_weight = 0.0f;
+        float flatten_reg_weight = 0.0f;
         float opacity_reg_weight = 0.0f;
         const float* sparsity_opa_sigmoid = nullptr;
         const float* sparsity_z = nullptr;
@@ -144,7 +148,7 @@ namespace lfs::training {
     // Explicit forward pass - returns render output and context for backward
     // Optional tile parameters for memory-efficient training (tile_width/height=0 means full image)
     // bg_image is optional - if provided, uses per-pixel background blending instead of solid color
-    std::expected<std::pair<RenderOutput, FastRasterizeContext>, std::string> fast_rasterize_forward(
+    std::expected<std::pair<RenderOutput, FastRasterizeContext>, lfs::Error> fast_rasterize_forward(
         lfs::core::Camera& viewpoint_camera,
         lfs::core::SplatData& gaussian_model,
         lfs::core::Tensor& bg_color,
@@ -153,7 +157,8 @@ namespace lfs::training {
         int tile_width = 0,
         int tile_height = 0,
         bool mip_filter = false,
-        const lfs::core::Tensor& bg_image = {});
+        const lfs::core::Tensor& bg_image = {},
+        bool render_normal = false);
 
     // Backward pass with optional extra alpha gradient for masked training
     void fast_rasterize_backward(
@@ -167,7 +172,10 @@ namespace lfs::training {
         int iteration = 0,
         const FastGSFusedExtraGradients& fused_extra_gradients = {},
         const lfs::core::Tensor& grad_depth = {},
-        bool detach_depth_weights = false);
+        const lfs::core::Tensor& grad_normal = {});
+
+    // Release per-thread renderer caches before the owning CUDA stream is torn down.
+    bool release_fast_rasterizer_thread_local_caches() noexcept;
 
     // Convenience wrapper for inference (no backward needed)
     inline RenderOutput fast_rasterize(
@@ -178,7 +186,7 @@ namespace lfs::training {
         const lfs::core::Tensor& bg_image = {}) {
         auto result = fast_rasterize_forward(viewpoint_camera, gaussian_model, bg_color, 0, 0, 0, 0, mip_filter, bg_image);
         if (!result) {
-            throw std::runtime_error(result.error());
+            throw lfs::Exception(std::move(result.error()));
         }
         RenderOutput output = std::move(result->first);
         result->second.release_forward_context();

@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <set>
 
 namespace lfs::python {
@@ -140,8 +141,23 @@ namespace lfs::python {
                         "depth_loss_weight", "Depth Loss Weight", 2.0f, 0.0f, 100.0f,
                         "Weight for depth supervision")
             .string_prop(&OptimizationParameters::depth_loss_mode,
-                         "depth_loss_mode", "Depth Loss Mode", "adaptive-warped-l1",
-                         "Depth supervision mode: pearson or adaptive-warped-l1")
+                         "depth_loss_mode", "Depth Loss Mode", "ssi",
+                         "Depth prior convention: ssi (auto-detect), ssi-disparity, or ssi-depth")
+            .bool_prop(&OptimizationParameters::use_normal_loss,
+                       "use_normal_loss", "Use Normal Loss", false,
+                       "Use dataset normal maps for normal supervision")
+            .float_prop(&OptimizationParameters::normal_loss_weight,
+                        "normal_loss_weight", "Normal Loss Weight", 0.05f, 0.0f, 100.0f,
+                        "Weight for prior normal supervision")
+            .float_prop(&OptimizationParameters::normal_consistency_weight,
+                        "normal_consistency_weight", "Normal Consistency Weight", 0.05f, 0.0f, 100.0f,
+                        "Weight for depth-normal consistency")
+            .float_prop(&OptimizationParameters::normal_flatten_weight,
+                        "normal_flatten_weight", "Normal Flatten Weight", 1.0f, 0.0f, 1000.0f,
+                        "Min-axis scale flattening weight while normal supervision is active")
+            .string_prop(&OptimizationParameters::normal_loss_space,
+                         "normal_loss_space", "Normal Loss Space", "auto",
+                         "Normal prior coordinate space: auto, camera-opencv, camera-opengl, or world")
 
             // Bilateral grid
             .bool_prop(&OptimizationParameters::use_bilateral_grid,
@@ -414,6 +430,12 @@ namespace lfs::python {
             [](const DatasetConfig& c) { return c.max_width; },
             [](DatasetConfig& c, int v) { c.max_width = v; });
 
+        add_int(
+            "min_track_length", "Minimum Track Length", 0, 0, 65535,
+            "Minimum COLMAP sparse point track length; 0 disables filtering", false,
+            [](const DatasetConfig& c) { return c.min_track_length; },
+            [](DatasetConfig& c, int v) { c.min_track_length = v; });
+
         add_bool(
             "use_cpu_cache", "CPU Cache", true, "Cache images in CPU memory", false,
             [](const DatasetConfig& c) { return c.loading_params.use_cpu_memory; },
@@ -424,10 +446,39 @@ namespace lfs::python {
             [](const DatasetConfig& c) { return c.loading_params.use_fs_cache; },
             [](DatasetConfig& c, bool v) { c.loading_params.use_fs_cache = v; });
 
+        add_bool(
+            "use_16bit_color", "16-bit Color", false, "Train with 16-bit color images (HDR); caches losslessly as JPEG 2000", false,
+            [](const DatasetConfig& c) { return c.loading_params.use_16bit_color; },
+            [](DatasetConfig& c, bool v) { c.loading_params.use_16bit_color = v; });
+
         PropertyRegistry::instance().register_group(std::move(group));
     }
 
     namespace {
+        std::mutex python_property_subscriptions_mutex;
+        std::set<size_t> python_property_subscriptions;
+
+        void track_python_property_subscription(const size_t id) {
+            std::lock_guard lock(python_property_subscriptions_mutex);
+            python_property_subscriptions.insert(id);
+        }
+
+        void forget_python_property_subscription(const size_t id) {
+            std::lock_guard lock(python_property_subscriptions_mutex);
+            python_property_subscriptions.erase(id);
+        }
+
+        void clear_python_property_subscriptions() {
+            std::set<size_t> subscriptions;
+            {
+                std::lock_guard lock(python_property_subscriptions_mutex);
+                subscriptions.swap(python_property_subscriptions);
+            }
+            for (const size_t id : subscriptions) {
+                PropertyRegistry::instance().unsubscribe(id);
+            }
+        }
+
         core::param::OptimizationParameters& get_default_params() {
             static core::param::OptimizationParameters default_params{};
             return default_params;
@@ -769,7 +820,7 @@ namespace lfs::python {
         return tm->getEditableDatasetParams();
     }
 
-    const core::param::DatasetConfig& PyDatasetConfig::params() const {
+    core::param::DatasetConfig PyDatasetConfig::params() const {
         const auto* tm = get_trainer_manager();
         if (!tm) {
             throw std::runtime_error("TrainerManager not available");
@@ -1037,7 +1088,7 @@ namespace lfs::python {
             .def_prop_rw(
                 "means_lr",
                 [](PyOptimizationParams& self) { return self.params().means_lr; },
-                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.means_lr = v; }); },
+                [](PyOptimizationParams& self, float v) { self.set("means_lr", nb::cast(v)); },
                 "Learning rate for gaussian positions")
             .def_prop_rw(
                 "means_lr_end",
@@ -1253,7 +1304,32 @@ namespace lfs::python {
                 "depth_loss_mode",
                 [](PyOptimizationParams& self) { return self.params().depth_loss_mode; },
                 [](PyOptimizationParams&, const std::string& v) { modify_params([v](auto& p) { p.depth_loss_mode = v; }); },
-                "Depth supervision mode: 'pearson' or 'adaptive-warped-l1'")
+                "Depth prior convention: 'ssi' (auto-detect), 'ssi-disparity', or 'ssi-depth'")
+            .def_prop_rw(
+                "use_normal_loss",
+                [](PyOptimizationParams& self) { return self.params().use_normal_loss; },
+                [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.use_normal_loss = v; }); },
+                "Load normal maps and use normal-map supervision during training")
+            .def_prop_rw(
+                "normal_loss_weight",
+                [](PyOptimizationParams& self) { return self.params().normal_loss_weight; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.normal_loss_weight = std::max(0.0f, v); }); },
+                "Weight for prior normal supervision")
+            .def_prop_rw(
+                "normal_consistency_weight",
+                [](PyOptimizationParams& self) { return self.params().normal_consistency_weight; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.normal_consistency_weight = std::max(0.0f, v); }); },
+                "Weight for depth-normal consistency supervision")
+            .def_prop_rw(
+                "normal_flatten_weight",
+                [](PyOptimizationParams& self) { return self.params().normal_flatten_weight; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.normal_flatten_weight = std::max(0.0f, v); }); },
+                "Min-axis scale flattening weight while normal supervision is active")
+            .def_prop_rw(
+                "normal_loss_space",
+                [](PyOptimizationParams& self) { return self.params().normal_loss_space; },
+                [](PyOptimizationParams&, const std::string& v) { modify_params([v](auto& p) { p.normal_loss_space = v; }); },
+                "Normal prior coordinate space: 'auto', 'camera-opencv', 'camera-opengl', or 'world'")
             .def_prop_rw(
                 "undistort",
                 [](PyOptimizationParams& self) { return self.params().undistort; },
@@ -1390,6 +1466,17 @@ namespace lfs::python {
                 },
                 "Maximum image width in pixels; 0 disables the cap")
             .def_prop_rw(
+                "min_track_length",
+                [](const PyDatasetConfig& self) { return self.params().min_track_length; },
+                [](PyDatasetConfig& self, int v) {
+                    if (!self.can_edit())
+                        throw std::runtime_error("Cannot edit dataset params during training");
+                    if (v < 0)
+                        throw std::invalid_argument("min_track_length must be non-negative; 0 disables filtering");
+                    self.params().min_track_length = v;
+                },
+                "Minimum COLMAP sparse point track length; 0 disables filtering")
+            .def_prop_rw(
                 "use_cpu_cache",
                 [](const PyDatasetConfig& self) { return self.params().loading_params.use_cpu_memory; },
                 [](PyDatasetConfig& self, bool v) {
@@ -1407,6 +1494,15 @@ namespace lfs::python {
                     self.params().loading_params.use_fs_cache = v;
                 },
                 "Use filesystem cache for images")
+            .def_prop_rw(
+                "use_16bit_color",
+                [](const PyDatasetConfig& self) { return self.params().loading_params.use_16bit_color; },
+                [](PyDatasetConfig& self, bool v) {
+                    if (!self.can_edit())
+                        throw std::runtime_error("Cannot edit dataset params during training");
+                    self.params().loading_params.use_16bit_color = v;
+                },
+                "Train with 16-bit color images (HDR); caches losslessly as JPEG 2000")
             .def_prop_ro(
                 "centralize_dataset",
                 [](const PyDatasetConfig& self) { return self.params().centralize_dataset; },
@@ -1463,7 +1559,8 @@ namespace lfs::python {
                     }
                 };
 
-                size_t sub_id = PropertyRegistry::instance().subscribe(group_id, prop_id, cpp_callback);
+                const size_t sub_id = PropertyRegistry::instance().subscribe(group_id, prop_id, cpp_callback);
+                track_python_property_subscription(sub_id);
                 return sub_id;
             },
             nb::arg("property_path"), nb::arg("callback"),
@@ -1474,6 +1571,7 @@ namespace lfs::python {
             "unsubscribe_property_change",
             [](size_t subscription_id) {
                 PropertyRegistry::instance().unsubscribe(subscription_id);
+                forget_python_property_subscription(subscription_id);
             },
             nb::arg("subscription_id"),
             "Unsubscribe from property change notifications");
@@ -1521,7 +1619,8 @@ namespace lfs::python {
                         }
                     };
 
-                    PropertyRegistry::instance().subscribe(group_id, prop_id, cpp_callback);
+                    const size_t sub_id = PropertyRegistry::instance().subscribe(group_id, prop_id, cpp_callback);
+                    track_python_property_subscription(sub_id);
                     return func;
                 });
             },
@@ -1529,6 +1628,9 @@ namespace lfs::python {
             "Decorator for property change handlers.\n"
             "Usage: @lf.property_callback('optimization.means_lr')\n"
             "       def on_lr_change(old_val, new_val): ...");
+
+        m.def("_clear_property_callbacks", &clear_python_property_subscriptions);
+        nb::module_::import_("atexit").attr("register")(m.attr("_clear_property_callbacks"));
     }
 
 } // namespace lfs::python

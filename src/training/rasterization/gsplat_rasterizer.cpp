@@ -4,6 +4,7 @@
 
 #include "gsplat_rasterizer.hpp"
 #include "core/cuda/memory_arena.hpp"
+#include "core/error.hpp"
 #include "core/logger.hpp"
 #include "core/tensor/internal/cuda_stream_context.hpp"
 #include "gsplat/Ops.h"
@@ -14,6 +15,17 @@
 #include <spdlog/spdlog.h>
 
 namespace lfs::training {
+
+    namespace {
+        struct GsplatThreadLocalCaches {
+            core::Tensor K;
+            core::Tensor image_chw;
+            core::Tensor alpha_chw;
+            core::Tensor depth_chw;
+        };
+
+        thread_local GsplatThreadLocalCaches gsplat_thread_caches;
+    } // namespace
 
     std::expected<std::pair<RenderOutput, GsplatRasterizeContext>, std::string> gsplat_rasterize_forward(
         core::Camera& viewpoint_camera,
@@ -93,6 +105,8 @@ namespace lfs::training {
                 }
             }
 
+            core::pin_operands({&means, &opacities, &scales, &quats, &sh0, &shN});
+
             // Current-stream-first (the caller's guard), tensor stream as
             // fallback — matches the lib-wide rule and the begin_frame stream,
             // so a metrics-thread render lands its kernels and consumers on the
@@ -102,11 +116,13 @@ namespace lfs::training {
                                                 : means.stream();
 
             // Keep K tensor cached and update values in-place to avoid per-call allocations.
-            thread_local core::Tensor cached_K_tensor;
-            if (!cached_K_tensor.is_valid() || cached_K_tensor.numel() != 9) {
+            auto& cached_K_tensor = gsplat_thread_caches.K;
+            if (!cached_K_tensor.is_valid() || cached_K_tensor.numel() != 9 ||
+                cached_K_tensor.stream() != fwd_stream) {
                 cached_K_tensor = core::Tensor::empty({1, 3, 3}, core::Device::CUDA, core::DataType::Float32);
+                if (cached_K_tensor.stream() != fwd_stream)
+                    cached_K_tensor.set_stream(fwd_stream);
             }
-            cached_K_tensor.set_stream(fwd_stream);
             const std::array<float, 9> K_host = {
                 k00, 0.0f, k02,
                 0.0f, k11, k12,
@@ -135,8 +151,10 @@ namespace lfs::training {
 
             if (use_bg_image) {
                 // Use per-pixel background image - passed directly to gsplat kernel
+                core::pin_operands({&bg_image});
                 bg_image_ptr = bg_image.ptr<float>();
             } else if (bg_color.is_valid() && bg_color.numel() > 0) {
+                core::pin_operands({&bg_color});
                 bg_color_ptr = bg_color.ptr<float>();
             }
 
@@ -241,6 +259,15 @@ namespace lfs::training {
 
             // Allocate from arena
             char* blob = arena_allocator(total_size);
+            if (blob == nullptr) {
+                throw lfs::Exception(lfs::make_error(lfs::ErrorInit{
+                    .code = lfs::ErrorCode::ResourceExhausted,
+                    .domain = lfs::ErrorDomain::CUDA,
+                    .user_message = "Ran out of GPU memory while rendering during training.",
+                    .detail = std::format("gsplat forward arena allocation failed ({} bytes)", total_size),
+                    .detection = LFS_SOURCE_SITE_CURRENT(),
+                }));
+            }
 
             // Carve out buffers (aligned)
             char* ptr = blob;
@@ -334,10 +361,10 @@ namespace lfs::training {
             // Create tensor views over arena memory for output
             auto render_colors_tensor = core::Tensor::from_blob(
                 render_colors_ptr_out, {static_cast<size_t>(C), static_cast<size_t>(H), static_cast<size_t>(W), static_cast<size_t>(channels)},
-                core::Device::CUDA, core::DataType::Float32);
+                core::Device::CUDA, core::DataType::Float32, fwd_stream);
             auto render_alphas_tensor = core::Tensor::from_blob(
                 render_alphas_ptr_out, {static_cast<size_t>(C), static_cast<size_t>(H), static_cast<size_t>(W), 1UL},
-                core::Device::CUDA, core::DataType::Float32);
+                core::Device::CUDA, core::DataType::Float32, fwd_stream);
 
             // Process based on render mode
             core::Tensor final_image, final_depth;
@@ -368,9 +395,9 @@ namespace lfs::training {
             }
 
             // Convert from [1, H, W, C] arena views to reusable CHW buffers.
-            thread_local core::Tensor cached_image_chw;
-            thread_local core::Tensor cached_alpha_chw;
-            thread_local core::Tensor cached_depth_chw;
+            auto& cached_image_chw = gsplat_thread_caches.image_chw;
+            auto& cached_alpha_chw = gsplat_thread_caches.alpha_chw;
+            auto& cached_depth_chw = gsplat_thread_caches.depth_chw;
 
             if (final_image.is_valid() && final_image.numel() > 0) {
                 auto image_hwc = final_image.squeeze(0); // [H, W, C]
@@ -380,10 +407,12 @@ namespace lfs::training {
 
                 const size_t image_channels = image_hwc.shape()[2];
                 const core::TensorShape image_shape = {image_channels, static_cast<size_t>(H), static_cast<size_t>(W)};
-                if (!cached_image_chw.is_valid() || cached_image_chw.shape() != image_shape) {
+                if (!cached_image_chw.is_valid() || cached_image_chw.shape() != image_shape ||
+                    cached_image_chw.stream() != fwd_stream) {
                     cached_image_chw = core::Tensor::empty(image_shape, core::Device::CUDA, core::DataType::Float32);
+                    if (cached_image_chw.stream() != fwd_stream)
+                        cached_image_chw.set_stream(fwd_stream);
                 }
-                cached_image_chw.set_stream(fwd_stream);
 
                 kernels::launch_permute_hwc_to_chw(
                     image_hwc.ptr<float>(),
@@ -397,10 +426,12 @@ namespace lfs::training {
             }
 
             const core::TensorShape alpha_shape = {1UL, static_cast<size_t>(H), static_cast<size_t>(W)};
-            if (!cached_alpha_chw.is_valid() || cached_alpha_chw.shape() != alpha_shape) {
+            if (!cached_alpha_chw.is_valid() || cached_alpha_chw.shape() != alpha_shape ||
+                cached_alpha_chw.stream() != fwd_stream) {
                 cached_alpha_chw = core::Tensor::empty(alpha_shape, core::Device::CUDA, core::DataType::Float32);
+                if (cached_alpha_chw.stream() != fwd_stream)
+                    cached_alpha_chw.set_stream(fwd_stream);
             }
-            cached_alpha_chw.set_stream(fwd_stream);
             cudaMemcpyAsync(
                 cached_alpha_chw.ptr<float>(),
                 render_alphas_ptr_out,
@@ -416,10 +447,12 @@ namespace lfs::training {
                 }
 
                 const core::TensorShape depth_shape = {1UL, static_cast<size_t>(H), static_cast<size_t>(W)};
-                if (!cached_depth_chw.is_valid() || cached_depth_chw.shape() != depth_shape) {
+                if (!cached_depth_chw.is_valid() || cached_depth_chw.shape() != depth_shape ||
+                    cached_depth_chw.stream() != fwd_stream) {
                     cached_depth_chw = core::Tensor::empty(depth_shape, core::Device::CUDA, core::DataType::Float32);
+                    if (cached_depth_chw.stream() != fwd_stream)
+                        cached_depth_chw.set_stream(fwd_stream);
                 }
-                cached_depth_chw.set_stream(fwd_stream);
                 cudaMemcpyAsync(
                     cached_depth_chw.ptr<float>(),
                     depth_hwc.ptr<float>(),
@@ -566,6 +599,15 @@ namespace lfs::training {
                                     v_opacities_size + v_sh_coeffs_size;
 
             char* bwd_blob = arena_allocator(total_bwd_size);
+            if (bwd_blob == nullptr) {
+                throw lfs::Exception(lfs::make_error(lfs::ErrorInit{
+                    .code = lfs::ErrorCode::ResourceExhausted,
+                    .domain = lfs::ErrorDomain::CUDA,
+                    .user_message = "Ran out of GPU memory during training backward.",
+                    .detail = std::format("gsplat backward arena allocation failed ({} bytes)", total_bwd_size),
+                    .detection = LFS_SOURCE_SITE_CURRENT(),
+                }));
+            }
 
             // Carve out backward buffers
             char* bwd_ptr = bwd_blob;
@@ -830,6 +872,17 @@ namespace lfs::training {
             arena.end_frame(ctx.frame_id, stream);
             throw;
         }
+    }
+
+    bool release_gsplat_rasterizer_thread_local_caches() noexcept {
+        gsplat_thread_caches.K = {};
+        gsplat_thread_caches.image_chw = {};
+        gsplat_thread_caches.alpha_chw = {};
+        gsplat_thread_caches.depth_chw = {};
+        return !gsplat_thread_caches.K.is_valid() &&
+               !gsplat_thread_caches.image_chw.is_valid() &&
+               !gsplat_thread_caches.alpha_chw.is_valid() &&
+               !gsplat_thread_caches.depth_chw.is_valid();
     }
 
 } // namespace lfs::training

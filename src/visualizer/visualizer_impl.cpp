@@ -4,14 +4,23 @@
 
 #include "visualizer_impl.hpp"
 #include "core/animatable_property.hpp"
+#include "core/cuda_error.hpp"
 #include "core/data_loading_service.hpp"
-#include "core/event_bus.hpp"
+#include "core/error.hpp"
+#include "core/error_bus.hpp"
+#include "core/error_reporter.hpp"
+#include "core/event_bridge/event_bridge.hpp"
+#include "core/event_bridge/localization_manager.hpp"
+#include "core/guarded_task.hpp"
 #include "core/logger.hpp"
+#include "core/memory_pressure.hpp"
 #include "core/path_utils.hpp"
 #include "core/services.hpp"
+#include "gui/error_event_bridge.hpp"
 #include "gui/panel_registry.hpp"
 #include "gui/panels/tools_panel.hpp"
 #include "gui/panels/windows_console_utils.hpp"
+#include "gui/string_keys.hpp"
 #include "ipc/render_settings_convert.hpp"
 #include "operation/undo_entry.hpp"
 #include "operation/undo_history.hpp"
@@ -31,13 +40,17 @@
 #include "visualizer/app_store.hpp"
 #include "window/vulkan_context.hpp"
 #include <SDL3/SDL_events.h>
+#include <SDL3/SDL_messagebox.h>
 #include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
+#include <utility>
 #ifdef WIN32
 #include <windows.h>
 #endif
@@ -46,7 +59,38 @@ namespace lfs::vis {
 
     using namespace lfs::core::events;
 
+    namespace ErrModalKeys = lichtfeld::Strings::ErrorModal;
+
     namespace {
+
+        // Builds one frame-loop ErrorNotification carrying the kRenderFrame context
+        // frame, matching the bridge's make_error precedent (error_event_bridge.cpp).
+        lfs::ErrorNotification makeFrameNotification(const lfs::ErrorCode code,
+                                                     const lfs::ErrorDomain domain,
+                                                     const lfs::Severity severity,
+                                                     const lfs::ErrorSurface surface,
+                                                     std::string user_message, std::string detail,
+                                                     std::vector<lfs::ErrorAction> actions,
+                                                     const lfs::core::SourceSite site) {
+            lfs::Error base = lfs::make_error(lfs::ErrorInit{
+                .code = code,
+                .domain = domain,
+                .severity = severity,
+                .retryability = lfs::Retryability::NotRetryable,
+                .operation_id = lfs::OperationId{},
+                .user_message = std::move(user_message),
+                .detail = std::move(detail),
+                .detection = site,
+                .fields = lfs::SmallFields{},
+                .native = std::nullopt,
+            });
+            return lfs::ErrorNotification{
+                .error = std::move(base).with_context(gui::error_op::kRenderFrame, site),
+                .surface = surface,
+                .actions = std::move(actions),
+                .operation_id = lfs::OperationId::generate(),
+            };
+        }
 
         void wakeEventLoopViaServices() {
             if (auto* const window_manager = services().windowOrNull()) {
@@ -55,6 +99,7 @@ namespace lfs::vis {
         }
 
         constexpr double kResizeSettleMinWaitSeconds = 0.001;
+        constexpr double kTooltipRevealMinWaitSeconds = 0.001;
 #if defined(__linux__)
         constexpr auto kWindowResizePaintDemandWindow = std::chrono::milliseconds(160);
 #endif
@@ -81,6 +126,67 @@ namespace lfs::vis {
                 }
             }
             return transforms;
+        }
+
+        void cancelRemainingWork(std::vector<Visualizer::WorkItem>& work,
+                                 const size_t first,
+                                 const std::string_view queue_name,
+                                 const std::thread::id owner_thread) noexcept {
+            for (size_t i = first; i < work.size(); ++i) {
+                if (!work[i].cancel)
+                    continue;
+                lfs::core::run_guarded<void>(
+                    lfs::core::TaskContext{
+                        .name = std::format("{}.cancel", queue_name),
+                        .domain = lfs::ErrorDomain::Core,
+                        .operation_id = lfs::OperationId::generate(),
+                        .site = LFS_SOURCE_SITE_CURRENT(),
+                        .expected_thread = owner_thread,
+                    },
+                    [&work, i]() -> lfs::Result<void> {
+                        work[i].cancel();
+                        return {};
+                    },
+                    [](lfs::Result<void>&& result) {
+                        if (!result) {
+                            lfs::core::ErrorReporter::get().report(result.error(), lfs::core::ReportChannel::OwnerLog);
+                        }
+                    });
+            }
+        }
+
+        // Posted work is an external callback boundary. A failing item may report
+        // through its own promise, but must never unwind the GUI frame loop.
+        void runPostedWork(std::vector<Visualizer::WorkItem>& work,
+                           const std::string_view queue_name,
+                           const std::thread::id owner_thread) noexcept {
+            for (size_t i = 0; i < work.size(); ++i) {
+                if (!work[i].run)
+                    continue;
+                bool item_failed = false;
+                lfs::core::run_guarded<void>(
+                    lfs::core::TaskContext{
+                        .name = std::string(queue_name),
+                        .domain = lfs::ErrorDomain::Core,
+                        .operation_id = lfs::OperationId::generate(),
+                        .site = LFS_SOURCE_SITE_CURRENT(),
+                        .expected_thread = owner_thread,
+                    },
+                    [&work, i]() -> lfs::Result<void> {
+                        work[i].run();
+                        return {};
+                    },
+                    [&item_failed](lfs::Result<void>&& result) {
+                        if (!result) {
+                            item_failed = true;
+                            lfs::core::ErrorReporter::get().report(result.error(), lfs::core::ReportChannel::OwnerLog);
+                        }
+                    });
+                if (item_failed) {
+                    cancelRemainingWork(work, i + 1, queue_name, owner_thread);
+                    return;
+                }
+            }
         }
 
     } // namespace
@@ -156,7 +262,7 @@ namespace lfs::vis {
 
     VisualizerImpl::~VisualizerImpl() {
         // Clear event handlers before destroying components to prevent use-after-free
-        lfs::core::event::bus().clear_all();
+        lfs::event::EventBridge::instance().clear_all();
         services().clear();
 
         // Clear operator system
@@ -227,12 +333,6 @@ namespace lfs::vis {
         callback_cleanup_.add([] { python::set_operator_callbacks(nullptr); });
         python::set_gui_manager(gui_manager_.get());
         callback_cleanup_.add([] { python::set_gui_manager(nullptr); });
-        python::set_startup_plugin_load_state_callback([](bool active, float progress, const char* stage) {
-            if (auto* const gui = python::get_gui_manager()) {
-                gui->setStartupPluginLoadState(active, progress, stage ? stage : "");
-            }
-        });
-        callback_cleanup_.add([] { python::set_startup_plugin_load_state_callback(nullptr); });
         python::set_main_loop_wake_callback(&wakeEventLoopViaServices);
         callback_cleanup_.add([] { python::set_main_loop_wake_callback(nullptr); });
         core::reactive::Store::set_wake_callback(&wakeEventLoopViaServices);
@@ -543,6 +643,19 @@ namespace lfs::vis {
                     gm->gizmo().setTransformSpace(static_cast<TransformSpace>(space));
             });
         callback_cleanup_.add([] { python::set_transform_space_callbacks(nullptr, nullptr); });
+        python::set_multi_transform_mode_callbacks(
+            []() -> int {
+                const auto* gm = python::get_gui_manager();
+                return gm ? static_cast<int>(gm->gizmo().getMultiTransformMode()) : 0;
+            },
+            [](int mode) {
+                if (auto* gm = python::get_gui_manager()) {
+                    const auto normalized_mode =
+                        gui::normalizeMultiTransformMode(static_cast<gui::MultiTransformMode>(mode));
+                    gm->gizmo().setMultiTransformMode(normalized_mode);
+                }
+            });
+        callback_cleanup_.add([] { python::set_multi_transform_mode_callbacks(nullptr, nullptr); });
         python::set_thumbnail_callbacks(
             [](const char* video_id) {
                 if (auto* gm = python::get_gui_manager())
@@ -753,6 +866,196 @@ namespace lfs::vis {
         main_loop_->setRenderCallback([this]() { render(); });
         main_loop_->setShutdownCallback([this]() { shutdown(); });
         main_loop_->setShouldCloseCallback([this]() { return allowclose(); });
+        main_loop_->setInterruptCallback([this]() { requestApplicationClose(); });
+        main_loop_->setFrameErrorCallback([this](std::exception_ptr eptr) {
+            handleFrameException(std::move(eptr));
+        });
+        main_loop_->setFrameCompletedCallback([this]() { onFrameCompleted(); });
+    }
+
+    void VisualizerImpl::handleFrameException(std::exception_ptr eptr) noexcept {
+        try {
+            std::rethrow_exception(eptr);
+        } catch (const lfs::core::MemoryAllocationError& e) {
+            if (lfs::core::cuda_is_unavailable()) {
+                return;
+            }
+            const auto fx = frame_state_.on_fault(FrameFault::OomPressure);
+            if (fx.run_reclaim_episode) {
+                // GPU memory shortage reached the frame loop. Reclaim render-safe
+                // caches once and keep running; the next frame is the retry.
+                auto& coordinator = lfs::core::MemoryPressureCoordinator::instance();
+                const size_t freed = coordinator.run_episode(
+                    e.failure(), lfs::core::PressureContext::RenderThread);
+                LOG_ERROR("GPU memory pressure during frame (attempt {}): {}. Freed {:.1f} MiB; "
+                          "reducing preview quality and retrying.",
+                          frame_state_.consecutive_oom_faults(), e.what(),
+                          static_cast<double>(freed) / (1024.0 * 1024.0));
+            }
+            applyFrameStateEffects(fx);
+        } catch (const lfs::Exception& e) {
+            const auto fault = e.error().code() == lfs::ErrorCode::DeviceLost
+                                   ? FrameFault::DeviceLost
+                                   : FrameFault::RendererInternal;
+            const auto fx = frame_state_.on_fault(fault);
+            if (fx.publish_internal_modal) {
+                publishRendererInternalModal(e.error());
+            } else if (fx.publish_renderer_dead_modal) {
+                applyFrameStateEffects(fx);
+            } else {
+                logRateLimitedFrameError(e);
+            }
+        } catch (const std::exception& e) {
+            // LFS-CENSUS-OK(empty-catch): frame-fault boundary — routes the fault
+            // through the FrameStateMachine and surfaces it via ErrorBus/log, not a
+            // swallow (the untyped sibling of the lfs::Exception clause above).
+            const auto fx = frame_state_.on_fault(FrameFault::RendererInternal);
+            if (fx.publish_internal_modal) {
+                publishRendererInternalModal(lfs::ErrorCode::Internal, std::string(e.what()));
+            } else {
+                logRateLimitedFrameError(e);
+            }
+        } catch (...) {
+            const auto fx = frame_state_.on_fault(FrameFault::RendererInternal);
+            if (fx.publish_internal_modal) {
+                publishRendererInternalModal(lfs::ErrorCode::Internal, "Unknown frame error");
+            } else {
+                LOG_ERROR("Frame failed with an unknown error");
+            }
+        }
+    }
+
+    void VisualizerImpl::logRateLimitedFrameError(const std::exception& e) noexcept {
+        const auto now = std::chrono::steady_clock::now();
+        if (last_frame_error_log_.time_since_epoch().count() == 0 ||
+            now - last_frame_error_log_ >= std::chrono::seconds(5)) {
+            LOG_ERROR("Frame failed: {}{}", e.what(),
+                      suppressed_frame_errors_ > 0
+                          ? std::format(" ({} similar errors suppressed)", suppressed_frame_errors_)
+                          : std::string{});
+            last_frame_error_log_ = now;
+            suppressed_frame_errors_ = 0;
+        } else {
+            ++suppressed_frame_errors_;
+        }
+    }
+
+    void VisualizerImpl::applyFrameStateEffects(const FrameStateMachine::Effects& fx) noexcept {
+        if (fx.publish_pressure_toast) {
+            lfs::ErrorBus::instance().publish(makeFrameNotification(
+                lfs::ErrorCode::ResourceExhausted, lfs::ErrorDomain::Rendering,
+                lfs::Severity::Warning, lfs::ErrorSurface::Toast,
+                LOC(ErrModalKeys::GPU_PRESSURE_RETRYING), std::string{}, {},
+                LFS_SOURCE_SITE_CURRENT()));
+        }
+        if (fx.publish_oom_modal) {
+            LOG_ERROR("Viewport rendering paused: GPU out of memory after {} consecutive "
+                      "reclaim attempts failed to recover",
+                      frame_state_.consecutive_oom_faults());
+            std::vector<lfs::ErrorAction> actions;
+            actions.push_back(lfs::ErrorAction{
+                .kind = lfs::ErrorActionKind::Retry,
+                .label = {},
+                .on_invoke = [this](lfs::OperationId) {
+                    frame_state_.on_retry_action();
+                    if (rendering_manager_)
+                        rendering_manager_->markDirty(DirtyFlag::ALL);
+                    wakeMainLoop();
+                },
+            });
+            actions.push_back(gui::openLogAction());
+            lfs::ErrorBus::instance().publish(makeFrameNotification(
+                lfs::ErrorCode::ResourceExhausted, lfs::ErrorDomain::Rendering, lfs::Severity::Error,
+                lfs::ErrorSurface::Modal, LOC(ErrModalKeys::OOM_RENDER_PAUSED), std::string{},
+                std::move(actions), LFS_SOURCE_SITE_CURRENT()));
+        }
+        if (fx.publish_renderer_dead_modal) {
+            publishRendererDeadModal(fx.dead_cause);
+        }
+    }
+
+    std::vector<lfs::ErrorAction> VisualizerImpl::rendererInternalActions() {
+        std::vector<lfs::ErrorAction> actions;
+        actions.push_back(lfs::ErrorAction{
+            .kind = lfs::ErrorActionKind::Retry,
+            .label = {},
+            .on_invoke = [this](lfs::OperationId) {
+                frame_state_.on_retry_action();
+                if (rendering_manager_)
+                    rendering_manager_->markDirty(DirtyFlag::ALL);
+                wakeMainLoop();
+            },
+        });
+        actions.push_back(lfs::ErrorAction{
+            .kind = lfs::ErrorActionKind::StopRenderer,
+            .label = {},
+            .on_invoke = [this](lfs::OperationId) { frame_state_.on_stop_renderer_action(); },
+        });
+        actions.push_back(gui::openLogAction());
+        return actions;
+    }
+
+    // §1.5.2: the lfs::Exception path carries THIS structured error (detection
+    // site, native VK info, fields, developer chain) into the notification, not a
+    // synthetic one — only the context frame is appended.
+    void VisualizerImpl::publishRendererInternalModal(const lfs::Error& error) noexcept {
+        LOG_ERROR("Viewport renderer stopped after repeated internal frame errors: {}",
+                  lfs::format_for_developer(error));
+        lfs::Error contextual = error;
+        lfs::ErrorBus::instance().publish(lfs::ErrorNotification{
+            .error = std::move(contextual).with_context(gui::error_op::kRenderFrame, LFS_SOURCE_SITE_CURRENT()),
+            .surface = lfs::ErrorSurface::Modal,
+            .actions = rendererInternalActions(),
+            .operation_id = lfs::OperationId::generate(),
+        });
+    }
+
+    void VisualizerImpl::publishRendererInternalModal(const lfs::ErrorCode code,
+                                                      std::string detail) noexcept {
+        LOG_ERROR("Viewport renderer stopped after repeated internal frame errors: {}", detail);
+        lfs::ErrorBus::instance().publish(makeFrameNotification(
+            code, lfs::ErrorDomain::Rendering, lfs::Severity::Error, lfs::ErrorSurface::Modal,
+            LOC(ErrModalKeys::RENDERER_FAILED_BODY), std::move(detail), rendererInternalActions(),
+            LFS_SOURCE_SITE_CURRENT()));
+    }
+
+    void VisualizerImpl::publishRendererDeadModal(const RendererTerminalState cause) noexcept {
+        auto* const ctx = window_manager_ ? window_manager_->getVulkanContext() : nullptr;
+        std::string detail = ctx ? ctx->lastError() : std::string{};
+        const bool device_lost = cause == RendererTerminalState::DeviceLost;
+        const lfs::ErrorCode code =
+            device_lost ? lfs::ErrorCode::DeviceLost : lfs::ErrorCode::DeadlineExceeded;
+        const char* const body_key = device_lost ? ErrModalKeys::RENDERER_DEVICE_LOST_BODY
+                                                 : ErrModalKeys::RENDERER_STALLED_BODY;
+
+        // AMB-P3-1: emit the correlated durable record REGARDLESS — a dead context
+        // cannot present the bus modal and the OS dialog can fail on Wayland.
+        LOG_ERROR("Renderer terminal ({}): {}", device_lost ? "device lost" : "stalled",
+                  detail.empty() ? std::string_view{"no detail"} : std::string_view{detail});
+
+        std::vector<lfs::ErrorAction> actions;
+        actions.push_back(gui::openLogAction());
+        actions.push_back(lfs::ErrorAction{.kind = lfs::ErrorActionKind::Dismiss});
+        lfs::ErrorBus::instance().publish(makeFrameNotification(
+            code, lfs::ErrorDomain::Vulkan, lfs::Severity::Fatal, lfs::ErrorSurface::Modal,
+            LOC(body_key), std::move(detail), std::move(actions), LFS_SOURCE_SITE_CURRENT()));
+
+        if (device_lost) {
+            SDL_Window* const window = window_manager_ ? window_manager_->getWindow() : nullptr;
+            if (!SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
+                                          LOC(ErrModalKeys::RENDERER_DEVICE_LOST),
+                                          LOC(ErrModalKeys::RENDERER_DEVICE_LOST_BODY), window)) {
+                LOG_ERROR("Failed to present device-lost dialog: {}", SDL_GetError());
+            }
+        }
+    }
+
+    void VisualizerImpl::onFrameCompleted() noexcept {
+        frame_state_.on_frame_success();
+        lfs::core::MemoryPressureCoordinator::instance().maybe_recover();
+        if (auto* const ctx = window_manager_ ? window_manager_->getVulkanContext() : nullptr) {
+            applyFrameStateEffects(frame_state_.on_renderer_terminal(ctx->rendererTerminalState()));
+        }
     }
 
     void VisualizerImpl::beginShutdown([[maybe_unused]] const std::string_view reason) {
@@ -767,6 +1070,8 @@ namespace lfs::vis {
             pending_work.swap(work_queue_);
             pending_render_work.swap(render_work_queue_);
         }
+
+        python::request_plugin_preload_stop();
 
         for (auto& work : pending_work) {
             if (work.cancel)
@@ -797,9 +1102,14 @@ namespace lfs::vis {
                 LOG_WARN("Cannot reset: no dataset");
                 return;
             }
-            if (trainer_manager_ && trainer_manager_->isTrainingActive()) {
-                pending_reset_ = true;
-                trainer_manager_->stopTraining();
+            if (trainer_manager_ &&
+                (trainer_manager_->isTrainingActive() || trainer_manager_->isCompletionPending())) {
+                if (pending_training_action_ == PendingTrainingAction::None) {
+                    pending_training_action_ = PendingTrainingAction::Reset;
+                }
+                if (trainer_manager_->canStop()) {
+                    trainer_manager_->stopTraining();
+                }
                 return;
             }
             performReset();
@@ -1030,14 +1340,14 @@ namespace lfs::vis {
                       viewport_.windowSize.x, viewport_.windowSize.y);
         }
 
-        // Initialize GUI (sets up ImGui, builds font atlas)
+        // Initialize GUI systems.
         if (!gui_initialized_) {
             LOG_TIMER("startup.gui_manager.init");
             gui_manager_->init();
             gui_initialized_ = true;
         }
 
-        // InputController requires ImGui to be initialized
+        // InputController requires the GUI focus state to be initialized.
         if (!input_controller_) {
             input_controller_ = std::make_unique<InputController>(
                 window_manager_->getWindow(), viewport_);
@@ -1059,7 +1369,7 @@ namespace lfs::vis {
 
         {
             LOG_TIMER("startup.python.ensure_initialized");
-            python::ensure_initialized();
+            (void)python::ensure_initialized();
         }
         {
             LOG_TIMER("startup.python.builtin_ui_registered");
@@ -1075,6 +1385,8 @@ namespace lfs::vis {
     }
 
     void VisualizerImpl::update() {
+        const auto update_started_at = std::chrono::steady_clock::now();
+        const bool preload_running_at_start = python::is_plugin_preload_running();
         update_work_processed_ = false;
         window_manager_->updateWindowSize();
 
@@ -1083,8 +1395,18 @@ namespace lfs::vis {
             LOG_TIMER("startup.python.preload_plugins_async");
             python::preload_user_plugins_async();
         }
-        if (startup_plugin_preload_started_) {
-            python::process_plugin_preload_step();
+
+        const auto plugin_load_status = python::get_startup_plugin_load_status();
+        if (gui_manager_ &&
+            plugin_load_status.revision != startup_plugin_load_status_revision_) {
+            const bool plugin_load_started = plugin_load_status.state != "not_started";
+            gui_manager_->setStartupPluginLoadState(
+                plugin_load_started,
+                plugin_load_status.active,
+                plugin_load_status.progress,
+                plugin_load_status.detail);
+            assert(!plugin_load_started || !gui_manager_->isStartupBlockingInput());
+            startup_plugin_load_status_revision_ = plugin_load_status.revision;
         }
 
         // Process MCP work queue
@@ -1095,18 +1417,7 @@ namespace lfs::vis {
                 work.swap(work_queue_);
             }
             update_work_processed_ = !work.empty();
-            for (size_t i = 0; i < work.size(); ++i) {
-                try {
-                    if (work[i].run)
-                        work[i].run();
-                } catch (...) {
-                    for (size_t j = i + 1; j < work.size(); ++j) {
-                        if (work[j].cancel)
-                            work[j].cancel();
-                    }
-                    throw;
-                }
-            }
+            runPostedWork(work, "viewer", viewer_thread_id_);
         }
 
         if (gui_manager_) {
@@ -1133,39 +1444,13 @@ namespace lfs::vis {
             selection_tool_->update(*tool_context_);
         }
 
-        if (pending_new_project_ && trainer_manager_ &&
-            trainer_manager_->canPerform(TrainingAction::ClearScene)) {
-            pending_new_project_ = false;
-            trainer_manager_->waitForCompletion();
-            performNewProject();
-        }
-
-        if (pending_reset_ && trainer_manager_ && !trainer_manager_->isTrainingActive()) {
-            pending_reset_ = false;
-            trainer_manager_->waitForCompletion();
-            performReset();
-        }
-
         if (!gui_frame_rendered_) {
             // Wait for at least one GUI frame to render before loading data
         } else if (!pending_view_paths_.empty()) {
             auto paths = std::exchange(pending_view_paths_, {});
             LOG_INFO("Loading {} splat file(s)", paths.size());
-            if (const auto result = data_loader_->loadPLY(paths[0]); !result) {
-                LOG_ERROR("Failed to load {}: {}", lfs::core::path_to_utf8(paths[0]), result.error());
-                state::SplatFileLoadFailed{.path = paths[0], .error = result.error()}.emit();
-            } else {
-                for (size_t i = 1; i < paths.size(); ++i) {
-                    try {
-                        data_loader_->addSplatFileToScene(paths[i]);
-                    } catch (const std::exception& e) {
-                        LOG_ERROR("Failed to add {}: {}", lfs::core::path_to_utf8(paths[i]), e.what());
-                        state::SplatFileLoadFailed{.path = paths[i], .error = e.what()}.emit();
-                    }
-                }
-                if (paths.size() > 1) {
-                    scene_manager_->consolidateNodeModels();
-                }
+            if (const auto result = data_loader_->loadSplatFiles(paths); !result) {
+                LOG_ERROR("Failed to load startup splat batch: {}", result.error());
             }
         } else if (!pending_dataset_path_.empty()) {
             auto path = std::exchange(pending_dataset_path_, {});
@@ -1187,6 +1472,27 @@ namespace lfs::vis {
             LOG_INFO("Auto-starting training (--train flag)");
             cmd::StartTraining{}.emit();
         }
+
+        const bool preload_running_at_end = python::is_plugin_preload_running();
+        // The transition update can also consume pending startup assets (for example,
+        // a --view PLY) after it starts the worker. Sample only steady-state preload
+        // updates so unrelated startup I/O is not attributed to plugin loading.
+        if (preload_running_at_start) {
+            plugin_preload_timing_active_ = true;
+            plugin_preload_max_update_stall_ = std::max(
+                plugin_preload_max_update_stall_,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - update_started_at));
+        }
+        if (plugin_preload_timing_active_ && !preload_running_at_end) {
+            const double max_stall_ms =
+                std::chrono::duration<double, std::milli>(
+                    plugin_preload_max_update_stall_)
+                    .count();
+            LOG_DEBUG("Plugin preload frame budget: max VisualizerImpl::update stall {:.3f} ms",
+                      max_stall_ms);
+            plugin_preload_timing_active_ = false;
+        }
     }
 
     void VisualizerImpl::processRenderWorkQueue() {
@@ -1199,19 +1505,7 @@ namespace lfs::vis {
             return;
 
         processing_render_work_ = true;
-        for (size_t i = 0; i < render_work.size(); ++i) {
-            try {
-                if (render_work[i].run)
-                    render_work[i].run();
-            } catch (...) {
-                for (size_t j = i + 1; j < render_work.size(); ++j) {
-                    if (render_work[j].cancel)
-                        render_work[j].cancel();
-                }
-                processing_render_work_ = false;
-                throw;
-            }
-        }
+        runPostedWork(render_work, "render", viewer_thread_id_);
         processing_render_work_ = false;
     }
 
@@ -1310,6 +1604,14 @@ namespace lfs::vis {
                                     std::max(kResizeSettleMinWaitSeconds, settle_wait));
         }
 
+        // Wake exactly when a pending tooltip is due so the reveal costs a single
+        // frame instead of rendering continuously through the hover delay.
+        if (gui_manager_) {
+            if (const auto tooltip_wait = gui_manager_->secondsUntilTooltipReveal())
+                wait_seconds = std::min(wait_seconds,
+                                        std::max(kTooltipRevealMinWaitSeconds, *tooltip_wait));
+        }
+
         if (is_training) {
             window_manager_->waitEvents(wait_seconds); // Training tick is capped at ~10 Hz when no resize settle is due.
         } else {
@@ -1360,8 +1662,9 @@ namespace lfs::vis {
         }
 
         if (input_controller_) {
-            const bool startup_overlay_visible = gui_manager_ && gui_manager_->isStartupVisible();
-            if (!viewport_export_locked && !startup_overlay_visible) {
+            const bool startup_overlay_blocking =
+                gui_manager_ && gui_manager_->isStartupBlockingInput();
+            if (!viewport_export_locked && !startup_overlay_blocking) {
                 input_controller_->update(delta_time);
             }
         }
@@ -1436,7 +1739,8 @@ namespace lfs::vis {
             return;
         }
 
-        if (!viewport_export_locked && !interactive_transition_settling) {
+        if (!viewport_export_locked && !interactive_transition_settling &&
+            !frame_state_.scene_render_suspended()) {
             if (!python::is_plugin_preload_running() && frame_demand.python_redraw && gui_manager_)
                 gui_manager_->syncVisiblePanelsBeforeSceneRender();
 
@@ -1541,12 +1845,31 @@ namespace lfs::vis {
             return false;
         }
 
+        const auto defer_close_for_training = [this] {
+            if (!trainer_manager_ ||
+                (!trainer_manager_->isTrainingActive() && !trainer_manager_->isCompletionPending())) {
+                return false;
+            }
+            pending_training_action_ = PendingTrainingAction::Close;
+            if (trainer_manager_->canStop()) {
+                trainer_manager_->stopTraining();
+            }
+            window_manager_->cancelClose();
+            return true;
+        };
+
         if (!gui_manager_) {
+            if (defer_close_for_training()) {
+                return false;
+            }
             beginShutdown();
             return true;
         }
 
         if (gui_manager_->isForceExit()) {
+            if (defer_close_for_training()) {
+                return false;
+            }
             beginShutdown();
 #ifdef WIN32
             const HWND hwnd = GetConsoleWindow();
@@ -1569,14 +1892,15 @@ namespace lfs::vis {
     }
 
     void VisualizerImpl::shutdown() {
+        if (trainer_manager_ &&
+            (trainer_manager_->isTrainingActive() || trainer_manager_->isCompletionPending())) {
+            LOG_CRITICAL("Shutdown reached before the training worker was reaped");
+            return;
+        }
+
         beginShutdown();
 
-        // Stop training before GPU resources are freed
         if (trainer_manager_) {
-            if (trainer_manager_->isTrainingActive()) {
-                trainer_manager_->stopTraining();
-                trainer_manager_->waitForCompletion();
-            }
             trainer_manager_.reset();
         }
 
@@ -1700,6 +2024,9 @@ namespace lfs::vis {
     }
 
     void VisualizerImpl::handleNewProject() {
+        if (pending_training_action_ == PendingTrainingAction::Close) {
+            return;
+        }
         if (gui_manager_) {
             gui_manager_->asyncTasks().cancelImport();
         }
@@ -1707,17 +2034,21 @@ namespace lfs::vis {
         pending_view_paths_.clear();
         pending_dataset_path_.clear();
         pending_auto_train_ = false;
-        pending_reset_ = false;
+        if (pending_training_action_ == PendingTrainingAction::Reset) {
+            pending_training_action_ = PendingTrainingAction::None;
+        }
 
-        if (trainer_manager_ && !trainer_manager_->canPerform(TrainingAction::ClearScene)) {
-            pending_new_project_ = true;
+        if (trainer_manager_ &&
+            (!trainer_manager_->canPerform(TrainingAction::ClearScene) ||
+             trainer_manager_->isCompletionPending())) {
+            pending_training_action_ = PendingTrainingAction::NewProject;
             if (trainer_manager_->canStop()) {
                 trainer_manager_->stopTraining();
             }
             return;
         }
 
-        pending_new_project_ = false;
+        pending_training_action_ = PendingTrainingAction::None;
         performNewProject();
     }
 
@@ -1740,8 +2071,8 @@ namespace lfs::vis {
         pending_view_paths_.clear();
         pending_dataset_path_.clear();
         pending_auto_train_ = false;
-        pending_new_project_ = false;
-        pending_reset_ = false;
+        pending_training_action_ = PendingTrainingAction::None;
+        pending_training_action_posted_ = false;
     }
 
     void VisualizerImpl::wakeMainLoop() const {
@@ -1911,6 +2242,45 @@ namespace lfs::vis {
         pending_training_completion_refresh_frames_ = 3;
         if (rendering_manager_) {
             rendering_manager_->markDirty(DirtyFlag::ALL);
+        }
+        wakeMainLoop();
+        schedulePendingTrainingAction();
+    }
+
+    void VisualizerImpl::schedulePendingTrainingAction() {
+        if (pending_training_action_ == PendingTrainingAction::None || pending_training_action_posted_) {
+            return;
+        }
+        pending_training_action_posted_ = postWork({
+            .run = [this] { performPendingTrainingAction(); },
+            .cancel = [this] { pending_training_action_posted_ = false; },
+        });
+    }
+
+    void VisualizerImpl::performPendingTrainingAction() {
+        pending_training_action_posted_ = false;
+        const auto action = std::exchange(pending_training_action_, PendingTrainingAction::None);
+        switch (action) {
+        case PendingTrainingAction::Reset:
+            performReset();
+            break;
+        case PendingTrainingAction::NewProject:
+            performNewProject();
+            break;
+        case PendingTrainingAction::Close:
+            requestApplicationClose();
+            break;
+        case PendingTrainingAction::None:
+            break;
+        }
+    }
+
+    void VisualizerImpl::requestApplicationClose() {
+        if (gui_manager_) {
+            gui_manager_->setForceExit(true);
+        }
+        if (window_manager_) {
+            window_manager_->requestClose();
         }
         wakeMainLoop();
     }

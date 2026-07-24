@@ -28,6 +28,25 @@ from . import (
 )
 
 
+class Error(RuntimeError):
+    """
+    Base class for every typed LichtFeld error crossing the Python boundary. Derives RuntimeError for backward compatibility. Carries .code, .domain, .user_message, .operation_id, .retryable, .details, and .context.
+    """
+
+class InvalidArgumentError(Error, ValueError):
+    """Raised for InvalidArgument / BoundsViolation errors."""
+
+class NotFoundError(Error, FileNotFoundError):
+    """Raised for NotFound errors; also a FileNotFoundError."""
+
+class CancelledError(Error):
+    """Raised when an operation was cancelled."""
+
+class ResourceError(Error):
+    """
+    Raised for ResourceExhausted errors (memory/disk/queue). Carries .requested_bytes / .available_bytes (int or None).
+    """
+
 class RenderMode(enum.Enum):
     SPLATS = 0
 
@@ -244,7 +263,7 @@ def clear_scene() -> None:
 def switch_to_edit_mode() -> None:
     """Switch from training to edit mode"""
 
-def load_file(path: str, is_dataset: bool = False, output_path: str = '', init_path: str = '', centralize_dataset: str = 'off', max_width: int | None = None, apply_auto_crop: bool = False) -> None:
+def load_file(path: str, is_dataset: bool = False, output_path: str = '', init_path: str = '', centralize_dataset: str = 'off', max_width: int | None = None, apply_auto_crop: bool = False, min_track_length: int | None = None) -> None:
     """Load a file (PLY, checkpoint) or dataset into the scene."""
 
 def load_config_file(path: str) -> None:
@@ -433,7 +452,9 @@ def focus_selection() -> bool:
     """
 
 def get_camera_navigation_mode() -> str:
-    """Get the active camera navigation mode ('orbit', 'trackball', or 'fpv')"""
+    """
+    Get the active camera navigation mode ('orbit', 'trackball', 'fpv', or 'drone')
+    """
 
 def set_camera_navigation_mode(mode: str) -> None:
     """Set the active camera navigation mode"""
@@ -449,6 +470,9 @@ def toggle_fullscreen() -> None:
 
 def is_fullscreen() -> bool:
     """Check if the window is in fullscreen mode"""
+
+def get_vulkan_capabilities() -> dict:
+    """Return Vulkan device capabilities used to gate rendering controls"""
 
 def toggle_ui() -> None:
     """Toggle UI overlay visibility"""
@@ -2070,10 +2094,49 @@ class OptimizationParams:
 
     @property
     def depth_loss_mode(self) -> str:
-        """Depth supervision mode: 'pearson' or 'adaptive-warped-l1'"""
+        """
+        Depth prior convention: 'ssi' (auto-detect), 'ssi-disparity', or 'ssi-depth'
+        """
 
     @depth_loss_mode.setter
     def depth_loss_mode(self, arg: str, /) -> None: ...
+
+    @property
+    def use_normal_loss(self) -> bool:
+        """Load normal maps and use normal-map supervision during training"""
+
+    @use_normal_loss.setter
+    def use_normal_loss(self, arg: bool, /) -> None: ...
+
+    @property
+    def normal_loss_weight(self) -> float:
+        """Weight for prior normal supervision"""
+
+    @normal_loss_weight.setter
+    def normal_loss_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def normal_consistency_weight(self) -> float:
+        """Weight for depth-normal consistency supervision"""
+
+    @normal_consistency_weight.setter
+    def normal_consistency_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def normal_flatten_weight(self) -> float:
+        """Min-axis scale flattening weight while normal supervision is active"""
+
+    @normal_flatten_weight.setter
+    def normal_flatten_weight(self, arg: float, /) -> None: ...
+
+    @property
+    def normal_loss_space(self) -> str:
+        """
+        Normal prior coordinate space: 'auto', 'camera-opencv', 'camera-opengl', or 'world'
+        """
+
+    @normal_loss_space.setter
+    def normal_loss_space(self, arg: str, /) -> None: ...
 
     @property
     def undistort(self) -> bool:
@@ -2180,6 +2243,13 @@ class DatasetParams:
     def max_width(self, arg: int, /) -> None: ...
 
     @property
+    def min_track_length(self) -> int:
+        """Minimum COLMAP sparse point track length; 0 disables filtering"""
+
+    @min_track_length.setter
+    def min_track_length(self, arg: int, /) -> None: ...
+
+    @property
     def use_cpu_cache(self) -> bool:
         """Cache images in CPU memory"""
 
@@ -2192,6 +2262,13 @@ class DatasetParams:
 
     @use_fs_cache.setter
     def use_fs_cache(self, arg: bool, /) -> None: ...
+
+    @property
+    def use_16bit_color(self) -> bool:
+        """Train with 16-bit color images (HDR); caches losslessly as JPEG 2000"""
+
+    @use_16bit_color.setter
+    def use_16bit_color(self, arg: bool, /) -> None: ...
 
     @property
     def centralize_dataset(self) -> str:

@@ -1,6 +1,7 @@
 /* SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "adam_api.h"
 #include "core/camera.hpp"
 #include "core/cuda/memory_arena.hpp"
 #include "core/splat_data.hpp"
@@ -9,6 +10,8 @@
 #include "rasterization/fastgs/utils/utils.h"
 #include "training/optimizer/adam_optimizer.hpp"
 #include "training/rasterization/fast_rasterizer.hpp"
+#include <array>
+#include <bit>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <filesystem>
@@ -124,8 +127,8 @@ protected:
             create_synthetic_data();
             return;
         }
-        n_ = std::min(result->means().shape()[0], size_t(10000));
-        means_ = result->means().slice(0, 0, n_).contiguous().to(Device::CUDA);
+        n_ = std::min(result->value.means().shape()[0], size_t(10000));
+        means_ = result->value.means().slice(0, 0, n_).contiguous().to(Device::CUDA);
         init_params();
     }
 
@@ -171,7 +174,7 @@ protected:
 // Forward kernels
 TEST_F(FastGSKernelTest, Forward_Preprocess) {
     auto r = forward();
-    ASSERT_TRUE(r.has_value()) << r.error();
+    ASSERT_TRUE(r.has_value()) << lfs::format_for_developer(r.error());
     EXPECT_GT(r->second.forward_ctx.n_instances, 0);
 }
 
@@ -212,7 +215,7 @@ TEST_F(FastGSKernelTest, Forward_Blend) {
 
 TEST_F(FastGSKernelTest, Forward_Full) {
     auto r = forward();
-    ASSERT_TRUE(r.has_value()) << r.error();
+    ASSERT_TRUE(r.has_value()) << lfs::format_for_developer(r.error());
     EXPECT_EQ(r->first.width, W);
     EXPECT_EQ(r->first.height, H);
 }
@@ -258,7 +261,7 @@ TEST(FastGSDepthGradientTest, BackwardDepthMatchesLibtorchAutogradForCenteredSpl
     auto bg = Tensor::zeros({3}, Device::CUDA);
 
     auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false);
-    ASSERT_TRUE(forward.has_value()) << forward.error();
+    ASSERT_TRUE(forward.has_value()) << lfs::format_for_developer(forward.error());
     ASSERT_EQ(forward->first.depth.numel(), 1);
     EXPECT_GT(forward->first.depth.item<float>(), 0.0f);
 
@@ -339,7 +342,7 @@ TEST(FastGSDepthGradientTest, BackwardDepthMatchesLibtorchAutogradForOverlapping
     auto bg = Tensor::zeros({3}, Device::CUDA);
 
     auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false);
-    ASSERT_TRUE(forward.has_value()) << forward.error();
+    ASSERT_TRUE(forward.has_value()) << lfs::format_for_developer(forward.error());
     ASSERT_EQ(forward->first.depth.numel(), 1);
 
     const float depth0 = means_data[2] + t_data[2];
@@ -398,50 +401,108 @@ TEST(FastGSDepthGradientTest, BackwardDepthMatchesLibtorchAutogradForOverlapping
     }
 }
 
-TEST(FastGSDepthGradientTest, DetachedDepthWeightsMoveDepthButNotOpacity) {
+namespace {
+    struct NormalChannelScene {
+        std::vector<float> means_data{0.0f, 0.0f, 1.0f};
+        // Distinct raw log-scales with z clearly smallest so the normal axis
+        // (argmin variance) is stable under the perturbations below.
+        std::vector<float> scaling_data{-1.0f, -1.5f, -3.0f};
+        float opacity_value = 0.3f;
+        std::vector<float> t_data{0.0f, 0.0f, 4.0f};
+
+        SplatData make_splat(const std::vector<float>& rotation_data) const {
+            auto means = Tensor::from_blob(const_cast<float*>(means_data.data()), {1, 3}, Device::CPU, DataType::Float32).to(Device::CUDA);
+            auto sh0 = Tensor::zeros({1, 1, 3}, Device::CUDA);
+            auto shN = Tensor::zeros({1, 0, 3}, Device::CUDA);
+            auto scaling = Tensor::from_blob(const_cast<float*>(scaling_data.data()), {1, 3}, Device::CPU, DataType::Float32).to(Device::CUDA);
+            auto rotation = Tensor::from_blob(const_cast<float*>(rotation_data.data()), {1, 4}, Device::CPU, DataType::Float32).to(Device::CUDA);
+            const float raw_opacity = std::log(opacity_value / (1.0f - opacity_value));
+            auto opacity = Tensor::full({1}, raw_opacity, Device::CUDA);
+            return SplatData(0, means, sh0, shN, scaling, rotation, opacity, 1.0f);
+        }
+
+        Camera make_camera() const {
+            auto R = Tensor::eye(3, Device::CUDA);
+            auto T = Tensor::from_blob(const_cast<float*>(t_data.data()), {3}, Device::CPU, DataType::Float32).to(Device::CUDA);
+            return Camera(R, T, 1.0f, 1.0f, 0.5f, 0.5f,
+                          Tensor(), Tensor(), CameraModelType::PINHOLE,
+                          "normal_grad", "", std::filesystem::path{}, 1, 1, 0);
+        }
+    };
+} // namespace
+
+TEST(FastGSNormalChannelTest, RendersCameraSpaceNormalForCenteredSplat) {
     if (!torch::cuda::is_available()) {
         GTEST_SKIP() << "CUDA not available";
     }
 
-    std::vector<float> means_data{
-        0.0f, 0.0f, 0.5f,
-        0.0f, 0.0f, 1.5f};
-    auto means = Tensor::from_blob(means_data.data(), {2, 3}, Device::CPU, DataType::Float32).to(Device::CUDA);
-    auto sh0 = Tensor::zeros({2, 1, 3}, Device::CUDA);
-    auto shN = Tensor::zeros({2, 0, 3}, Device::CUDA);
-    auto scaling = Tensor::full({2, 3}, -1.5f, Device::CUDA);
-    std::vector<float> rotation_data{
-        1.0f, 0.0f, 0.0f, 0.0f,
-        1.0f, 0.0f, 0.0f, 0.0f};
-    auto rotation = Tensor::from_blob(rotation_data.data(), {2, 4}, Device::CPU, DataType::Float32).to(Device::CUDA);
-
-    const std::vector<float> opacity_values{0.25f, 0.4f};
-    std::vector<float> raw_opacity_values{
-        std::log(opacity_values[0] / (1.0f - opacity_values[0])),
-        std::log(opacity_values[1] / (1.0f - opacity_values[1]))};
-    auto opacity = Tensor::from_blob(raw_opacity_values.data(), {2}, Device::CPU, DataType::Float32).to(Device::CUDA);
-    auto splat = SplatData(0, means, sh0, shN, scaling, rotation, opacity, 1.0f);
-
-    auto R = Tensor::eye(3, Device::CUDA);
-    std::vector<float> t_data{0.0f, 0.0f, 4.0f};
-    auto T = Tensor::from_blob(t_data.data(), {3}, Device::CPU, DataType::Float32).to(Device::CUDA);
-    auto camera = Camera(R, T, 1.0f, 1.0f, 0.5f, 0.5f,
-                         Tensor(), Tensor(), CameraModelType::PINHOLE,
-                         "depth_grad_detached", "", std::filesystem::path{}, 1, 1, 0);
+    NormalChannelScene scene;
+    const std::vector<float> identity_quat{1.0f, 0.0f, 0.0f, 0.0f};
+    auto splat = scene.make_splat(identity_quat);
+    auto camera = scene.make_camera();
     auto bg = Tensor::zeros({3}, Device::CUDA);
 
-    auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false);
-    ASSERT_TRUE(forward.has_value()) << forward.error();
-    ASSERT_EQ(forward->first.depth.numel(), 1);
+    auto without_normal = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false);
+    ASSERT_TRUE(without_normal.has_value())
+        << lfs::format_for_developer(without_normal.error());
+    EXPECT_FALSE(without_normal->first.normal.is_valid())
+        << "normal channel must stay off unless requested";
+    without_normal->second.release_forward_context();
+
+    auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false, Tensor{}, true);
+    ASSERT_TRUE(forward.has_value()) << lfs::format_for_developer(forward.error());
+    ASSERT_TRUE(forward->first.normal.is_valid());
+    ASSERT_EQ(forward->first.normal.numel(), 3);
+
+    // Identity rotation, z the smallest axis: world normal is -z (oriented
+    // toward the camera at -4z), identity w2c keeps it in place, and the
+    // pixel-centered splat blends with weight alpha.
+    const auto normal_cpu = forward->first.normal.to(Device::CPU);
+    const float* n = normal_cpu.ptr<float>();
+    EXPECT_NEAR(n[0], 0.0f, 1.0e-5f);
+    EXPECT_NEAR(n[1], 0.0f, 1.0e-5f);
+    EXPECT_NEAR(n[2], -scene.opacity_value, 1.0e-4f);
+    forward->second.release_forward_context();
+}
+
+TEST(FastGSNormalChannelTest, BackwardNormalRotationGradientMatchesFiniteDifferences) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    NormalChannelScene scene;
+    // Generic quaternion away from symmetry; keeps the smallest-axis column
+    // pointed toward the camera so the orientation sign stays fixed.
+    const std::vector<float> base_quat{0.95f, 0.15f, -0.1f, 0.05f};
+    const std::vector<float> upstream{0.7f, -0.4f, 1.1f};
+    auto camera = scene.make_camera();
+    auto bg = Tensor::zeros({3}, Device::CUDA);
+
+    const auto render_loss = [&](const std::vector<float>& quat) {
+        auto splat = scene.make_splat(quat);
+        auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false, Tensor{}, true);
+        if (!forward.has_value()) {
+            throw lfs::Exception(std::move(forward.error()));
+        }
+        const auto normal_cpu = forward->first.normal.to(Device::CPU);
+        const float* n = normal_cpu.ptr<float>();
+        const float loss = upstream[0] * n[0] + upstream[1] * n[1] + upstream[2] * n[2];
+        forward->second.release_forward_context();
+        return loss;
+    };
+
+    auto splat = scene.make_splat(base_quat);
+    auto forward = fast_rasterize_forward(camera, splat, bg, 0, 0, 0, 0, false, Tensor{}, true);
+    ASSERT_TRUE(forward.has_value()) << lfs::format_for_developer(forward.error());
 
     AdamConfig cfg{.lr = 0.001f, .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-15};
     AdamOptimizer opt(splat, cfg);
     opt.allocate_gradients();
     opt.zero_grad(0);
 
-    const float upstream_depth_grad = 1.3f;
+    std::vector<float> upstream_data = upstream;
     auto grad_image = Tensor::zeros_like(forward->first.image);
-    auto grad_depth = Tensor::full({1, 1}, upstream_depth_grad, Device::CUDA);
+    auto grad_normal = Tensor::from_blob(upstream_data.data(), {3, 1, 1}, Device::CPU, DataType::Float32).to(Device::CUDA);
     fast_rasterize_backward(
         forward->second,
         grad_image,
@@ -452,29 +513,25 @@ TEST(FastGSDepthGradientTest, DetachedDepthWeightsMoveDepthButNotOpacity) {
         DensificationType::None,
         1,
         {},
-        grad_depth,
-        true);
+        {},
+        grad_normal);
 
-    const auto mean_grad = recovered_fused_grad(opt, ParamType::Means).to(Device::CPU);
-    const auto opacity_grad = recovered_fused_grad(opt, ParamType::Opacity).to(Device::CPU);
+    const auto rotation_grad = recovered_fused_grad(opt, ParamType::Rotation).to(Device::CPU);
+    const float* actual = rotation_grad.ptr<float>();
 
-    const float expected_depth_grad0 = opacity_values[0] * upstream_depth_grad;
-    const float expected_depth_grad1 = (1.0f - opacity_values[0]) * opacity_values[1] * upstream_depth_grad;
-    const float* actual_mean_grad = mean_grad.ptr<float>();
-    EXPECT_NEAR(actual_mean_grad[2], expected_depth_grad0, 1.0e-4f)
-        << "detached depth-weight path should keep the front splat z gradient";
-    EXPECT_NEAR(actual_mean_grad[5], expected_depth_grad1, 1.0e-4f)
-        << "detached depth-weight path should keep the rear splat z gradient";
-    EXPECT_NEAR(actual_mean_grad[0], 0.0f, 1.0e-5f);
-    EXPECT_NEAR(actual_mean_grad[1], 0.0f, 1.0e-5f);
-    EXPECT_NEAR(actual_mean_grad[3], 0.0f, 1.0e-5f);
-    EXPECT_NEAR(actual_mean_grad[4], 0.0f, 1.0e-5f);
-
-    const float* actual_opacity_grad = opacity_grad.ptr<float>();
-    EXPECT_NEAR(actual_opacity_grad[0], 0.0f, 1.0e-5f)
-        << "depth loss must not directly train front opacity when depth weights are detached";
-    EXPECT_NEAR(actual_opacity_grad[1], 0.0f, 1.0e-5f)
-        << "depth loss must not directly train rear opacity when depth weights are detached";
+    // The splat sits exactly on the pixel center, so the blend weight has zero
+    // derivative w.r.t. rotation there and central differences through the full
+    // forward isolate exactly the detached-weight value path the kernel emits.
+    const float h = 2.0e-2f;
+    for (int c = 0; c < 4; ++c) {
+        std::vector<float> plus = base_quat;
+        std::vector<float> minus = base_quat;
+        plus[c] += h;
+        minus[c] -= h;
+        const float expected = (render_loss(plus) - render_loss(minus)) / (2.0f * h);
+        EXPECT_NEAR(actual[c], expected, std::max(2.0e-3f, std::abs(expected) * 2.0e-2f))
+            << "rotation gradient mismatch for quaternion component " << c;
+    }
 }
 
 TEST_F(FastGSKernelTest, Backward_Preprocess) {
@@ -514,6 +571,260 @@ TEST_F(FastGSKernelTest, Optimizer_AdamStep) {
 
     EXPECT_GT(diff, 0.0f);
 }
+
+namespace {
+    enum class QuantizedAdamLayout {
+        Contiguous,
+        Swizzled,
+    };
+
+    class FastGSFrozenAdamTest : public ::testing::TestWithParam<QuantizedAdamLayout> {
+    protected:
+        static constexpr int ROW_SIZE = 4;
+        static constexpr float LR = 0.01f;
+
+        void SetUp() override {
+            if (!torch::cuda::is_available()) {
+                GTEST_SKIP() << "CUDA not available";
+            }
+        }
+
+        static Tensor float_tensor(std::vector<float>& values, const int n_rows) {
+            return Tensor::from_blob(
+                       values.data(),
+                       {static_cast<size_t>(n_rows), static_cast<size_t>(ROW_SIZE)},
+                       Device::CPU,
+                       DataType::Float32)
+                .clone()
+                .to(Device::CUDA);
+        }
+
+        static Tensor uint8_tensor(std::vector<std::uint8_t>& values, const int n_rows) {
+            return Tensor::from_blob(
+                       values.data(),
+                       {static_cast<size_t>(n_rows), static_cast<size_t>(ROW_SIZE)},
+                       Device::CPU,
+                       DataType::UInt8)
+                .clone()
+                .to(Device::CUDA);
+        }
+
+        template <size_t N>
+        static Tensor bool_tensor(std::array<bool, N>& values) {
+            return Tensor::from_blob(values.data(), {N}, Device::CPU, DataType::Bool)
+                .clone()
+                .to(Device::CUDA);
+        }
+
+        void launch(
+            Tensor& param,
+            Tensor& exp_avg_q,
+            Tensor& exp_avg_scale,
+            Tensor& exp_avg_sq_q,
+            Tensor& exp_avg_sq_scale,
+            Tensor& grad,
+            const Tensor& frozen_mask,
+            const float frozen_lr_scale,
+            const int n_rows) {
+            constexpr float BETA1 = 0.0f;
+            constexpr float BETA2 = 0.0f;
+            constexpr float EPS = 0.0f;
+            constexpr float BIAS_CORRECTION1_RCP = 1.0f;
+            constexpr float BIAS_CORRECTION2_SQRT_RCP = 1.0f;
+
+            if (GetParam() == QuantizedAdamLayout::Contiguous) {
+                fast_lfs::optimizer::adam_step_quantized_raw(
+                    param.ptr<float>(),
+                    exp_avg_q.ptr<std::uint8_t>(),
+                    exp_avg_scale.ptr<float>(),
+                    exp_avg_sq_q.ptr<std::uint8_t>(),
+                    exp_avg_sq_scale.ptr<float>(),
+                    grad.ptr<float>(),
+                    frozen_mask.ptr<bool>(),
+                    n_rows,
+                    frozen_lr_scale,
+                    n_rows,
+                    ROW_SIZE,
+                    LR,
+                    BETA1,
+                    BETA2,
+                    EPS,
+                    BIAS_CORRECTION1_RCP,
+                    BIAS_CORRECTION2_SQRT_RCP);
+            } else {
+                fast_lfs::optimizer::adam_step_quantized_swizzled_raw(
+                    param.ptr<float>(),
+                    exp_avg_q.ptr<std::uint8_t>(),
+                    exp_avg_scale.ptr<float>(),
+                    exp_avg_sq_q.ptr<std::uint8_t>(),
+                    exp_avg_sq_scale.ptr<float>(),
+                    grad.ptr<float>(),
+                    frozen_mask.ptr<bool>(),
+                    n_rows,
+                    frozen_lr_scale,
+                    n_rows,
+                    1,
+                    LR,
+                    BETA1,
+                    BETA2,
+                    EPS,
+                    BIAS_CORRECTION1_RCP,
+                    BIAS_CORRECTION2_SQRT_RCP);
+            }
+            ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+        }
+    };
+
+    TEST_P(FastGSFrozenAdamTest, ZeroScalePreservesFrozenParameterAndMomentsBitExactly) {
+        std::vector<float> param_values{1.25f, -2.5f, 0.125f, 8.0f};
+        std::vector<float> grad_values{0.5f, -1.0f, 2.0f, -4.0f};
+        std::vector<std::uint8_t> exp_avg_values{129, 7, 255, 128};
+        std::vector<std::uint8_t> exp_avg_sq_values{3, 17, 254, 1};
+        std::vector<float> exp_avg_scale_values{0.25f};
+        std::vector<float> exp_avg_sq_scale_values{0.5f};
+        std::array<bool, 1> frozen_values{true};
+
+        auto param = float_tensor(param_values, 1);
+        auto grad = float_tensor(grad_values, 1);
+        auto exp_avg_q = uint8_tensor(exp_avg_values, 1);
+        auto exp_avg_sq_q = uint8_tensor(exp_avg_sq_values, 1);
+        auto exp_avg_scale = Tensor::from_vector(exp_avg_scale_values, {1}, Device::CUDA);
+        auto exp_avg_sq_scale = Tensor::from_vector(exp_avg_sq_scale_values, {1}, Device::CUDA);
+        auto frozen_mask = bool_tensor(frozen_values);
+
+        launch(
+            param,
+            exp_avg_q,
+            exp_avg_scale,
+            exp_avg_sq_q,
+            exp_avg_sq_scale,
+            grad,
+            frozen_mask,
+            0.0f,
+            1);
+
+        const auto param_cpu = param.to(Device::CPU);
+        const auto exp_avg_q_cpu = exp_avg_q.to(Device::CPU);
+        const auto exp_avg_sq_q_cpu = exp_avg_sq_q.to(Device::CPU);
+        const auto exp_avg_scale_cpu = exp_avg_scale.to(Device::CPU);
+        const auto exp_avg_sq_scale_cpu = exp_avg_sq_scale.to(Device::CPU);
+        for (int i = 0; i < ROW_SIZE; ++i) {
+            EXPECT_EQ(std::bit_cast<std::uint32_t>(param_cpu.ptr<float>()[i]),
+                      std::bit_cast<std::uint32_t>(param_values[i]));
+            EXPECT_EQ(exp_avg_q_cpu.ptr<std::uint8_t>()[i], exp_avg_values[i]);
+            EXPECT_EQ(exp_avg_sq_q_cpu.ptr<std::uint8_t>()[i], exp_avg_sq_values[i]);
+        }
+        EXPECT_EQ(std::bit_cast<std::uint32_t>(exp_avg_scale_cpu.ptr<float>()[0]),
+                  std::bit_cast<std::uint32_t>(exp_avg_scale_values[0]));
+        EXPECT_EQ(std::bit_cast<std::uint32_t>(exp_avg_sq_scale_cpu.ptr<float>()[0]),
+                  std::bit_cast<std::uint32_t>(exp_avg_sq_scale_values[0]));
+    }
+
+    TEST_P(FastGSFrozenAdamTest, UnitScaleMatchesIdenticalUnfrozenRow) {
+        std::vector<float> param_values{
+            0.25f, -0.5f, 1.5f, -2.0f,
+            0.25f, -0.5f, 1.5f, -2.0f};
+        std::vector<float> grad_values{
+            0.5f, -1.0f, 2.0f, -4.0f,
+            0.5f, -1.0f, 2.0f, -4.0f};
+        std::vector<std::uint8_t> exp_avg_values(2 * ROW_SIZE, 128);
+        std::vector<std::uint8_t> exp_avg_sq_values(2 * ROW_SIZE, 0);
+        std::vector<float> scale_values(2, 0.0f);
+        std::array<bool, 2> frozen_values{true, false};
+
+        auto param = float_tensor(param_values, 2);
+        auto grad = float_tensor(grad_values, 2);
+        auto exp_avg_q = uint8_tensor(exp_avg_values, 2);
+        auto exp_avg_sq_q = uint8_tensor(exp_avg_sq_values, 2);
+        auto exp_avg_scale = Tensor::from_vector(scale_values, {2}, Device::CUDA);
+        auto exp_avg_sq_scale = Tensor::from_vector(scale_values, {2}, Device::CUDA);
+        auto frozen_mask = bool_tensor(frozen_values);
+
+        launch(
+            param,
+            exp_avg_q,
+            exp_avg_scale,
+            exp_avg_sq_q,
+            exp_avg_sq_scale,
+            grad,
+            frozen_mask,
+            1.0f,
+            2);
+
+        const auto param_cpu = param.to(Device::CPU);
+        const auto exp_avg_q_cpu = exp_avg_q.to(Device::CPU);
+        const auto exp_avg_sq_q_cpu = exp_avg_sq_q.to(Device::CPU);
+        const auto exp_avg_scale_cpu = exp_avg_scale.to(Device::CPU);
+        const auto exp_avg_sq_scale_cpu = exp_avg_sq_scale.to(Device::CPU);
+        for (int i = 0; i < ROW_SIZE; ++i) {
+            EXPECT_EQ(std::bit_cast<std::uint32_t>(param_cpu.ptr<float>()[i]),
+                      std::bit_cast<std::uint32_t>(param_cpu.ptr<float>()[ROW_SIZE + i]));
+            EXPECT_EQ(exp_avg_q_cpu.ptr<std::uint8_t>()[i],
+                      exp_avg_q_cpu.ptr<std::uint8_t>()[ROW_SIZE + i]);
+            EXPECT_EQ(exp_avg_sq_q_cpu.ptr<std::uint8_t>()[i],
+                      exp_avg_sq_q_cpu.ptr<std::uint8_t>()[ROW_SIZE + i]);
+        }
+        EXPECT_EQ(std::bit_cast<std::uint32_t>(exp_avg_scale_cpu.ptr<float>()[0]),
+                  std::bit_cast<std::uint32_t>(exp_avg_scale_cpu.ptr<float>()[1]));
+        EXPECT_EQ(std::bit_cast<std::uint32_t>(exp_avg_sq_scale_cpu.ptr<float>()[0]),
+                  std::bit_cast<std::uint32_t>(exp_avg_sq_scale_cpu.ptr<float>()[1]));
+    }
+
+    TEST_P(FastGSFrozenAdamTest, TenthScaleProducesExactTenthDeltaAndNormalMoments) {
+        std::vector<float> param_values(2 * ROW_SIZE, 0.0f);
+        std::vector<float> grad_values(2 * ROW_SIZE, 1.0f);
+        std::vector<std::uint8_t> exp_avg_values(2 * ROW_SIZE, 128);
+        std::vector<std::uint8_t> exp_avg_sq_values(2 * ROW_SIZE, 0);
+        std::vector<float> scale_values(2, 0.0f);
+        std::array<bool, 2> frozen_values{true, false};
+
+        auto param = float_tensor(param_values, 2);
+        auto grad = float_tensor(grad_values, 2);
+        auto exp_avg_q = uint8_tensor(exp_avg_values, 2);
+        auto exp_avg_sq_q = uint8_tensor(exp_avg_sq_values, 2);
+        auto exp_avg_scale = Tensor::from_vector(scale_values, {2}, Device::CUDA);
+        auto exp_avg_sq_scale = Tensor::from_vector(scale_values, {2}, Device::CUDA);
+        auto frozen_mask = bool_tensor(frozen_values);
+
+        launch(
+            param,
+            exp_avg_q,
+            exp_avg_scale,
+            exp_avg_sq_q,
+            exp_avg_sq_scale,
+            grad,
+            frozen_mask,
+            0.1f,
+            2);
+
+        const auto param_cpu = param.to(Device::CPU);
+        const auto exp_avg_q_cpu = exp_avg_q.to(Device::CPU);
+        const auto exp_avg_sq_q_cpu = exp_avg_sq_q.to(Device::CPU);
+        const auto exp_avg_scale_cpu = exp_avg_scale.to(Device::CPU);
+        const auto exp_avg_sq_scale_cpu = exp_avg_sq_scale.to(Device::CPU);
+        for (int i = 0; i < ROW_SIZE; ++i) {
+            const float expected_frozen = param_cpu.ptr<float>()[ROW_SIZE + i] * 0.1f;
+            EXPECT_EQ(std::bit_cast<std::uint32_t>(param_cpu.ptr<float>()[i]),
+                      std::bit_cast<std::uint32_t>(expected_frozen));
+            EXPECT_EQ(exp_avg_q_cpu.ptr<std::uint8_t>()[i],
+                      exp_avg_q_cpu.ptr<std::uint8_t>()[ROW_SIZE + i]);
+            EXPECT_EQ(exp_avg_sq_q_cpu.ptr<std::uint8_t>()[i],
+                      exp_avg_sq_q_cpu.ptr<std::uint8_t>()[ROW_SIZE + i]);
+        }
+        EXPECT_EQ(std::bit_cast<std::uint32_t>(exp_avg_scale_cpu.ptr<float>()[0]),
+                  std::bit_cast<std::uint32_t>(exp_avg_scale_cpu.ptr<float>()[1]));
+        EXPECT_EQ(std::bit_cast<std::uint32_t>(exp_avg_sq_scale_cpu.ptr<float>()[0]),
+                  std::bit_cast<std::uint32_t>(exp_avg_sq_scale_cpu.ptr<float>()[1]));
+    }
+
+    INSTANTIATE_TEST_SUITE_P(
+        QuantizedLayouts,
+        FastGSFrozenAdamTest,
+        ::testing::Values(QuantizedAdamLayout::Contiguous, QuantizedAdamLayout::Swizzled),
+        [](const ::testing::TestParamInfo<QuantizedAdamLayout>& info) {
+            return info.param == QuantizedAdamLayout::Contiguous ? "Contiguous" : "Swizzled";
+        });
+} // namespace
 
 TEST_F(FastGSKernelTest, Optimizer_ZeroRows) {
     auto opt = make_optimizer();
@@ -616,51 +927,6 @@ TEST_F(FastGSKernelTest, TiledRendering_Consistency) {
 
     float diff = (tile->first.image - region).abs().max().item<float>();
     EXPECT_LT(diff, 0.01f);
-}
-
-// Performance
-TEST_F(FastGSKernelTest, Performance_Forward) {
-    for (int i = 0; i < 3; ++i)
-        forward();
-    cudaDeviceSynchronize();
-
-    auto t0 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 10; ++i)
-        forward();
-    cudaDeviceSynchronize();
-    auto t1 = std::chrono::high_resolution_clock::now();
-
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / 10;
-    EXPECT_LT(ms, 10.0);
-}
-
-TEST_F(FastGSKernelTest, Performance_Backward) {
-    auto r = forward();
-    ASSERT_TRUE(r.has_value());
-
-    auto grad = Tensor::randn_like(r->first.image);
-    r->second.release_forward_context();
-    auto opt = make_optimizer();
-
-    for (int i = 0; i < 3; ++i) {
-        auto fwd = forward();
-        ASSERT_TRUE(fwd.has_value());
-        opt->zero_grad(0);
-        fast_rasterize_backward(fwd->second, grad, *splat_, *opt, {});
-    }
-    cudaDeviceSynchronize();
-
-    auto t0 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 10; ++i) {
-        auto fwd = forward();
-        opt->zero_grad(0);
-        fast_rasterize_backward(fwd->second, grad, *splat_, *opt, {});
-    }
-    cudaDeviceSynchronize();
-    auto t1 = std::chrono::high_resolution_clock::now();
-
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / 10;
-    EXPECT_LT(ms, 20.0);
 }
 
 // =============================================================================

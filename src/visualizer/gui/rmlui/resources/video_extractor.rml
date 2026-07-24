@@ -27,6 +27,17 @@
             <img src="../icon/sequencer/step-forward.png" />
           </button>
           <span id="time-label">--:--.-- / --:--.--</span>
+          <button id="btn-rotation-ccw" class="transport-btn" type="button" title="@tr:video_extractor.rotate_ccw">
+            <img src="../icon/sequencer/rotate-ccw.png" />
+          </button>
+          <span id="rotation-value" style="color:#cdd6f4;min-width:28px;text-align:center;font-size:13dp">0°</span>
+          <button id="btn-rotation-cw" class="transport-btn" type="button" title="@tr:video_extractor.rotate_cw">
+            <img src="../icon/sequencer/rotate-cw.png" />
+          </button>
+          <span id="hdr-badge" class="hdr-badge" style="display:none">
+            <span id="hdr-badge-type"></span>
+            <span id="hdr-badge-label"></span>
+          </span>
         </div>
 
         <div id="timeline">
@@ -96,6 +107,57 @@
         <div class="section">
           <div class="section-rule">
             <span class="section-rule__lead"></span>
+            <span class="section-rule__label">@tr:video_extractor.sharpness</span>
+            <span class="section-rule__line"></span>
+          </div>
+          <div class="settings-row">
+            <span class="field-label"></span>
+            <label class="toggle-label">
+              <input id="sharpness-toggle" type="checkbox" />
+              <span>@tr:video_extractor.sharpness_filter</span>
+            </label>
+          </div>
+            <div id="sharpness-options" class="sharpness-options">
+            <div class="settings-row">
+              <span class="field-label">@tr:video_extractor.sharpness_algorithm</span>
+              <select id="sharpness-algorithm-select" class="wide-select">
+                <option value="combined">@tr:video_extractor.sharpness_algo_combined</option>
+                <option value="tenengrad">@tr:video_extractor.sharpness_algo_tenengrad</option>
+                <option value="laplacian">@tr:video_extractor.sharpness_algo_laplacian</option>
+              </select>
+            </div>
+            <div class="settings-row">
+              <span class="field-label">@tr:video_extractor.sharpness_mode</span>
+              <select id="sharpness-mode-select" class="wide-select">
+                <option value="threshold">@tr:video_extractor.sharpness_mode_threshold</option>
+                <option value="window">@tr:video_extractor.sharpness_mode_window</option>
+              </select>
+              <span id="sharpness-mode-desc" class="inline-note">@tr:video_extractor.sharpness_mode_desc_threshold</span>
+            </div>
+            <div id="sharpness-threshold-row" class="settings-row">
+              <span class="field-label">@tr:video_extractor.sharpness_threshold_label</span>
+              <input id="sharpness-threshold-slider" class="value-slider" type="range" min="0" max="100" step="1" value="10" />
+              <span id="sharpness-threshold-value" class="value-readout">10%</span>
+            </div>
+            <div id="sharpness-window-row" class="settings-row" style="display:none">
+              <span class="field-label">@tr:video_extractor.sharpness_coverage_label</span>
+              <select id="window-candidates-select" class="compact-select">
+                <option value="auto">@tr:video_extractor.candidates_auto</option>
+                <option value="3">@tr:video_extractor.candidates_fast</option>
+                <option value="5">@tr:video_extractor.candidates_balanced</option>
+                <option value="10" selected="selected">@tr:video_extractor.candidates_quality</option>
+                <option value="20">@tr:video_extractor.candidates_high_quality</option>
+                <option value="50">@tr:video_extractor.candidates_very_high</option>
+                <option value="0">@tr:video_extractor.candidates_all</option>
+              </select>
+              <span id="window-candidates-readout" class="inline-note">10 / ~25 frames</span>
+              </div>
+            </div>
+          </div>
+
+        <div class="section">
+          <div class="section-rule">
+            <span class="section-rule__lead"></span>
             <span class="section-rule__label">@tr:video_extractor.output_format</span>
             <span class="section-rule__line"></span>
           </div>
@@ -109,6 +171,15 @@
               <input id="quality-slider" class="value-slider" type="range" min="50" max="100" step="1" value="95" />
               <span id="quality-value" class="value-readout">95%</span>
             </div>
+            <span style="flex:1; min-width:20dp;"></span>
+            <label class="toggle-label metadata-check">
+              <input id="generate-metadata" type="checkbox" />
+              <span>@tr:video_extractor.generate_metadata</span>
+            </label>
+            <label id="hdr-to-sdr-row" class="toggle-label metadata-check" style="display:none">
+              <input id="hdr-to-sdr" type="checkbox" />
+              <span>@tr:video_extractor.convert_hdr_to_sdr</span>
+            </label>
           </div>
         </div>
 
@@ -178,6 +249,18 @@
             <span id="error-text" class="status-text">@tr:video_extractor.error</span>
             <button id="btn-error-dismiss" class="btn btn--secondary mini-btn" type="button">@tr:video_extractor.dismiss</button>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Overwrite confirmation overlay -->
+    <div id="overwrite-overlay" class="extractor-overlay hidden">
+      <div class="confirm-dialog">
+        <span id="overwrite-message" class="confirm-message">@tr:video_extractor.overwrite_prompt</span>
+        <div class="separator"></div>
+        <div class="confirm-buttons">
+          <button id="overwrite-no" class="btn btn--secondary" type="button">@tr:video_extractor.overwrite_cancel</button>
+          <button id="overwrite-yes" class="btn btn--error" type="button">@tr:video_extractor.overwrite_clear</button>
         </div>
       </div>
     </div>

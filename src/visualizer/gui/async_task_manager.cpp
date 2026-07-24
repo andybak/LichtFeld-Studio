@@ -45,6 +45,22 @@ namespace lfs::vis::gui {
 
     using ExportFormat = lfs::core::ExportFormat;
 
+    namespace {
+
+        template <typename Fn>
+        class ScopeExit final {
+        public:
+            explicit ScopeExit(Fn fn) : fn_(std::move(fn)) {}
+            ScopeExit(const ScopeExit&) = delete;
+            ScopeExit& operator=(const ScopeExit&) = delete;
+            ~ScopeExit() noexcept { fn_(); }
+
+        private:
+            Fn fn_;
+        };
+
+    } // namespace
+
     [[nodiscard]] const char* getDatasetTypeName(const std::filesystem::path& path) {
         switch (lfs::io::Loader::getDatasetType(path)) {
         case lfs::io::DatasetType::COLMAP: return "COLMAP";
@@ -322,30 +338,63 @@ namespace lfs::vis::gui {
         }
         return image.contiguous();
     }
+    [[nodiscard]] const VideoExportCropBoxSnapshot* activeVideoExportPointCloudCropBox(
+        const VideoExportSceneSnapshot& snapshot) {
+        const VideoExportCropBoxSnapshot* selected = nullptr;
+        if (snapshot.selected_cropbox_index >= 0) {
+            const size_t idx = static_cast<size_t>(snapshot.selected_cropbox_index);
+            if (idx < snapshot.cropboxes.size() && snapshot.cropboxes[idx].has_data &&
+                snapshot.cropboxes[idx].data.enabled) {
+                selected = &snapshot.cropboxes[idx];
+            }
+        }
+        if (selected) {
+            return selected;
+        }
+
+        const VideoExportCropBoxSnapshot* single = nullptr;
+        for (const auto& cb : snapshot.cropboxes) {
+            if (!cb.has_data || !cb.data.enabled) {
+                continue;
+            }
+            if (single) {
+                return nullptr;
+            }
+            single = &cb;
+        }
+        return single;
+    }
+
+    [[nodiscard]] const VideoExportEllipsoidSnapshot* activeVideoExportPointCloudEllipsoid(
+        const VideoExportSceneSnapshot& snapshot) {
+        if (!snapshot.active_ellipsoid || !snapshot.active_ellipsoid->data.enabled) {
+            return nullptr;
+        }
+        return &*snapshot.active_ellipsoid;
+    }
 
     void applyVideoExportPointCloudFilters(rendering::PointCloudFilterState& filters,
                                            const VideoExportSceneSnapshot& snapshot,
                                            const RenderSettings& render_settings) {
-        if (!(render_settings.use_crop_box || render_settings.show_crop_box) || snapshot.cropboxes.empty()) {
+        if (const auto* const cb = activeVideoExportPointCloudCropBox(snapshot)) {
+            filters.crop_box = rendering::BoundingBox{
+                .min = cb->data.min,
+                .max = cb->data.max,
+                .transform = glm::inverse(cb->world_transform)};
+            filters.crop_ellipsoid.reset();
+            filters.crop_inverse = cb->data.inverse;
+            filters.crop_desaturate = render_settings.desaturate_cropping;
             return;
         }
 
-        const size_t idx = (snapshot.selected_cropbox_index >= 0)
-                               ? static_cast<size_t>(snapshot.selected_cropbox_index)
-                               : 0;
-        if (idx >= snapshot.cropboxes.size() || !snapshot.cropboxes[idx].has_data) {
-            return;
+        if (const auto* const el = activeVideoExportPointCloudEllipsoid(snapshot)) {
+            filters.crop_ellipsoid = rendering::Ellipsoid{
+                .radii = el->data.radii,
+                .transform = glm::inverse(el->world_transform)};
+            filters.crop_box.reset();
+            filters.crop_inverse = el->data.inverse;
+            filters.crop_desaturate = render_settings.desaturate_cropping;
         }
-
-        const auto& cb = snapshot.cropboxes[idx];
-        filters.crop_box = rendering::BoundingBox{
-            .min = cb.data.min,
-            .max = cb.data.max,
-            .transform = glm::inverse(cb.world_transform)};
-        filters.crop_inverse = cb.data.inverse;
-        filters.crop_desaturate = render_settings.show_crop_box &&
-                                  !render_settings.use_crop_box &&
-                                  render_settings.desaturate_cropping;
     }
 
     rendering::MeshRenderOptions makeVideoExportMeshOptions(const RenderSettings& render_settings,
@@ -389,6 +438,7 @@ namespace lfs::vis::gui {
                 .data = cb.has_data ? &cb.data : nullptr,
                 .world_transform = cb.world_transform,
                 .local_transform = glm::mat4(1.0f),
+                .effectively_visible = true,
             });
         }
 
@@ -401,6 +451,7 @@ namespace lfs::vis::gui {
                 .data = &el.data,
                 .world_transform = el.world_transform,
                 .local_transform = glm::mat4(1.0f),
+                .effectively_visible = true,
             });
         }
         return state;
@@ -411,13 +462,20 @@ namespace lfs::vis::gui {
         if (!image || !image->is_valid() || image->ndim() != 3) {
             return std::unexpected("Rendered Gaussian frame is invalid");
         }
-        if (image->size(0) <= 0 || image->size(1) <= 0 || image->size(2) != 3) {
-            return std::unexpected("Rendered Gaussian frame must have shape [H, W, 3]");
+        if (image->size(0) <= 0 || image->size(1) <= 0 ||
+            (image->size(2) != 3 && image->size(2) != 4)) {
+            return std::unexpected("Rendered Gaussian frame must have shape [H, W, 3] or [H, W, 4]");
         }
 
         auto frame = *image;
+        // Preview readbacks currently arrive as uint8 HWC and need normalization;
+        // float preview tensors are expected to already be in normalized color space.
+        const bool normalize_uint8 = frame.dtype() == lfs::core::DataType::UInt8;
         if (frame.dtype() != lfs::core::DataType::Float32) {
             frame = frame.to(lfs::core::DataType::Float32);
+        }
+        if (normalize_uint8) {
+            frame = frame / 255.0f;
         }
         frame = frame.permute({2, 0, 1}).contiguous();
         if (frame.device() != lfs::core::Device::CUDA) {
@@ -485,14 +543,24 @@ namespace lfs::vis::gui {
                 primary_frame = std::move(*render_result);
             } else {
                 auto scene_state = makeVideoExportGaussianSceneState(snapshot);
-                auto preview_image = rendering_manager.renderPreviewImage(
-                    *snapshot.combined_model,
-                    std::move(scene_state),
-                    glm::mat3_cast(cam_state.rotation),
-                    cam_state.position,
-                    cam_state.focal_length_mm,
-                    width,
-                    height);
+                const auto camera_rotation = glm::mat3_cast(cam_state.rotation);
+                auto preview_image = render_environment
+                                         ? rendering_manager.renderPreviewImageRgba8(
+                                               *snapshot.combined_model,
+                                               std::move(scene_state),
+                                               camera_rotation,
+                                               cam_state.position,
+                                               cam_state.focal_length_mm,
+                                               width,
+                                               height)
+                                         : rendering_manager.renderPreviewImage(
+                                               *snapshot.combined_model,
+                                               std::move(scene_state),
+                                               camera_rotation,
+                                               cam_state.position,
+                                               cam_state.focal_length_mm,
+                                               width,
+                                               height);
                 auto video_frame = makeGaussianPreviewVideoFrame(preview_image);
                 if (!video_frame) {
                     return std::unexpected(video_frame.error());
@@ -505,7 +573,7 @@ namespace lfs::vis::gui {
                 auto frame_image = std::make_shared<lfs::core::Tensor>(std::move(*video_frame));
                 auto materialized = engine.materializeGpuFrame(
                     frame_image,
-                    makeVideoExportFrameMetadata(frame_view, false),
+                    makeVideoExportFrameMetadata(frame_view, render_environment),
                     {width, height});
                 if (!materialized || !materialized->valid()) {
                     return std::unexpected(materialized ? "Rendered Gaussian frame is invalid"
@@ -656,6 +724,8 @@ namespace lfs::vis::gui {
                 params.dataset.centralize_dataset = cmd.centralize_dataset;
             if (cmd.max_width.has_value() && *cmd.max_width >= 0)
                 params.dataset.max_width = *cmd.max_width;
+            if (cmd.min_track_length.has_value() && *cmd.min_track_length >= 0)
+                params.dataset.min_track_length = *cmd.min_track_length;
             import_state_.apply_auto_crop.store(cmd.apply_auto_crop);
             startAsyncImport(cmd.path, params);
         });
@@ -887,7 +957,7 @@ namespace lfs::vis::gui {
                         export_state_.stage = "Cancelled";
                     }
                     publishExportState();
-                    lfs::core::events::state::ExportFailed{.error = error_msg}.emit();
+                    lfs::core::events::state::ExportFailed{.error = error_msg, .cancelled = true}.emit();
                 } else {
                     LOG_ERROR("COLMAP export failed: {}", error_msg);
                     {
@@ -1165,7 +1235,8 @@ namespace lfs::vis::gui {
                     }
                     publishExportState();
                     lfs::core::events::state::ExportFailed{
-                        .error = error_msg}
+                        .error = error_msg,
+                        .cancelled = true}
                         .emit();
                 } else {
                     LOG_ERROR("Export failed: {}", error_msg);
@@ -1253,6 +1324,14 @@ namespace lfs::vis::gui {
             }
         }
         lfs::vis::app_store().import_overlay_state.set(std::move(state));
+    }
+
+    void AsyncTaskManager::setImportNumImages(const size_t num_images) {
+        {
+            const std::lock_guard lock(import_state_.mutex);
+            import_state_.num_images = num_images;
+        }
+        publishImportOverlayState();
     }
 
     void AsyncTaskManager::publishVideoExportOverlayState() {
@@ -1412,29 +1491,87 @@ namespace lfs::vis::gui {
         LOG_INFO("Async import: {}", lfs::core::path_to_utf8(path));
 
         import_state_.thread.emplace(
-            [this, path](const std::stop_token stop_token) {
-                lfs::core::param::TrainingParameters local_params;
-                {
-                    const std::lock_guard lock(import_state_.mutex);
-                    local_params = import_state_.params;
-                }
+            [this, path](const std::stop_token stop_token) noexcept {
+                const auto record_failure = [this](const char* detail) noexcept {
+                    try {
+                        const std::lock_guard lock(import_state_.mutex);
+                        import_state_.success = false;
+                        import_state_.load_result.reset();
+                        import_state_.stage = "Failed";
+                        import_state_.error.clear();
+                    } catch (...) {
+                    }
 
-                const auto parse_centralize = [](const std::string& s) {
-                    if (s == "off")
-                        return lfs::io::CentralizeDataset::Off;
-                    if (s == "by_pointcloud")
-                        return lfs::io::CentralizeDataset::ByPointCloud;
-                    if (s == "by_cameras")
-                        return lfs::io::CentralizeDataset::ByCameras;
-                    return lfs::io::CentralizeDataset::Off;
+                    try {
+                        const std::string message = detail && *detail
+                                                        ? std::format("Import failed with exception: {}", detail)
+                                                        : "Import failed with an unknown exception";
+                        {
+                            const std::lock_guard lock(import_state_.mutex);
+                            import_state_.error = message;
+                        }
+                        LOG_ERROR("{}", message);
+                    } catch (...) {
+                        // The worker boundary must remain no-throw even when
+                        // reporting an allocation failure. success was reset
+                        // before launch, so completion still follows the
+                        // failure path if diagnostic allocation also fails.
+                    }
                 };
-                const lfs::io::LoadOptions load_options{
-                    .resize_factor = local_params.dataset.resize_factor,
-                    .max_width = local_params.dataset.max_width,
-                    .images_folder = local_params.dataset.images,
-                    .validate_only = false,
-                    .centralize = parse_centralize(local_params.dataset.centralize_dataset),
-                    .progress = [this, &stop_token](const float pct, const std::string& msg) {
+
+                const ScopeExit publish_terminal([this, &stop_token]() noexcept {
+                    if (stop_token.stop_requested()) {
+                        import_state_.active.store(false);
+                    } else {
+                        import_state_.progress.store(1.0f);
+                        import_state_.load_complete.store(true, std::memory_order_release);
+                    }
+
+                    try {
+                        publishImportOverlayState();
+                    } catch (...) {
+                        // Publishing is best-effort during teardown/error
+                        // handling; the atomic terminal state remains visible.
+                    }
+                    try {
+                        wakeMainThreadForAsyncWork();
+                    } catch (...) {
+                    }
+                });
+
+                try {
+                    lfs::core::param::TrainingParameters local_params;
+                    {
+                        const std::lock_guard lock(import_state_.mutex);
+                        local_params = import_state_.params;
+                    }
+
+                    const auto parse_centralize = [](const std::string& s) {
+                        if (s == "off")
+                            return lfs::io::CentralizeDataset::Off;
+                        if (s == "by_pointcloud")
+                            return lfs::io::CentralizeDataset::ByPointCloud;
+                        if (s == "by_cameras")
+                            return lfs::io::CentralizeDataset::ByCameras;
+                        return lfs::io::CentralizeDataset::Off;
+                    };
+                    int effective_min_track_length = local_params.dataset.min_track_length;
+                    if (effective_min_track_length > 0 &&
+                        local_params.init_path.has_value() &&
+                        !local_params.init_path->empty()) {
+                        LOG_WARN(
+                            "min-track-length cannot be used with --init; COLMAP sparse point filtering will not be applied because initialization uses '{}'",
+                            *local_params.init_path);
+                        effective_min_track_length = 0;
+                    }
+                    const lfs::io::LoadOptions load_options{
+                        .resize_factor = local_params.dataset.resize_factor,
+                        .max_width = local_params.dataset.max_width,
+                        .images_folder = local_params.dataset.images,
+                        .min_track_length = effective_min_track_length,
+                        .validate_only = false,
+                        .centralize = parse_centralize(local_params.dataset.centralize_dataset),
+                        .progress = [this, &stop_token](const float pct, const std::string& msg) {
                         if (stop_token.stop_requested())
                             return;
                         import_state_.progress.store(pct / 100.0f);
@@ -1443,49 +1580,48 @@ namespace lfs::vis::gui {
                             import_state_.stage = msg;
                         }
                         publishImportOverlayState(); },
-                    .cancel_requested = [&stop_token]() { return stop_token.stop_requested(); }};
+                        .cancel_requested = [&stop_token]() { return stop_token.stop_requested(); }};
 
-                auto loader = lfs::io::Loader::create();
-                auto result = loader->load(path, load_options);
+                    auto loader = lfs::io::Loader::create();
+                    auto result = loader->load(path, load_options);
 
-                if (stop_token.stop_requested()) {
-                    import_state_.active.store(false);
-                    publishImportOverlayState();
-                    return;
-                }
-
-                {
-                    const std::lock_guard lock(import_state_.mutex);
-                    if (result) {
-                        import_state_.load_result = std::move(*result);
-                        import_state_.success = true;
-                        import_state_.stage = "Applying...";
-                        std::visit([this](const auto& data) {
-                            using T = std::decay_t<decltype(data)>;
-                            if constexpr (std::is_same_v<T, std::shared_ptr<lfs::core::SplatData>>) {
-                                import_state_.num_points = data->size();
-                                import_state_.num_images = 0;
-                            } else if constexpr (std::is_same_v<T, lfs::io::LoadedScene>) {
-                                import_state_.num_images = data.cameras.size();
-                                import_state_.num_points = data.point_cloud ? data.point_cloud->size() : 0;
-                            } else if constexpr (std::is_same_v<T, std::shared_ptr<lfs::core::MeshData>>) {
-                                import_state_.num_points = data ? data->vertex_count() : 0;
-                                import_state_.num_images = 0;
-                                import_state_.is_mesh = true;
-                            }
-                        },
-                                   import_state_.load_result->data);
-                    } else {
-                        import_state_.success = false;
-                        import_state_.error = result.error().format();
-                        import_state_.stage = "Failed";
-                        LOG_ERROR("Import failed: {}", import_state_.error);
+                    if (stop_token.stop_requested()) {
+                        return;
                     }
+
+                    {
+                        const std::lock_guard lock(import_state_.mutex);
+                        if (result) {
+                            import_state_.load_result = std::move(*result);
+                            import_state_.success = true;
+                            import_state_.stage = "Applying...";
+                            std::visit([this](const auto& data) {
+                                using T = std::decay_t<decltype(data)>;
+                                if constexpr (std::is_same_v<T, std::shared_ptr<lfs::core::SplatData>>) {
+                                    import_state_.num_points = data->size();
+                                    import_state_.num_images = 0;
+                                } else if constexpr (std::is_same_v<T, lfs::io::LoadedScene>) {
+                                    import_state_.num_images = data.cameras.size();
+                                    import_state_.num_points = data.point_cloud ? data.point_cloud->size() : 0;
+                                } else if constexpr (std::is_same_v<T, std::shared_ptr<lfs::core::MeshData>>) {
+                                    import_state_.num_points = data ? data->vertex_count() : 0;
+                                    import_state_.num_images = 0;
+                                    import_state_.is_mesh = true;
+                                }
+                            },
+                                       import_state_.load_result->data);
+                        } else {
+                            import_state_.success = false;
+                            import_state_.error = result.error().format();
+                            import_state_.stage = "Failed";
+                            LOG_ERROR("Import failed: {}", import_state_.error);
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    record_failure(e.what());
+                } catch (...) {
+                    record_failure(nullptr);
                 }
-                import_state_.progress.store(1.0f);
-                import_state_.load_complete.store(true, std::memory_order_release);
-                publishImportOverlayState();
-                wakeMainThreadForAsyncWork();
             });
     }
 

@@ -15,6 +15,7 @@
 #include "window/vulkan_context.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -23,6 +24,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <string>
 #include <string_view>
@@ -47,12 +49,8 @@ namespace lfs::vis {
             VkSemaphore completion_semaphore = VK_NULL_HANDLE;
             std::uint64_t completion_value = 0;
             std::uint64_t lod_page_generation = 0;
-            // True while page decodes/uploads are still in flight, or a
-            // deferred capacity readback found a clamped VkSplat frame.
+            // True while page decodes/uploads are still in flight.
             bool lod_streaming_active = false;
-            // True when the deferred capacity readbacks from the previous pass
-            // confirm an unclamped frame for the current steady-state path.
-            bool capacity_readback_settled = false;
         };
 
         struct ModelInputSnapshot {
@@ -65,11 +63,11 @@ namespace lfs::vis {
             const void* opacity = nullptr;
             const void* sh0 = nullptr;
             const void* shn = nullptr;
-            // Tracking the deleted mask pointer + byte count is enough to invalidate
-            // the resident-input cache when the user soft-deletes (or undoes a
-            // delete). The renderer then re-runs the copy path so the opacity
-            // upload applies the latest mask.
+            // The pointer/size catches mask allocation or removal; the version
+            // catches in-place content edits so every input ring opacity copy is
+            // refreshed without treating the edit as a full model change.
             const void* deleted = nullptr;
+            std::uint64_t deleted_version = 0;
             std::size_t means_bytes = 0;
             std::size_t scaling_bytes = 0;
             std::size_t rotation_bytes = 0;
@@ -151,7 +149,7 @@ namespace lfs::vis {
         [[nodiscard]] cudaExternalSemaphore_t renderCompleteFence() const {
             return render_complete_cuda_.handle();
         }
-        [[nodiscard]] std::uint64_t renderCompleteValue() const { return last_signaled_render_value_; }
+        [[nodiscard]] std::uint64_t renderCompleteValue() const { return last_submitted_render_value_; }
 
         // Eagerly create the render stream + completion fence so the trainer↔viewer
         // handshake can be installed before the first live frame submits (covers
@@ -159,6 +157,10 @@ namespace lfs::vis {
         [[nodiscard]] std::expected<void, std::string> ensureHandshakeReady(VulkanContext& context) {
             return ensureInitialized(context);
         }
+        [[nodiscard]] std::expected<void, std::string> ensureTrainingSharedScratchReady(
+            VulkanContext& context,
+            std::size_t num_splats,
+            glm::ivec2 viewport_size);
 
         // Invoked with the completion value immediately after each live-model
         // submit, BEFORE the shared arena frame is released — the trainer's
@@ -175,6 +177,9 @@ namespace lfs::vis {
         [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImage(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Main) const;
+        [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImageRgba(
+            VulkanContext& context,
+            OutputSlot output_slot = OutputSlot::Main) const;
         [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImageRgb8(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Main) const;
@@ -186,6 +191,9 @@ namespace lfs::vis {
         // tensor. Valid only directly after a render into this slot, before the
         // next render reuses the pixel_depth scratch.
         [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readPreviewDepth(
+            VulkanContext& context,
+            OutputSlot output_slot = OutputSlot::Preview) const;
+        [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputDepthImage(
             VulkanContext& context,
             OutputSlot output_slot = OutputSlot::Preview) const;
         // Forces the non-batched per-pixel rasterizer chain (not the macro-tile
@@ -214,6 +222,7 @@ namespace lfs::vis {
             bool force_input_upload);
 
         void releasePreviewResources();
+        void releaseSplitOutputResources();
         void releaseSceneResources();
         void reset();
         [[nodiscard]] std::optional<LodPageCache::Snapshot> ensureLodPageCacheSnapshot(
@@ -252,31 +261,24 @@ namespace lfs::vis {
         };
         [[nodiscard]] GpuLodSelectionStatus gpuLodSelectionStatus() const;
 
-        // True when the most recent render's start-of-frame deferred poll
-        // confirmed the previously rendered frame produced complete, unclamped
-        // content using the steady-state rasterizer chain. One-shot preview/
-        // export captures poll this to avoid reading back a capacity-clamped
-        // (partial) frame; see RenderingManager::renderPreviewImageToPreviewSlotWithState.
-        [[nodiscard]] bool previewCaptureSettled() const { return last_preview_capture_settled_; }
-
     private:
         struct ComposePipeline;
         struct InputBindingResult {
-            bool uses_temporary_upload_slot = false;
             bool model_snapshot_changed = false;
         };
 
         [[nodiscard]] std::expected<void, std::string> ensureInitialized(VulkanContext& context);
-        // Returns true iff the timeline reached `value` within the bound (i.e. the
-        // submit that would signal it actually completed); false on timeout.
-        [[nodiscard]] bool waitCompletionValueBounded(std::uint64_t value) noexcept;
+        // Returns the next candidate without mutating timeline state. The value
+        // is committed only after VulkanGSPipeline confirms vkQueueSubmit
+        // accepted its signal operation.
+        [[nodiscard]] std::expected<std::uint64_t, std::string> nextRenderCompletionValue(
+            std::string_view pass) const;
         [[nodiscard]] std::expected<InputBindingResult, std::string> prepareInputs(
             VulkanContext& context,
             const lfs::core::SplatData& splat_data,
             std::size_t ring_slot,
             bool force_upload,
-            int upload_sh_degree,
-            bool synchronize_upload = false);
+            int upload_sh_degree);
         [[nodiscard]] std::expected<void, std::string> ensureLodPageInputStorage(
             VulkanContext& context,
             const lfs::core::SplatData& splat_data,
@@ -288,6 +290,7 @@ namespace lfs::vis {
             std::span<const LodPageCache::PendingUpload> uploads,
             std::size_t ring_slot);
         void configureLodUploadEngine(const lfs::core::SplatData& splat_data);
+        void stopLodStreaming(std::string_view reason);
         void discardLodEngineResults(std::vector<LodPageCache::PendingUpload>&& results,
                                      std::string_view reason);
         void logLodUploadProgress(std::size_t published_pages);
@@ -306,8 +309,6 @@ namespace lfs::vis {
             const lfs::rendering::ViewportRenderRequest& request,
             std::size_t num_splats,
             std::size_t ring_slot);
-        [[nodiscard]] bool inputsResident(const lfs::core::SplatData& splat_data,
-                                          std::size_t ring_slot) const;
         [[nodiscard]] std::expected<void, std::string> ensureOutputImages(
             VulkanContext& context,
             glm::ivec2 size,
@@ -339,12 +340,6 @@ namespace lfs::vis {
         static constexpr std::size_t kOverlayRegionCount = 7;
         static constexpr std::size_t kSelectionQueryRegionCount = 8;
         static constexpr std::size_t kRegionAlignment = 256; // VK minStorageBufferOffsetAlignment upper bound on common HW
-        struct CudaInputSlot {
-            VulkanContext::ExternalBuffer buffer{};
-            lfs::rendering::CudaVulkanBufferInterop interop{};
-            std::array<std::size_t, kInputRegionCount> region_offset{};
-            std::array<std::size_t, kInputRegionCount> region_bytes{};
-        };
         struct CudaOpacityCopySlot {
             VulkanContext::ExternalBuffer buffer{};
             lfs::rendering::CudaVulkanBufferInterop interop{};
@@ -405,9 +400,6 @@ namespace lfs::vis {
         };
 
         void detachManagedBuffers();
-        void plugRingInputs(std::size_t ring_slot, std::size_t num_splats, bool reset_cached_raster_state);
-        void aliasSortScratchToInputSlot(std::size_t ring_slot);
-        void releaseInputSlot(VulkanContext& context, std::size_t ring_slot);
         void releaseOpacityCopySlot(VulkanContext& context, std::size_t ring_slot);
         void logVramBreakdownIfChanged(std::string_view reason);
         [[nodiscard]] std::expected<void, std::string> ensureSharedScratchArena(
@@ -454,6 +446,19 @@ namespace lfs::vis {
         // readOutputImage / sampleDepthAtPixel instead of allocating a fresh pool/fence
         // per call. Torn down in reset() while the device is still valid.
         [[nodiscard]] std::expected<void, std::string> ensureReadbackContext() const;
+        [[nodiscard]] std::expected<void, std::string> ensureReadbackStagingBuffer(
+            VulkanContext& context,
+            VkDeviceSize required_bytes) const;
+        [[nodiscard]] std::expected<void, std::string> submitReadbackAndWait(
+            VulkanContext& context,
+            VkCommandBuffer command_buffer,
+            std::uint64_t completion_value,
+            VkPipelineStageFlags wait_stage,
+            VkDeviceSize byte_count,
+            std::string_view validation_label,
+            std::string_view operation_label,
+            bool reset_fence = true,
+            std::source_location location = std::source_location::current()) const;
         [[nodiscard]] std::expected<glm::ivec2, std::string> latestOutputImageSize(OutputSlot output_slot) const;
 
         VulkanContext* context_ = nullptr;
@@ -464,6 +469,10 @@ namespace lfs::vis {
         mutable VkCommandPool readback_pool_ = VK_NULL_HANDLE;
         mutable VkCommandBuffer readback_cmd_ = VK_NULL_HANDLE;
         mutable VkFence readback_fence_ = VK_NULL_HANDLE;
+        mutable VkBuffer readback_staging_buffer_ = VK_NULL_HANDLE;
+        mutable VmaAllocation readback_staging_allocation_ = VK_NULL_HANDLE;
+        mutable VmaAllocationInfo readback_staging_info_{};
+        mutable VkDeviceSize readback_staging_capacity_ = 0;
         VulkanGSRenderer renderer_;
         VulkanGSPipelineBuffers buffers_;
         struct LodUploadSignature {
@@ -565,54 +574,45 @@ namespace lfs::vis {
             VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
             VkImageLayout depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
             std::uint64_t generation = 0;
+            // Timeline value signalled by the compute submission that produced
+            // this exact ring image. Graphics-queue readbacks wait this value;
+            // a host wait alone is not a Vulkan cross-queue memory dependency.
+            std::uint64_t completion_value = 0;
         };
         static constexpr std::size_t kOutputSlotCount = 4;
         static constexpr std::size_t kFrameRingSize = 3;
         std::array<std::array<OutputImageSlot, kFrameRingSize>, kOutputSlotCount> output_slots_{};
         std::array<std::size_t, kOutputSlotCount> latest_output_ring_slot_{};
         std::array<std::uint64_t, kOutputSlotCount> output_generations_{};
+        // Vulkan-only completion counter for queue-to-queue dependencies. Keep
+        // this separate from the externally shared CUDA payload below so Vulkan
+        // readbacks never depend on external-payload tracking semantics.
+        VkSemaphore vulkan_render_complete_timeline_ = VK_NULL_HANDLE;
         VkSemaphore render_complete_timeline_ = VK_NULL_HANDLE;
-        std::uint64_t render_complete_value_ = 0;
-        // The latest completion value a submit actually signaled (or is guaranteed
-        // to signal). renderCompleteValue() returns this — never the reserved
-        // counter — so the trainer/arena never wait a value a failed frame left
-        // unsignaled.
-        std::uint64_t last_signaled_render_value_ = 0;
+        // Last value whose signal operation was accepted by vkQueueSubmit.
+        // Failed recording leaves it unchanged, so no consumer waits on an
+        // unsignaled candidate.
+        std::uint64_t last_submitted_render_value_ = 0;
         // When set, render() takes the legacy per-pixel chain so the depth
         // readback captures per-pixel depth (see setDepthCaptureMode).
         bool depth_capture_mode_ = false;
         // When set, the capture rasterizer writes expected (alpha-weighted) depth.
         bool depth_capture_expected_ = false;
         std::array<std::uint64_t, kFrameRingSize> ring_completion_values_{};
+        // Phase 7C-P3: owner latch for bounded ring/readback waits. Quarantine
+        // never zeros ring_completion_values_ (would manufacture a free slot).
+        mutable std::atomic<bool> gpu_wait_quarantined_{false};
         std::size_t next_ring_slot_ = 0;
         // Whether the last main render used the macro-tile chain; the
         // selection-overlay re-render reuses its sorted buffers and must match.
         bool last_render_used_macro_chain_ = false;
-        // The first frame after a model/input reset needs the synchronous
-        // render-tile chain so the viewport never presents the macro chain's
-        // zero-count warm-up frame.
+        std::size_t resident_depth_wave_armed_ = 0;
+        int resident_sort_bits_ = 0;
+        // The first frame after an input reset remains on the legacy chain;
+        // it uses the same fixed-K wave machinery as every other legacy frame.
         bool macro_chain_warmup_pending_ = true;
-        // Visible-splat capacity high-water mark, fed by the deferred raw emit
-        // count (decays /8 per poll, grows after a clamped frame). 0 until the
-        // first readback lands; the first frames size at the render domain.
-        std::size_t visible_high_water_ = 0;
-        // A clamped frame was observed and a complete one has not landed yet;
-        // keeps frames scheduled while idle so the capacity self-heal converges.
-        bool visible_clamp_pending_ = false;
-        bool instance_clamp_pending_ = false;
-        // Set each render from the start-of-frame deferred poll: true once a
-        // representative frame (one that used the same steady-state rasterizer
-        // chain the next pass will use) is confirmed complete and unclamped.
-        // Drives the synchronous capacity self-heal used by one-shot preview/
-        // export captures, which cannot tolerate the interactive loop's
-        // one-frame clamp transient.
-        bool last_preview_capture_settled_ = false;
 
-        // Fallback CUDA-backed input buffers for models that are not already
-        // backed by Vulkan-external tensor storage. Direct Vulkan-external
-        // training tensors bypass this ring and bind their VkBuffers directly.
         static constexpr std::size_t kInputRingSize = kFrameRingSize;
-        std::array<CudaInputSlot, kInputRingSize> cuda_inputs_{};
         std::array<CudaOpacityCopySlot, kInputRingSize> cuda_opacity_copies_{};
         std::array<CudaOverlaySlot, kInputRingSize> cuda_overlays_{};
         CudaSelectionQuerySlot cuda_selection_query_{};
@@ -640,14 +640,20 @@ namespace lfs::vis {
         // cudaStreamSynchronize that previously blocked the CPU after every
         // upload (P15). Values are monotonic; on each upload we bump the slot's
         // counter, signal CUDA-side, and queue a Vulkan-side wait.
-        struct UploadTimeline {
+        struct CudaTimelineHandoff {
             VulkanContext::ExternalSemaphore vk_semaphore{};
             lfs::rendering::CudaTimelineSemaphore cuda_semaphore{};
             std::uint64_t value = 0;
+
+            [[nodiscard]] std::expected<void, std::string> initialize(
+                VulkanContext& context,
+                std::string_view error_label,
+                std::string_view debug_name);
+            void reset(VulkanContext* context);
         };
-        std::array<UploadTimeline, kInputRingSize> upload_timelines_{};
-        std::array<UploadTimeline, kInputRingSize> overlay_upload_timelines_{};
-        UploadTimeline selection_query_timeline_{};
+        std::array<CudaTimelineHandoff, kInputRingSize> upload_timelines_{};
+        std::array<CudaTimelineHandoff, kInputRingSize> overlay_upload_timelines_{};
+        CudaTimelineHandoff selection_query_timeline_{};
 
         cudaStream_t render_stream_ = nullptr;
 
@@ -672,7 +678,7 @@ namespace lfs::vis {
 
         // Async RAD page streaming: decoded pages are packed and copied on the
         // engine's own thread/stream; render frames only publish completions.
-        UploadTimeline lod_engine_timeline_{};
+        CudaTimelineHandoff lod_engine_timeline_{};
         LodUploadEngine lod_upload_engine_;
         std::uint64_t lod_upload_log_batches_ = 0;
         bool lod_upload_log_converged_ = false;

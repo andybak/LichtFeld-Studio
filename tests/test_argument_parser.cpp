@@ -41,7 +41,8 @@ TEST(ArgumentParserTest, TrainingDefaultsApplyMaxWidthCap) {
     EXPECT_FALSE((*parsed)->cli_bg_color_set);
     EXPECT_EQ((*parsed)->dataset.max_width, 3840);
     EXPECT_EQ((*parsed)->dataset.resize_factor, 1);
-    EXPECT_EQ((*parsed)->optimization.depth_loss_mode, "adaptive-warped-l1");
+    EXPECT_EQ((*parsed)->optimization.depth_loss_mode, "ssi");
+    EXPECT_FLOAT_EQ((*parsed)->freeze_lr_scale, 0.0f);
 }
 
 TEST(ArgumentParserTest, MaxWidthCanBeExplicitlySet) {
@@ -215,6 +216,80 @@ TEST(ArgumentParserTest, TrainingParsesFrozenAddSplatExcludeExport) {
     EXPECT_TRUE((*parsed)->exclude_frozen_add_splats_from_export);
 }
 
+TEST(ArgumentParserTest, TrainingParsesFrozenLrScale) {
+    const auto data_path = make_test_path("lfs_arg_parser_freeze_lr_scale_data");
+    const auto output_path = make_test_path("lfs_arg_parser_freeze_lr_scale_output");
+
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "--headless",
+        "--data-path",
+        data_path.c_str(),
+        "--output-path",
+        output_path.c_str(),
+        "--freeze-lr-scale",
+        "0.05"};
+
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+    EXPECT_FLOAT_EQ((*parsed)->freeze_lr_scale, 0.05f);
+}
+
+TEST(ArgumentParserTest, TrainingRejectsFrozenLrScaleOutsideUnitInterval) {
+    const auto data_path = make_test_path("lfs_arg_parser_invalid_freeze_lr_scale_data");
+    const auto output_path = make_test_path("lfs_arg_parser_invalid_freeze_lr_scale_output");
+
+    for (const char* scale : {"1.5", "-0.1"}) {
+        SCOPED_TRACE(scale);
+        const char* argv[] = {
+            "LichtFeld-Studio",
+            "--headless",
+            "--data-path",
+            data_path.c_str(),
+            "--output-path",
+            output_path.c_str(),
+            "--freeze-lr-scale",
+            scale};
+
+        auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+        ASSERT_FALSE(parsed.has_value());
+        EXPECT_NE(parsed.error().find("freeze_lr_scale must be within [0, 1]"), std::string::npos)
+            << parsed.error();
+    }
+}
+
+TEST(ArgumentParserTest, FreezeMustImmediatelyFollowAddedSplat) {
+    const auto dir = make_test_path("lfs_arg_parser_freeze_order");
+    const auto data_path = std::filesystem::path(dir) / "data";
+    const auto output_path = std::filesystem::path(dir) / "output";
+    const auto splat = std::filesystem::path(dir) / "background.ply";
+    std::filesystem::create_directories(data_path);
+    std::filesystem::create_directories(output_path);
+    std::ofstream(splat).put('\n');
+
+    const std::string data_str = data_path.string();
+    const std::string output_str = output_path.string();
+    const std::string splat_str = splat.string();
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "--headless",
+        "--data-path",
+        data_str.c_str(),
+        "--output-path",
+        output_str.c_str(),
+        "--add-splat",
+        splat_str.c_str(),
+        "--freeze-lr-scale",
+        "0.05",
+        "--freeze"};
+
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    ASSERT_FALSE(parsed.has_value());
+    EXPECT_NE(parsed.error().find("--freeze must immediately follow --add-splat <path>"),
+              std::string::npos)
+        << parsed.error();
+}
+
 TEST(ArgumentParserTest, TrainingParsesExplicitDepthLossOptions) {
     const auto data_path = make_test_path("lfs_arg_parser_depth_loss_data");
     const auto output_path = make_test_path("lfs_arg_parser_depth_loss_output");
@@ -230,14 +305,14 @@ TEST(ArgumentParserTest, TrainingParsesExplicitDepthLossOptions) {
         "--depth-loss-weight",
         "3.25",
         "--depth-loss-mode",
-        "adaptive-warped-l1"};
+        "ssi-disparity"};
 
     auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
     ASSERT_TRUE(parsed.has_value()) << parsed.error();
 
     EXPECT_TRUE((*parsed)->optimization.use_depth_loss);
     EXPECT_FLOAT_EQ((*parsed)->optimization.depth_loss_weight, 3.25f);
-    EXPECT_EQ((*parsed)->optimization.depth_loss_mode, "adaptive-warped-l1");
+    EXPECT_EQ((*parsed)->optimization.depth_loss_mode, "ssi-disparity");
 }
 
 TEST(ArgumentParserTest, TrainingRejectsLegacyDepthLossAlias) {
@@ -257,7 +332,35 @@ TEST(ArgumentParserTest, TrainingRejectsLegacyDepthLossAlias) {
 
     auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
     ASSERT_FALSE(parsed.has_value());
-    EXPECT_NE(parsed.error().find("depth_loss_mode must be 'pearson' or 'adaptive-warped-l1'"), std::string::npos);
+    EXPECT_NE(parsed.error().find("depth_loss_mode must be 'ssi', 'ssi-disparity', or 'ssi-depth'"), std::string::npos);
+}
+
+TEST(ArgumentParserTest, TrainingParsesExplicitNormalLossOptions) {
+    const auto data_path = make_test_path("lfs_arg_parser_normal_loss_data");
+    const auto output_path = make_test_path("lfs_arg_parser_normal_loss_output");
+
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "--headless",
+        "--data-path",
+        data_path.c_str(),
+        "--output-path",
+        output_path.c_str(),
+        "--use-normal-loss",
+        "--normal-loss-weight",
+        "0.75",
+        "--normal-consistency-weight",
+        "0.25",
+        "--normal-flatten-weight",
+        "5.0"};
+
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+
+    EXPECT_TRUE((*parsed)->optimization.use_normal_loss);
+    EXPECT_FLOAT_EQ((*parsed)->optimization.normal_loss_weight, 0.75f);
+    EXPECT_FLOAT_EQ((*parsed)->optimization.normal_consistency_weight, 0.25f);
+    EXPECT_FLOAT_EQ((*parsed)->optimization.normal_flatten_weight, 5.0f);
 }
 
 TEST(ArgumentParserTest, TrainingParsesBackgroundModeModulation) {

@@ -244,8 +244,11 @@ namespace lfs::core {
             const CropBoxData* data = nullptr;
             glm::mat4 world_transform{1.0f};
             glm::mat4 local_transform{1.0f};
+            bool effectively_visible = false;
+            bool parent_effectively_visible = false;
         };
         [[nodiscard]] std::vector<RenderableCropBox> getVisibleCropBoxes() const;
+        [[nodiscard]] std::vector<RenderableCropBox> getRenderableCropBoxes() const;
 
         [[nodiscard]] NodeId getEllipsoidForSplat(NodeId splat_id) const;
         [[nodiscard]] NodeId getOrCreateEllipsoidForSplat(NodeId splat_id);
@@ -260,8 +263,11 @@ namespace lfs::core {
             const EllipsoidData* data = nullptr;
             glm::mat4 world_transform{1.0f};
             glm::mat4 local_transform{1.0f};
+            bool effectively_visible = false;
+            bool parent_effectively_visible = false;
         };
         [[nodiscard]] std::vector<RenderableEllipsoid> getVisibleEllipsoids() const;
+        [[nodiscard]] std::vector<RenderableEllipsoid> getRenderableEllipsoids() const;
 
         const lfs::core::SplatData* getCombinedModel() const;
 
@@ -469,6 +475,13 @@ namespace lfs::core {
         void updateWorldTransform(const SceneNode& node) const;
         void removeNodeInternal(const std::string& name, bool keep_children, bool force);
         [[nodiscard]] size_t currentSelectionCapacity() const;
+        [[nodiscard]] lfs::core::Tensor liveSelectionMask(size_t expected_size,
+                                                          Device device,
+                                                          DataType dtype) const;
+        [[nodiscard]] std::shared_ptr<lfs::core::Tensor> normalizeSelectionMask(
+            std::shared_ptr<lfs::core::Tensor> mask,
+            size_t expected_size,
+            size_t* selected_count = nullptr) const;
         void resizeSelectionIfSizeMismatch(size_t expected_size);
 
         SelectionGroup* findGroup(uint8_t id);

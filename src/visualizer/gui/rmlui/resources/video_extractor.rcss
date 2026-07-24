@@ -12,6 +12,7 @@ body {
 .video-extractor-window {
     min-width: 0;
     min-height: 0;
+    position: relative;
 }
 
 #content-wrap {
@@ -107,6 +108,51 @@ body {
     margin-left: 10dp;
     color: #cdd6f4;
     min-width: 130dp;
+}
+
+.hdr-badge {
+    margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 4dp;
+    padding: 2dp 8dp;
+    border-radius: 4dp;
+    font-size: 10dp;
+    font-weight: 700;
+    letter-spacing: 0.3dp;
+    text-transform: uppercase;
+    white-space: nowrap;
+    line-height: 18dp;
+    height: 18dp;
+    flex-shrink: 0;
+}
+
+.hdr-badge--sdr {
+    background-color: #45475a;
+    color: #bac2de;
+}
+
+.hdr-badge--hdr {
+    background-color: #5a4a2a;
+    color: #f9e2af;
+}
+
+#hdr-badge-type {
+    font-weight: 500;
+    letter-spacing: 0.1dp;
+}
+
+#hdr-badge-label {
+    font-weight: 700;
+    letter-spacing: 0.3dp;
+}
+
+.hdr-badge--sdr #hdr-badge-label {
+    color: #bac2de;
+}
+
+.hdr-badge--hdr #hdr-badge-label {
+    color: #f9e2af;
 }
 
 #timeline {
@@ -312,14 +358,21 @@ body {
 }
 
 .wide-select {
-    width: 150dp;
-    min-width: 150dp;
+    width: 180dp;
+    min-width: 180dp;
     height: 24dp;
     min-height: 24dp;
     line-height: 22dp;
     padding: 0;
     margin: 0;
     flex-shrink: 0;
+}
+
+/* Wider select variants for sharpness options which have longer labels */
+#sharpness-algorithm-select,
+#sharpness-mode-select {
+    width: 250dp;
+    min-width: 250dp;
 }
 
 .compact-select {
@@ -434,6 +487,11 @@ body {
     min-width: 72dp;
 }
 
+#window-candidates-select {
+    width: 160dp;
+    min-width: 160dp;
+}
+
 .pattern-input {
     width: 200dp;
     min-width: 200dp;
@@ -479,4 +537,69 @@ button:disabled,
 input:disabled,
 select:disabled {
     opacity: 0.45;
+}
+
+.toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 6dp;
+    cursor: pointer;
+    color: #cdd6f4;
+}
+
+.sharpness-options {
+    display: flex;
+    flex-direction: column;
+    gap: 5dp;
+}
+
+.sharpness-options.hidden {
+    display: none;
+}
+
+/* ── Overwrite confirmation overlay ────────────────────── */
+
+.extractor-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 50;
+    background-color: rgba(0, 0, 0, 0.48);
+}
+
+.extractor-overlay.hidden {
+    display: none;
+}
+
+.confirm-dialog {
+    border-width: 2dp;
+    padding: 16dp;
+    min-width: 280dp;
+    max-width: 380dp;
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+    border-color: #a6e3a1;
+}
+
+.confirm-message {
+    display: block;
+    font-size: 12dp;
+    text-align: center;
+    margin-bottom: 8dp;
+}
+
+.confirm-buttons {
+    display: flex;
+    justify-content: center;
+    gap: 8dp;
+    margin-top: 8dp;
+}
+
+.confirm-buttons .btn {
+    min-width: 80dp;
 }

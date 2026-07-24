@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "core/export.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -19,6 +21,10 @@
 
 namespace lfs::core {
 
+    class GlobalArenaManager;
+    LFS_CORE_API GlobalArenaManager& global_arena_manager();
+    LFS_CORE_API void shutdown_global_arena_manager();
+
     class RasterizerMemoryArena {
     public:
         struct Config {
@@ -27,6 +33,7 @@ namespace lfs::core {
             size_t max_physical = 8ULL << 30;  // 8GB max physical memory
             size_t granularity = 2 << 20;      // 2MB allocation granularity
             size_t alignment = 256;
+            bool enable_vmm = true; // Disable to use and validate the cudaMalloc fallback.
             bool enable_profiling = false;
             size_t log_interval = 1000; // Log every N frames
         };
@@ -146,7 +153,7 @@ namespace lfs::core {
         // Completion event of the most recent stream-aware frame. Invalid when
         // the last frame was legacy (no stream) — the next begin then falls back
         // to a device sync. Guarded by last_frame_event_mutex_.
-        std::mutex last_frame_event_mutex_;
+        mutable std::mutex last_frame_event_mutex_;
         cudaEvent_t last_frame_event_ = nullptr;
         bool last_frame_event_valid_ = false;
 
@@ -174,7 +181,7 @@ namespace lfs::core {
         // a device-wide sync, and end_frame records the event on `stream` — which
         // must be the stream all of the frame's arena work was enqueued on. Frames
         // without a stream keep the legacy cudaDeviceSynchronize and invalidate
-        // the chain. LFS_ARENA_LEGACY_SYNC=1 forces the legacy sync everywhere.
+        // the chain.
         //
         // A tenant whose arena work runs on a VULKAN queue (the viewport) must
         // call note_external_release before ending its frame: neither the chain
@@ -242,6 +249,7 @@ namespace lfs::core {
         MemoryInfo get_memory_info() const;
         void dump_statistics() const;
         void log_memory_status(uint64_t frame_id, bool force = false);
+        [[nodiscard]] bool has_last_frame_event_for_testing() const;
 
         bool is_under_memory_pressure() const;
         float get_memory_pressure() const;
@@ -254,7 +262,7 @@ namespace lfs::core {
         // wait_timeout: nullopt = non-blocking try; 0 = wait forever; else bounded.
         std::optional<uint64_t> begin_frame_impl(cudaStream_t stream, bool from_rendering,
                                                  std::optional<uint32_t> wait_timeout_ms);
-        bool wait_for_previous_frame(cudaStream_t stream);
+        cudaError_t wait_for_previous_frame(cudaStream_t stream);
         // Host-blocks on a pending Vulkan release fence (note_external_release)
         // and clears it. Must run before any path that frees or replaces arena
         // backing — a device sync cannot observe the in-flight Vulkan batch.
@@ -273,7 +281,7 @@ namespace lfs::core {
 
     class GlobalArenaManager {
     public:
-        static GlobalArenaManager& instance();
+        static GlobalArenaManager& instance() { return global_arena_manager(); }
         RasterizerMemoryArena& get_arena();
         RasterizerMemoryArena* try_get_arena();
         bool install_external_backing(RasterizerMemoryArena::ExternalBacking backing);
@@ -282,12 +290,19 @@ namespace lfs::core {
                                    const std::function<bool(size_t)>& commit);
         void clear_external_backing(const void* device_ptr = nullptr);
         void reset();
+        void shutdown() { shutdown_global_arena_manager(); }
+        /// Reconstructs the arena with a caller-supplied capacity for deterministic OOM tests.
+        void reconfigure_for_testing(RasterizerMemoryArena::Config config);
 
     private:
+        friend GlobalArenaManager& global_arena_manager();
+        friend void shutdown_global_arena_manager();
+
         GlobalArenaManager() = default;
         ~GlobalArenaManager() = default;
         std::unique_ptr<RasterizerMemoryArena> arena_;
         std::mutex init_mutex_;
+        bool shutdown_ = false;
     };
 
 } // namespace lfs::core

@@ -114,7 +114,10 @@ namespace fast_lfs::rasterization::kernels {
         // computation adapted from https://github.com/NVlabs/tiny-cuda-nn/blob/212104156403bd87616c1a4f73a1c5f2c2e172a9/include/tiny-cuda-nn/common_device.h#L340
         float3 result = 0.5f + 0.28209479177387814f * sh_coefficients_0[primitive_idx];
         if (active_sh_bases > 1) {
-            auto [x, y, z] = safe_normalize(position - cam_position);
+            const float3 direction = safe_normalize(position - cam_position);
+            const float x = direction.x;
+            const float y = direction.y;
+            const float z = direction.z;
             float3 c[15];
             load_shN_coeffs(sh_coefficients_rest, primitive_idx, active_sh_bases, sh_layout_slots, c);
             result = result + (-0.48860251190291987f * y) * c[0] + (0.48860251190291987f * z) * c[1] + (-0.48860251190291987f * x) * c[2];
@@ -176,10 +179,14 @@ namespace fast_lfs::rasterization::kernels {
         const float eps) {
         if (!param.enabled || param.n_attributes <= 0)
             return;
+        float row_step_size = param.step_size;
         if (param.frozen_mask != nullptr &&
             primitive_idx < static_cast<uint>(param.frozen_mask_size) &&
-            param.frozen_mask[primitive_idx])
-            return;
+            param.frozen_mask[primitive_idx]) {
+            if (param.frozen_lr_scale == 0.0f)
+                return;
+            row_step_size *= param.frozen_lr_scale;
+        }
         const uint n_attr = static_cast<uint>(param.n_attributes);
         const uint base = primitive_idx * n_attr;
         if (base >= static_cast<uint>(param.n_elements))
@@ -215,7 +222,7 @@ namespace fast_lfs::rasterization::kernels {
             const float v = beta2 * old_v + (1.0f - beta2) * grad * grad;
             if (i < active) {
                 const float denom = sqrtf(v) * param.bias_correction2_sqrt_rcp + eps;
-                param.param[base + i] -= param.step_size * m / denom;
+                param.param[base + i] -= row_step_size * m / denom;
             }
             param.exp_avg_q[base + i] = quantize_m(m, new_m_scale);
             param.exp_avg_sq_q[base + i] = quantize_sqrt_v(v, new_v_scale);
@@ -237,6 +244,27 @@ namespace fast_lfs::rasterization::kernels {
             return 0.0f;
         return fused_adam.scale_reg_weight * expf(param.param[element_idx]) /
                static_cast<float>(param.n_elements);
+    }
+
+    // L = weight * mean_over_primitives(exp(min raw scale)): flattens splats
+    // along their thinnest axis so the min-axis normal is well-defined
+    // (PGSR-style). The argmin is treated as a constant.
+    __device__ inline void add_flatten_regularization_grads(
+        const FusedAdamSettings& fused_adam,
+        const FusedAdamParam& param,
+        const uint scale_base,
+        float (&grads)[3]) {
+        if (fused_adam.flatten_reg_weight <= 0.0f || param.n_elements <= 0)
+            return;
+        const float s0 = param.param[scale_base];
+        const float s1 = param.param[scale_base + 1];
+        const float s2 = param.param[scale_base + 2];
+        const uint min_axis = (s0 <= s1 && s0 <= s2) ? 0u : (s1 <= s2) ? 1u
+                                                                       : 2u;
+        const float s_min = min_axis == 0u ? s0 : (min_axis == 1u ? s1 : s2);
+        // n_elements counts all three scale channels per primitive.
+        grads[min_axis] += 3.0f * fused_adam.flatten_reg_weight * expf(s_min) /
+                           static_cast<float>(param.n_elements);
     }
 
     __device__ inline float opacity_extra_grad(
@@ -297,10 +325,14 @@ namespace fast_lfs::rasterization::kernels {
         const FusedAdamParam& p = fused_adam.shN;
         if (!p.enabled || n_slots_to_update == 0u || sh_layout_slots == 0u)
             return;
+        float row_step_size = p.step_size;
         if (p.frozen_mask != nullptr &&
             primitive_idx < static_cast<uint>(p.frozen_mask_size) &&
-            p.frozen_mask[primitive_idx])
-            return;
+            p.frozen_mask[primitive_idx]) {
+            if (p.frozen_lr_scale == 0.0f)
+                return;
+            row_step_size *= p.frozen_lr_scale;
+        }
 
         float4* param4 = reinterpret_cast<float4*>(p.param);
         uchar4* m4 = reinterpret_cast<uchar4*>(p.exp_avg_q);
@@ -358,7 +390,7 @@ namespace fast_lfs::rasterization::kernels {
                 const float m = beta1 * dequant_m(mc[c], old_m_scale) + (1.0f - beta1) * gc[c];
                 const float v = beta2 * old_v + (1.0f - beta2) * gc[c] * gc[c];
                 const float denom = sqrtf(v) * p.bias_correction2_sqrt_rcp + eps;
-                pc[c] -= p.step_size * m / denom;
+                pc[c] -= row_step_size * m / denom;
                 nm[c] = quantize_m(m, new_m_scale);
                 nv[c] = quantize_sqrt_v(v, new_v_scale);
             }
@@ -387,8 +419,14 @@ namespace fast_lfs::rasterization::kernels {
         adam_step_row(sh0_grads, fused_adam.sh0, primitive_idx, 3, fused_adam.beta1, fused_adam.beta2, fused_adam.eps);
         float3 dcolor_dposition = make_float3(0.0f);
         if constexpr (ACTIVE_SH_BASES > 1) {
-            auto [x_raw, y_raw, z_raw] = position - cam_position;
-            auto [x, y, z] = safe_normalize(make_float3(x_raw, y_raw, z_raw));
+            const float3 raw_direction = position - cam_position;
+            const float x_raw = raw_direction.x;
+            const float y_raw = raw_direction.y;
+            const float z_raw = raw_direction.z;
+            const float3 direction = safe_normalize(raw_direction);
+            const float x = direction.x;
+            const float y = direction.y;
+            const float z = direction.z;
 
             // Load all coeffs we need via the float4-packed shuffle.
             float3 c[15];

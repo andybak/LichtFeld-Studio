@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/argument_parser.hpp"
+#include "core/environment.hpp"
 #include "core/logger.hpp"
 #include "core/parameters.hpp"
 #include "core/path_utils.hpp"
@@ -171,6 +172,7 @@ namespace {
                 "\nSUBCOMMANDS:\n"
                 "convert -- Convert between .ply, .sog, .spz, .usd/.usda/.usdc, .html\n"
                 "mesh2splat -- Convert a mesh file to Gaussian splats\n"
+                "preprocess -- Generate depth and/or normal maps for an image dataset\n"
                 "plugin -- Manage plugins (create, check, list)\n"
                 "\n"
                 "Run '<subcommand> --help' for details.\n"
@@ -178,13 +180,15 @@ namespace {
                 "EXAMPLES:\n"
                 "lichtfeld-studio -d ./data -o ./output\n"
                 "lichtfeld-studio --resume checkpoint.resume\n"
+                "lichtfeld-studio --render-camera-path path.json --render-load model.ply --render-output out.mp4\n"
                 "lichtfeld-studio -v model.ply\n"
                 "lichtfeld-studio convert in.ply out.spz\n"
                 "lichtfeld-studio mesh2splat model.obj -o model_splat.ply\n"
+                "lichtfeld-studio preprocess ./data/scene --mode both\n"
                 "lichtfeld-studio plugin create my_plugin\n"
                 "\n"
                 "ENVIRONMENT:\n"
-                "LOG_LEVEL -- Set log level (trace/debug/info/perf/warn/error)\n");
+                "LFS_LOG_LEVEL -- Set log level (trace/debug/info/perf/warn/error)\n");
             parser.helpParams.width = 240;
 
             // =============================================================================
@@ -195,6 +199,7 @@ namespace {
             ::args::Flag version(mode_group, "version", "Display version information", {'V', "version"});
             ::args::ValueFlag<std::string> view_ply(mode_group, "path", "View file(s). Supports splat (.ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz) and mesh (.obj, .fbx, .gltf, .glb, .stl) formats. If directory, loads all.", {'v', "view"});
             ::args::ValueFlag<std::string> resume_checkpoint(mode_group, "checkpoint", "Resume training from checkpoint file", {"resume"});
+            ::args::ValueFlag<std::string> render_camera_path(mode_group, "path", "Render a JSON camera-keyframe path to video, headless (no GUI/window). Requires --render-load and --render-output; see RENDER PATH options.", {"render-camera-path"});
             ::args::CompletionFlag completion(parser, {"complete"});
 
             // =============================================================================
@@ -209,9 +214,22 @@ namespace {
             ::args::ValueFlag<std::string> init_path(paths_group, "path", "Initialize from splat file (.ply, .sog, .spz, .usd, .usda, .usdc, .usdz, .resume)", {"init"});
             ::args::ValueFlagList<std::string> add_splats(paths_group, "path", "Append trained splat file(s) to the training model before optimizer initialization", {"add-splat"});
             ::args::CounterFlag freeze(paths_group, "freeze", "Freeze the immediately preceding --add-splat rows from optimizer gradients and densification", {"freeze"});
+            ::args::ValueFlag<float> freeze_lr_scale(paths_group, "scale", "Learning-rate scale for frozen splats (0 = fully frozen, default; try 0.01-0.1 to let frozen splats absorb small appearance mismatch)", {"freeze-lr-scale"});
             ::args::Flag exclude_export(paths_group, "exclude_export", "Exclude frozen --add-splat rows from PLY exports", {"exclude-export"});
 
             ::args::ValueFlag<std::string> import_cameras(paths_group, "path", "Import COLMAP cameras from sparse folder (no images required)", {"import-cameras"});
+
+            // =============================================================================
+            // RENDER PATH (used with --render-camera-path)
+            // =============================================================================
+            ::args::Group render_path_sep(parser, " ");
+            ::args::Group render_path_group(parser, "RENDER PATH (used with --render-camera-path):");
+            ::args::ValueFlag<std::string> render_load(render_path_group, "path", "Trained scene to render (.ply/.sog/.spz or .resume checkpoint)", {"render-load"});
+            ::args::ValueFlag<std::string> render_output(render_path_group, "path", "Output video file (.mp4)", {"render-output"});
+            ::args::ValueFlag<int> render_width(render_path_group, "width", "Output width (default 1920)", {"render-width"});
+            ::args::ValueFlag<int> render_height(render_path_group, "height", "Output height (default 1080)", {"render-height"});
+            ::args::ValueFlag<int> render_fps(render_path_group, "fps", "Output framerate (default 30)", {"render-fps"});
+            ::args::ValueFlag<int> render_crf(render_path_group, "crf", "Video quality, lower=better (default 18)", {"render-crf"});
 
             // =============================================================================
             // TRAINING PARAMETERS
@@ -257,8 +275,10 @@ namespace {
                                                                 {"4", 4},
                                                                 {"8", 8}});
             ::args::ValueFlag<int> max_width(dataset_group, "max_width", "Max width of images in px; 0 disables the cap (default: 3840)", {"max-width"});
+            ::args::ValueFlag<int> min_track_length(dataset_group, "min_track_length", "Minimum point track length for COLMAP sparse point import; 0 disables filtering", {"min-track-length"});
             ::args::Flag no_cpu_cache(dataset_group, "no_cpu_cache", "Disable CPU memory caching (default: enabled)", {"no-cpu-cache"});
             ::args::Flag no_fs_cache(dataset_group, "no_fs_cache", "Disable filesystem caching (default: enabled)", {"no-fs-cache"});
+            ::args::Flag use_16bit(dataset_group, "use_16bit", "Train with 16-bit color images (HDR); caches losslessly as JPEG 2000 (default: 8-bit)", {"use-16bit"});
             ::args::Flag undistort(dataset_group, "undistort", "Undistort images on-the-fly before training", {"undistort"});
             ::args::MapFlag<std::string, std::string> centralize(dataset_group, "mode",
                                                                  "Centralize dataset origin: off, by_pointcloud, by_cameras (default: off)",
@@ -269,10 +289,10 @@ namespace {
                                                                      {"by_cameras", "by_cameras"}});
 
             // =============================================================================
-            // MASK / DEPTH OPTIONS
+            // MASK / DEPTH / NORMAL OPTIONS
             // =============================================================================
             ::args::Group mask_sep(parser, " ");
-            ::args::Group mask_group(parser, "MASK / DEPTH OPTIONS:");
+            ::args::Group mask_group(parser, "MASK / DEPTH / NORMAL OPTIONS:");
             ::args::MapFlag<std::string, lfs::core::param::MaskMode> mask_mode(mask_group, "mask_mode",
                                                                                "Mask mode: none, segment, ignore, segment_and_ignore, alpha_consistent (default: none)",
                                                                                {"mask-mode"},
@@ -286,7 +306,12 @@ namespace {
             ::args::Flag no_alpha_as_mask(mask_group, "no_alpha_as_mask", "Disable automatic alpha-as-mask for RGBA images", {"no-alpha-as-mask"});
             ::args::Flag use_depth_loss(mask_group, "use_depth_loss", "Load depth maps and enable depth-map supervision", {"use-depth-loss"});
             ::args::ValueFlag<float> depth_loss_weight(mask_group, "depth_loss_weight", "Depth loss weight (default: 2.0)", {"depth-loss-weight"});
-            ::args::ValueFlag<std::string> depth_loss_mode(mask_group, "depth_loss_mode", "Depth loss mode: pearson, adaptive-warped-l1 (default: adaptive-warped-l1)", {"depth-loss-mode"});
+            ::args::ValueFlag<std::string> depth_loss_mode(mask_group, "depth_loss_mode", "Depth prior convention: ssi (auto-detect), ssi-disparity, ssi-depth (default: ssi)", {"depth-loss-mode"});
+            ::args::Flag use_normal_loss(mask_group, "use_normal_loss", "Load normal maps and enable normal supervision", {"use-normal-loss"});
+            ::args::ValueFlag<float> normal_loss_weight(mask_group, "normal_loss_weight", "Prior normal loss weight (default: 0.05)", {"normal-loss-weight"});
+            ::args::ValueFlag<float> normal_consistency_weight(mask_group, "normal_consistency_weight", "Depth-normal consistency weight (default: 0.05)", {"normal-consistency-weight"});
+            ::args::ValueFlag<float> normal_flatten_weight(mask_group, "normal_flatten_weight", "Min-axis scale flattening weight while normal supervision is active (default: 1.0)", {"normal-flatten-weight"});
+            ::args::ValueFlag<std::string> normal_loss_space(mask_group, "normal_loss_space", "Normal prior space: auto, camera-opencv, camera-opengl, world (default: auto)", {"normal-loss-space"});
 
             // =============================================================================
             // SPARSITY OPTIMIZATION
@@ -376,8 +401,8 @@ namespace {
                 std::string filter_pattern;
 
                 // Check environment variable first
-                if (const char* env_level = std::getenv("LOG_LEVEL")) {
-                    level = parse_log_level(env_level);
+                if (const auto env_level = lfs::core::environment::value("LFS_LOG_LEVEL")) {
+                    level = parse_log_level(std::string(*env_level));
                 }
                 // Verbose/quiet flags override environment variable
                 if (verbose) {
@@ -462,6 +487,47 @@ namespace {
                 if (gut) {
                     params.optimization.gut = true;
                 }
+                return std::make_tuple(ParseResult::Success, std::function<void()>{});
+            }
+
+            // Headless camera-path -> video render mode: no training, no window.
+            if (render_camera_path) {
+                const auto& camera_path_str = ::args::get(render_camera_path);
+                const auto camera_path = lfs::core::utf8_to_path(camera_path_str);
+                if (!std::filesystem::exists(camera_path)) {
+                    return std::unexpected(std::format("Camera path file does not exist: {}", camera_path_str));
+                }
+                if (!render_load || ::args::get(render_load).empty()) {
+                    return std::unexpected(std::format(
+                        "ERROR: --render-camera-path requires --render-load\n\n{}", parser.Help()));
+                }
+                if (!render_output || ::args::get(render_output).empty()) {
+                    return std::unexpected(std::format(
+                        "ERROR: --render-camera-path requires --render-output\n\n{}", parser.Help()));
+                }
+                const auto load_path = lfs::core::utf8_to_path(::args::get(render_load));
+                if (!std::filesystem::exists(load_path)) {
+                    return std::unexpected(std::format("Scene to render does not exist: {}", ::args::get(render_load)));
+                }
+
+                lfs::core::param::RenderPathConfig cfg;
+                cfg.camera_path = camera_path;
+                cfg.load_path = load_path;
+                cfg.output_path = lfs::core::utf8_to_path(::args::get(render_output));
+                if (render_width) {
+                    cfg.width = ::args::get(render_width);
+                }
+                if (render_height) {
+                    cfg.height = ::args::get(render_height);
+                }
+                if (render_fps) {
+                    cfg.fps = ::args::get(render_fps);
+                }
+                if (render_crf) {
+                    cfg.crf = ::args::get(render_crf);
+                }
+                params.render_path = cfg;
+
                 return std::make_tuple(ParseResult::Success, std::function<void()>{});
             }
 
@@ -605,6 +671,12 @@ namespace {
                     return std::unexpected("ERROR: --max-width must be 0 or greater");
                 }
             }
+            if (min_track_length) {
+                int min_track = ::args::get(min_track_length);
+                if (min_track < 0) {
+                    return std::unexpected("ERROR: --min-track-length must be 0 or greater");
+                }
+            }
 
             // Validate sh_degree (0-3)
             if (sh_degree) {
@@ -683,8 +755,10 @@ namespace {
                                         iterations_val = cli_option_present({"-i", "--iter"}) ? std::optional<uint32_t>(::args::get(iterations)) : std::optional<uint32_t>(),
                                         resize_factor_val = resize_factor ? std::optional<int>(::args::get(resize_factor)) : std::optional<int>(1), // default 1
                                         max_width_val = max_width ? std::optional<int>(::args::get(max_width)) : std::optional<int>(3840),
+                                        min_track_length_val = cli_option_present({"--min-track-length"}) ? std::optional<int>(::args::get(min_track_length)) : std::optional<int>(),
                                         no_cpu_cache_flag = static_cast<bool>(no_cpu_cache),
                                         no_fs_cache_flag = static_cast<bool>(no_fs_cache),
+                                        use_16bit_flag = static_cast<bool>(use_16bit),
                                         tcp_server_connection_port_val = tcp_server_connection_port ? std::optional<int>(::args::get(tcp_server_connection_port)) : std::optional<int>(),
                                         tcp_broadcast_connection_port_val = tcp_broadcast_connection_port ? std::optional<int>(::args::get(tcp_broadcast_connection_port)) : std::optional<int>(),
                                         tcp_connection_flag = bool(tcp_connection),
@@ -709,6 +783,10 @@ namespace {
                                         mask_mode_val = cli_option_present({"--mask-mode"}) ? std::optional<lfs::core::param::MaskMode>(::args::get(mask_mode)) : std::optional<lfs::core::param::MaskMode>(),
                                         depth_loss_weight_val = cli_option_present({"--depth-loss-weight"}) ? std::optional<float>(::args::get(depth_loss_weight)) : std::optional<float>(),
                                         depth_loss_mode_val = cli_option_present({"--depth-loss-mode"}) ? std::optional<std::string>(::args::get(depth_loss_mode)) : std::optional<std::string>(),
+                                        normal_loss_weight_val = cli_option_present({"--normal-loss-weight"}) ? std::optional<float>(::args::get(normal_loss_weight)) : std::optional<float>(),
+                                        normal_consistency_weight_val = cli_option_present({"--normal-consistency-weight"}) ? std::optional<float>(::args::get(normal_consistency_weight)) : std::optional<float>(),
+                                        normal_flatten_weight_val = cli_option_present({"--normal-flatten-weight"}) ? std::optional<float>(::args::get(normal_flatten_weight)) : std::optional<float>(),
+                                        normal_loss_space_val = cli_option_present({"--normal-loss-space"}) ? std::optional<std::string>(::args::get(normal_loss_space)) : std::optional<std::string>(),
                                         // Python scripts
                                         python_scripts_val = cli_option_present({"--python-script"}) ? std::optional<std::vector<std::string>>(::args::get(python_scripts)) : std::optional<std::vector<std::string>>(),
                                         centralize_val = cli_option_present({"--centralize"}) ? std::optional<std::string>(::args::get(centralize)) : std::optional<std::string>(),
@@ -740,8 +818,10 @@ namespace {
                                         invert_masks_flag = bool(invert_masks),
                                         no_alpha_as_mask_flag = bool(no_alpha_as_mask),
                                         use_depth_loss_flag = bool(use_depth_loss),
+                                        use_normal_loss_flag = bool(use_normal_loss),
                                         no_error_map_flag = bool(no_error_map),
                                         no_edge_map_flag = bool(no_edge_map),
+                                        freeze_lr_scale_val = cli_option_present({"--freeze-lr-scale"}) ? std::optional<float>(::args::get(freeze_lr_scale)) : std::optional<float>(),
                                         exclude_export_flag = bool(exclude_export),
                                         output_name_val = cli_option_present({"--output-name"}) ? std::optional<std::string>(::args::get(output_name)) : std::optional<std::string>()]() {
                 auto& opt = params.optimization;
@@ -763,10 +843,12 @@ namespace {
                 setVal(iterations_val, opt.iterations);
                 setVal(resize_factor_val, ds.resize_factor);
                 setVal(max_width_val, ds.max_width);
+                setVal(min_track_length_val, ds.min_track_length);
                 if (no_cpu_cache_flag)
                     ds.loading_params.use_cpu_memory = false;
                 if (no_fs_cache_flag)
                     ds.loading_params.use_fs_cache = false;
+                setFlag(use_16bit_flag, ds.loading_params.use_16bit_color);
                 setVal(max_cap_val, opt.max_cap);
                 setVal(tcp_server_connection_port_val, svs.tcp_server_connection_port);
                 setVal(tcp_broadcast_connection_port_val, svs.tcp_broadcast_connection_port);
@@ -828,6 +910,7 @@ namespace {
                     opt.use_error_map = false;
                 if (no_edge_map_flag)
                     opt.use_edge_map = false;
+                setVal(freeze_lr_scale_val, params.freeze_lr_scale);
                 setFlag(exclude_export_flag, params.exclude_frozen_add_splats_from_export);
 
                 // Mask parameters
@@ -840,6 +923,11 @@ namespace {
                 if (depth_loss_mode_val) {
                     opt.depth_loss_mode = *depth_loss_mode_val;
                 }
+                setFlag(use_normal_loss_flag, opt.use_normal_loss);
+                setVal(normal_loss_weight_val, opt.normal_loss_weight);
+                setVal(normal_consistency_weight_val, opt.normal_consistency_weight);
+                setVal(normal_flatten_weight_val, opt.normal_flatten_weight);
+                setVal(normal_loss_space_val, opt.normal_loss_space);
                 // Also propagate to dataset config for loading
                 ds.invert_masks = opt.invert_masks;
                 ds.mask_threshold = opt.mask_threshold;
@@ -888,7 +976,10 @@ lfs::core::args::parse_args_and_params(int argc, const char* const argv[]) {
     auto params = std::make_unique<lfs::core::param::TrainingParameters>();
     auto args = convert_args(argc, argv);
 
-    if (args.size() >= 2 && !args[1].starts_with('-') && args[1] != "convert" && args[1] != "plugin") {
+    if (args.size() >= 2 && !args[1].starts_with('-') &&
+        args[1] != "convert" && args[1] != "mesh2splat" &&
+        args[1] != "mesh-to-splat" && args[1] != "preprocess" &&
+        args[1] != "plugin") {
         const std::filesystem::path p = lfs::core::utf8_to_path(args[1]);
         std::error_code ec;
         if (std::filesystem::exists(p, ec))
@@ -972,6 +1063,24 @@ namespace {
         "  Input:  .obj, .fbx, .gltf, .glb, .stl, .dae, .3ds, .ply\n"
         "  Output: .ply, .sog, .spz, .usd, .usda, .usdc, .html, .rad\n"
         "  Multiple output formats: pass a comma-separated list to --format\n"
+        "\n";
+
+    constexpr const char* PREPROCESS_HELP_HEADER = "LichtFeld Studio - Generate dataset depth and normal maps with MoGe-2 ONNX\n";
+    constexpr const char* PREPROCESS_HELP_FOOTER =
+        "\n"
+        "EXAMPLES:\n"
+        "  LichtFeld-Studio preprocess ./data/scene\n"
+        "  LichtFeld-Studio preprocess ./data/scene --mode both --overwrite\n"
+        "  LichtFeld-Studio preprocess ./data/scene --png-compression 0 --threads 8\n"
+        "  LichtFeld-Studio preprocess --download-only\n"
+        "\n"
+        "OUTPUTS:\n"
+        "  depth/<relative-image>.png   8-bit grayscale depth map\n"
+        "  normals/<relative-image>.png RGB normal map encoded from [-1,1] to [0,255]\n"
+        "  Existing outputs are skipped by default for resumable runs.\n"
+        "  Use --overwrite to recreate existing outputs.\n"
+        "  PNG compression defaults to level 1; use 0 for fastest/largest files.\n"
+        "  The auto-downloaded default model is SHA-256 verified before use.\n"
         "\n";
 
     std::optional<lfs::core::param::OutputFormat> parseFormat(const std::string& str) {
@@ -1219,6 +1328,112 @@ namespace {
 
         return core_args::Mesh2SplatMode{params};
     }
+
+    std::expected<lfs::core::args::ParsedArgs, std::string> parsePreprocessArgs(const int argc, const char* const argv[]) {
+        namespace core_args = lfs::core::args;
+        namespace param = lfs::core::param;
+
+        ::args::ArgumentParser parser(PREPROCESS_HELP_HEADER, PREPROCESS_HELP_FOOTER);
+        ::args::HelpFlag help(parser, "help", "Display help menu", {'h', "help"});
+        ::args::Positional<std::string> input(parser, "dataset", "Dataset root containing the images folder");
+        ::args::MapFlag<std::string, param::PreprocessOutputMode> mode(parser, "mode",
+                                                                       "Output mode: depth, normals, both (default: both)",
+                                                                       {"mode"},
+                                                                       std::unordered_map<std::string, param::PreprocessOutputMode>{
+                                                                           {"depth", param::PreprocessOutputMode::Depth},
+                                                                           {"normal", param::PreprocessOutputMode::Normals},
+                                                                           {"normals", param::PreprocessOutputMode::Normals},
+                                                                           {"both", param::PreprocessOutputMode::Both}});
+        ::args::ValueFlag<std::string> images(parser, "folder", "Images subfolder (default: images)", {"images"});
+        ::args::ValueFlag<std::string> model(parser, "path", "Local ONNX model path; skips default cache download", {"model"});
+        ::args::ValueFlag<int> max_side(parser, "pixels", "Inference longest side, rounded to /14 (default: 518; 0 disables resize)", {"max-side"});
+        ::args::ValueFlag<std::int64_t> num_tokens(parser, "tokens", "MoGe dynamic-token input when present (default: 1800)", {"num-tokens"});
+        ::args::ValueFlag<int> threads(parser, "count", "ONNX Runtime CPU threads (default: all available cores)", {"threads"});
+        ::args::ValueFlag<int> png_compression(parser, "level", "PNG compression level 0-9 (default: 1; 0 is fastest/largest)", {"png-compression"});
+        ::args::ValueFlag<int> bit_depth(parser, "bits", "Output PNG bit depth, 8 or 16 (default: 16; 8-bit depth priors quantize visibly)", {"bit-depth"});
+        ::args::Flag cpu(parser, "cpu", "Force CPU inference even if CUDA is available", {"cpu"});
+        ::args::Flag overwrite(parser, "overwrite", "Overwrite existing depth/normal files", {'y', "overwrite"});
+        ::args::Flag no_download(parser, "no-download", "Fail if the default model is not already cached", {"no-download"});
+        ::args::Flag download_only(parser, "download-only", "Download/verify the default model and exit", {"download-only"});
+
+        std::vector<std::string> args_vec(argv + 1, argv + argc);
+        args_vec[0] = std::string(argv[0]) + " preprocess";
+        parser.Prog(args_vec[0]);
+
+        try {
+            parser.ParseArgs(std::vector<std::string>(args_vec.begin() + 1, args_vec.end()));
+        } catch (const ::args::Help&) {
+            std::print("{}", parser.Help());
+            return core_args::HelpMode{};
+        } catch (const ::args::ParseError& e) {
+            return std::unexpected(std::format("{}\n\n{}", e.what(), parser.Help()));
+        }
+
+        param::PreprocessParameters params;
+        if (input) {
+            params.dataset_path = lfs::core::utf8_to_path(::args::get(input));
+        }
+        if (images) {
+            params.images_folder = ::args::get(images);
+        }
+        if (model) {
+            params.model_path = lfs::core::utf8_to_path(::args::get(model));
+        }
+        if (mode) {
+            params.mode = ::args::get(mode);
+        }
+        if (max_side) {
+            params.max_side = ::args::get(max_side);
+        }
+        if (num_tokens) {
+            params.num_tokens = ::args::get(num_tokens);
+        }
+        if (threads) {
+            params.threads = ::args::get(threads);
+        }
+        if (png_compression) {
+            params.png_compression = ::args::get(png_compression);
+        }
+        if (bit_depth) {
+            params.bit_depth = ::args::get(bit_depth);
+        }
+        params.force_cpu = cpu;
+        params.overwrite = overwrite;
+        params.no_download = no_download;
+        params.download_only = download_only;
+
+        if (!params.download_only) {
+            if (params.dataset_path.empty()) {
+                return std::unexpected(std::format("Missing dataset path\n\n{}", parser.Help()));
+            }
+            if (!std::filesystem::exists(params.dataset_path)) {
+                return std::unexpected(std::format("Dataset not found: {}", lfs::core::path_to_utf8(params.dataset_path)));
+            }
+            if (!std::filesystem::is_directory(params.dataset_path)) {
+                return std::unexpected(std::format("Expected dataset directory: {}", lfs::core::path_to_utf8(params.dataset_path)));
+            }
+        }
+        if (params.max_side < 0) {
+            return std::unexpected("--max-side must be 0 or greater");
+        }
+        if (params.num_tokens <= 0) {
+            return std::unexpected("--num-tokens must be greater than 0");
+        }
+        if (params.threads < 0) {
+            return std::unexpected("--threads must be 0 or greater");
+        }
+        if (params.png_compression < 0 || params.png_compression > 9) {
+            return std::unexpected("--png-compression must be between 0 and 9");
+        }
+        if (params.bit_depth != 8 && params.bit_depth != 16) {
+            return std::unexpected("--bit-depth must be 8 or 16");
+        }
+        if (!params.model_path.empty() && !std::filesystem::exists(params.model_path)) {
+            return std::unexpected(std::format("Model not found: {}", lfs::core::path_to_utf8(params.model_path)));
+        }
+
+        return core_args::PreprocessMode{params};
+    }
 } // namespace
 
 std::expected<lfs::core::args::ParsedArgs, std::string>
@@ -1238,6 +1453,8 @@ lfs::core::args::parse_args(const int argc, const char* const argv[]) {
             return parseConvertArgs(argc, argv);
         } else if (arg1 == "mesh2splat" || arg1 == "mesh-to-splat") {
             return parseMesh2SplatArgs(argc, argv);
+        } else if (arg1 == "preprocess") {
+            return parsePreprocessArgs(argc, argv);
         } else if (arg1 == "plugin") {
             if (argc < 3) {
                 return std::unexpected("Usage: LichtFeld-Studio plugin <create|check|list> [name]");

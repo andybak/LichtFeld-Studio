@@ -14,7 +14,6 @@
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
 #include <functional>
-#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -58,8 +57,11 @@ namespace {
             const cudaError_t err = cudaMalloc(&ptr, size);
 #endif
             if (err != cudaSuccess) {
-                throw std::runtime_error("OUT_OF_MEMORY: Failed to allocate FastGS sort buffer (" +
-                                         std::to_string(size) + " bytes): " + cudaGetErrorString(err));
+                LFS_ENSURE_CUDA_SUCCESS_MSG(
+                    err, "FastGS sort-buffer allocation",
+                    lfs::core::detail::format_cuda_safe(
+                        "requested_bytes={}, label={}", size,
+                        label_ ? label_ : "rasterizer.fastgs.scratch"));
             }
             ptr_ = ptr;
             size_ = size;
@@ -77,10 +79,19 @@ namespace {
 #if CUDART_VERSION >= 11020
             // Free on the stream that used the buffer — a nullptr free would be
             // unordered with the sort kernels once they run on a real stream.
-            cudaFreeAsync(ptr_, stream_);
+            const cudaError_t status = cudaFreeAsync(ptr_, stream_);
 #else
-            cudaFree(ptr_);
+            const cudaError_t status = cudaFree(ptr_);
 #endif
+            if (status != cudaSuccess) {
+                lfs::core::ensure_cuda_success(
+                    status, "FastGS sort-buffer free",
+                    lfs::core::detail::format_cuda_safe(
+                        "ptr={}, bytes={}, label={}", ptr_, size_,
+                        label_ ? label_ : "rasterizer.fastgs.scratch"),
+                    LFS_SOURCE_SITE_CURRENT(),
+                    lfs::core::CudaFailureDisposition::LogOnlyNoLatch);
+            }
             ptr_ = nullptr;
             size_ = 0;
         }
@@ -124,6 +135,8 @@ fast_lfs::rasterization::ForwardResult fast_lfs::rasterization::forward(
     float* image,
     float* alpha,
     float* depth,
+    float* normal,
+    float3* primitive_normals,
     const int n_primitives,
     const int active_sh_bases,
     const int sh_layout_bases,
@@ -155,16 +168,16 @@ fast_lfs::rasterization::ForwardResult fast_lfs::rasterization::forward(
     // overlap trick (~64KB memset) relied on legacy-stream implicit ordering
     // with the previous frame's reads of this same arena memory — gone once
     // the kernels run on an explicit stream.
-    CUDA_CHECK(cudaMemsetAsync(per_tile_buffers.instance_ranges, 0, sizeof(uint2) * n_tiles, stream),
-               "cudaMemsetAsync(tile instance ranges)");
+    LFS_FASTGS_CUDA_CALL(cudaMemsetAsync(per_tile_buffers.instance_ranges, 0, sizeof(uint2) * n_tiles, stream),
+                         "cudaMemsetAsync(tile instance ranges)");
 
     // Allocate per-primitive buffers through arena
     char* per_primitive_buffers_blob = per_primitive_buffers_func(required<PerPrimitiveBuffers>(n_primitives));
     PerPrimitiveBuffers per_primitive_buffers = PerPrimitiveBuffers::from_blob(per_primitive_buffers_blob, n_primitives);
 
     auto* forward_status = per_primitive_buffers.forward_status;
-    CUDA_CHECK(cudaMemsetAsync(forward_status, 0, sizeof(raster::FastGSForwardStatus), stream),
-               "cudaMemsetAsync(FastGS forward status)");
+    LFS_FASTGS_CUDA_CALL(cudaMemsetAsync(forward_status, 0, sizeof(raster::FastGSForwardStatus), stream),
+                         "cudaMemsetAsync(FastGS forward status)");
 
     // Preprocess primitives
     kernels::forward::preprocess_cu<<<div_round_up(n_primitives, config::block_size_preprocess), config::block_size_preprocess, 0, stream>>>(
@@ -183,6 +196,7 @@ fast_lfs::rasterization::ForwardResult fast_lfs::rasterization::forward(
         per_primitive_buffers.mean2d,
         per_primitive_buffers.conic_opacity,
         per_primitive_buffers.color,
+        normal != nullptr ? primitive_normals : nullptr,
         n_primitives,
         grid.x,
         grid.y,
@@ -198,13 +212,9 @@ fast_lfs::rasterization::ForwardResult fast_lfs::rasterization::forward(
         far_,
         depth_bits,
         mip_filter);
+    LFS_CUDA_LAUNCH_CHECK(stream, "fastgs.forward.preprocess");
     check_cuda_with_fastgs_status(cudaGetLastError(), "preprocess", forward_status, "preprocess", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-    if constexpr (config::debug) {
-        check_cuda_with_fastgs_status(cudaDeviceSynchronize(), "preprocess", forward_status, "preprocess", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        throw_if_fastgs_forward_status(forward_status, "preprocess", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-    } else {
-        sync_fastgs_phase_if_requested("preprocess", forward_status, "preprocess", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-    }
+    sync_fastgs_phase_if_requested("preprocess", forward_status, "preprocess", static_cast<uint64_t>(n_primitives), n_tiles_u64);
 
     check_cuda_with_fastgs_status(
         cub::DeviceScan::InclusiveSum(
@@ -219,15 +229,13 @@ fast_lfs::rasterization::ForwardResult fast_lfs::rasterization::forward(
         "primitive offset scan",
         static_cast<uint64_t>(n_primitives),
         n_tiles_u64);
-    CHECK_CUDA(config::debug, "cub::DeviceScan::InclusiveSum (Primitive Offsets)");
-    if constexpr (!config::debug) {
-        sync_fastgs_phase_if_requested(
-            "cub::DeviceScan::InclusiveSum (Primitive Offsets)",
-            forward_status,
-            "primitive offset scan",
-            static_cast<uint64_t>(n_primitives),
-            n_tiles_u64);
-    }
+    LFS_FASTGS_PHASE_CHECK("cub::DeviceScan::InclusiveSum (Primitive Offsets)");
+    sync_fastgs_phase_if_requested(
+        "cub::DeviceScan::InclusiveSum (Primitive Offsets)",
+        forward_status,
+        "primitive offset scan",
+        static_cast<uint64_t>(n_primitives),
+        n_tiles_u64);
 
     // Sizing readback: host-blocking by necessity (buffer sizes depend on it),
     // but scoped to this stream instead of relying on legacy-stream ordering.
@@ -247,7 +255,7 @@ fast_lfs::rasterization::ForwardResult fast_lfs::rasterization::forward(
         "primitive offset scan",
         static_cast<uint64_t>(n_primitives),
         n_tiles_u64);
-    CHECK_CUDA(config::debug, "cudaMemcpy(n_instances)");
+    LFS_FASTGS_PHASE_CHECK("cudaMemcpy(n_instances)");
     const int n_instances = checked_fastgs_instance_count(n_instances_u64, static_cast<uint64_t>(n_primitives), n_tiles_u64);
 
     StreamOrderedDeviceBuffer keys_current("rasterizer.fastgs.sort_keys", stream);
@@ -286,7 +294,12 @@ fast_lfs::rasterization::ForwardResult fast_lfs::rasterization::forward(
             "radix sort workspace query",
             static_cast<uint64_t>(n_primitives),
             n_tiles_u64);
+        LFS_ASSERT_MSG(
+            cub_workspace_size > 0,
+            "FastGS CUB radix sort returned an empty workspace for nonempty instance input");
         cub_workspace.allocate(cub_workspace_size);
+        LFS_ASSERT_MSG(cub_workspace.as<char>() != nullptr,
+                       "FastGS CUB radix sort cannot execute with null workspace");
 
         per_instance_sort_total_size =
             keys_current.size() +
@@ -308,13 +321,9 @@ fast_lfs::rasterization::ForwardResult fast_lfs::rasterization::forward(
             grid.x,
             depth_bits,
             n_primitives);
+        LFS_CUDA_LAUNCH_CHECK(stream, "fastgs.forward.create_instances");
         check_cuda_with_fastgs_status(cudaGetLastError(), "create_instances", forward_status, "create_instances", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        if constexpr (config::debug) {
-            check_cuda_with_fastgs_status(cudaDeviceSynchronize(), "create_instances", forward_status, "create_instances", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-            throw_if_fastgs_forward_status(forward_status, "create_instances", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        } else {
-            sync_fastgs_phase_if_requested("create_instances", forward_status, "create_instances", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        }
+        sync_fastgs_phase_if_requested("create_instances", forward_status, "create_instances", static_cast<uint64_t>(n_primitives), n_tiles_u64);
 
         check_cuda_with_fastgs_status(
             cub::DeviceRadixSort::SortPairs(
@@ -329,15 +338,13 @@ fast_lfs::rasterization::ForwardResult fast_lfs::rasterization::forward(
             "radix sort",
             static_cast<uint64_t>(n_primitives),
             n_tiles_u64);
-        CHECK_CUDA(config::debug, "cub::DeviceRadixSort::SortPairs (Tile/Depth)");
-        if constexpr (!config::debug) {
-            sync_fastgs_phase_if_requested(
-                "cub::DeviceRadixSort::SortPairs (Tile/Depth)",
-                forward_status,
-                "radix sort",
-                static_cast<uint64_t>(n_primitives),
-                n_tiles_u64);
-        }
+        LFS_FASTGS_PHASE_CHECK("cub::DeviceRadixSort::SortPairs (Tile/Depth)");
+        sync_fastgs_phase_if_requested(
+            "cub::DeviceRadixSort::SortPairs (Tile/Depth)",
+            forward_status,
+            "radix sort",
+            static_cast<uint64_t>(n_primitives),
+            n_tiles_u64);
 
         sorted_primitive_indices = primitive_indices.Current();
     }
@@ -351,38 +358,39 @@ fast_lfs::rasterization::ForwardResult fast_lfs::rasterization::forward(
             depth_bits,
             n_tiles_u32,
             n_instances);
+        LFS_CUDA_LAUNCH_CHECK(stream, "fastgs.forward.extract_instance_ranges");
         check_cuda_with_fastgs_status(cudaGetLastError(), "extract_instance_ranges", forward_status, "extract_instance_ranges", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        if constexpr (config::debug) {
-            check_cuda_with_fastgs_status(cudaDeviceSynchronize(), "extract_instance_ranges", forward_status, "extract_instance_ranges", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-            throw_if_fastgs_forward_status(forward_status, "extract_instance_ranges", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        } else {
-            sync_fastgs_phase_if_requested("extract_instance_ranges", forward_status, "extract_instance_ranges", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        }
+        sync_fastgs_phase_if_requested("extract_instance_ranges", forward_status, "extract_instance_ranges", static_cast<uint64_t>(n_primitives), n_tiles_u64);
     }
 
     // Perform blending
-    kernels::forward::blend_cu<<<grid, block, 0, stream>>>(
-        per_tile_buffers.instance_ranges,
-        sorted_primitive_indices,
-        per_primitive_buffers.mean2d,
-        per_primitive_buffers.conic_opacity,
-        per_primitive_buffers.color,
-        per_primitive_buffers.depths,
-        image,
-        alpha,
-        depth,
-        per_tile_buffers.n_contributions,
-        per_tile_buffers.final_transmittance,
-        width,
-        height,
-        grid.x);
-    check_cuda_with_fastgs_status(cudaGetLastError(), "blend", forward_status, "blend", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-    if constexpr (config::debug) {
-        check_cuda_with_fastgs_status(cudaDeviceSynchronize(), "blend", forward_status, "blend", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        throw_if_fastgs_forward_status(forward_status, "blend", static_cast<uint64_t>(n_primitives), n_tiles_u64);
+    auto launch_blend = [&]<bool RENDER_NORMAL>() {
+        kernels::forward::blend_cu<RENDER_NORMAL><<<grid, block, 0, stream>>>(
+            per_tile_buffers.instance_ranges,
+            sorted_primitive_indices,
+            per_primitive_buffers.mean2d,
+            per_primitive_buffers.conic_opacity,
+            per_primitive_buffers.color,
+            per_primitive_buffers.depths,
+            primitive_normals,
+            image,
+            alpha,
+            depth,
+            normal,
+            per_tile_buffers.n_contributions,
+            per_tile_buffers.final_transmittance,
+            width,
+            height,
+            grid.x);
+        LFS_CUDA_LAUNCH_CHECK(stream, "fastgs.forward.blend");
+    };
+    if (normal != nullptr) {
+        launch_blend.template operator()<true>();
     } else {
-        sync_fastgs_phase_if_requested("blend", forward_status, "blend", static_cast<uint64_t>(n_primitives), n_tiles_u64);
+        launch_blend.template operator()<false>();
     }
+    check_cuda_with_fastgs_status(cudaGetLastError(), "blend", forward_status, "blend", static_cast<uint64_t>(n_primitives), n_tiles_u64);
+    sync_fastgs_phase_if_requested("blend", forward_status, "blend", static_cast<uint64_t>(n_primitives), n_tiles_u64);
 
     if (n_instances > 0) {
         if (sorted_primitive_indices == primitive_indices_current.as<uint>()) {

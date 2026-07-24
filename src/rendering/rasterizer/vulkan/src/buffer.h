@@ -23,41 +23,78 @@
 struct _VulkanBuffer {
     VkBuffer buffer;
     VmaAllocation allocation;
-    size_t allocSize;    // allocated size in bytes
-    size_t size;         // actual size in bytes (within the [offset, offset+size) view)
-    VkDeviceSize offset; // descriptor binding offset (0 for owned buffers; non-zero for views into a coalesced parent allocation)
-    const char* label;   // diagnostics label; nullptr = untracked
+    size_t allocSize;                            // total VkBuffer size in bytes (not the VMA memory-allocation size)
+    size_t capacity;                             // accessible bytes in this view, beginning at offset
+    size_t size;                                 // active bytes in this view; must not exceed capacity
+    VkDeviceSize offset;                         // absolute VkBuffer binding offset (0 for owned buffers)
+    const char* label;                           // diagnostics label; nullptr = untracked
+    VkBufferUsageFlags extra_usage;              // requested opt-in usage bits; immutable while live
+    VkBufferUsageFlags created_with_extra_usage; // opt-in usage bits used at VkBuffer creation
 
     _VulkanBuffer()
         : buffer(VK_NULL_HANDLE),
           allocation(VK_NULL_HANDLE),
           allocSize(0),
+          capacity(0),
           size(0),
           offset(0),
-          label(nullptr) {}
+          label(nullptr),
+          extra_usage(0),
+          created_with_extra_usage(0) {}
 
     _VulkanBuffer(const _VulkanBuffer& other)
         : buffer(other.buffer),
           allocation(other.allocation),
           allocSize(other.allocSize),
+          capacity(other.capacity),
           size(other.size),
           offset(other.offset),
-          label(other.label) {}
+          label(other.label),
+          extra_usage(other.extra_usage),
+          created_with_extra_usage(other.created_with_extra_usage) {}
 
     _VulkanBuffer& operator=(const _VulkanBuffer& other) {
         buffer = other.buffer;
         allocation = other.allocation;
         allocSize = other.allocSize;
+        capacity = other.capacity;
         size = other.size;
         offset = other.offset;
         label = other.label;
+        extra_usage = other.extra_usage;
+        created_with_extra_usage = other.created_with_extra_usage;
         return *this;
     }
 
     // used to test if descriptor needs to be updated
     bool operator==(const _VulkanBuffer& other) const {
         return buffer == other.buffer && allocation == other.allocation &&
-               allocSize == other.allocSize && offset == other.offset;
+               allocSize == other.allocSize && capacity == other.capacity &&
+               offset == other.offset && extra_usage == other.extra_usage &&
+               created_with_extra_usage == other.created_with_extra_usage;
+    }
+
+    // A view is described in two coordinate systems: offset is absolute in the
+    // VkBuffer, while capacity and all operation offsets are relative to that
+    // view. Keeping this check here prevents callers from accidentally treating
+    // a region capacity as the size of the whole backing buffer.
+    [[nodiscard]] bool hasValidViewBounds() const noexcept {
+        if (buffer == VK_NULL_HANDLE || allocSize == 0 || capacity == 0) {
+            return false;
+        }
+        const auto backing_size = static_cast<VkDeviceSize>(allocSize);
+        const auto view_capacity = static_cast<VkDeviceSize>(capacity);
+        return offset <= backing_size && view_capacity <= backing_size - offset;
+    }
+
+    [[nodiscard]] bool containsRange(const VkDeviceSize relative_offset,
+                                     const VkDeviceSize byte_size) const noexcept {
+        if (!hasValidViewBounds() || byte_size == 0) {
+            return false;
+        }
+        const auto view_capacity = static_cast<VkDeviceSize>(capacity);
+        return relative_offset <= view_capacity &&
+               byte_size <= view_capacity - relative_offset;
     }
 };
 
@@ -128,24 +165,24 @@ struct VulkanGSPipelineBuffers {
     Buffer<int32_t> visible_flags;               // (N,) projection-visible primitive flag
     Buffer<int32_t> visible_prefix;              // (N,) inclusive scan of visible_flags
     Buffer<uint32_t> visible_count;              // (1,) visible primitive count
-    Buffer<uint32_t> visible_sort_dispatch_args; // VkDispatchIndirectCommand for visible primitive radix sort
+    Buffer<uint32_t> visible_sort_dispatch_args; // VisibleSortDispatch: radix only
 
     // HiGS viewer chain: position-only cull prepass emits a compact survivor
     // list; the survivor projection writes all per-splat outputs at
     // wave-appended compact slots, so sorted ids ARE slots and orig_ids maps a
     // slot back to its model splat index for selection masks.
     Buffer<int32_t> survivors;           // (N,) surviving render indices
-    Buffer<uint32_t> survivor_state;     // [0]=count, [1..3]=survivor projection dispatch args
+    Buffer<uint32_t> survivor_state;     // SurvivorState: count + projection dispatch
     Buffer<uint32_t> visible_emit_count; // [0]=compact-slot appends (unclamped, for overflow detection)
     Buffer<int32_t> orig_ids;            // (visible,) model splat index per compact slot
     Buffer<int32_t> cumsum_counts;       // [4] indirect cumsum element counts per level
-    Buffer<uint32_t> visible_dispatch;   // [12] radix / 64-thread / cumsum L0 / cumsum L1 args
+    Buffer<uint32_t> visible_dispatch;   // VisibleChainDispatch: radix / per-element / cumsum L0 / L1
 
     // HiGS macro raster: half4 partials per (pool batch, render tile, pixel),
     // per-batch active-tile mask, and per-wave raster+compose indirect args.
     Buffer<uint16_t> macro_partials;    // (pool_batches, 32, 256, 4) halfs
     Buffer<uint32_t> macro_active_mask; // (total batches,)
-    Buffer<uint32_t> macro_wave_args;   // [2 * HIGS_RASTER_MAX_WAVES * 3]
+    Buffer<uint32_t> macro_wave_args;   // MacroWaveDispatch: raster + compose command per wave
 
     // tiles
     Buffer<int32_t> index_buffer_offset;       // N
@@ -153,12 +190,13 @@ struct VulkanGSPipelineBuffers {
     Buffer<sortingKey_t> sorting_keys_2;       // NInt [no_shrink]
     Buffer<int32_t> sorting_gauss_idx_1;       // NInt [no_shrink]
     Buffer<int32_t> sorting_gauss_idx_2;       // NInt [no_shrink]
-    Buffer<uint32_t> tile_sort_count;          // (1,) actual tile instance count
-    Buffer<uint32_t> tile_sort_dispatch_args;  // VkDispatchIndirectCommand for tile-instance radix sort
+    Buffer<uint32_t> tile_sort_count;          // raw count/overflow sentinel
+    Buffer<uint32_t> depth_wave_dispatch;      // DepthWave header + one record per armed wave
+    Buffer<uint32_t> wave_predicates;          // one conditional-rendering predicate per wave
     Buffer<int32_t> tile_ranges;               // (Gh*Gw, 2)
     Buffer<int32_t> tile_batch_counts;         // (Gh*Gw,) bounded raster chunks per tile
     Buffer<int32_t> tile_batch_offsets;        // (Gh*Gw,) inclusive prefix sum of tile_batch_counts
-    Buffer<uint32_t> tile_batch_dispatch_args; // VkDispatchIndirectCommand for raster chunks
+    Buffer<uint32_t> tile_batch_dispatch_args; // TileBatchDispatch: raster chunks
     Buffer<uint32_t> tile_batch_descriptors;   // (num_batches, uint4: tile, start, end, reserved)
     bool is_unsorted_1 = true;
     Buffer<sortingKey_t>& unsorted_keys() { return is_unsorted_1 ? sorting_keys_1 : sorting_keys_2; }
@@ -171,6 +209,7 @@ struct VulkanGSPipelineBuffers {
     Buffer<int32_t> tile_batch_n_contributors; // (num_batches, TILE_SIZE)
     Buffer<float> pixel_state;                 // (H, W, 4)
     Buffer<float> pixel_depth;                 // (H, W, 1), median view-space depth
+    Buffer<float> pixel_depth_weight;          // (H, W, 1), expected-depth denominator
     Buffer<int32_t> n_contributors;            // (H, W, 1)
 
     // intermediate buffers
@@ -178,11 +217,6 @@ struct VulkanGSPipelineBuffers {
     Buffer<int32_t> _cumsum_blockSums2;
     Buffer<int32_t> _sorting_histogram;
     Buffer<int32_t> _sorting_histogram_cumsum;
-
-    // Per-session high-water-mark for unsorted_keys / unsorted_gauss_idx capacity.
-    // Driven by the deferred (1-frame-stale) num_indices readback so generate_keys
-    // can size buffers without a synchronous cumsum readback.
-    size_t num_indices_high_water = 0;
 
     // LOD index indirection buffer
     Buffer<uint32_t> lod_indices;             // [M] selected physical splat indices

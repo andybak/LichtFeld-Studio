@@ -2,14 +2,15 @@
   "builtin-baseline": "c3867e714dd3a51c272826eea77267876517ed99",
   "dependencies": [
     "cppzmq",
+    "curl",
     "args",
     "assimp",
     "boost-preprocessor",
-    "boost-regex",
     {
       "name": "ffmpeg",
       "features": [
         "avcodec",
+        "avfilter",
         "avformat",
         "nvcodec",
         "swscale",
@@ -18,18 +19,17 @@
     },
     "freetype",
     "glm",
-    "gtest",
     {
-      "name": "imgui",
+      "name": "libarchive",
+      "default-features": false,
       "features": [
-        "docking-experimental",
-        "freetype",
-        "sdl3-binding"
+        "bzip2",
+        "lzma",
+        "zstd"
       ]
     },
-    "implot",
-    "libarchive",
     "libdeflate",
+    "libplacebo",
     "libwebp",
     "nanobind",
     {
@@ -83,6 +83,27 @@
     "shader-slang",
     "usd"
   ],
+  "features": {
+    "tests": {
+      "description": "Dependencies used only by the C++ test targets",
+      "dependencies": [
+        "gtest"
+      ]
+    },
+    "vulkan-validation": {
+      "description": "Pinned Vulkan validation layer and SPIR-V validator for developer builds",
+      "dependencies": [
+        {
+          "name": "spirv-tools",
+          "features": [
+            "tools"
+          ],
+          "host": true
+        },
+        "vulkan-validationlayers"
+      ]
+    }
+  },
   "overrides": [
     {
       "name": "cppzmq",
@@ -98,10 +119,6 @@
     },
     {
       "name": "boost-preprocessor",
-      "version": "1.90.0#1"
-    },
-    {
-      "name": "boost-regex",
       "version": "1.90.0#1"
     },
     {
@@ -123,14 +140,6 @@
     {
       "name": "gtest",
       "version": "1.17.0#2"
-    },
-    {
-      "name": "imgui",
-      "version": "1.92.6"
-    },
-    {
-      "name": "implot",
-      "version": "0.17"
     },
     {
       "name": "libarchive",

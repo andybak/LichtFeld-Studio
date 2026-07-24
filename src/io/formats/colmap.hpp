@@ -9,6 +9,8 @@
 #include "core/tensor.hpp"
 #include "io/error.hpp"
 #include "io/loader.hpp"
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <glm/glm.hpp>
 #include <memory>
@@ -22,6 +24,13 @@ namespace lfs::io {
     using lfs::core::Device;
     using lfs::core::PointCloud;
     using lfs::core::Tensor;
+
+    struct ColmapPointCloudLoadStats {
+        PointCloud point_cloud;
+        std::size_t total_points = 0;
+        std::size_t points_after_filtering = 0;
+        bool track_filter_applied = false;
+    };
 
     // Camera data structure used for intermediate loading before Camera creation
     struct CameraData {
@@ -57,7 +66,7 @@ namespace lfs::io {
      * @param images_folder Folder containing images (default: "images")
      * @return Result containing tuple of (vector of Camera, scene_center tensor [3])
      */
-    Result<std::tuple<std::vector<std::shared_ptr<Camera>>, Tensor>>
+    Result<LoadOutcome<std::tuple<std::vector<std::shared_ptr<Camera>>, Tensor>>>
     read_colmap_cameras_and_images(
         const std::filesystem::path& base,
         const std::string& images_folder = "images",
@@ -68,8 +77,13 @@ namespace lfs::io {
      * @param filepath Base directory containing points3D.bin
      * @return PointCloud
      */
-    PointCloud read_colmap_point_cloud(const std::filesystem::path& filepath,
-                                       const LoadOptions& options = {});
+    Result<LoadOutcome<PointCloud>> read_colmap_point_cloud(
+        const std::filesystem::path& filepath,
+        const LoadOptions& options = {});
+
+    Result<LoadOutcome<ColmapPointCloudLoadStats>> read_colmap_point_cloud_with_stats(
+        const std::filesystem::path& filepath,
+        const LoadOptions& options = {});
 
     /**
      * @brief Read COLMAP cameras and images from text files
@@ -77,7 +91,7 @@ namespace lfs::io {
      * @param images_folder Folder containing images (default: "images")
      * @return Result containing tuple of (vector of Camera, scene_center tensor [3])
      */
-    Result<std::tuple<std::vector<std::shared_ptr<Camera>>, Tensor>>
+    Result<LoadOutcome<std::tuple<std::vector<std::shared_ptr<Camera>>, Tensor>>>
     read_colmap_cameras_and_images_text(
         const std::filesystem::path& base,
         const std::string& images_folder = "images",
@@ -104,8 +118,13 @@ namespace lfs::io {
      * @param filepath Base directory containing points3D.txt
      * @return PointCloud
      */
-    PointCloud read_colmap_point_cloud_text(const std::filesystem::path& filepath,
-                                            const LoadOptions& options = {});
+    Result<LoadOutcome<PointCloud>> read_colmap_point_cloud_text(
+        const std::filesystem::path& filepath,
+        const LoadOptions& options = {});
+
+    Result<LoadOutcome<ColmapPointCloudLoadStats>> read_colmap_point_cloud_text_with_stats(
+        const std::filesystem::path& filepath,
+        const LoadOptions& options = {});
 
     /**
      * @brief Read COLMAP cameras only (no image file validation required)

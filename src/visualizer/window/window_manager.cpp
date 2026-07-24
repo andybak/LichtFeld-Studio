@@ -19,11 +19,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <imgui_impl_sdl3.h>
 #include <iostream>
 #include <string>
 #include <utility>
-#include <imgui.h>
 
 namespace lfs::vis {
 
@@ -41,6 +39,36 @@ namespace lfs::vis {
         constexpr unsigned kResizeRight = 1u << 1;
         constexpr unsigned kResizeTop = 1u << 2;
         constexpr unsigned kResizeBottom = 1u << 3;
+
+        void configureValidationLayerSearchPath() {
+#ifdef LFS_VULKAN_VALIDATION_LAYER_DIR
+#ifdef _WIN32
+            constexpr char path_separator = ';';
+#else
+            constexpr char path_separator = ':';
+#endif
+            std::string layer_path = LFS_VULKAN_VALIDATION_LAYER_DIR;
+            if (const char* const existing_path = std::getenv("VK_ADD_LAYER_PATH");
+                existing_path && *existing_path) {
+                layer_path += path_separator;
+                layer_path += existing_path;
+            }
+
+#ifdef _WIN32
+            const bool configured = _putenv_s("VK_ADD_LAYER_PATH", layer_path.c_str()) == 0;
+#else
+            const bool configured = ::setenv("VK_ADD_LAYER_PATH", layer_path.c_str(), 1) == 0;
+#endif
+            if (!configured) {
+                LOG_WARN("Failed to configure the pinned Vulkan validation layer path");
+            } else if (const char* const override_path = std::getenv("VK_LAYER_PATH");
+                       override_path && *override_path) {
+                LOG_WARN("VK_LAYER_PATH overrides the pinned Vulkan validation layer path: {}", override_path);
+            } else {
+                LOG_INFO("Vulkan validation layer path: {}", LFS_VULKAN_VALIDATION_LAYER_DIR);
+            }
+#endif
+        }
 
         const char* windowEventName(const Uint32 event_type) {
             switch (event_type) {
@@ -354,6 +382,8 @@ namespace lfs::vis {
     }
 
     bool WindowManager::init() {
+        configureValidationLayerSearchPath();
+
         if (shouldPreferX11OnGnome()) {
             SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
             LOG_INFO("GNOME Wayland session detected; preferring X11/Xwayland for native window decorations");
@@ -519,13 +549,10 @@ namespace lfs::vis {
 
     void WindowManager::pollEvents() {
         frame_input_.beginFrame();
-        const bool imgui_ready = ImGui::GetCurrentContext() != nullptr;
         const SDL_WindowID main_window_id = window_ ? SDL_GetWindowID(window_) : 0;
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             const bool suppress_gui_route = shouldSuppressGuiRoutingForResize(event, main_window_id);
-            if (imgui_ready && !suppress_gui_route)
-                ImGui_ImplSDL3_ProcessEvent(&event);
             if (!suppress_gui_route)
                 frame_input_.processEvent(event, main_window_id);
             processEvent(event);
@@ -540,7 +567,6 @@ namespace lfs::vis {
 
     void WindowManager::waitEvents(double timeout_seconds) {
         frame_input_.beginFrame();
-        const bool imgui_ready = ImGui::GetCurrentContext() != nullptr;
         const SDL_WindowID main_window_id = window_ ? SDL_GetWindowID(window_) : 0;
         SDL_Event event;
         if (vulkan_context_ &&
@@ -556,15 +582,11 @@ namespace lfs::vis {
         const int timeout_ms = static_cast<int>(timeout_seconds * 1000.0);
         if (SDL_WaitEventTimeout(&event, timeout_ms)) {
             bool suppress_gui_route = shouldSuppressGuiRoutingForResize(event, main_window_id);
-            if (imgui_ready && !suppress_gui_route)
-                ImGui_ImplSDL3_ProcessEvent(&event);
             if (!suppress_gui_route)
                 frame_input_.processEvent(event, main_window_id);
             processEvent(event);
             while (SDL_PollEvent(&event)) {
                 suppress_gui_route = shouldSuppressGuiRoutingForResize(event, main_window_id);
-                if (imgui_ready && !suppress_gui_route)
-                    ImGui_ImplSDL3_ProcessEvent(&event);
                 if (!suppress_gui_route)
                     frame_input_.processEvent(event, main_window_id);
                 processEvent(event);

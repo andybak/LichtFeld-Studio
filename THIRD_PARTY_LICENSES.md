@@ -47,8 +47,9 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 ## Graphics & UI Libraries
 | Project | Description | License |
 |---------|-------------|---------|
-| [Dear ImGui](https://github.com/ocornut/imgui) | Immediate mode GUI library | MIT |
 | [SDL3](https://www.libsdl.org/) | Window/input/context management | zlib |
+| [RmlUi](https://github.com/mikke89/RmlUi) | Retained-mode UI (HTML/CSS-like documents) | MIT |
+| [Zep](https://github.com/Rezonality/zep) | Embeddable text editor (Rml display backend) | MIT |
 | [GLM](https://github.com/g-truc/glm) | OpenGL Mathematics library | MIT |
 | [glad](https://github.com/Dav1dde/glad) | OpenGL loader | MIT |
 
@@ -57,6 +58,12 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 |---------|-------------|---------|
 | [NVIDIA nvImageCodec](https://github.com/NVIDIA/nvImageCodec) | GPU-accelerated image encoding/decoding | Apache-2.0 |
 | [Intel TBB](https://github.com/oneapi-src/oneTBB) | Threading Building Blocks | Apache-2.0 |
+
+## ML Inference & Models
+| Project | Description | License |
+|---------|-------------|---------|
+| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | Cross-platform ML inference engine (preprocess CLI) | MIT |
+| [MoGe-2](https://github.com/microsoft/MoGe) | Monocular geometry estimation, depth/normal maps. Code and [model weights](https://huggingface.co/Ruicheng/moge-2-vitb-normal) © Microsoft, MIT; DINOv2 backbone components © Meta AI, Apache-2.0. Model downloaded at first use of `preprocess`, redistributed with attribution via GitHub release assets | MIT / Apache-2.0 |
 
 ## Video Encoding
 | Project | Description | License |

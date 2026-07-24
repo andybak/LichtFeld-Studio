@@ -18,6 +18,7 @@
 #include "input/key_codes.hpp"
 #include "input/sdl_key_mapping.hpp"
 #include "io/loader.hpp"
+#include "io/video/video_extensions.hpp"
 #include "operator/operator_context.hpp"
 #include "operator/operator_id.hpp"
 #include "operator/operator_registry.hpp"
@@ -38,7 +39,6 @@
 #include <cmath>
 #include <format>
 #include <limits>
-#include <imgui.h>
 
 namespace lfs::vis {
 
@@ -407,10 +407,6 @@ namespace lfs::vis {
             std::fill(std::begin(keys_movement_), std::end(keys_movement_), false);
             clearWasdMomentumViewport();
             hovered_camera_id_ = -1;
-
-            // Clear ImGui input to prevent tooltip trails
-            ImGui::GetIO().ClearInputKeys();
-            ImGui::GetIO().ClearInputMouse();
         });
     }
 
@@ -494,15 +490,58 @@ namespace lfs::vis {
         return movement_keys_per_mode_[static_cast<size_t>(getCurrentToolMode())];
     }
 
+    const char* InputController::cameraNavigationModeName(const CameraNavigationMode mode) {
+        switch (mode) {
+        case CameraNavigationMode::Orbit: return "orbit";
+        case CameraNavigationMode::Trackball: return "trackball";
+        case CameraNavigationMode::FPV: return "fpv";
+        case CameraNavigationMode::Drone: return "drone";
+        }
+        return "orbit";
+    }
+
+    std::optional<InputController::CameraNavigationMode>
+    InputController::cameraNavigationModeFromName(const std::string_view name) {
+        if (name == "orbit")
+            return CameraNavigationMode::Orbit;
+        if (name == "trackball" || name == "turntable")
+            return CameraNavigationMode::Trackball;
+        if (name == "fpv" || name == "fly")
+            return CameraNavigationMode::FPV;
+        if (name == "drone")
+            return CameraNavigationMode::Drone;
+        return std::nullopt;
+    }
+
     void InputController::setCameraNavigationMode(const CameraNavigationMode mode) {
         if (camera_navigation_mode_ == mode)
             return;
 
         clearViewportDragState();
+        const bool leaving_drone = camera_navigation_mode_ == CameraNavigationMode::Drone;
         camera_navigation_mode_ = mode;
         // The pivot is left untouched: orbit modes work with any pivot and FPV
         // re-seeds it on every look drag, so switching modes must not discard a
         // user-set pivot.
+        if (leaving_drone) {
+            Viewport* finished_viewport = nullptr;
+            if (wasd_momentum_viewport_) {
+                wasd_momentum_viewport_->camera.finishDrone();
+                publishCameraMove(wasd_momentum_viewport_);
+                finished_viewport = wasd_momentum_viewport_;
+                wasd_momentum_viewport_ = nullptr;
+            }
+            auto& keyboard_viewport = activeKeyboardViewport();
+            if (&keyboard_viewport != finished_viewport) {
+                keyboard_viewport.camera.finishDrone();
+                publishCameraMove(&keyboard_viewport);
+            }
+        } else if (mode == CameraNavigationMode::Drone) {
+            clearWasdMomentumViewport();
+            auto& keyboard_viewport = activeKeyboardViewport();
+            keyboard_viewport.camera.enterDrone();
+            publishCameraMove(&keyboard_viewport);
+        }
     }
 
     void InputController::onWindowFocusLost() {
@@ -513,6 +552,7 @@ namespace lfs::vis {
         held_keys_.clear();
         pending_click_drag_ = {};
         forced_mouse_press_action_ = input::Action::NONE;
+        text_input_viewport_click_button_ = -1;
         is_node_rect_dragging_ = false;
         node_rect_button_ = -1;
         node_point_pick_enabled_ = false;
@@ -611,6 +651,12 @@ namespace lfs::vis {
         const bool over_transform_gizmo = isTransformGizmoOverOrUsing();
         const int mods = getModifierKeys();
 
+        if (text_input_viewport_click_button_ == button &&
+            action == input::ACTION_RELEASE) {
+            text_input_viewport_click_button_ = -1;
+            return;
+        }
+
         // Consume all mouse events while pie menu is open
         if (gui && gui->gizmo().isPieMenuOpen()) {
             if (action == input::ACTION_PRESS && button == static_cast<int>(input::AppMouseButton::LEFT)) {
@@ -630,6 +676,17 @@ namespace lfs::vis {
             } else if (action == input::ACTION_RELEASE) {
                 gui->captureMouseButtonRelease(button);
             }
+            return;
+        }
+
+        const bool wants_text_input = input_router_
+                                          ? input_router_->isTextInputActive()
+                                          : gui::guiFocusState().want_text_input;
+        if (action == input::ACTION_PRESS &&
+            wants_text_input &&
+            !over_gui &&
+            isInViewport(x, y)) {
+            text_input_viewport_click_button_ = button;
             return;
         }
 
@@ -851,7 +908,8 @@ namespace lfs::vis {
                     drag_split_panel_ = interaction->panel;
                     focusSplitPanel(interaction->panel);
 
-                    if (camera_navigation_mode_ == CameraNavigationMode::FPV) {
+                    if (camera_navigation_mode_ == CameraNavigationMode::FPV ||
+                        camera_navigation_mode_ == CameraNavigationMode::Drone) {
                         float pivot_distance = glm::length(
                             interaction->viewport->camera.getPivot() - interaction->viewport->camera.t);
                         if (!std::isfinite(pivot_distance) || pivot_distance < 0.1f)
@@ -1374,7 +1432,11 @@ namespace lfs::vis {
                 break;
             }
             case DragMode::Rotate:
-                target_viewport->camera.rotateFpv(pos);
+                if (camera_navigation_mode_ == CameraNavigationMode::Drone) {
+                    target_viewport->camera.droneLook(pos);
+                } else {
+                    target_viewport->camera.rotateFpv(pos);
+                }
                 break;
             case DragMode::Orbit: {
                 const float current_time = static_cast<float>(SDL_GetTicks() / 1000.0f);
@@ -1463,7 +1525,8 @@ namespace lfs::vis {
         if (std::abs(delta) < 0.01f)
             return;
 
-        const bool carry_pivot = camera_navigation_mode_ == CameraNavigationMode::FPV;
+        const bool carry_pivot = camera_navigation_mode_ == CameraNavigationMode::FPV ||
+                                 camera_navigation_mode_ == CameraNavigationMode::Drone;
 
         if (scroll_action == input::Action::CAMERA_ROLL) {
             target_viewport.camera.rotate_roll(delta);
@@ -2078,37 +2141,74 @@ namespace lfs::vis {
         if (keys_active) {
             if (wasd_momentum_viewport_ && wasd_momentum_viewport_ != active_movement_viewport) {
                 wasd_momentum_viewport_->camera.clearWasdMomentum();
+                wasd_momentum_viewport_->camera.clearDroneMotion();
             }
             wasd_momentum_viewport_ = active_movement_viewport;
         }
 
-        auto* const movement_viewport = keys_active ? active_movement_viewport : wasd_momentum_viewport_;
-        if (movement_viewport && (keys_active || movement_viewport->camera.hasWasdMomentum())) {
-            const float movement_speed_bonus =
-                (keys_active && (getModifierKeys() & input::KEYMOD_SHIFT) != 0) ? kWasdShiftSpeedBonus : 0.0f;
-            movement_viewport->camera.setSceneExtent(sceneExtent());
-            movement_viewport->camera.advanceWasd(
-                delta_time,
-                keys_active && keys_movement_[0],
-                keys_active && keys_movement_[2],
-                keys_active && keys_movement_[1],
-                keys_active && keys_movement_[3],
-                keys_active && keys_movement_[4],
-                keys_active && keys_movement_[5],
-                movement_speed_bonus);
+        const float movement_speed_bonus =
+            (keys_active && (getModifierKeys() & input::KEYMOD_SHIFT) != 0) ? kWasdShiftSpeedBonus : 0.0f;
 
-            onCameraMovementStart();
-            publishCameraMove(movement_viewport);
+        if (camera_navigation_mode_ == CameraNavigationMode::Drone) {
+            // The drone must keep integrating with no keys held: braking,
+            // leveling and mouse-look smoothing all settle through
+            // advanceDrone until hasDroneMotion() reaches false.
+            auto* drone_viewport = keys_active ? active_movement_viewport : wasd_momentum_viewport_;
+            if (!drone_viewport && active_movement_viewport->camera.hasDroneMotion())
+                drone_viewport = active_movement_viewport;
+            if (drone_viewport && (keys_active || drone_viewport->camera.hasDroneMotion())) {
+                drone_viewport->camera.setSceneExtent(sceneExtent());
+                drone_viewport->camera.advanceDrone(
+                    delta_time,
+                    keys_active && keys_movement_[0],
+                    keys_active && keys_movement_[2],
+                    keys_active && keys_movement_[1],
+                    keys_active && keys_movement_[3],
+                    keys_active && keys_movement_[4],
+                    keys_active && keys_movement_[5],
+                    movement_speed_bonus);
 
-            if (!keys_active && !movement_viewport->camera.hasWasdMomentum()) {
-                ui::CameraMove{
-                    .rotation = movement_viewport->getRotationMatrix(),
-                    .translation = movement_viewport->getTranslation()}
-                    .emit();
+                wasd_momentum_viewport_ = drone_viewport;
+                onCameraMovementStart();
+                publishCameraMove(drone_viewport);
+
+                if (!keys_active && !drone_viewport->camera.hasDroneMotion()) {
+                    ui::CameraMove{
+                        .rotation = drone_viewport->getRotationMatrix(),
+                        .translation = drone_viewport->getTranslation()}
+                        .emit();
+                    wasd_momentum_viewport_ = nullptr;
+                }
+            } else if (!keys_active) {
                 wasd_momentum_viewport_ = nullptr;
             }
-        } else if (!keys_active) {
-            wasd_momentum_viewport_ = nullptr;
+        } else {
+            auto* const movement_viewport = keys_active ? active_movement_viewport : wasd_momentum_viewport_;
+            if (movement_viewport && (keys_active || movement_viewport->camera.hasWasdMomentum())) {
+                movement_viewport->camera.setSceneExtent(sceneExtent());
+                movement_viewport->camera.advanceWasd(
+                    delta_time,
+                    keys_active && keys_movement_[0],
+                    keys_active && keys_movement_[2],
+                    keys_active && keys_movement_[1],
+                    keys_active && keys_movement_[3],
+                    keys_active && keys_movement_[4],
+                    keys_active && keys_movement_[5],
+                    movement_speed_bonus);
+
+                onCameraMovementStart();
+                publishCameraMove(movement_viewport);
+
+                if (!keys_active && !movement_viewport->camera.hasWasdMomentum()) {
+                    ui::CameraMove{
+                        .rotation = movement_viewport->getRotationMatrix(),
+                        .translation = movement_viewport->getTranslation()}
+                        .emit();
+                    wasd_momentum_viewport_ = nullptr;
+                }
+            } else if (!keys_active) {
+                wasd_momentum_viewport_ = nullptr;
+            }
         }
 
         // Check if camera movement has timed out and should resume training
@@ -2125,6 +2225,16 @@ namespace lfs::vis {
         std::optional<std::filesystem::path> dataset_path;
         std::optional<std::filesystem::path> environment_map_path;
         std::vector<std::string> unrecognized_files;
+
+        if (paths.size() == 1) {
+            const std::filesystem::path dropped_path = lfs::core::utf8_to_path(paths.front());
+            if (lfs::io::video::is_supported_video_extension(dropped_path.extension().string())) {
+                cmd::ShowVideoExtractor{.video_path = dropped_path}.emit();
+                LOG_INFO("Opening video extractor via drag-and-drop: {}",
+                         lfs::core::path_to_utf8(dropped_path.filename()));
+                return;
+            }
+        }
 
         for (const auto& path_str : paths) {
             std::filesystem::path filepath = lfs::core::utf8_to_path(path_str);
@@ -2217,10 +2327,11 @@ namespace lfs::vis {
         }
 
         if (!unrecognized_files.empty() && splat_files.empty() && !dataset_path && !environment_map_path) {
-            static constexpr auto SUPPORTED_FORMATS =
-                "Supported formats: .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .obj, .fbx, .gltf, .glb, .stl, .dae, .hdr, .exr, .json, .resume, or dataset directories";
+            const std::string supported_formats = std::format(
+                "Supported formats: .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .obj, .fbx, .gltf, .glb, .stl, .dae, .hdr, .exr, .json, .resume, {}, or dataset directories",
+                lfs::io::video::supported_video_extensions_display());
             LOG_DEBUG("Dropped {} unrecognized file(s)", unrecognized_files.size());
-            state::FileDropFailed{.files = unrecognized_files, .error = SUPPORTED_FORMATS}.emit();
+            state::FileDropFailed{.files = unrecognized_files, .error = supported_formats}.emit();
         }
     }
 
@@ -2285,8 +2396,7 @@ namespace lfs::vis {
         }
 
         // Get camera intrinsics using the proper method
-        const auto [focal_x, focal_y, center_x, center_y] = cam_data->get_intrinsics();
-        (void)focal_x;
+        const float focal_y = std::get<1>(cam_data->get_intrinsics());
         const float height = static_cast<float>(cam_data->image_height());
 
         // Calculate vertical FOV using the actual focal length
@@ -2670,6 +2780,7 @@ namespace lfs::vis {
             return;
         }
         wasd_momentum_viewport_->camera.clearWasdMomentum();
+        wasd_momentum_viewport_->camera.clearDroneMotion();
         wasd_momentum_viewport_ = nullptr;
     }
 
@@ -2933,8 +3044,8 @@ namespace lfs::vis {
                 cmd::ToggleGTComparison{}.emit();
             }
 
-            if (auto* trainer = services().trainerOrNull(); trainer && trainer->isRunning()) {
-                trainer->pauseTrainingTemporary();
+            if (auto* trainer_mgr = services().trainerOrNull();
+                trainer_mgr && trainer_mgr->pauseTrainingTemporaryIfActive()) {
                 training_was_paused_by_camera_ = true;
             }
         } else {
@@ -2960,7 +3071,7 @@ namespace lfs::vis {
             if (training_was_paused_by_camera_ && services().trainerOrNull() && services().trainerOrNull()->isRunning()) {
                 services().trainerOrNull()->resumeTrainingTemporary();
                 training_was_paused_by_camera_ = false;
-                LOG_INFO("Camera movement stopped - resuming training temporarily");
+                LOG_DEBUG("Camera movement stopped - resumed temporary training pause");
             }
         }
     }

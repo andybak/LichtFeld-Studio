@@ -64,6 +64,32 @@ namespace lfs::rendering {
     // error message on mismatch / missing setup. Result is cached.
     [[nodiscard]] std::optional<std::string> verifyCudaMatchesVulkanDevice();
 
+    // One explicitly non-blocking CUDA lane for image copies that are ordered into Vulkan by an
+    // external timeline semaphore. Never silently substitute the legacy NULL stream: that stream
+    // synchronizes with the trainer's blocking CUDA stream and directly stalls training.
+    class CudaVulkanUploadStream {
+    public:
+        CudaVulkanUploadStream() = default;
+        ~CudaVulkanUploadStream();
+
+        CudaVulkanUploadStream(const CudaVulkanUploadStream&) = delete;
+        CudaVulkanUploadStream& operator=(const CudaVulkanUploadStream&) = delete;
+        CudaVulkanUploadStream(CudaVulkanUploadStream&& other) noexcept;
+        CudaVulkanUploadStream& operator=(CudaVulkanUploadStream&& other) noexcept;
+
+        [[nodiscard]] bool init();
+        [[nodiscard]] bool synchronize();
+        void reset() noexcept;
+
+        [[nodiscard]] bool valid() const { return stream_ != nullptr; }
+        [[nodiscard]] cudaStream_t stream() const { return stream_; }
+        [[nodiscard]] const std::string& lastError() const { return last_error_; }
+
+    private:
+        cudaStream_t stream_ = nullptr;
+        std::string last_error_;
+    };
+
     namespace detail {
         enum class CudaVulkanTensorLayout : std::uint8_t {
             Hwc,
@@ -96,33 +122,32 @@ namespace lfs::rendering {
         [[nodiscard]] const std::string& lastError() const { return last_error_; }
         [[nodiscard]] CudaVulkanExtent2D extent() const { return extent_; }
         [[nodiscard]] CudaVulkanImageFormat format() const { return format_; }
-        [[nodiscard]] cudaSurfaceObject_t surfaceObject() const { return surface_; }
-        [[nodiscard]] cudaArray_t cudaArray() const { return cuda_array_; }
 
-        [[nodiscard]] lfs::core::Tensor view_as_tensor() const;
         // flip_y: when true, vertically mirror the image during the surface copy. The rasterizer
         // emits images with OpenGL's bottom-left origin (FrameMetadata::flip_y); pass true when
         // the consuming Vulkan image samples top-left (e.g., RmlUi-bound textures).
-        [[nodiscard]] bool copyViewToSurface(cudaStream_t stream = nullptr, bool flip_y = false) const;
         [[nodiscard]] bool copyTensorToSurface(const lfs::core::Tensor& tensor,
-                                               cudaStream_t stream = nullptr,
+                                               cudaStream_t stream,
                                                bool flip_y = false) const;
-        [[nodiscard]] bool wait(std::uint64_t value, cudaStream_t stream = nullptr) const;
-        [[nodiscard]] bool signal(std::uint64_t value, cudaStream_t stream = nullptr) const;
+        // Queue an external-timeline wait before CUDA accesses the shared image,
+        // then signal the corresponding CUDA-complete value after the access.
+        // Both require an explicit stream so GUI traffic can never leak onto
+        // the legacy default stream and serialize with training.
+        [[nodiscard]] bool wait(std::uint64_t value, cudaStream_t stream) const;
+        [[nodiscard]] bool signal(std::uint64_t value, cudaStream_t stream) const;
 
     private:
-        [[nodiscard]] bool fail(std::string message) const;
-        [[nodiscard]] bool failCuda(const char* operation, cudaError_t status) const;
-
         cudaExternalMemory_t cuda_mem_ = nullptr;
         cudaMipmappedArray_t cuda_mip_ = nullptr;
         cudaArray_t cuda_array_ = nullptr;
         cudaSurfaceObject_t surface_ = 0;
         cudaExternalSemaphore_t cuda_timeline_ = nullptr;
         mutable std::uint64_t last_signaled_ = 0;
+        mutable std::uint64_t last_waited_ = 0;
+        std::size_t allocation_size_ = 0;
+        std::size_t cuda_visible_size_ = 0;
         CudaVulkanExtent2D extent_{};
         CudaVulkanImageFormat format_ = CudaVulkanImageFormat::Rgba8Unorm;
-        mutable lfs::core::Tensor staging_tensor_;
         mutable lfs::core::Tensor upload_source_;
         mutable std::string last_error_;
     };
@@ -153,15 +178,13 @@ namespace lfs::rendering {
         // viewer-release fence). Lifetime stays owned by this object.
         [[nodiscard]] cudaExternalSemaphore_t handle() const { return cuda_timeline_; }
 
-        [[nodiscard]] bool cudaSignal(std::uint64_t value, cudaStream_t stream = nullptr) const;
-        [[nodiscard]] bool cudaWait(std::uint64_t value, cudaStream_t stream = nullptr) const;
+        [[nodiscard]] bool cudaSignal(std::uint64_t value, cudaStream_t stream) const;
+        [[nodiscard]] bool cudaWait(std::uint64_t value, cudaStream_t stream) const;
 
     private:
-        [[nodiscard]] bool fail(std::string message) const;
-        [[nodiscard]] bool failCuda(const char* operation, cudaError_t status) const;
-
         cudaExternalSemaphore_t cuda_timeline_ = nullptr;
         mutable std::uint64_t last_signaled_ = 0;
+        mutable std::uint64_t last_waited_ = 0;
         mutable std::string last_error_;
     };
 
@@ -185,7 +208,7 @@ namespace lfs::rendering {
         [[nodiscard]] std::size_t size() const { return size_; }
         [[nodiscard]] bool copyFromTensor(const lfs::core::Tensor& tensor,
                                           std::size_t byte_count,
-                                          cudaStream_t stream = nullptr) const;
+                                          cudaStream_t stream) const;
         // Offset-aware variant for coalesced layouts where one CUDA-imported
         // VkBuffer holds multiple sub-regions (xyz | rotations | scales+opacs |
         // sh) instead of four separate allocations.
@@ -193,18 +216,8 @@ namespace lfs::rendering {
                                           std::size_t byte_count,
                                           std::size_t dst_offset,
                                           cudaStream_t stream) const;
-        [[nodiscard]] bool copyToTensor(lfs::core::Tensor& tensor,
-                                        std::size_t byte_count,
-                                        cudaStream_t stream = nullptr) const;
-        [[nodiscard]] bool copyToTensor(lfs::core::Tensor& tensor,
-                                        std::size_t byte_count,
-                                        std::size_t src_offset,
-                                        cudaStream_t stream) const;
 
     private:
-        [[nodiscard]] bool fail(std::string message) const;
-        [[nodiscard]] bool failCuda(const char* operation, cudaError_t status) const;
-
         cudaExternalMemory_t cuda_mem_ = nullptr;
         void* device_ptr_ = nullptr;
         std::size_t allocation_size_ = 0;

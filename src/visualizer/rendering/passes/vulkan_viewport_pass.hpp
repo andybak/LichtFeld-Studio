@@ -111,6 +111,10 @@ namespace lfs::vis {
         VkImageView external_scene_image_view = VK_NULL_HANDLE;
         VkImageLayout external_scene_image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         std::uint64_t external_scene_image_generation = 0;
+        // Interactive resize deliberately keeps the last complete interop image
+        // until the render extent settles. Do not replace that binding with an
+        // incompletely prepared image during the deferral window.
+        bool preserve_scene_image_binding = false;
 
         bool grid_enabled = false;
         glm::mat4 grid_view{1.0f};
@@ -134,6 +138,9 @@ namespace lfs::vis {
         std::uint32_t post_ui_overlay_vertex_count = 0;
         std::vector<VulkanViewportPivotOverlay> pivot_overlays;
         std::vector<VulkanViewportTexturedOverlay> textured_overlays;
+        // Textured overlays drawn in the UI phase (after ui_shape_overlay): screen-space
+        // text and icons that must layer above overlay fills and gizmo shapes.
+        std::vector<VulkanViewportTexturedOverlay> ui_textured_overlays;
         std::vector<VulkanViewportFrustumInstance> frustum_instances;
         std::vector<VulkanViewportFrustumBatch> frustum_batches;
 

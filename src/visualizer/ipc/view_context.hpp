@@ -77,7 +77,7 @@ namespace lfs::vis {
         bool show_ellipsoid = false;
         bool use_ellipsoid = false;
         bool desaturate_unselected = false;
-        bool desaturate_cropping = true;
+        bool desaturate_cropping = false;
         bool hide_outside_depth_box = false;
         bool crop_filter_for_selection = false;
         std::array<float, 3> background_color{0.0f, 0.0f, 0.0f};
@@ -103,6 +103,7 @@ namespace lfs::vis {
         std::array<float, 3> eval_camera_color{1.0f, 0.0f, 0.0f};
         bool show_pivot = false;
         int split_view_mode = 0;
+        int gt_comparison_mode = 0;
         float split_position = 0.5f;
         int raster_backend = 2;
         bool gut = false;

@@ -4,13 +4,18 @@
 
 #include "app/application.hpp"
 #include "app/converter.hpp"
+#include "core/abi.hpp"
 #include "core/argument_parser.hpp"
+#include "core/crash_handler.hpp"
+#include "core/cuda_error.hpp"
 #include "core/executable_path.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "git_version.h"
 #include "gui/gpu_memory_query.hpp"
+#include "lfs_core_abi_stamp.h"
+#include "preprocessing/preprocess.hpp"
 #include "python/plugin_runner.hpp"
 #include "python/runner.hpp"
 
@@ -177,18 +182,70 @@ namespace {
         // regardless of compiled-in search paths or env var timing.
         pxr::PlugRegistry::GetInstance().RegisterPlugins(path_utf8);
     }
+
+    int run_mode(lfs::core::args::ParsedArgs args) {
+        return std::visit([](auto&& mode) -> int {
+            using T = std::decay_t<decltype(mode)>;
+
+            if constexpr (std::is_same_v<T, lfs::core::args::HelpMode>) {
+                return 0;
+            } else if constexpr (std::is_same_v<T, lfs::core::args::VersionMode>) {
+                std::println("LichtFeld Studio {} ({})", GIT_TAGGED_VERSION, GIT_COMMIT_HASH_SHORT);
+                return 0;
+            } else if constexpr (std::is_same_v<T, lfs::core::args::WarmupMode>) {
+                applyCudaContextTuning();
+                analyzeCudaContextDistribution();
+                return 0;
+            } else if constexpr (std::is_same_v<T, lfs::core::args::ConvertMode>) {
+                configure_usd_plugins();
+                return lfs::app::run_converter(mode.params);
+            } else if constexpr (std::is_same_v<T, lfs::core::args::Mesh2SplatMode>) {
+                return lfs::app::run_mesh2splat(mode.params);
+            } else if constexpr (std::is_same_v<T, lfs::core::args::PreprocessMode>) {
+                return lfs::preprocessing::run_preprocess(mode.params);
+            } else if constexpr (std::is_same_v<T, lfs::core::args::PluginMode>) {
+                return lfs::python::run_plugin_command(mode);
+            } else if constexpr (std::is_same_v<T, lfs::core::args::TrainingMode>) {
+                LOG_INFO("LichtFeld Studio");
+                LOG_INFO("version {} | tag {}", GIT_TAGGED_VERSION, GIT_COMMIT_HASH_SHORT);
+
+                // Driver-level tuning must precede *any* CUDA call, including the
+                // cudaFree(nullptr) inside analyzeCudaContextDistribution.
+                applyCudaContextTuning();
+
+                // Probe and decompose the CUDA driver's context-creation cost only for the
+                // GPU app path. CLI-only modes such as --help, convert, preprocess,
+                // plugin, and mesh2splat must not create a CUDA primary context just
+                // for HUD metrics.
+                analyzeCudaContextDistribution();
+                configure_usd_plugins();
+
+                if (mode.params->optimization.debug_python) {
+                    lfs::python::start_debugpy(mode.params->optimization.debug_python_port);
+                }
+
+                lfs::app::Application app;
+                return app.run(std::move(mode.params));
+            }
+        },
+                          std::move(args));
+    }
+
 } // namespace
 
 int main(int argc, char* argv[]) {
-    // Driver-level tuning must precede *any* CUDA call, including the cudaFree(nullptr)
-    // inside analyzeCudaContextDistribution. Lazy module loading defers kernel cubin
-    // upload until first use, dropping the eager-load slice of cuda.primary_context.
-    applyCudaContextTuning();
+    const char* const loaded_core_stamp = lfs_core_abi_stamp();
+    if (loaded_core_stamp == nullptr || !lfs_core_abi_matches(LFS_CORE_ABI_STAMP)) {
+        std::println(stderr,
+                     "Fatal: lfs_core ABI mismatch. The application expects '{}' but loaded '{}'. "
+                     "Remove stale binaries and rebuild LichtFeld Studio.",
+                     LFS_CORE_ABI_STAMP,
+                     loaded_core_stamp != nullptr ? loaded_core_stamp : "<null>");
+        return 2;
+    }
 
-    // Probe and decompose the CUDA driver's context-creation cost before any other
-    // code touches the device. Surfaces per-phase byte values into the HUD breakdown.
-    analyzeCudaContextDistribution();
-    configure_usd_plugins();
+    lfs::core::install_crash_handlers();
+    lfs::core::initialize_cuda_diagnostics();
 
     auto result = lfs::core::args::parse_args(argc, argv);
     if (!result) {
@@ -196,38 +253,6 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    return std::visit([](auto&& mode) -> int {
-        using T = std::decay_t<decltype(mode)>;
-
-        if constexpr (std::is_same_v<T, lfs::core::args::HelpMode>) {
-            return 0;
-        } else if constexpr (std::is_same_v<T, lfs::core::args::VersionMode>) {
-            std::println("LichtFeld Studio {} ({})", GIT_TAGGED_VERSION, GIT_COMMIT_HASH_SHORT);
-            return 0;
-        } else if constexpr (std::is_same_v<T, lfs::core::args::WarmupMode>) {
-            return 0;
-        } else if constexpr (std::is_same_v<T, lfs::core::args::ConvertMode>) {
-            return lfs::app::run_converter(mode.params);
-        } else if constexpr (std::is_same_v<T, lfs::core::args::Mesh2SplatMode>) {
-            return lfs::app::run_mesh2splat(mode.params);
-        } else if constexpr (std::is_same_v<T, lfs::core::args::PluginMode>) {
-            return lfs::python::run_plugin_command(mode);
-        } else if constexpr (std::is_same_v<T, lfs::core::args::TrainingMode>) {
-            LOG_INFO("LichtFeld Studio");
-            LOG_INFO("version {} | tag {}", GIT_TAGGED_VERSION, GIT_COMMIT_HASH_SHORT);
-
-            // Probe and decompose the CUDA driver's context-creation cost only for the
-            // GPU app path. CLI-only modes such as --help, convert, plugin, and
-            // mesh2splat must not create a CUDA primary context just for HUD metrics.
-            analyzeCudaContextDistribution();
-
-            if (mode.params->optimization.debug_python) {
-                lfs::python::start_debugpy(mode.params->optimization.debug_python_port);
-            }
-
-            lfs::app::Application app;
-            return app.run(std::move(mode.params));
-        }
-    },
-                      std::move(*result));
+    return lfs::core::run_with_exception_firewall(
+        [&result] { return run_mode(std::move(*result)); });
 }

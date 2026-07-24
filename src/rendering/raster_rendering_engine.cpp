@@ -10,6 +10,8 @@
 #include "core/point_cloud.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
+#include "environment_image.hpp"
+#include "environment_math.hpp"
 #include "image_layout.hpp"
 #include "point_cloud_raster.cuh"
 #include "rendering/coordinate_conventions.hpp"
@@ -43,22 +45,9 @@ namespace lfs::rendering {
             bool color_has_alpha = false;
         };
 
-        struct EnvironmentImage {
-            std::filesystem::path path;
-            int width = 0;
-            int height = 0;
-            std::vector<float> pixels;
-
-            [[nodiscard]] bool valid() const {
-                return width > 0 && height > 0 &&
-                       pixels.size() == static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
-            }
-        };
-
         struct EnvironmentImageCache {
             std::mutex mutex;
-            EnvironmentImage image;
-            std::string last_error;
+            std::shared_ptr<const EnvironmentImage> image;
         };
 
         [[nodiscard]] EnvironmentImageCache& environmentImageCache() {
@@ -87,134 +76,104 @@ namespace lfs::rendering {
             return lfs::core::getAssetsDir() / requested;
         }
 
-        Result<EnvironmentImage> loadEnvironmentImage(const std::filesystem::path& environment_path) {
-            const auto resolved_path = resolveEnvironmentPath(environment_path);
-            auto& cache = environmentImageCache();
-            std::lock_guard lock(cache.mutex);
-            if (cache.image.valid() && cache.image.path == resolved_path) {
-                return cache.image;
-            }
+    } // namespace
 
-            cache.image = {};
-            cache.last_error.clear();
-            if (resolved_path.empty()) {
-                cache.last_error = "Environment map path is empty";
-                return std::unexpected(cache.last_error);
-            }
-            if (!std::filesystem::exists(resolved_path)) {
-                cache.last_error = std::format("Environment map not found: {}", resolved_path.string());
-                return std::unexpected(cache.last_error);
-            }
+    std::expected<std::shared_ptr<const EnvironmentImage>, std::string>
+    loadEnvironmentImageShared(const std::filesystem::path& environment_path) {
+        const auto resolved_path = resolveEnvironmentPath(environment_path);
+        auto& cache = environmentImageCache();
+        std::lock_guard lock(cache.mutex);
+        if (cache.image && cache.image->valid() && cache.image->path == resolved_path) {
+            return cache.image;
+        }
 
-            const std::string path_utf8 = lfs::core::path_to_utf8(resolved_path);
-            std::unique_ptr<OIIO::ImageInput> input(OIIO::ImageInput::open(path_utf8));
-            if (!input) {
-                cache.last_error = std::format("Failed to open environment map {}: {}", path_utf8, OIIO::geterror());
-                return std::unexpected(cache.last_error);
-            }
+        cache.image.reset();
+        if (resolved_path.empty()) {
+            return std::unexpected("Environment map path is empty");
+        }
+        if (!std::filesystem::exists(resolved_path)) {
+            return std::unexpected(std::format("Environment map not found: {}", resolved_path.string()));
+        }
 
-            const auto& spec = input->spec();
-            if (spec.width <= 0 || spec.height <= 0 || spec.nchannels <= 0) {
-                input->close();
-                cache.last_error = std::format("Invalid environment map dimensions for {}", path_utf8);
-                return std::unexpected(cache.last_error);
-            }
+        const std::string path_utf8 = lfs::core::path_to_utf8(resolved_path);
+        std::unique_ptr<OIIO::ImageInput> input(OIIO::ImageInput::open(path_utf8));
+        if (!input) {
+            return std::unexpected(std::format("Failed to open environment map {}: {}",
+                                               path_utf8,
+                                               OIIO::geterror()));
+        }
 
-            std::vector<float> source_pixels(
-                static_cast<size_t>(spec.width) * static_cast<size_t>(spec.height) *
-                static_cast<size_t>(spec.nchannels));
-            if (!input->read_image(0, 0, 0, spec.nchannels, OIIO::TypeDesc::FLOAT, source_pixels.data())) {
-                cache.last_error = std::format("Failed to read environment map {}: {}", path_utf8, input->geterror());
-                input->close();
-                return std::unexpected(cache.last_error);
-            }
+        const auto& spec = input->spec();
+        if (spec.width <= 0 || spec.height <= 0 || spec.nchannels <= 0) {
             input->close();
+            return std::unexpected(std::format("Invalid environment map dimensions for {}", path_utf8));
+        }
 
-            EnvironmentImage image{
-                .path = resolved_path,
-                .width = spec.width,
-                .height = spec.height,
-                .pixels = std::vector<float>(
-                    static_cast<size_t>(spec.width) * static_cast<size_t>(spec.height) * 3u),
-            };
-            for (int y = 0; y < spec.height; ++y) {
-                for (int x = 0; x < spec.width; ++x) {
-                    const size_t src_index =
-                        (static_cast<size_t>(y) * static_cast<size_t>(spec.width) + static_cast<size_t>(x)) *
-                        static_cast<size_t>(spec.nchannels);
-                    const size_t dst_index =
-                        (static_cast<size_t>(y) * static_cast<size_t>(spec.width) + static_cast<size_t>(x)) * 3u;
-                    if (spec.nchannels >= 3) {
-                        image.pixels[dst_index + 0] = source_pixels[src_index + 0];
-                        image.pixels[dst_index + 1] = source_pixels[src_index + 1];
-                        image.pixels[dst_index + 2] = source_pixels[src_index + 2];
-                    } else {
-                        const float value = source_pixels[src_index];
-                        image.pixels[dst_index + 0] = value;
-                        image.pixels[dst_index + 1] = value;
-                        image.pixels[dst_index + 2] = value;
-                    }
-                }
+        const int read_channels = spec.nchannels >= 3 ? 3 : 1;
+        std::vector<float> source_pixels(
+            static_cast<size_t>(spec.width) * static_cast<size_t>(spec.height) *
+            static_cast<size_t>(read_channels));
+        if (!input->read_image(0, 0, 0, read_channels, OIIO::TypeDesc::FLOAT, source_pixels.data())) {
+            const std::string error =
+                std::format("Failed to read environment map {}: {}", path_utf8, input->geterror());
+            input->close();
+            return std::unexpected(error);
+        }
+        input->close();
+
+        auto image = std::make_shared<EnvironmentImage>();
+        image->path = resolved_path;
+        image->width = spec.width;
+        image->height = spec.height;
+        if (read_channels == 3) {
+            image->pixels = std::move(source_pixels);
+        } else {
+            const size_t pixel_count =
+                static_cast<size_t>(spec.width) * static_cast<size_t>(spec.height);
+            image->pixels.resize(pixel_count * 3u);
+            for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
+                const float value = source_pixels[pixel];
+                image->pixels[pixel * 3u + 0u] = value;
+                image->pixels[pixel * 3u + 1u] = value;
+                image->pixels[pixel * 3u + 2u] = value;
             }
-
-            cache.image = image;
-            LOG_INFO("Loaded tensor environment map {}", resolved_path.string());
-            return image;
         }
 
-        [[nodiscard]] glm::vec3 acesTonemap(const glm::vec3& value) {
-            constexpr float a = 2.51f;
-            constexpr float b = 0.03f;
-            constexpr float c = 2.43f;
-            constexpr float d = 0.59f;
-            constexpr float e = 0.14f;
-            return glm::clamp(
-                (value * (a * value + glm::vec3(b))) /
-                    (value * (c * value + glm::vec3(d)) + glm::vec3(e)),
-                glm::vec3(0.0f),
-                glm::vec3(1.0f));
-        }
+        cache.image = image;
+        LOG_INFO("Loaded tensor environment map {}", resolved_path.string());
+        return image;
+    }
 
-        [[nodiscard]] glm::vec3 rotateAroundY(const glm::vec3& value, const float radians) {
-            const float c = std::cos(radians);
-            const float s = std::sin(radians);
-            return {
-                c * value.x + s * value.z,
-                value.y,
-                -s * value.x + c * value.z,
-            };
+    std::expected<EnvironmentImage, std::string> loadEnvironmentImage(
+        const std::filesystem::path& environment_path) {
+        auto image = loadEnvironmentImageShared(environment_path);
+        if (!image) {
+            return std::unexpected(image.error());
         }
+        return **image;
+    }
+
+    void releaseEnvironmentImageCache() {
+        auto& cache = environmentImageCache();
+        std::lock_guard lock(cache.mutex);
+        cache.image.reset();
+    }
+
+    namespace {
 
         [[nodiscard]] glm::vec3 sampleEnvironmentBilinear(const EnvironmentImage& image,
-                                                          float u,
-                                                          float v) {
+                                                          const float u,
+                                                          const float v) {
             if (!image.valid()) {
                 return glm::vec3(0.0f);
             }
-            u = u - std::floor(u);
-            v = std::clamp(v, 0.0f, 1.0f);
-
-            const float x = u * static_cast<float>(image.width - 1);
-            const float y = v * static_cast<float>(image.height - 1);
-            const int x0 = std::clamp(static_cast<int>(std::floor(x)), 0, image.width - 1);
-            const int y0 = std::clamp(static_cast<int>(std::floor(y)), 0, image.height - 1);
-            const int x1 = (x0 + 1) % image.width;
-            const int y1 = std::clamp(y0 + 1, 0, image.height - 1);
-            const float tx = x - static_cast<float>(x0);
-            const float ty = y - static_cast<float>(y0);
-
-            const auto fetch = [&](const int px, const int py) {
+            const auto fetch = [&](const int px, const int py) -> envmath::Vec3 {
                 const size_t index =
                     (static_cast<size_t>(py) * static_cast<size_t>(image.width) + static_cast<size_t>(px)) * 3u;
-                return glm::vec3(
-                    image.pixels[index + 0],
-                    image.pixels[index + 1],
-                    image.pixels[index + 2]);
+                return {image.pixels[index + 0], image.pixels[index + 1], image.pixels[index + 2]};
             };
-
-            const glm::vec3 top = glm::mix(fetch(x0, y0), fetch(x1, y0), tx);
-            const glm::vec3 bottom = glm::mix(fetch(x0, y1), fetch(x1, y1), tx);
-            return glm::mix(top, bottom, ty);
+            const auto color = envmath::sampleEnvironmentBilinear(fetch, u, v, image.width, image.height);
+            return {color.x, color.y, color.z};
         }
 
         [[nodiscard]] glm::vec3 environmentDirectionForPixel(
@@ -224,42 +183,35 @@ namespace lfs::rendering {
             const bool equirectangular_view) {
             const float width = static_cast<float>(std::max(frame_view.size.x, 1));
             const float height = static_cast<float>(std::max(frame_view.size.y, 1));
-            const float tex_u = (static_cast<float>(x) + 0.5f) / width;
-            const float tex_v = 1.0f - (static_cast<float>(y) + 0.5f) / height;
 
-            glm::vec3 local_dir;
-            if (equirectangular_view) {
-                const float lon = (tex_u - 0.5f) * (2.0f * glm::pi<float>());
-                const float lat = (tex_v - 0.5f) * glm::pi<float>();
-                const float cos_lat = std::cos(lat);
-                local_dir = glm::normalize(glm::vec3(
-                    std::sin(lon) * cos_lat,
-                    std::sin(lat),
-                    -std::cos(lon) * cos_lat));
+            float focal_x = 0.0f;
+            float focal_y = 0.0f;
+            float center_x = width * 0.5f;
+            float center_y = height * 0.5f;
+            if (frame_view.intrinsics_override.has_value() && !frame_view.orthographic) {
+                const auto& intrinsics = *frame_view.intrinsics_override;
+                focal_x = intrinsics.focal_x;
+                focal_y = intrinsics.focal_y;
+                center_x = intrinsics.center_x;
+                center_y = intrinsics.center_y;
             } else {
-                float focal_x = 0.0f;
-                float focal_y = 0.0f;
-                float center_x = width * 0.5f;
-                float center_y = height * 0.5f;
-                if (frame_view.intrinsics_override.has_value() && !frame_view.orthographic) {
-                    const auto& intrinsics = *frame_view.intrinsics_override;
-                    focal_x = intrinsics.focal_x;
-                    focal_y = intrinsics.focal_y;
-                    center_x = intrinsics.center_x;
-                    center_y = intrinsics.center_y;
-                } else {
-                    const auto focal = computePixelFocalLengths(frame_view.size, frame_view.focal_length_mm);
-                    focal_x = focal.first;
-                    focal_y = focal.second;
-                }
-                const glm::vec2 pixel(tex_u * width, tex_v * height);
-                local_dir = glm::normalize(glm::vec3(
-                    (pixel.x - center_x) / std::max(focal_x, 1e-6f),
-                    (pixel.y - center_y) / std::max(focal_y, 1e-6f),
-                    -1.0f));
+                const auto focal = computePixelFocalLengths(frame_view.size, frame_view.focal_length_mm);
+                focal_x = focal.first;
+                focal_y = focal.second;
             }
 
-            return glm::normalize(frame_view.rotation * local_dir);
+            const auto dir = envmath::environmentWorldDirection(
+                static_cast<float>(x),
+                static_cast<float>(y),
+                width,
+                height,
+                equirectangular_view,
+                focal_x,
+                focal_y,
+                center_x,
+                center_y,
+                &frame_view.rotation[0][0]);
+            return {dir.x, dir.y, dir.z};
         }
 
         Result<std::vector<float>> renderEnvironmentBackground(
@@ -278,7 +230,7 @@ namespace lfs::rendering {
                 return image;
             }
 
-            auto environment = loadEnvironmentImage(request.environment.map_path);
+            auto environment = loadEnvironmentImageShared(request.environment.map_path);
             if (!environment) {
                 return std::unexpected(environment.error());
             }
@@ -289,22 +241,16 @@ namespace lfs::rendering {
                 for (int x = 0; x < width; ++x) {
                     glm::vec3 world_dir = environmentDirectionForPixel(
                         request.frame_view, x, y, request.environment.equirectangular);
-                    world_dir = glm::normalize(rotateAroundY(world_dir, rotation));
+                    const auto rotated = envmath::rotateAroundY({world_dir.x, world_dir.y, world_dir.z}, rotation);
+                    const auto uv = envmath::equirectUvForDirection(envmath::normalized(rotated));
 
-                    const float longitude = std::atan2(world_dir.x, -world_dir.z);
-                    const float latitude = std::asin(std::clamp(world_dir.y, -1.0f, 1.0f));
-                    const float u = longitude / (2.0f * glm::pi<float>()) + 0.5f;
-                    const float v = 0.5f - latitude / glm::pi<float>();
-
-                    glm::vec3 color = sampleEnvironmentBilinear(*environment, u, v) * exposure;
-                    color = acesTonemap(color);
-                    color = glm::pow(color, glm::vec3(1.0f / 2.2f));
-                    color = glm::clamp(color, glm::vec3(0.0f), glm::vec3(1.0f));
+                    const glm::vec3 hdr = sampleEnvironmentBilinear(**environment, uv.u, uv.v);
+                    const auto color = envmath::shadeEnvironmentRadiance({hdr.x, hdr.y, hdr.z}, exposure);
 
                     const size_t pixel = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
-                    image[pixel] = color.r;
-                    image[pixel_count + pixel] = color.g;
-                    image[2 * pixel_count + pixel] = color.b;
+                    image[pixel] = color.x;
+                    image[pixel_count + pixel] = color.y;
+                    image[2 * pixel_count + pixel] = color.z;
                 }
             }
             return image;
@@ -324,27 +270,6 @@ namespace lfs::rendering {
                 .far_plane = result.far_plane,
                 .orthographic = result.orthographic,
                 .color_has_alpha = result.color_has_alpha};
-        }
-
-        [[nodiscard]] int readTensorIndex(const Tensor* const tensor,
-                                          const size_t index) {
-            if (!tensor || !tensor->is_valid() || index >= tensor->numel()) {
-                return 0;
-            }
-
-            switch (tensor->dtype()) {
-            case lfs::core::DataType::Float32:
-                return static_cast<int>(std::lround(tensor->ptr<float>()[index]));
-            case lfs::core::DataType::Int32:
-                return tensor->ptr<int>()[index];
-            case lfs::core::DataType::Int64:
-                return static_cast<int>(tensor->ptr<int64_t>()[index]);
-            case lfs::core::DataType::UInt8:
-            case lfs::core::DataType::Bool:
-                return static_cast<int>(tensor->ptr<unsigned char>()[index]);
-            default:
-                return 0;
-            }
         }
 
         [[nodiscard]] std::optional<glm::mat4> cameraVisualizerTransform(
@@ -478,146 +403,6 @@ namespace lfs::rendering {
                 request.viewport_pos.y + projected->y * scale_y);
         }
 
-        [[nodiscard]] glm::vec3 readPointColor(const float* const colors,
-                                               const size_t point_index,
-                                               const bool desaturate) {
-            glm::vec3 color(
-                std::clamp(colors[point_index * 3 + 0], 0.0f, 1.0f),
-                std::clamp(colors[point_index * 3 + 1], 0.0f, 1.0f),
-                std::clamp(colors[point_index * 3 + 2], 0.0f, 1.0f));
-
-            if (desaturate) {
-                const float gray = glm::dot(color, glm::vec3(0.299f, 0.587f, 0.114f));
-                color = glm::mix(color, glm::vec3(gray), 0.75f);
-            }
-            return color;
-        }
-
-        [[nodiscard]] bool pointPassesCrop(const glm::vec3& world_pos,
-                                           const PointCloudFilterState& filters,
-                                           bool& desaturate) {
-            desaturate = false;
-            if (!filters.crop_box.has_value()) {
-                return true;
-            }
-
-            const auto& crop = *filters.crop_box;
-            const glm::vec3 local = glm::vec3(crop.transform * glm::vec4(world_pos, 1.0f));
-            const bool inside =
-                local.x >= crop.min.x && local.x <= crop.max.x &&
-                local.y >= crop.min.y && local.y <= crop.max.y &&
-                local.z >= crop.min.z && local.z <= crop.max.z;
-            const bool visible = filters.crop_inverse ? !inside : inside;
-            desaturate = filters.crop_desaturate && !visible;
-            return visible || filters.crop_desaturate;
-        }
-
-        [[nodiscard]] std::optional<glm::vec3> projectPointToPixel(
-            const glm::vec3& world_pos,
-            const PointCloudRenderRequest& request,
-            const glm::mat4& view,
-            const glm::mat4& projection) {
-            const glm::vec4 view_pos4 = view * glm::vec4(world_pos, 1.0f);
-            const glm::vec3 view_pos(view_pos4);
-            const int width = request.frame_view.size.x;
-            const int height = request.frame_view.size.y;
-
-            if (request.render.equirectangular) {
-                const float len = glm::length(view_pos);
-                if (len <= 1e-6f) {
-                    return std::nullopt;
-                }
-                const glm::vec3 dir = view_pos / len;
-                const float u = 0.5f + std::atan2(dir.x, -dir.z) / (2.0f * glm::pi<float>());
-                const float v = 0.5f + std::asin(std::clamp(dir.y, -1.0f, 1.0f)) / glm::pi<float>();
-                const float px = u * static_cast<float>(width - 1);
-                const float py = v * static_cast<float>(height - 1);
-                if (!std::isfinite(px) || !std::isfinite(py) ||
-                    px < 0.0f || px >= static_cast<float>(width) ||
-                    py < 0.0f || py >= static_cast<float>(height)) {
-                    return std::nullopt;
-                }
-                return glm::vec3(px, py, len);
-            }
-
-            const glm::vec4 clip = projection * view_pos4;
-            if (std::abs(clip.w) <= 1e-6f) {
-                return std::nullopt;
-            }
-            const glm::vec3 ndc = glm::vec3(clip) / clip.w;
-            if (!std::isfinite(ndc.x) || !std::isfinite(ndc.y) || !std::isfinite(ndc.z) ||
-                ndc.x < -1.0f || ndc.x > 1.0f ||
-                ndc.y < -1.0f || ndc.y > 1.0f ||
-                ndc.z < 0.0f || ndc.z > 1.0f) {
-                return std::nullopt;
-            }
-
-            const float px = (ndc.x * 0.5f + 0.5f) * static_cast<float>(width - 1);
-            const float py = (ndc.y * 0.5f + 0.5f) * static_cast<float>(height - 1);
-            const float depth = request.frame_view.orthographic ? -view_pos.z : std::max(-view_pos.z, 0.0f);
-            if (depth <= 0.0f && !request.frame_view.orthographic) {
-                return std::nullopt;
-            }
-            return glm::vec3(px, py, depth);
-        }
-
-        [[nodiscard]] int pointRadiusPixels(const PointCloudRenderRequest& request,
-                                            const float depth) {
-            const float voxel = std::max(request.render.voxel_size * request.render.scaling_modifier, 1e-5f);
-            if (request.frame_view.orthographic) {
-                const float pixels_per_world =
-                    static_cast<float>(request.frame_view.size.y) /
-                    std::max(request.frame_view.ortho_scale, 1e-5f);
-                return std::max(1, static_cast<int>(std::ceil(voxel * pixels_per_world * 0.5f)));
-            }
-
-            const float vfov = focalLengthToVFovRad(request.frame_view.focal_length_mm);
-            const float focal_y = lfs::core::fov2focal(vfov, request.frame_view.size.y);
-            return std::max(1, static_cast<int>(std::ceil(voxel * focal_y / std::max(depth, 1e-4f))));
-        }
-
-        void drawSoftwarePoint(std::vector<float>& image,
-                               std::vector<float>& depth,
-                               const int width,
-                               const int height,
-                               const int channels,
-                               const glm::vec3& pixel_depth,
-                               const glm::vec3& color,
-                               const int radius) {
-            const int cx = static_cast<int>(std::lround(pixel_depth.x));
-            const int cy = static_cast<int>(std::lround(pixel_depth.y));
-            const float point_depth = pixel_depth.z;
-            const int r2 = radius * radius;
-
-            for (int yy = cy - radius; yy <= cy + radius; ++yy) {
-                if (yy < 0 || yy >= height) {
-                    continue;
-                }
-                for (int xx = cx - radius; xx <= cx + radius; ++xx) {
-                    if (xx < 0 || xx >= width) {
-                        continue;
-                    }
-                    const int dx = xx - cx;
-                    const int dy = yy - cy;
-                    if (dx * dx + dy * dy > r2) {
-                        continue;
-                    }
-
-                    const size_t pixel_index = static_cast<size_t>(yy) * width + xx;
-                    if (point_depth >= depth[pixel_index]) {
-                        continue;
-                    }
-                    depth[pixel_index] = point_depth;
-                    image[pixel_index] = color.r;
-                    image[static_cast<size_t>(height) * width + pixel_index] = color.g;
-                    image[static_cast<size_t>(2) * height * width + pixel_index] = color.b;
-                    if (channels == 4) {
-                        image[static_cast<size_t>(3) * height * width + pixel_index] = 1.0f;
-                    }
-                }
-            }
-        }
-
         Result<RasterImageResult> renderSoftwarePointCloud(
             const Tensor& positions_source,
             const Tensor& colors_source,
@@ -749,6 +534,7 @@ namespace lfs::rendering {
                 {static_cast<size_t>(1), static_cast<size_t>(height), static_cast<size_t>(width)},
                 lfs::core::Device::CUDA, lfs::core::DataType::Float32);
 
+            lfs::core::pin_operands({&positions_cuda, &colors_cuda});
             pcraster::LaunchParams params{};
             params.positions = positions_cuda.ptr<float>();
             params.colors = colors_cuda.ptr<float>();
@@ -771,6 +557,16 @@ namespace lfs::rendering {
                 params.crop.max[2] = crop.max.z;
                 params.crop.inverse = request.filters.crop_inverse;
                 params.crop.desaturate = request.filters.crop_desaturate;
+            }
+            params.has_crop_ellipsoid = request.filters.crop_ellipsoid.has_value();
+            if (params.has_crop_ellipsoid) {
+                const auto& ellipsoid = *request.filters.crop_ellipsoid;
+                std::copy_n(glm::value_ptr(ellipsoid.transform), 16, params.crop_ellipsoid.to_local);
+                params.crop_ellipsoid.radii[0] = ellipsoid.radii.x;
+                params.crop_ellipsoid.radii[1] = ellipsoid.radii.y;
+                params.crop_ellipsoid.radii[2] = ellipsoid.radii.z;
+                params.crop_ellipsoid.inverse = request.filters.crop_inverse;
+                params.crop_ellipsoid.desaturate = request.filters.crop_desaturate;
             }
             std::copy_n(glm::value_ptr(view), 16, params.view);
             std::copy_n(glm::value_ptr(view_proj), 16, params.view_proj);
@@ -1875,7 +1671,9 @@ namespace lfs::rendering {
                 }
             }
 
-            return best_uid;
+            if (best_score < HIT_RADIUS_PIXELS)
+                return best_uid;
+            return -1;
         }
 
         ScreenOverlayRenderer* getScreenOverlayRenderer() override {

@@ -3,11 +3,16 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/camera.hpp"
+#include "core/cuda/lanczos_resize/lanczos_resize.hpp"
 #include "core/cuda/undistort/undistort.hpp"
+#include "core/cuda_error_typed.hpp"
 #include "core/image_io.hpp"
 #include "core/image_loader.hpp"
 #include "core/logger.hpp"
+#include "core/path_utils.hpp"
 #include "core/tensor/internal/memory_pool.hpp"
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <cuda_runtime.h>
 
@@ -41,6 +46,18 @@ namespace lfs::core {
         return w2c_cpu.to(Device::CUDA).unsqueeze(0).contiguous();
     }
 
+    static std::array<float, 9> camera_rotation_to_cpu_array(const Tensor& R) {
+        std::array<float, 9> result{};
+        auto R_cpu = R.cpu().contiguous();
+        auto R_acc = R_cpu.accessor<float, 2>();
+        for (size_t row = 0; row < 3; ++row) {
+            for (size_t col = 0; col < 3; ++col) {
+                result[row * 3 + col] = R_acc(row, col);
+            }
+        }
+        return result;
+    }
+
     Camera::Camera(const Tensor& R,
                    const Tensor& T,
                    float focal_x, float focal_y,
@@ -54,7 +71,8 @@ namespace lfs::core {
                    int camera_width, int camera_height,
                    int uid,
                    int camera_id,
-                   const std::filesystem::path& depth_path)
+                   const std::filesystem::path& depth_path,
+                   const std::filesystem::path& normal_path)
         : _uid(uid),
           _camera_id(camera_id),
           _focal_x(focal_x),
@@ -70,6 +88,7 @@ namespace lfs::core {
           _image_path(image_path),
           _mask_path(mask_path),
           _depth_path(depth_path),
+          _normal_path(normal_path),
           _camera_width(camera_width),
           _camera_height(camera_height),
           _image_width(camera_width),
@@ -117,8 +136,24 @@ namespace lfs::core {
 
         // Non-blocking so image loading doesn't serialize with the legacy stream.
         // On failure fall back to the default stream rather than a bad handle.
-        if (const cudaError_t err = cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking); err != cudaSuccess) {
-            LOG_WARN("Camera: cudaStreamCreateWithFlags failed ({}), falling back to default stream", cudaGetErrorString(err));
+        // log_cuda_teardown_failure is the frozen no-throw log-and-continue adapter.
+        const auto stream_create_site = LFS_SOURCE_SITE_CURRENT();
+        ::lfs::core::record_cuda_breadcrumb(
+            "cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking)",
+            __FILE__, __LINE__, nullptr);
+        const auto stream_create_state = ::lfs::core::prepare_cuda_check(
+            "cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking)",
+            stream_create_site, nullptr);
+        const cudaError_t stream_create_status =
+            cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
+        const auto stream_create_completion =
+            ::lfs::core::complete_cuda_check(stream_create_status, stream_create_state);
+        if (stream_create_completion.effective_error != cudaSuccess) {
+            ::lfs::core::log_cuda_teardown_failure(
+                stream_create_status, stream_create_state, stream_create_completion,
+                "cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking)",
+                "camera stream creation, falling back to default stream",
+                stream_create_site);
             _stream = nullptr;
         }
     }
@@ -127,7 +162,7 @@ namespace lfs::core {
         // Destroy CUDA stream if it was created
         if (_stream) {
             CudaMemoryPool::instance().release_stream(_stream);
-            cudaStreamDestroy(_stream);
+            LFS_CUDA_LOG_TEARDOWN(cudaStreamDestroy(_stream), _stream, "camera stream teardown");
             _stream = nullptr;
         }
     }
@@ -149,11 +184,13 @@ namespace lfs::core {
           _image_name(std::move(other._image_name)),
           _mask_path(std::move(other._mask_path)),
           _depth_path(std::move(other._depth_path)),
+          _normal_path(std::move(other._normal_path)),
           _split(other._split),
           _camera_width(other._camera_width),
           _camera_height(other._camera_height),
           _image_width(other._image_width),
           _image_height(other._image_height),
+          _image_size_loaded(other._image_size_loaded),
           _world_view_transform(std::move(other._world_view_transform)),
           _cam_position(std::move(other._cam_position)),
           _cached_mask(std::move(other._cached_mask)),
@@ -161,6 +198,9 @@ namespace lfs::core {
           _in_memory_mask_raw(std::move(other._in_memory_mask_raw)),
           _cached_depth(std::move(other._cached_depth)),
           _depth_loaded(other._depth_loaded),
+          _depth_quantization_step(other._depth_quantization_step),
+          _cached_normal(std::move(other._cached_normal)),
+          _normal_loaded(other._normal_loaded),
           _undistort_precomputed(other._undistort_precomputed),
           _undistort_prepared(other._undistort_prepared),
           _undistort_params(other._undistort_params),
@@ -169,6 +209,7 @@ namespace lfs::core {
         other._stream = nullptr;
         other._mask_loaded = false;
         other._depth_loaded = false;
+        other._normal_loaded = false;
         other._undistort_precomputed = false;
         other._undistort_prepared = false;
     }
@@ -178,7 +219,7 @@ namespace lfs::core {
             // Destroy our current stream
             if (_stream) {
                 CudaMemoryPool::instance().release_stream(_stream);
-                cudaStreamDestroy(_stream);
+                LFS_CUDA_LOG_TEARDOWN(cudaStreamDestroy(_stream), _stream, "camera stream teardown");
             }
 
             // Move all members
@@ -198,11 +239,13 @@ namespace lfs::core {
             _image_name = std::move(other._image_name);
             _mask_path = std::move(other._mask_path);
             _depth_path = std::move(other._depth_path);
+            _normal_path = std::move(other._normal_path);
             _split = other._split;
             _camera_width = other._camera_width;
             _camera_height = other._camera_height;
             _image_width = other._image_width;
             _image_height = other._image_height;
+            _image_size_loaded = other._image_size_loaded;
             _world_view_transform = std::move(other._world_view_transform);
             _cam_position = std::move(other._cam_position);
             _cached_mask = std::move(other._cached_mask);
@@ -210,6 +253,9 @@ namespace lfs::core {
             _in_memory_mask_raw = std::move(other._in_memory_mask_raw);
             _cached_depth = std::move(other._cached_depth);
             _depth_loaded = other._depth_loaded;
+            _depth_quantization_step = other._depth_quantization_step;
+            _cached_normal = std::move(other._cached_normal);
+            _normal_loaded = other._normal_loaded;
             _undistort_precomputed = other._undistort_precomputed;
             _undistort_prepared = other._undistort_prepared;
             _undistort_params = other._undistort_params;
@@ -219,6 +265,7 @@ namespace lfs::core {
             other._stream = nullptr;
             other._mask_loaded = false;
             other._depth_loaded = false;
+            other._normal_loaded = false;
             other._undistort_precomputed = false;
             other._undistort_prepared = false;
         }
@@ -241,11 +288,13 @@ namespace lfs::core {
           _image_path(other._image_path),
           _mask_path(other._mask_path),
           _depth_path(other._depth_path),
+          _normal_path(other._normal_path),
           _split(other._split),
           _camera_width(other._camera_width),
           _camera_height(other._camera_height),
           _image_width(other._image_width),
           _image_height(other._image_height),
+          _image_size_loaded(other._image_size_loaded),
           _cam_position(other._cam_position),
           _FoVx(other._FoVx),
           _FoVy(other._FoVy) {
@@ -253,8 +302,24 @@ namespace lfs::core {
 
         // Non-blocking so image loading doesn't serialize with the legacy stream.
         // On failure fall back to the default stream rather than a bad handle.
-        if (const cudaError_t err = cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking); err != cudaSuccess) {
-            LOG_WARN("Camera: cudaStreamCreateWithFlags failed ({}), falling back to default stream", cudaGetErrorString(err));
+        // log_cuda_teardown_failure is the frozen no-throw log-and-continue adapter.
+        const auto stream_create_site = LFS_SOURCE_SITE_CURRENT();
+        ::lfs::core::record_cuda_breadcrumb(
+            "cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking)",
+            __FILE__, __LINE__, nullptr);
+        const auto stream_create_state = ::lfs::core::prepare_cuda_check(
+            "cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking)",
+            stream_create_site, nullptr);
+        const cudaError_t stream_create_status =
+            cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
+        const auto stream_create_completion =
+            ::lfs::core::complete_cuda_check(stream_create_status, stream_create_state);
+        if (stream_create_completion.effective_error != cudaSuccess) {
+            ::lfs::core::log_cuda_teardown_failure(
+                stream_create_status, stream_create_state, stream_create_completion,
+                "cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking)",
+                "camera stream creation, falling back to default stream",
+                stream_create_site);
             _stream = nullptr;
         }
     }
@@ -296,12 +361,13 @@ namespace lfs::core {
             const auto shape = image.shape();
             _image_width = shape[2];
             _image_height = shape[1];
+            _image_size_loaded = true;
         }
 
         if (image.device() != Device::CUDA) {
             image = image.to(Device::CUDA, _stream);
             if (_stream) {
-                cudaStreamSynchronize(_stream);
+                LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "image upload sync");
             }
         }
 
@@ -353,6 +419,7 @@ namespace lfs::core {
         }
 
         LOG_DEBUG("load_image_size(): Final dimensions: {}x{}", _image_width, _image_height);
+        _image_size_loaded = true;
     }
 
     size_t Camera::get_num_bytes_from_file(int resize_factor, int max_width) const {
@@ -410,7 +477,7 @@ namespace lfs::core {
             if (mask.device() != Device::CUDA) {
                 mask = mask.to(Device::CUDA, _stream);
                 if (_stream) {
-                    cudaStreamSynchronize(_stream);
+                    LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "mask upload sync");
                 }
             }
             if (mask.dtype() == DataType::UInt8) {
@@ -436,7 +503,7 @@ namespace lfs::core {
             if (mask.device() != Device::CUDA) {
                 mask = mask.to(Device::CUDA, _stream);
                 if (_stream) {
-                    cudaStreamSynchronize(_stream);
+                    LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "mask upload sync");
                 }
             }
 
@@ -492,25 +559,60 @@ namespace lfs::core {
             return Tensor();
         }
 
-        const ImageLoadParams params{
-            .path = _depth_path,
-            .resize_factor = resize_factor,
-            .max_width = max_width,
-            .stream = _stream};
-
-        Tensor depth = load_image_cached(params);
-
-        if (depth.device() != Device::CUDA) {
-            depth = depth.to(Device::CUDA, _stream);
+        Tensor depth;
+        if (auto [gray, native_w, native_h] = load_image_gray_high_bitdepth(_depth_path); gray) {
+            auto cpu_depth = Tensor::from_blob(
+                gray,
+                TensorShape({static_cast<size_t>(native_h), static_cast<size_t>(native_w)}),
+                Device::CPU, DataType::Float32);
+            depth = cpu_depth.to(Device::CUDA, _stream);
             if (_stream) {
-                cudaStreamSynchronize(_stream);
+                LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "depth upload sync");
             }
-        }
+            free_image_float(gray);
 
-        if (depth.dtype() == DataType::UInt8) {
-            depth = depth.to(DataType::Float32).div(255.0f);
-        } else if (depth.dtype() != DataType::Float32) {
-            depth = depth.to(DataType::Float32);
+            int target_w = native_w;
+            int target_h = native_h;
+            if (resize_factor > 1) {
+                target_w /= resize_factor;
+                target_h /= resize_factor;
+            }
+            if (max_width > 0 && (target_w > max_width || target_h > max_width)) {
+                if (target_w > target_h) {
+                    target_h = std::max(1, max_width * target_h / target_w);
+                    target_w = max_width;
+                } else {
+                    target_w = std::max(1, max_width * target_w / target_h);
+                    target_h = max_width;
+                }
+            }
+            if (target_w != native_w || target_h != native_h) {
+                depth = lanczos_resize_grayscale(depth, target_h, target_w, 2, _stream);
+                if (_stream) {
+                    LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "depth resize sync");
+                }
+            }
+        } else {
+            const ImageLoadParams params{
+                .path = _depth_path,
+                .resize_factor = resize_factor,
+                .max_width = max_width,
+                .stream = _stream};
+
+            depth = load_image_cached(params);
+
+            if (depth.device() != Device::CUDA) {
+                depth = depth.to(Device::CUDA, _stream);
+                if (_stream) {
+                    LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "depth upload sync");
+                }
+            }
+
+            if (depth.dtype() == DataType::UInt8) {
+                depth = depth.to(DataType::Float32).div(255.0f);
+            } else if (depth.dtype() != DataType::Float32) {
+                depth = depth.to(DataType::Float32);
+            }
         }
 
         // Convert RGB [C,H,W] to grayscale [H,W].
@@ -539,6 +641,150 @@ namespace lfs::core {
         LOG_DEBUG("Loaded depth for {}: [{},{}]", _image_name, _cached_depth.shape()[0], _cached_depth.shape()[1]);
 
         return _cached_depth;
+    }
+
+    Tensor Camera::load_and_get_normal(const int resize_factor, const int max_width,
+                                       const NormalPriorDecode& decode) {
+        if (_normal_loaded && _cached_normal.is_valid()) {
+            return _cached_normal;
+        }
+
+        if (_normal_path.empty() || !std::filesystem::exists(_normal_path)) {
+            return Tensor();
+        }
+
+        Tensor normal;
+        if (auto [rgb, native_w, native_h] = load_image_rgb_high_bitdepth(_normal_path); rgb) {
+            auto cpu_normal = Tensor::from_blob(
+                rgb,
+                TensorShape({static_cast<size_t>(native_h), static_cast<size_t>(native_w), 3}),
+                Device::CPU, DataType::Float32);
+            normal = cpu_normal.to(Device::CUDA, _stream);
+            if (_stream) {
+                LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "normal upload sync");
+            }
+            free_image_float(rgb);
+            normal = normal.permute({2, 0, 1}).contiguous();
+        } else {
+            const ImageLoadParams params{
+                .path = _normal_path,
+                .stream = _stream};
+
+            normal = load_image_cached(params);
+
+            if (normal.is_valid() && normal.device() != Device::CUDA) {
+                normal = normal.to(Device::CUDA, _stream);
+                if (_stream) {
+                    LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "normal upload sync");
+                }
+            }
+            if (normal.is_valid()) {
+                if (normal.dtype() == DataType::UInt8) {
+                    normal = normal.to(DataType::Float32).div(255.0f);
+                } else if (normal.dtype() != DataType::Float32) {
+                    normal = normal.to(DataType::Float32);
+                }
+            }
+        }
+
+        if (!normal.is_valid() || normal.ndim() != 3) {
+            LOG_WARN("Normal map for {} could not be loaded from {}", _image_name,
+                     lfs::core::path_to_utf8(_normal_path));
+            return Tensor();
+        }
+        if (normal.shape()[0] != 3) {
+            if (normal.shape()[0] > 3) {
+                normal = normal.slice(0, 0, 3).contiguous();
+            } else if (normal.shape()[2] == 3) {
+                normal = normal.permute({2, 0, 1}).contiguous();
+            } else {
+                LOG_WARN("Normal map for {} has {} channels, expected 3", _image_name, normal.shape()[0]);
+                return Tensor();
+            }
+        }
+
+        // Decode the v = n*0.5 + 0.5 file encoding; the loss re-normalizes per
+        // pixel, so quantization/resampling shrinkage is harmless here.
+        normal = normal.mul(2.0f).sub(1.0f);
+
+        if (decode.srgb || decode.flip_yz || decode.world_space) {
+            auto normal_cpu = normal.cpu().contiguous();
+            const size_t pixel_count = normal_cpu.shape()[1] * normal_cpu.shape()[2];
+            if (decode.srgb) {
+                srgb_normal_prior_to_linear_chw(normal_cpu.ptr<float>(), pixel_count * 3);
+            }
+            if (decode.flip_yz) {
+                flip_normal_prior_yz_chw(normal_cpu.ptr<float>(), pixel_count);
+            }
+            if (decode.world_space) {
+                const std::array<float, 9> r_w2c = camera_rotation_to_cpu_array(_R);
+                std::array<float, 9> world_to_camera{};
+                for (size_t row = 0; row < 3; ++row) {
+                    for (size_t col = 0; col < 3; ++col) {
+                        float sum = 0.0f;
+                        for (size_t k = 0; k < 3; ++k) {
+                            sum += r_w2c[row * 3 + k] * decode.world_rotation[k * 3 + col];
+                        }
+                        world_to_camera[row * 3 + col] = sum;
+                    }
+                }
+                transform_normal_prior_world_to_camera_chw(
+                    normal_cpu.ptr<float>(),
+                    pixel_count,
+                    world_to_camera);
+            }
+            normal = normal_cpu.to(Device::CUDA, _stream);
+            if (_stream) {
+                LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "normal upload sync");
+            }
+        }
+
+        const int native_h = static_cast<int>(normal.shape()[1]);
+        const int native_w = static_cast<int>(normal.shape()[2]);
+        int target_w = native_w;
+        int target_h = native_h;
+        if (resize_factor > 1) {
+            target_w /= resize_factor;
+            target_h /= resize_factor;
+        }
+        if (max_width > 0 && (target_w > max_width || target_h > max_width)) {
+            if (target_w > target_h) {
+                target_h = std::max(1, max_width * target_h / target_w);
+                target_w = max_width;
+            } else {
+                target_w = std::max(1, max_width * target_w / target_h);
+                target_h = max_width;
+            }
+        }
+        if (target_w != native_w || target_h != native_h) {
+            normal = lanczos_resize_float_chw(normal, target_h, target_w, 2, _stream);
+            if (_stream) {
+                LFS_CUDA_TRY(cudaStreamSynchronize(_stream), _stream, "normal resize sync");
+            }
+        }
+
+        if (_undistort_prepared) {
+            const auto scaled = scale_undistort_params(
+                _undistort_params,
+                static_cast<int>(normal.shape()[2]),
+                static_cast<int>(normal.shape()[1]));
+            normal = undistort_image(normal, scaled, _stream);
+        }
+
+        _cached_normal = normal.contiguous();
+        _normal_loaded = true;
+
+        LOG_DEBUG("Loaded normal map for {}: [{},{}]", _image_name,
+                  _cached_normal.shape()[1], _cached_normal.shape()[2]);
+
+        return _cached_normal;
+    }
+
+    float Camera::depth_prior_quantization_step() {
+        if (_depth_quantization_step < 0.0f) {
+            _depth_quantization_step = has_depth() ? image_quantization_step(_depth_path) : 0.0f;
+        }
+        return _depth_quantization_step;
     }
 
     void Camera::precompute_undistortion(float blank_pixels) {

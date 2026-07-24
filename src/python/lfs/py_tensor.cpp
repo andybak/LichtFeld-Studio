@@ -304,12 +304,8 @@ namespace lfs::python {
 
     nb::object PyTensor::numpy(bool copy) const {
         validate();
-        Tensor cpu_tensor = tensor_.device() == Device::CUDA ? tensor_.cpu() : tensor_;
-
-        // Ensure contiguous
-        if (!cpu_tensor.is_contiguous()) {
-            cpu_tensor = cpu_tensor.contiguous();
-        }
+        Tensor host = tensor_.device() == Device::CUDA ? tensor_.cpu() : tensor_;
+        Tensor cpu_tensor = host.is_contiguous() ? std::move(host) : host.contiguous();
 
         const auto& dims = cpu_tensor.shape().dims();
         size_t elem_size = 4;
@@ -469,10 +465,8 @@ namespace lfs::python {
 
     nb::object PyTensor::tolist() const {
         validate();
-        Tensor cpu_tensor = tensor_.device() == Device::CUDA ? tensor_.cpu() : tensor_;
-        if (!cpu_tensor.is_contiguous()) {
-            cpu_tensor = cpu_tensor.contiguous();
-        }
+        Tensor host = tensor_.device() == Device::CUDA ? tensor_.cpu() : tensor_;
+        Tensor cpu_tensor = host.is_contiguous() ? std::move(host) : host.contiguous();
 
         const auto& dims = cpu_tensor.shape().dims();
         size_t offset = 0;
@@ -1394,7 +1388,13 @@ namespace lfs::python {
             try {
                 capsule = nb::cast<nb::capsule>(dlpack_fn(nb::arg("stream") = consumer));
                 stream_handshake = true;
-            } catch (const std::exception&) {
+            } catch (const nb::python_error& e) {
+                // Only the capability-signaling TypeError ("__dlpack__ takes no
+                // stream argument") warrants the legacy zero-arg retry; any other
+                // producer error propagates so a real bug is not masked by a silent
+                // second producer execution (Phase 9 Section 1.5 / doc :202).
+                if (!e.matches(PyExc_TypeError))
+                    throw;
                 capsule = nb::cast<nb::capsule>(dlpack_fn());
             }
         } else if (nb::isinstance<nb::capsule>(obj)) {

@@ -3,6 +3,7 @@
 
 #include "shared_scene_tools.hpp"
 
+#include "core/error_envelope.hpp"
 #include "core/path_utils.hpp"
 #include "mcp_tools.hpp"
 
@@ -50,6 +51,12 @@ namespace lfs::mcp {
                 params.optimization.iterations = args["max_iterations"].get<size_t>();
             if (args.contains("output_path"))
                 params.dataset.output_path = args["output_path"].get<std::string>();
+            if (args.contains("min_track_length")) {
+                const int min_track = args["min_track_length"].get<int>();
+                if (min_track < 0)
+                    return std::unexpected("min_track_length must be 0 or greater");
+                params.dataset.min_track_length = min_track;
+            }
             if (params.dataset.output_path.empty())
                 params.dataset.output_path = core::param::default_dataset_output_path(params.dataset.data_path);
 
@@ -86,6 +93,7 @@ namespace lfs::mcp {
                         {"path", json{{"type", "string"}, {"description", "Path to COLMAP dataset directory"}}},
                         {"images_folder", json{{"type", "string"}, {"description", "Images subfolder (default: images)"}}},
                         {"output_path", json{{"type", "string"}, {"description", "Optional output directory for checkpoints and exports (default: <dataset>/output)"}}},
+                        {"min_track_length", json{{"type", "integer"}, {"minimum", 0}, {"description", "Minimum COLMAP track length for sparse point import; 0 disables filtering"}}},
                         {"max_iterations", json{{"type", "integer"}, {"description", "Maximum training iterations (default: 30000)"}}},
                         {"strategy", json{{"type", "string"}, {"enum", json::array({"default", "mcmc", "mrnf", "igs+"})}, {"description", "Training strategy or 'default' to keep the built-in default"}}}},
                     .required = {"path"}},
@@ -107,6 +115,7 @@ namespace lfs::mcp {
                     {"success", true},
                     {"path", core::path_to_utf8(path)},
                     {"output_path", core::path_to_utf8(params.dataset.output_path)},
+                    {"min_track_length", params.dataset.min_track_length},
                     {"strategy", params.optimization.strategy},
                 };
                 if (backend.gaussian_count) {
@@ -226,6 +235,29 @@ namespace lfs::mcp {
                     {"data", *result},
                 };
             });
+
+        if (backend.last_training_error) {
+            registry.register_tool(
+                McpTool{
+                    .name = "training.get_last_error",
+                    .description = "Get the most recent training failure as a structured error "
+                                   "envelope, or null if none. During an active run this may briefly "
+                                   "differ from the legacy 'last_error' string surface.",
+                    .input_schema = {.type = "object", .properties = json::object(), .required = {}},
+                    .metadata = query_metadata(backend, "training")},
+                [backend](const json&) -> json {
+                    auto latched = backend.last_training_error();
+                    if (!latched) {
+                        return json{{"success", true}, {"last_error", nullptr}, {"last_error_message", nullptr}};
+                    }
+                    json envelope = core::to_wire_envelope(*latched);
+                    std::string message = envelope.value("message", std::string{});
+                    return json{
+                        {"success", true},
+                        {"last_error", std::move(envelope)},
+                        {"last_error_message", std::move(message)}};
+                });
+        }
     }
 
 } // namespace lfs::mcp

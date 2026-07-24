@@ -61,6 +61,7 @@ namespace lfs::io {
         int resize_factor = -1;
         int max_width = 0;
         std::string images_folder = "images";
+        int min_track_length = 0;
         bool validate_only = false;
         CentralizeDataset centralize = CentralizeDataset::Off;
         ProgressCallback progress = nullptr;
@@ -179,7 +180,7 @@ namespace lfs::io {
     /// Returns false for simple point clouds (xyz + colors only)
     LFS_IO_API bool is_gaussian_splat_ply(const std::filesystem::path& filepath);
 
-    /// Load PLY as simple point cloud (xyz + optional colors)
+    /// Load PLY as simple point cloud (xyz + optional colors and normals)
     /// Use this for PLY files that are NOT Gaussian splats
     LFS_IO_API std::expected<PointCloud, std::string> load_ply_point_cloud(const std::filesystem::path& filepath,
                                                                            const LoadOptions& options = {});

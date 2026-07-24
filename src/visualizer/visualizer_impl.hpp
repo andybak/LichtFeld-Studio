@@ -5,6 +5,8 @@
 #pragma once
 
 #include "core/editor_context.hpp"
+#include "core/error_codes.hpp"
+#include "core/frame_state_machine.hpp"
 #include "core/main_loop.hpp"
 #include "core/parameter_manager.hpp"
 #include "core/parameters.hpp"
@@ -21,6 +23,8 @@
 #include "window/window_manager.hpp"
 #include <cassert>
 #include <chrono>
+#include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -153,6 +157,23 @@ namespace lfs::vis {
         bool allowclose();
         void wakeMainLoop() const;
 
+        // Frame exception boundary. Contains an OOM or other error escaping a
+        // frame so the loop never aborts: OOM triggers one render-safe pressure
+        // episode, other errors escalate under a rate limit.
+        void handleFrameException(std::exception_ptr eptr) noexcept;
+        void onFrameCompleted() noexcept;
+        // Executes the FrameStateMachine's publish effects on the UI thread
+        // (pressure toast, OOM-paused modal, renderer-dead modal + OS dialog).
+        void applyFrameStateEffects(const FrameStateMachine::Effects& effects) noexcept;
+        // Internal-terminal modal carrying the caught fault's code and developer
+        // detail; renderer-dead modal (+ AMB-P3-1 OS dialog) for a lost/stalled
+        // renderer that can no longer present its own obituary.
+        void publishRendererInternalModal(lfs::ErrorCode code, std::string detail) noexcept;
+        void publishRendererInternalModal(const lfs::Error& error) noexcept;
+        std::vector<lfs::ErrorAction> rendererInternalActions();
+        void publishRendererDeadModal(RendererTerminalState cause) noexcept;
+        void logRateLimitedFrameError(const std::exception& e) noexcept;
+
         // Event system
         void setupEventHandlers();
         void setupComponentConnections();
@@ -161,6 +182,9 @@ namespace lfs::vis {
         void handleLoadConfigFile(const std::filesystem::path& path);
         void handleNewProject();
         void performNewProject();
+        void schedulePendingTrainingAction();
+        void performPendingTrainingAction();
+        void requestApplicationClose();
         void handleSwitchToLatestCheckpoint();
         void performReset();
         void resetProjectState();
@@ -249,6 +273,11 @@ namespace lfs::vis {
         std::unique_ptr<ParameterManager> parameter_manager_;
         std::unique_ptr<MainLoop> main_loop_;
 
+        // Frame exception boundary state (viewer thread only).
+        FrameStateMachine frame_state_;
+        uint64_t suppressed_frame_errors_ = 0;
+        std::chrono::steady_clock::time_point last_frame_error_log_{};
+
         // Tools
         std::shared_ptr<tools::AlignTool> align_tool_;
         std::shared_ptr<tools::SelectionTool> selection_tool_;
@@ -277,11 +306,20 @@ namespace lfs::vis {
         bool tools_initialized_ = false;
         bool view_context_bridge_initialized_ = false;
         bool pending_auto_train_ = false;
-        bool pending_new_project_ = false;
-        bool pending_reset_ = false;
+        enum class PendingTrainingAction : std::uint8_t {
+            None,
+            Reset,
+            NewProject,
+            Close,
+        };
+        PendingTrainingAction pending_training_action_ = PendingTrainingAction::None;
+        bool pending_training_action_posted_ = false;
         int pending_training_completion_refresh_frames_ = 0;
         bool gui_frame_rendered_ = false;
         bool startup_plugin_preload_started_ = false;
+        std::uint64_t startup_plugin_load_status_revision_ = 0;
+        bool plugin_preload_timing_active_ = false;
+        std::chrono::nanoseconds plugin_preload_max_update_stall_{};
         bool update_work_processed_ = false;
         std::chrono::high_resolution_clock::time_point last_frame_time_ = std::chrono::high_resolution_clock::now();
         bool sequencer_ui_initialized_ = false;

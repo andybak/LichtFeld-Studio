@@ -12,6 +12,7 @@
 #include <cassert>
 #include <chrono>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_set>
 
 #include "python_compat.hpp"
@@ -89,6 +90,10 @@ namespace lfs::python {
         GetTransformSpaceCallback g_get_transform_space_cb = nullptr;
         SetTransformSpaceCallback g_set_transform_space_cb = nullptr;
 
+        // Multi-transform mode callbacks
+        GetMultiTransformModeCallback g_get_multi_transform_mode_cb = nullptr;
+        SetMultiTransformModeCallback g_set_multi_transform_mode_cb = nullptr;
+
         // Asset Manager save callback
         SaveAssetCallback g_save_asset_cb = nullptr;
 
@@ -137,20 +142,11 @@ namespace lfs::python {
         std::once_flag g_redirect_once;
         std::atomic<bool> g_plugins_loaded{false};
 
-        // ImGui state shared across DLL boundaries (set once during init, read from render thread)
-        void* g_imgui_context{nullptr};
-        void* g_imgui_alloc_fn{nullptr};
-        void* g_imgui_free_fn{nullptr};
-        void* g_imgui_alloc_user_data{nullptr};
-
         constexpr float DEFAULT_DPI_SCALE{1.0f};
 
         CreateTextureFn g_create_texture{nullptr};
         DeleteTextureFn g_delete_texture{nullptr};
         MaxTextureSizeFn g_max_texture_size_fn{nullptr};
-
-        void* g_implot_context{nullptr};
-
         void* g_view_context_state{nullptr};
         float g_shared_dpi_scale{DEFAULT_DPI_SCALE};
         void* g_rml_manager{nullptr};
@@ -170,6 +166,7 @@ namespace lfs::python {
 
         // Thread-local frame context for unified access
         thread_local PyContext g_frame_context;
+        thread_local OverlayDrawContext g_overlay_draw_context;
 
         // Cached state updated via signal bridge
         std::atomic<bool> g_has_selection{false};
@@ -180,7 +177,8 @@ namespace lfs::python {
         std::atomic<uint64_t> g_redraw_generation{0};
         std::atomic<uint64_t> g_pre_scene_panel_sync_generation{0};
         MainLoopWakeCallback g_main_loop_wake_callback = nullptr;
-        StartupPluginLoadStateCallback g_startup_plugin_load_state_callback = nullptr;
+        std::mutex g_startup_plugin_load_status_mutex;
+        StartupPluginLoadStatus g_startup_plugin_load_status;
     } // namespace
 
     // Bridge API
@@ -207,6 +205,9 @@ namespace lfs::python {
         }
         if (g_get_transform_space_cb) {
             g_frame_context.transform_space = g_get_transform_space_cb();
+        }
+        if (g_get_multi_transform_mode_cb) {
+            g_frame_context.multi_transform_mode = g_get_multi_transform_mode_cb();
         }
         g_frame_context.selection_submode = g_selection_submode.load();
     }
@@ -242,15 +243,19 @@ namespace lfs::python {
         g_main_loop_wake_callback = cb;
     }
 
-    void set_startup_plugin_load_state_callback(StartupPluginLoadStateCallback cb) {
-        g_startup_plugin_load_state_callback = cb;
-    }
-
-    void notify_startup_plugin_load_state(bool active, float progress, const char* stage) {
-        if (g_startup_plugin_load_state_callback) {
-            g_startup_plugin_load_state_callback(active, progress, stage);
+    void set_startup_plugin_load_status(const StartupPluginLoadStatus& status) {
+        {
+            std::lock_guard lock(g_startup_plugin_load_status_mutex);
+            const auto revision = g_startup_plugin_load_status.revision + 1;
+            g_startup_plugin_load_status = status;
+            g_startup_plugin_load_status.revision = revision;
         }
         request_redraw();
+    }
+
+    StartupPluginLoadStatus get_startup_plugin_load_status() {
+        std::lock_guard lock(g_startup_plugin_load_status_mutex);
+        return g_startup_plugin_load_status;
     }
 
     // Operation context (short-lived)
@@ -553,6 +558,20 @@ namespace lfs::python {
             g_set_transform_space_cb(space);
     }
 
+    void set_multi_transform_mode_callbacks(GetMultiTransformModeCallback get_cb, SetMultiTransformModeCallback set_cb) {
+        g_get_multi_transform_mode_cb = get_cb;
+        g_set_multi_transform_mode_cb = set_cb;
+    }
+
+    int get_multi_transform_mode() {
+        return g_get_multi_transform_mode_cb ? g_get_multi_transform_mode_cb() : 0;
+    }
+
+    void set_multi_transform_mode(int mode) {
+        if (g_set_multi_transform_mode_cb)
+            g_set_multi_transform_mode_cb(mode);
+    }
+
     void set_save_asset_callback(SaveAssetCallback save_cb) {
         g_save_asset_cb = save_cb;
     }
@@ -654,26 +673,6 @@ namespace lfs::python {
     void mark_plugins_loaded() { g_plugins_loaded.store(true, std::memory_order_release); }
     bool are_plugins_loaded() { return g_plugins_loaded.load(std::memory_order_acquire); }
 
-    void set_imgui_context(void* ctx) {
-        g_imgui_context = ctx;
-    }
-
-    void* get_imgui_context() {
-        return g_imgui_context;
-    }
-
-    void set_imgui_allocator_functions(void* alloc_func, void* free_func, void* user_data) {
-        g_imgui_alloc_fn = alloc_func;
-        g_imgui_free_fn = free_func;
-        g_imgui_alloc_user_data = user_data;
-    }
-
-    void get_imgui_allocator_functions(void** alloc_func, void** free_func, void** user_data) {
-        *alloc_func = g_imgui_alloc_fn;
-        *free_func = g_imgui_free_fn;
-        *user_data = g_imgui_alloc_user_data;
-    }
-
     void set_ui_texture_service(const CreateTextureFn create, const DeleteTextureFn del, const MaxTextureSizeFn max_size) {
         assert(create && del && max_size);
         g_create_texture = create;
@@ -681,9 +680,18 @@ namespace lfs::python {
         g_max_texture_size_fn = max_size;
     }
 
+    void require_ui_texture_creation_thread() {
+        if (!on_graphics_thread()) {
+            throw std::runtime_error(
+                "UI texture creation must run on the graphics thread; defer icon or "
+                "image loading until a panel draw callback");
+        }
+    }
+
     TextureResult create_ui_texture(const unsigned char* data, const int w, const int h, const int channels) {
         if (!g_create_texture)
             return {0, w, h};
+        require_ui_texture_creation_thread();
         return g_create_texture(data, w, h, channels);
     }
 
@@ -697,9 +705,6 @@ namespace lfs::python {
         assert(g_max_texture_size_fn);
         return g_max_texture_size_fn();
     }
-
-    void set_implot_context(void* ctx) { g_implot_context = ctx; }
-    void* get_implot_context() { return g_implot_context; }
 
     void set_view_context_state(void* state) {
         g_view_context_state = state;
@@ -761,26 +766,265 @@ namespace lfs::python {
         g_ensure_initialized_callback = cb;
     }
 
-    std::string extract_python_error() {
-        PyObject *type, *value, *tb;
-        PyErr_Fetch(&type, &value, &tb);
-        std::string msg = "(unknown error)";
+    lfs::ErrorCode error_code_from_string(std::string_view token) noexcept {
+        using C = lfs::ErrorCode;
+        if (token == "Cancelled")
+            return C::Cancelled;
+        if (token == "InvalidArgument")
+            return C::InvalidArgument;
+        if (token == "BoundsViolation")
+            return C::BoundsViolation;
+        if (token == "FailedPrecondition")
+            return C::FailedPrecondition;
+        if (token == "NotFound")
+            return C::NotFound;
+        if (token == "PermissionDenied")
+            return C::PermissionDenied;
+        if (token == "AlreadyExists")
+            return C::AlreadyExists;
+        if (token == "ResourceExhausted")
+            return C::ResourceExhausted;
+        if (token == "DeadlineExceeded")
+            return C::DeadlineExceeded;
+        if (token == "Unavailable")
+            return C::Unavailable;
+        if (token == "DataLoss")
+            return C::DataLoss;
+        if (token == "Unsupported")
+            return C::Unsupported;
+        if (token == "DeviceLost")
+            return C::DeviceLost;
+        if (token == "ContractViolation")
+            return C::ContractViolation;
+        return C::Internal;
+    }
 
-        if (value) {
-            PyObject* str = PyObject_Str(value);
-            if (str) {
-                const char* c_msg = PyUnicode_AsUTF8(str);
-                if (c_msg) {
-                    msg = c_msg;
-                }
-                Py_DECREF(str);
+    lfs::ErrorDomain error_domain_from_string(std::string_view token) noexcept {
+        using D = lfs::ErrorDomain;
+        if (token == "Core")
+            return D::Core;
+        if (token == "Tensor")
+            return D::Tensor;
+        if (token == "IO")
+            return D::IO;
+        if (token == "Training")
+            return D::Training;
+        if (token == "Rendering")
+            return D::Rendering;
+        if (token == "Vulkan")
+            return D::Vulkan;
+        if (token == "CUDA")
+            return D::CUDA;
+        if (token == "Python")
+            return D::Python;
+        if (token == "MCP")
+            return D::MCP;
+        if (token == "TCP")
+            return D::TCP;
+        if (token == "Preprocess")
+            return D::Preprocess;
+        if (token == "Sequencer")
+            return D::Sequencer;
+        if (token == "App")
+            return D::App;
+        return D::Python;
+    }
+
+    namespace {
+        std::string py_object_to_utf8(PyObject* obj) {
+            if (!obj)
+                return {};
+            PyObject* str = PyObject_Str(obj);
+            if (!str) {
+                PyErr_Clear();
+                return {};
             }
+            std::string out;
+            if (const char* text = PyUnicode_AsUTF8(str)) {
+                out = text;
+            } else {
+                PyErr_Clear();
+            }
+            Py_DECREF(str);
+            return out;
+        }
+
+        std::string format_python_traceback(PyObject* type, PyObject* value, PyObject* tb) {
+            std::string message;
+            PyObject* traceback_module = PyImport_ImportModule("traceback");
+            if (!traceback_module) {
+                PyErr_Clear();
+                return message;
+            }
+            PyObject* format_exception = PyObject_GetAttrString(traceback_module, "format_exception");
+            if (format_exception && PyCallable_Check(format_exception)) {
+                PyObject* args = PyTuple_Pack(3, type ? type : Py_None,
+                                              value ? value : Py_None, tb ? tb : Py_None);
+                PyObject* lines = args ? PyObject_CallObject(format_exception, args) : nullptr;
+                if (lines) {
+                    PyObject* empty = PyUnicode_FromString("");
+                    PyObject* joined = empty ? PyUnicode_Join(empty, lines) : nullptr;
+                    if (joined) {
+                        if (const char* text = PyUnicode_AsUTF8(joined))
+                            message = text;
+                        Py_DECREF(joined);
+                    }
+                    Py_XDECREF(empty);
+                    Py_DECREF(lines);
+                } else {
+                    PyErr_Clear();
+                }
+                Py_XDECREF(args);
+            } else {
+                PyErr_Clear();
+            }
+            Py_XDECREF(format_exception);
+            Py_DECREF(traceback_module);
+            return message;
+        }
+
+        // Name alone is not identity: only asyncio's CancelledError (and the
+        // lichtfeld re-export) mean cancellation. An unrelated user class merely
+        // named CancelledError must stay Internal, not vanish as benign Cancelled.
+        bool is_cancelled_exception(PyObject* type, const std::string& py_type_name) {
+            if (py_type_name != "CancelledError")
+                return false;
+            PyObject* module_attr = type ? PyObject_GetAttrString(type, "__module__") : nullptr;
+            if (!module_attr) {
+                PyErr_Clear();
+                return false;
+            }
+            std::string module;
+            if (const char* text = PyUnicode_AsUTF8(module_attr))
+                module = text;
+            Py_DECREF(module_attr);
+            return module == "asyncio" || module.starts_with("asyncio.") ||
+                   module == "concurrent.futures" || module.starts_with("concurrent.futures.") ||
+                   module == "lichtfeld";
+        }
+    } // namespace
+
+    lfs::Error error_from_python(lfs::core::SourceSite site, lfs::OperationId op) noexcept {
+#ifndef NDEBUG
+        assert(PyGILState_Check() && "error_from_python requires the GIL held");
+#endif
+        PyObject* type = nullptr;
+        PyObject* value = nullptr;
+        PyObject* tb = nullptr;
+        PyErr_Fetch(&type, &value, &tb);
+        PyErr_NormalizeException(&type, &value, &tb);
+
+        lfs::ErrorCode code = lfs::ErrorCode::Internal;
+        lfs::ErrorDomain domain = lfs::ErrorDomain::Python;
+        std::string user_message;
+        std::string detail;
+        std::string py_type_name;
+        bool round_tripped = false;
+
+        try {
+            if (type) {
+                PyObject* name = PyObject_GetAttrString(type, "__name__");
+                if (name) {
+                    if (const char* text = PyUnicode_AsUTF8(name))
+                        py_type_name = text;
+                    Py_DECREF(name);
+                } else {
+                    PyErr_Clear();
+                }
+            }
+
+            // Round-trip: a re-raised lichtfeld.Error carries string .code/.domain.
+            if (value) {
+                PyObject* lf = PyImport_ImportModule("lichtfeld");
+                if (lf) {
+                    PyObject* err_type = PyObject_GetAttrString(lf, "Error");
+                    if (err_type) {
+                        const int is_lf = PyObject_IsInstance(value, err_type);
+                        if (is_lf > 0) {
+                            PyObject* code_attr = PyObject_GetAttrString(value, "code");
+                            PyObject* domain_attr = PyObject_GetAttrString(value, "domain");
+                            if (code_attr && PyUnicode_Check(code_attr) &&
+                                domain_attr && PyUnicode_Check(domain_attr)) {
+                                if (const char* c = PyUnicode_AsUTF8(code_attr))
+                                    code = error_code_from_string(c);
+                                if (const char* d = PyUnicode_AsUTF8(domain_attr))
+                                    domain = error_domain_from_string(d);
+                                round_tripped = true;
+                            }
+                            Py_XDECREF(code_attr);
+                            Py_XDECREF(domain_attr);
+                            if (!round_tripped)
+                                PyErr_Clear(); // a missing .code/.domain left an AttributeError pending
+                        } else if (is_lf < 0) {
+                            PyErr_Clear();
+                        }
+                        Py_DECREF(err_type);
+                    } else {
+                        PyErr_Clear();
+                    }
+                    Py_DECREF(lf);
+                } else {
+                    PyErr_Clear();
+                }
+            }
+
+            if (!round_tripped) {
+                const auto matches = [&](PyObject* exc) {
+                    return type && exc && PyErr_GivenExceptionMatches(type, exc);
+                };
+                if (matches(PyExc_KeyboardInterrupt) || is_cancelled_exception(type, py_type_name)) {
+                    code = lfs::ErrorCode::Cancelled;
+                } else if (matches(PyExc_MemoryError)) {
+                    code = lfs::ErrorCode::ResourceExhausted;
+                } else if (matches(PyExc_FileNotFoundError)) {
+                    code = lfs::ErrorCode::NotFound;
+                } else if (matches(PyExc_TypeError) || matches(PyExc_ValueError)) {
+                    code = lfs::ErrorCode::InvalidArgument;
+                } else {
+                    code = lfs::ErrorCode::Internal;
+                }
+            }
+
+            user_message = py_object_to_utf8(value);
+            detail = format_python_traceback(type, value, tb);
+            if (detail.empty())
+                detail = user_message;
+        } catch (...) {
+            // LFS-CENSUS-OK(empty-catch): noexcept boundary; a formatting failure
+            // degrades to whatever fields were already captured.
         }
 
         Py_XDECREF(type);
         Py_XDECREF(value);
         Py_XDECREF(tb);
-        return msg;
+
+        lfs::SmallFields fields;
+        if (!py_type_name.empty())
+            fields.add("py_type", py_type_name);
+
+        return lfs::make_error({
+            .code = code,
+            .domain = domain,
+            .severity = lfs::Severity::Error,
+            .operation_id = op,
+            .user_message = std::move(user_message),
+            .detail = lfs::truncate_utf8_safe(std::move(detail), lfs::kMaxDeveloperStringBytes),
+            .detection = site,
+            .fields = std::move(fields),
+        });
+    }
+
+    std::string extract_python_error() {
+        if (!PyErr_Occurred()) {
+            return "(unknown error)";
+        }
+        const lfs::Error error = error_from_python(LFS_SOURCE_SITE_CURRENT());
+        std::string detail(error.detail());
+        if (detail.empty())
+            detail = std::string(error.user_message());
+        if (detail.empty())
+            detail = "(unknown error)";
+        return detail;
     }
 
     void invoke_python_cleanup() {
@@ -1088,6 +1332,14 @@ namespace lfs::python {
     bool has_viewport_bounds() {
         std::lock_guard lock(g_viewport.mutex);
         return g_viewport.is_set;
+    }
+
+    void set_overlay_draw_context(const OverlayDrawContext context) {
+        g_overlay_draw_context = context;
+    }
+
+    OverlayDrawContext get_overlay_draw_context() {
+        return g_overlay_draw_context;
     }
 
     bool is_exit_popup_open() { return g_exit_popup_open.load(); }

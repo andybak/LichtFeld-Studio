@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "core/error_latch.hpp"
 #include "core/export.hpp"
 #include "core/parameters.hpp"
 #include "core/scene.hpp"
@@ -59,13 +60,17 @@ namespace lfs::mcp {
         void pause_training();
         void resume_training();
 
+        // Most recent training failure as a typed error, or nullopt (Phase 10).
+        [[nodiscard]] std::optional<lfs::Error> last_training_error() const {
+            return last_training_error_.get();
+        }
+
         bool is_loaded() const {
             std::lock_guard lock(mutex_);
             return scene_ != nullptr;
         }
         bool is_training() const {
-            std::lock_guard lock(mutex_);
-            return training_thread_ != nullptr;
+            return training_active_.load(std::memory_order_acquire);
         }
 
         std::shared_ptr<core::Scene> scene() const {
@@ -111,6 +116,8 @@ namespace lfs::mcp {
         size_t selection_output_buffer_index_ = 0;
 
         std::unique_ptr<std::jthread> training_thread_;
+        std::atomic<bool> training_active_{false};
+        core::ErrorLatch last_training_error_;
         mutable std::mutex mutex_;
         mutable std::mutex selection_mutex_;
     };

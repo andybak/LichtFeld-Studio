@@ -3,9 +3,32 @@
 ## Requirements
 
 - CUDA Toolkit 12.8+
+- cuDNN 9 for CUDA 12 (CI installs cuDNN 9.5.0 only when the runner image does not already provide it)
 - CMake 3.30+
 - vcpkg (`VCPKG_ROOT` set, or on Windows use `build_windows_ci.ps1` which bootstraps `../vcpkg` by default)
 - GCC 14+ (Linux) or Visual Studio 2022 v17.10+ (Windows)
+
+Windows builds require the **C++ Clang Compiler for Windows** Visual Studio
+Installer individual component in addition to the regular C++ desktop workload.
+It provides `clang-cl`, which is used only to build libplacebo (an unconditional
+dependency of the standard build) with a Microsoft-compatible ABI. The port
+locates `clang-cl.exe` on `PATH` or under `VSINSTALLDIR`/`VCINSTALLDIR` (for
+example from the x64 Native Tools Command Prompt). **MSBuild support for LLVM
+(clang-cl) toolset** is optional and only needed if you want the LLVM toolset
+selectable in Visual Studio IDE projects; the vcpkg port itself does not use
+MSBuild. The rest of LichtFeld Studio continues to use the configured Visual
+Studio/MSVC toolchain.
+
+On Windows, set `CUDNN_ROOT_DIR` to the cuDNN version root so the build can copy
+the CUDA-versioned cuDNN runtime DLLs next to the executable and into portable
+installs:
+
+```bat
+set CUDNN_ROOT_DIR=C:\Program Files\NVIDIA\CUDNN\v9.24
+```
+
+For unusual layouts, pass `-DLFS_CUDNN_BIN_DIR=...` directly to the cuDNN DLL
+directory, for example `...\bin\<cuda-version>\x64`.
 
 ## Linux Prerequisites
 
@@ -106,6 +129,22 @@ dist/
 | `BUILD_CUDA_MIN_SM` | 75 | Minimum GPU (75=Turing, 80=Ampere, 89=Ada) |
 | `BUILD_TESTS` | OFF | Build test suite |
 | `LFS_ENFORCE_LINUX_GUI_BACKENDS` | ON | Linux only. Fail configure if SDL3 would be built without both X11 and Wayland |
+
+ONNX Runtime is consumed as a pinned prebuilt GPU SDK on x64 Windows and Linux
+instead of being built by vcpkg. The default SDK is controlled by
+`LFS_ONNXRUNTIME_VERSION`; set `LFS_ONNXRUNTIME_ROOT` to an unpacked ONNX Runtime
+SDK to use a local or custom build. Set `LFS_ONNXRUNTIME_USE_PREBUILT=OFF` to
+fall back to a package-provided `onnxruntime` CMake config.
+
+## Preprocess Model Downloads
+
+The `preprocess` subcommand downloads the default MoGe-2 ONNX model on first
+use when `--model` is not provided. The cached model and every downloaded
+temporary file are SHA-256 verified on Windows and Linux before ONNX Runtime can
+load them. A hash mismatch deletes the untrusted temporary file, rejects the
+cached model, and exits with an error. Use `preprocess --download-only` to
+preload and verify the cache, or `--no-download` to require an already verified
+cache entry.
 
 ## Troubleshooting
 

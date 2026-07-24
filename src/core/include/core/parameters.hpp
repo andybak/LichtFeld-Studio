@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <string>
@@ -128,9 +129,16 @@ namespace lfs::core {
             bool use_alpha_as_mask = true;            // Auto-use alpha channel from RGBA images as mask
 
             // Depth supervision
-            bool use_depth_loss = false;                        // Use dataset depth maps when available
-            float depth_loss_weight = 2.0f;                     // Depth supervision weight
-            std::string depth_loss_mode = "adaptive-warped-l1"; // pearson or adaptive-warped-l1
+            bool use_depth_loss = false;         // Use dataset depth maps when available
+            float depth_loss_weight = 2.0f;      // Depth supervision weight (decays over training)
+            std::string depth_loss_mode = "ssi"; // ssi (auto prior), ssi-disparity, or ssi-depth
+
+            // Normal supervision
+            bool use_normal_loss = false;            // Use dataset normal maps when available
+            float normal_loss_weight = 0.05f;        // Prior normal supervision weight
+            float normal_consistency_weight = 0.05f; // Depth-normal consistency weight
+            float normal_flatten_weight = 1.0f;      // L1 on the smallest scale axis while normal supervision is active
+            std::string normal_loss_space = "auto";  // auto, camera-opencv, camera-opengl, or world
 
             // Mip filter (anti-aliasing)
             bool mip_filter = false;
@@ -221,7 +229,7 @@ namespace lfs::core {
             bool use_fs_cache = true;
             bool print_cache_status = true;
             int print_status_freq_num = 500; // every print_status_freq_num calls for load print cache status
-
+            bool use_16bit_color = false;
             nlohmann::json to_json() const;
             static LoadingParams from_json(const nlohmann::json& j);
         };
@@ -236,6 +244,7 @@ namespace lfs::core {
             std::vector<std::string> timelapse_images = {};
             int timelapse_every = 50;
             int max_width = 3840;
+            int min_track_length = 0;
             LoadingParams loading_params;
 
             // Mask loading parameters (copied from optimization params)
@@ -247,6 +256,7 @@ namespace lfs::core {
 
             nlohmann::json to_json() const;
             static DatasetConfig from_json(const nlohmann::json& j);
+            [[nodiscard]] std::string validate() const;
         };
 
         struct LFS_CORE_API ServerConfig {
@@ -256,6 +266,17 @@ namespace lfs::core {
 
             nlohmann::json to_json() const;
             static ServerConfig from_json(const nlohmann::json& j);
+        };
+
+        // Headless camera-path -> video render mode (see --render-camera-path)
+        struct LFS_CORE_API RenderPathConfig {
+            std::filesystem::path camera_path; // sequencer::Timeline JSON keyframe path
+            std::filesystem::path load_path;   // trained scene: .ply/.sog/.spz or .resume checkpoint
+            std::filesystem::path output_path; // destination .mp4
+            int width = 1920;
+            int height = 1080;
+            int fps = 30;
+            int crf = 18;
         };
 
         struct LFS_CORE_API TrainingParameters {
@@ -275,10 +296,14 @@ namespace lfs::core {
             // Optional trained splats to append to the training model before optimizer initialization
             std::vector<std::filesystem::path> add_splat_paths;
             std::vector<bool> add_splat_freeze;
+            float freeze_lr_scale = 0.0f;
             bool exclude_frozen_add_splats_from_export = false;
 
             // Checkpoint to resume training from
             std::optional<std::filesystem::path> resume_checkpoint = std::nullopt;
+
+            // Headless camera-path -> video render mode (see --render-camera-path)
+            std::optional<RenderPathConfig> render_path = std::nullopt;
 
             // Python scripts to execute for custom training callbacks
             std::vector<std::filesystem::path> python_scripts;
@@ -335,6 +360,26 @@ namespace lfs::core {
             Mesh2SplatOptions options;
             int sog_iterations = 10;
             bool overwrite = false;
+        };
+
+        enum class PreprocessOutputMode { Depth,
+                                          Normals,
+                                          Both };
+
+        struct LFS_CORE_API PreprocessParameters {
+            std::filesystem::path dataset_path;
+            std::string images_folder = "images";
+            std::filesystem::path model_path;
+            PreprocessOutputMode mode = PreprocessOutputMode::Both;
+            int max_side = 518;
+            std::int64_t num_tokens = 1800;
+            int threads = 0;
+            int png_compression = 1;
+            int bit_depth = 16;
+            bool force_cpu = false;
+            bool overwrite = false;
+            bool no_download = false;
+            bool download_only = false;
         };
 
         // Modern C++23 functions returning expected values

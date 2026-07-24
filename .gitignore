@@ -10,7 +10,6 @@ external/debug/libtorch/
 output*
 results
 .idea
-imgui.ini
 data
 *.pt
 *.py
@@ -22,6 +21,7 @@ data
 !tests/real_bicycle_sh_degree_training.py
 !tests/python/**/*.py
 !docs/plugins/examples/**/*.py
+!tools/*.py
 .venv/
 *.png
 !src/**/assets/**/*.png

@@ -23,19 +23,21 @@
 #include "scene/scene_render_state.hpp"
 #include "visualizer/internal/viewport.hpp"
 #include "visualizer/ipc/view_context.hpp"
+#include "visualizer/post_work_utils.hpp"
 #include "visualizer/rendering/rendering_manager.hpp"
+#include "visualizer/rendering/viewport_appearance_correction.hpp"
 #include "visualizer/visualizer.hpp"
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <expected>
 #include <filesystem>
-#include <future>
+#include <functional>
 #include <numbers>
 #include <variant>
 
@@ -52,7 +54,6 @@ namespace lfs::python {
         enum class PreviewReadback {
             FloatRgb,
             UInt8Rgb,
-            UInt8Rgba,
         };
 
         [[nodiscard]] std::optional<core::Tensor> viewportRenderImageHwc(
@@ -65,9 +66,8 @@ namespace lfs::python {
             const auto layout = rendering::detectImageLayout(image);
             if (layout == rendering::ImageLayout::Unknown)
                 return std::nullopt;
-            image = rendering::flipImageVertical(image, layout);
             if (layout == rendering::ImageLayout::CHW) {
-                image = image.permute({1, 2, 0});
+                image = rendering::flipImageVertical(image, layout).permute({1, 2, 0}).contiguous();
             } else {
                 image = image.contiguous();
             }
@@ -108,31 +108,11 @@ namespace lfs::python {
                 return std::nullopt;
             }
 
-            auto promise = std::make_shared<std::promise<std::optional<vis::ViewportRender>>>();
-            auto future = promise->get_future();
-            auto completed = std::make_shared<std::atomic_bool>(false);
-
-            auto finish = [promise, completed](std::optional<vis::ViewportRender> result) mutable {
-                if (!completed->exchange(true)) {
-                    promise->set_value(std::move(result));
-                }
-            };
-
-            const bool posted = viewer->postWork(vis::Visualizer::WorkItem{
-                .run =
-                    [invoke_capture, finish]() mutable {
-                        finish(invoke_capture());
-                    },
-                .cancel =
-                    [finish]() mutable {
-                        finish(std::nullopt);
-                    }});
-            if (!posted) {
-                return std::nullopt;
-            }
-
             nb::gil_scoped_release release;
-            return future.get();
+            return vis::post_work_and_wait(
+                [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
+                invoke_capture,
+                []() -> std::optional<vis::ViewportRender> { return std::nullopt; });
         }
 
         [[nodiscard]] core::PointCloud pointCloudFromMesh(const core::MeshData& mesh) {
@@ -392,31 +372,11 @@ namespace lfs::python {
                 return std::nullopt;
             }
 
-            auto promise = std::make_shared<std::promise<std::optional<core::Tensor>>>();
-            auto future = promise->get_future();
-            auto completed = std::make_shared<std::atomic_bool>(false);
-
-            auto finish = [promise, completed](std::optional<core::Tensor> result) mutable {
-                if (!completed->exchange(true)) {
-                    promise->set_value(std::move(result));
-                }
-            };
-
-            const bool posted = viewer->postWork(vis::Visualizer::WorkItem{
-                .run =
-                    [path, width, height, focal_length_mm, rotation, translation, finish]() mutable {
-                        finish(renderAssetPreviewOnViewerThread(path, width, height, focal_length_mm, rotation, translation));
-                    },
-                .cancel =
-                    [finish]() mutable {
-                        finish(std::nullopt);
-                    }});
-            if (!posted) {
-                return std::nullopt;
-            }
-
             nb::gil_scoped_release release;
-            return future.get();
+            return vis::post_work_and_wait(
+                [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
+                invoke_render,
+                []() -> std::optional<core::Tensor> { return std::nullopt; });
         }
 
         [[nodiscard]] std::optional<glm::mat3> tensorToVisualizerRotation(const PyTensor& py_tensor) {
@@ -499,17 +459,7 @@ namespace lfs::python {
             }
 
             std::shared_ptr<core::Tensor> image;
-            if (readback == PreviewReadback::UInt8Rgba) {
-                image = rendering_manager->renderPreviewImageRgba8(
-                    scene_manager,
-                    rotation,
-                    translation,
-                    lfs::rendering::vFovToFocalLength(fov_degrees),
-                    width,
-                    height,
-                    orthographic_override,
-                    ortho_scale_override);
-            } else if (readback == PreviewReadback::UInt8Rgb) {
+            if (readback == PreviewReadback::UInt8Rgb) {
                 image = rendering_manager->renderPreviewImageRgb8(
                     scene_manager,
                     rotation,
@@ -572,49 +522,11 @@ namespace lfs::python {
                 return std::nullopt;
             }
 
-            auto promise = std::make_shared<std::promise<std::optional<core::Tensor>>>();
-            auto future = promise->get_future();
-            auto completed = std::make_shared<std::atomic_bool>(false);
-
-            auto finish = [promise, completed](std::optional<core::Tensor> result) mutable {
-                if (!completed->exchange(true)) {
-                    promise->set_value(std::move(result));
-                }
-            };
-
-            const bool posted = viewer->postWork(vis::Visualizer::WorkItem{
-                .run =
-                    [rotation,
-                     translation,
-                     width,
-                     height,
-                     fov_degrees,
-                     readback,
-                     background_color_override,
-                     orthographic_override,
-                     ortho_scale_override,
-                     finish]() mutable {
-                        finish(renderViewOnViewerThread(
-                            rotation,
-                            translation,
-                            width,
-                            height,
-                            fov_degrees,
-                            readback,
-                            background_color_override,
-                            orthographic_override,
-                            ortho_scale_override));
-                    },
-                .cancel =
-                    [finish]() mutable {
-                        finish(std::nullopt);
-                    }});
-            if (!posted) {
-                return std::nullopt;
-            }
-
             nb::gil_scoped_release release;
-            return future.get();
+            return vis::post_work_and_wait(
+                [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
+                invoke_render,
+                []() -> std::optional<core::Tensor> { return std::nullopt; });
         }
 
         [[nodiscard]] std::optional<std::pair<core::Tensor, core::Tensor>> renderViewAndDepthOnViewerThread(
@@ -675,32 +587,12 @@ namespace lfs::python {
                 return std::nullopt;
             }
 
-            auto promise =
-                std::make_shared<std::promise<std::optional<std::pair<core::Tensor, core::Tensor>>>>();
-            auto future = promise->get_future();
-            auto completed = std::make_shared<std::atomic_bool>(false);
-            auto finish =
-                [promise, completed](std::optional<std::pair<core::Tensor, core::Tensor>> result) mutable {
-                    if (!completed->exchange(true)) {
-                        promise->set_value(std::move(result));
-                    }
-                };
-
-            const bool posted = viewer->postWork(vis::Visualizer::WorkItem{
-                .run =
-                    [rotation, translation, width, height, fov_degrees, expected_depth, finish]() mutable {
-                        finish(renderViewAndDepthOnViewerThread(rotation, translation, width, height, fov_degrees, expected_depth));
-                    },
-                .cancel =
-                    [finish]() mutable {
-                        finish(std::nullopt);
-                    }});
-            if (!posted) {
-                return std::nullopt;
-            }
-
             nb::gil_scoped_release release;
-            return future.get();
+            using Result = std::optional<std::pair<core::Tensor, core::Tensor>>;
+            return vis::post_work_and_wait(
+                [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
+                invoke_render,
+                []() -> Result { return std::nullopt; });
         }
     } // namespace
 
@@ -879,7 +771,7 @@ namespace lfs::python {
         add_bool(&Proxy::desaturate_unselected, "desaturate_unselected", "Desaturate Unselected",
                  "Desaturate unselected PLYs when one is selected", false);
         add_bool(&Proxy::desaturate_cropping, "desaturate_cropping", "Desaturate Cropping",
-                 "Dim outside crop area instead of hiding", true);
+                 "Dim outside crop area instead of hiding", false);
         add_bool(&Proxy::hide_outside_depth_box, "hide_outside_depth_box", "Hide Outside Depth Box",
                  "Hide Gaussians outside the selection depth box", false);
 
@@ -903,6 +795,9 @@ namespace lfs::python {
         add_int_enum(&Proxy::depth_visualization_mode, "depth_visualization_mode", "Depth Mode",
                      "Depth-map visualization mode",
                      {{"Color", "palette", 0}, {"Gray", "gray", 1}}, 0);
+        add_int_enum(&Proxy::gt_comparison_mode, "gt_comparison_mode", "GT Compare",
+                     "Ground-truth comparison payload",
+                     {{"RGB", "rgb", 0}, {"Normal", "normal", 1}, {"Depth", "depth", 2}}, 0);
         add_int_enum(&Proxy::camera_metrics_mode, "camera_metrics_mode", "Camera Metrics",
                      "Compute metrics when jumping to a source camera",
                      {{"Off", "OFF", 0}, {"PSNR", "PSNR", 1}, {"PSNR + SSIM", "PSNR_SSIM", 2}}, 0);
@@ -1226,7 +1121,7 @@ namespace lfs::python {
                 throw std::runtime_error("viewport export expected a 3D image tensor");
             }
             if (image.shape()[0] <= 4 && image.shape()[2] > 4) {
-                image = image.permute({1, 2, 0});
+                image = image.permute({1, 2, 0}).contiguous();
             }
             image = image.to(core::Device::CPU);
             if (image.dtype() != core::DataType::UInt8) {
@@ -1260,23 +1155,90 @@ namespace lfs::python {
             return toU8Hwc(std::move(*image));
         }
 
-        [[nodiscard]] core::Tensor renderCurrentViewRgba8(const vis::ViewInfo& view_info,
-                                                          const int width,
-                                                          const int height) {
-            auto image = renderViewThreadSafe(
-                viewInfoRotationMatrix(view_info),
-                glm::vec3{view_info.translation[0], view_info.translation[1], view_info.translation[2]},
-                width,
-                height,
-                view_info.fov,
-                PreviewReadback::UInt8Rgba,
-                std::nullopt,
-                view_info.orthographic,
-                scaledViewInfoOrthoScale(view_info, height));
-            if (!image || !image->is_valid()) {
-                throw std::runtime_error("transparent viewport export render failed");
+        using ExportImageResult = std::expected<core::Tensor, std::string>;
+
+        [[nodiscard]] ExportImageResult runExportOnViewerThread(
+            std::function<ExportImageResult()> invoke_render) {
+            auto* const viewer = get_visualizer();
+            if (!viewer || viewer->isOnViewerThread()) {
+                return invoke_render();
             }
-            return toU8Hwc(std::move(*image));
+            if (!viewer->acceptsPostedWork()) {
+                return std::unexpected("viewer is not accepting export work");
+            }
+
+            nb::gil_scoped_release release;
+            return vis::post_work_and_wait(
+                [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
+                std::move(invoke_render),
+                []() -> ExportImageResult {
+                    return std::unexpected("viewport export was cancelled");
+                });
+        }
+
+        [[nodiscard]] core::Tensor renderCurrentViewExport(const vis::ViewInfo& view_info,
+                                                           const int width,
+                                                           const int height,
+                                                           const vis::ExportPostProcessMode mode) {
+            auto result = runExportOnViewerThread([&view_info, width, height, mode]() -> ExportImageResult {
+                auto* const viewer = get_visualizer();
+                auto* const rendering_manager = viewer ? viewer->getRenderingManager() : nullptr;
+                auto* const scene_manager = viewer ? viewer->getSceneManager() : nullptr;
+                if (!rendering_manager || !scene_manager) {
+                    return std::unexpected("no active viewer is available");
+                }
+                const vis::RenderingManager::ExportImageRequest request{
+                    .rotation = viewInfoRotationMatrix(view_info),
+                    .translation = {view_info.translation[0],
+                                    view_info.translation[1],
+                                    view_info.translation[2]},
+                    .focal_length_mm = lfs::rendering::vFovToFocalLength(view_info.fov),
+                    .width = width,
+                    .height = height,
+                    .orthographic_override = view_info.orthographic,
+                    .ortho_scale_override = scaledViewInfoOrthoScale(view_info, height),
+                    .mode = mode,
+                };
+                return rendering_manager->renderExportImage(scene_manager, request);
+            });
+            if (!result) {
+                throw std::runtime_error("viewport export failed: " + result.error());
+            }
+            return std::move(*result);
+        }
+
+        // Post-process for images assembled outside renderExportImage (the BW2A
+        // transparent fallback): applies the same PPISP correction path.
+        [[nodiscard]] core::Tensor applyExportPostProcessThreadSafe(core::Tensor image,
+                                                                    const vis::ExportPostProcessMode mode) {
+            auto result = runExportOnViewerThread(
+                [image = std::move(image), mode]() mutable -> ExportImageResult {
+                    auto* const viewer = get_visualizer();
+                    auto* const rendering_manager = viewer ? viewer->getRenderingManager() : nullptr;
+                    auto* const scene_manager = viewer ? viewer->getSceneManager() : nullptr;
+                    if (!rendering_manager || !scene_manager) {
+                        return std::unexpected("no active viewer is available");
+                    }
+                    const auto view_info = viewInfoForPanelArg("main");
+                    const vis::ExportPostProcessView view{
+                        .rotation = view_info ? viewInfoRotationMatrix(*view_info) : glm::mat3{1.0f},
+                        .focal_length_mm =
+                            view_info ? lfs::rendering::vFovToFocalLength(view_info->fov) : 0.0f,
+                        .equirectangular_view = rendering_manager->getSettings().equirectangular,
+                        .controller_predict_size =
+                            view_info ? glm::ivec2{view_info->width, view_info->height} : glm::ivec2{0, 0},
+                    };
+                    return vis::applyExportPostProcess(std::move(image),
+                                                       scene_manager,
+                                                       rendering_manager->getSettings(),
+                                                       rendering_manager->getCurrentCameraId(),
+                                                       mode,
+                                                       view);
+                });
+            if (!result) {
+                throw std::runtime_error("viewport export post-process failed: " + result.error());
+            }
+            return std::move(*result);
         }
 
         [[nodiscard]] core::Tensor recoverAlphaRgba(core::Tensor black_rgb, core::Tensor white_rgb) {
@@ -1641,7 +1603,8 @@ namespace lfs::python {
 
             if (transparent) {
                 try {
-                    image = renderCurrentViewRgba8(*view_info, target_width, target_height);
+                    image = renderCurrentViewExport(
+                        *view_info, target_width, target_height, vis::ExportPostProcessMode::Transparent);
                 } catch (const std::exception& e) {
                     LOG_DEBUG("transparent viewport export direct RGBA render failed, falling back to BW2A: {}", e.what());
                     auto black = renderCurrentViewRgb8(
@@ -1654,10 +1617,23 @@ namespace lfs::python {
                         target_width,
                         target_height,
                         std::optional<glm::vec3>{glm::vec3{1.0f}});
-                    image = recoverAlphaRgba(std::move(black), std::move(white));
+                    image = applyExportPostProcessThreadSafe(
+                        recoverAlphaRgba(std::move(black), std::move(white)),
+                        vis::ExportPostProcessMode::Transparent);
                 }
             } else {
-                image = renderCurrentViewRgb8(*view_info, target_width, target_height, std::nullopt);
+                const auto render_settings = vis::get_render_settings();
+                const bool export_hdr_environment =
+                    render_settings &&
+                    render_settings->environment_mode ==
+                        static_cast<int>(vis::EnvironmentBackgroundMode::Equirectangular) &&
+                    !render_settings->environment_map_path.empty();
+                image = renderCurrentViewExport(
+                    *view_info,
+                    target_width,
+                    target_height,
+                    export_hdr_environment ? vis::ExportPostProcessMode::EnvironmentComposite
+                                           : vis::ExportPostProcessMode::Opaque);
             }
         }
 

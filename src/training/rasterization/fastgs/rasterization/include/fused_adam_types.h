@@ -18,6 +18,7 @@ namespace fast_lfs::rasterization {
         float* exp_avg_sq_scale = nullptr;
         const bool* frozen_mask = nullptr;
         int frozen_mask_size = 0;
+        float frozen_lr_scale = 0.0f;
         int n_elements = 0;
         int n_attributes = 0;
         float step_size = 0.0f;
@@ -31,6 +32,7 @@ namespace fast_lfs::rasterization {
         float beta2 = 0.999f;
         float eps = 1e-15f;
         float scale_reg_weight = 0.0f;
+        float flatten_reg_weight = 0.0f;
         float opacity_reg_weight = 0.0f;
         const float* sparsity_opa_sigmoid = nullptr;
         const float* sparsity_z = nullptr;

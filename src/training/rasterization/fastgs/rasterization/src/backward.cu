@@ -15,6 +15,7 @@ void fast_lfs::rasterization::backward(
     const float* grad_image,
     const float* grad_alpha,
     const float* grad_depth,
+    const float* grad_normal,
     const float* image,
     const float* alpha,
     const float3* means,
@@ -24,6 +25,7 @@ void fast_lfs::rasterization::backward(
     const float4* sh_coefficients_rest,
     const float4* w2c,
     const float3* cam_position,
+    const float3* primitive_normals,
     char* per_primitive_buffers_blob,
     char* per_tile_buffers_blob,
     const uint* sorted_primitive_indices,
@@ -32,6 +34,7 @@ void fast_lfs::rasterization::backward(
     float2* grad_mean2d_helper,
     float* grad_conic_helper,
     float* grad_depth_helper,
+    float3* grad_normal_helper,
     float4* grad_w2c,
     float* densification_info,
     const int n_primitives,
@@ -47,7 +50,6 @@ void fast_lfs::rasterization::backward(
     bool mip_filter,
     DensificationType densification_type,
     FusedAdamSettings fused_adam,
-    bool detach_depth_weights,
     cudaStream_t stream) {
     const dim3 grid(div_round_up(width, config::tile_width), div_round_up(height, config::tile_height), 1);
     const uint64_t n_tiles_u64 = static_cast<uint64_t>(grid.x) * static_cast<uint64_t>(grid.y);
@@ -61,17 +63,19 @@ void fast_lfs::rasterization::backward(
 
     if (n_instances > 0) {
         // Backward blend (template dispatch eliminates densification branch from inner loop)
-        auto launch_blend_backward = [&]<DensificationType DENS_TYPE>() {
-            kernels::backward::blend_backward_cu<DENS_TYPE><<<n_tiles, config::block_size_blend_backward, 0, stream>>>(
+        auto launch_blend_backward_typed = [&]<DensificationType DENS_TYPE, bool NORMAL_CHANNEL>() {
+            kernels::backward::blend_backward_cu<DENS_TYPE, NORMAL_CHANNEL><<<n_tiles, config::block_size_blend_backward, 0, stream>>>(
                 per_tile_buffers.instance_ranges,
                 sorted_primitive_indices,
                 per_primitive_buffers.mean2d,
                 per_primitive_buffers.conic_opacity,
                 per_primitive_buffers.color,
                 per_primitive_buffers.depths,
+                primitive_normals,
                 grad_image,
                 grad_alpha,
                 grad_depth,
+                grad_normal,
                 image,
                 alpha,
                 per_tile_buffers.n_contributions,
@@ -79,6 +83,7 @@ void fast_lfs::rasterization::backward(
                 grad_mean2d_helper,
                 grad_conic_helper,
                 grad_depth_helper,
+                grad_normal_helper,
                 grad_opacity_helper,
                 grad_color_helper,
                 densification_info,
@@ -88,8 +93,15 @@ void fast_lfs::rasterization::backward(
                 n_primitives,
                 width,
                 height,
-                grid.x,
-                detach_depth_weights);
+                grid.x);
+            LFS_CUDA_LAUNCH_CHECK(stream, "fastgs.backward.blend_backward");
+        };
+        auto launch_blend_backward = [&]<DensificationType DENS_TYPE>() {
+            if (grad_normal != nullptr && grad_normal_helper != nullptr) {
+                launch_blend_backward_typed.template operator()<DENS_TYPE, true>();
+            } else {
+                launch_blend_backward_typed.template operator()<DENS_TYPE, false>();
+            }
         };
         if (densification_type == DensificationType::MRNF && densification_info != nullptr) {
             launch_blend_backward.template operator()<DensificationType::MRNF>();
@@ -99,12 +111,7 @@ void fast_lfs::rasterization::backward(
             launch_blend_backward.template operator()<DensificationType::None>();
         }
         check_cuda_with_fastgs_status(cudaGetLastError(), "blend_backward", fastgs_status, "blend_backward", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        if constexpr (config::debug) {
-            check_cuda_with_fastgs_status(cudaDeviceSynchronize(), "blend_backward", fastgs_status, "blend_backward", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-            throw_if_fastgs_forward_status(fastgs_status, "blend_backward", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        } else {
-            sync_fastgs_phase_if_requested("blend_backward", fastgs_status, "blend_backward", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        }
+        sync_fastgs_phase_if_requested("blend_backward", fastgs_status, "blend_backward", static_cast<uint64_t>(n_primitives), n_tiles_u64);
     }
 
     // Backward preprocess — runs UNCONDITIONALLY now (handles both visible primitives'
@@ -124,6 +131,7 @@ void fast_lfs::rasterization::backward(
                 grad_mean2d_helper,
                 grad_conic_helper,
                 grad_depth_helper,
+                (grad_normal != nullptr) ? grad_normal_helper : nullptr,
                 grad_opacity_helper,
                 grad_color_helper,
                 grad_w2c,
@@ -137,6 +145,7 @@ void fast_lfs::rasterization::backward(
                 cy,
                 sh_layout_slots,
                 fused_adam);
+            LFS_CUDA_LAUNCH_CHECK(stream, "fastgs.backward.preprocess_backward");
         };
         auto launch_preprocess_backward_for_mip = [&]<int ACTIVE_SH_BASES>() {
             if (mip_filter) {
@@ -155,11 +164,6 @@ void fast_lfs::rasterization::backward(
             launch_preprocess_backward_for_mip.template operator()<16>();
         }
         check_cuda_with_fastgs_status(cudaGetLastError(), "preprocess_backward", fastgs_status, "preprocess_backward", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        if constexpr (config::debug) {
-            check_cuda_with_fastgs_status(cudaDeviceSynchronize(), "preprocess_backward", fastgs_status, "preprocess_backward", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-            throw_if_fastgs_forward_status(fastgs_status, "preprocess_backward", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        } else {
-            sync_fastgs_phase_if_requested("preprocess_backward", fastgs_status, "preprocess_backward", static_cast<uint64_t>(n_primitives), n_tiles_u64);
-        }
+        sync_fastgs_phase_if_requested("preprocess_backward", fastgs_status, "preprocess_backward", static_cast<uint64_t>(n_primitives), n_tiles_u64);
     }
 }

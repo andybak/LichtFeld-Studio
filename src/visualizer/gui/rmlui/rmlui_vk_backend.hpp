@@ -6,6 +6,9 @@
 
 #include <RmlUi/Core/RenderInterface.h>
 
+#include "core/assert.hpp"
+#include "rendering/vulkan_result.hpp"
+#include "rendering/vulkan_wait.hpp"
 #include "window/vulkan_image_barrier_tracker.hpp"
 
 #ifdef _WIN32
@@ -34,12 +37,15 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <stop_token>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
-#ifdef RMLUI_DEBUG
-#define RMLUI_VK_ASSERTMSG(statement, msg) RMLUI_ASSERTMSG(statement, msg)
+#ifdef DEBUG_BUILD
+#define RMLUI_VK_ASSERTMSG(statement, msg) LFS_DEBUG_ASSERT_MSG(statement, msg)
 
 // Uncomment the following line to enable additional Vulkan debugging.
 // #define RMLUI_VK_DEBUG
@@ -101,6 +107,7 @@ public:
     // The view+sampler must remain alive while any element references this URL. The
     // returned URL form is "lfs-vk://?v=<view_hex>&s=<sampler_hex>&w=W&h=H".
     static std::string MakeExternalTextureSource(VkImageView image_view, VkSampler sampler, int width, int height);
+    void SetTextureDebugName(Rml::TextureHandle texture_handle, std::string_view debug_name) const;
 
     // -- Inherited from Rml::RenderInterface --
 
@@ -229,8 +236,8 @@ private:
         ~UploadResourceManager() {}
 
         void Initialize(VkDevice p_device, VkQueue p_queue, uint32_t queue_family_index) {
-            RMLUI_VK_ASSERTMSG(p_queue, "you have to pass a valid VkQueue");
-            RMLUI_VK_ASSERTMSG(p_device, "you have to pass a valid VkDevice for creation resources");
+            if (p_queue == VK_NULL_HANDLE || p_device == VK_NULL_HANDLE)
+                return;
 
             m_p_device = p_device;
             m_p_graphics_queue = p_queue;
@@ -239,13 +246,22 @@ private:
         }
 
         void Shutdown() {
-            vkDestroyFence(m_p_device, m_p_fence, nullptr);
-            vkDestroyCommandPool(m_p_device, m_p_command_pool, nullptr);
+            if (m_p_device != VK_NULL_HANDLE) {
+                vkDestroyFence(m_p_device, m_p_fence, nullptr);
+                vkDestroyCommandPool(m_p_device, m_p_command_pool, nullptr);
+            }
+            m_p_fence = VK_NULL_HANDLE;
+            m_p_command_buffer = VK_NULL_HANDLE;
+            m_p_command_pool = VK_NULL_HANDLE;
         }
 
         template <typename Func>
-        void UploadToGPU(Func&& p_user_commands) noexcept {
-            RMLUI_VK_ASSERTMSG(m_p_command_buffer, "you didn't initialize VkCommandBuffer");
+        [[nodiscard]] bool UploadToGPU(Func&& p_user_commands) noexcept {
+            if (m_p_device == VK_NULL_HANDLE || m_p_graphics_queue == VK_NULL_HANDLE ||
+                m_p_command_pool == VK_NULL_HANDLE || m_p_command_buffer == VK_NULL_HANDLE ||
+                m_p_fence == VK_NULL_HANDLE) {
+                return false;
+            }
 
             VkCommandBufferBeginInfo info_command = {};
 
@@ -255,17 +271,21 @@ private:
             info_command.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
             VkResult status = vkBeginCommandBuffer(m_p_command_buffer, &info_command);
-
-            RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vkBeginCommandBuffer");
+            if (status != VK_SUCCESS)
+                return false;
 
             p_user_commands(m_p_command_buffer);
 
             status = vkEndCommandBuffer(m_p_command_buffer);
-
-            RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "faield to vkEndCommandBuffer");
-
-            Submit();
-            Wait();
+            if (status != VK_SUCCESS) {
+                vkResetCommandPool(m_p_device, m_p_command_pool, 0);
+                return false;
+            }
+            if (!Submit()) {
+                vkResetCommandPool(m_p_device, m_p_command_pool, 0);
+                return false;
+            }
+            return Wait();
         }
 
     private:
@@ -276,12 +296,13 @@ private:
             info.flags = 0;
 
             VkResult status = vkCreateFence(m_p_device, &info, nullptr, &m_p_fence);
-
-            RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vkCreateFence");
+            if (status != VK_SUCCESS)
+                m_p_fence = VK_NULL_HANDLE;
         }
 
         void Create_CommandBuffer() noexcept {
-            RMLUI_VK_ASSERTMSG(m_p_command_pool, "you have to initialize VkCommandPool before calling this method!");
+            if (m_p_command_pool == VK_NULL_HANDLE)
+                return;
 
             VkCommandBufferAllocateInfo info = {};
             info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -291,8 +312,8 @@ private:
             info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
 
             VkResult status = vkAllocateCommandBuffers(m_p_device, &info, &m_p_command_buffer);
-
-            RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vkAllocateCommandBuffers");
+            if (status != VK_SUCCESS)
+                m_p_command_buffer = VK_NULL_HANDLE;
         }
 
         void Create_CommandPool(uint32_t queue_family_index) noexcept {
@@ -304,8 +325,8 @@ private:
             info.flags = 0;
 
             VkResult status = vkCreateCommandPool(m_p_device, &info, nullptr, &m_p_command_pool);
-
-            RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vkCreateCommandPool");
+            if (status != VK_SUCCESS)
+                m_p_command_pool = VK_NULL_HANDLE;
         }
 
         void Create_All(uint32_t queue_family_index) noexcept {
@@ -314,15 +335,26 @@ private:
             Create_CommandBuffer();
         }
 
-        void Wait() noexcept {
-            RMLUI_VK_ASSERTMSG(m_p_fence, "you must initialize your VkFence");
-
-            vkWaitForFences(m_p_device, 1, &m_p_fence, VK_TRUE, UINT64_MAX);
-            vkResetFences(m_p_device, 1, &m_p_fence);
-            vkResetCommandPool(m_p_device, m_p_command_pool, 0);
+        [[nodiscard]] bool Wait() noexcept {
+            lfs::rendering::WaitContext wait_ctx;
+            wait_ctx.fingerprint = "rmlui.resource.wait";
+            auto wait_outcome = lfs::rendering::wait_fence_bounded(
+                m_p_device,
+                m_p_fence,
+                std::stop_token{},
+                lfs::rendering::VulkanWaitPolicy{},
+                wait_ctx);
+            if (!wait_outcome.has_value() ||
+                *wait_outcome != lfs::rendering::WaitOutcome::Ready) {
+                // Soft-fail; retain fence (do not reset while in-flight).
+                return false;
+            }
+            if (vkResetFences(m_p_device, 1, &m_p_fence) != VK_SUCCESS)
+                return false;
+            return vkResetCommandPool(m_p_device, m_p_command_pool, 0) == VK_SUCCESS;
         }
 
-        void Submit() noexcept {
+        [[nodiscard]] bool Submit() noexcept {
             VkSubmitInfo info = {};
 
             info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -335,9 +367,7 @@ private:
             info.pCommandBuffers = &m_p_command_buffer;
             info.commandBufferCount = 1;
 
-            auto status = vkQueueSubmit(m_p_graphics_queue, 1, &info, m_p_fence);
-
-            RMLUI_VK_ASSERTMSG(status == VkResult::VK_SUCCESS, "failed to vkQueueSubmit");
+            return vkQueueSubmit(m_p_graphics_queue, 1, &info, m_p_fence) == VK_SUCCESS;
         }
 
     private:
@@ -632,9 +662,12 @@ private:
     void DestroyResource_StagingBuffer(const buffer_data_t& data) noexcept;
 
     void Destroy_Textures() noexcept;
+    void Destroy_LiveTextures() noexcept;
     void Destroy_Geometries() noexcept;
 
     void Destroy_Texture(const texture_data_t& p_texture) noexcept;
+    void RegisterLiveTexture(texture_data_t* texture);
+    void UnregisterLiveTexture(texture_data_t* texture);
 
     void DestroyResourcesDependentOnSize() noexcept;
     void DestroySwapchainImageViews() noexcept;
@@ -662,7 +695,9 @@ private:
     void ResetDynamicRenderState();
     void RenderFullscreenTexture(texture_data_t& texture, Rml::BlendMode blend_mode);
 
-    void Wait() noexcept;
+    // Bounded acquire + image-fence wait. Returns false on soft-fail (WSI out-of-date,
+    // quarantine, cancel, device-lost) so BeginFrame can skip the frame without aborting.
+    [[nodiscard]] bool Wait() noexcept;
 
     void Update_PendingForDeletion_Textures_By_Frame(uint32_t resource_slot) noexcept;
     void Update_PendingForDeletion_Geometries(uint32_t resource_slot) noexcept;
@@ -697,6 +732,7 @@ private:
 
     VkInstance m_p_instance;
     VkDevice m_p_device;
+    lfs::rendering::VulkanDebugNameWriter m_debug_name_writer;
     VkPhysicalDevice m_p_physical_device;
     VkSurfaceKHR m_p_surface;
     VkSwapchainKHR m_p_swapchain;
@@ -755,6 +791,7 @@ private:
     Rml::Vector<VkImageLayout> m_swapchain_image_layouts;
     Rml::Vector<VkShaderModule> m_shaders;
     Rml::Array<Rml::Vector<texture_data_t*>, kSwapchainBackBufferCount> m_pending_for_deletion_textures_by_frames;
+    std::unordered_set<texture_data_t*> m_live_textures;
     std::vector<std::shared_ptr<async_preview_state_t>> m_async_preview_textures;
     std::atomic<uint64_t> m_preview_texture_generation{0};
     Rml::Vector<render_layer_t> m_render_layers;

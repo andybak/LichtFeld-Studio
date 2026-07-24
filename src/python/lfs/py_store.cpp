@@ -4,6 +4,7 @@
 #include "py_store.hpp"
 
 #include "core/logger.hpp"
+#include "py_error.hpp"
 #include "python/gil.hpp"
 #include "visualizer/app_store.hpp"
 
@@ -57,10 +58,17 @@ namespace lfs::python {
                     } else {
                         subscription->callback(value);
                     }
-                } catch (const nb::python_error& e) {
-                    LOG_ERROR("Python app store subscriber failed: {}", e.what());
+                } catch (nb::python_error& e) {
+                    // Containment needs the GIL to extract and report; if it is
+                    // gone the interpreter is dead or finalizing, and swallowing
+                    // here is deliberate — the pre-Phase 9 e.what() log ran
+                    // GIL-unsafe and was itself a shutdown crash class.
+                    if (can_acquire_gil()) {
+                        const GilAcquire gil;
+                        (void)contain_python_callback(e, PyCallbackPolicy::WarnAndContinue);
+                    }
                 } catch (const std::exception& e) {
-                    LOG_ERROR("Python app store subscriber failed: {}", e.what());
+                    (void)contain_cxx_callback(e.what(), PyCallbackPolicy::WarnAndContinue);
                 }
             });
 
@@ -92,10 +100,17 @@ namespace lfs::python {
                     } else {
                         subscription->callback(convert(value));
                     }
-                } catch (const nb::python_error& e) {
-                    LOG_ERROR("Python app store subscriber failed: {}", e.what());
+                } catch (nb::python_error& e) {
+                    // Containment needs the GIL to extract and report; if it is
+                    // gone the interpreter is dead or finalizing, and swallowing
+                    // here is deliberate — the pre-Phase 9 e.what() log ran
+                    // GIL-unsafe and was itself a shutdown crash class.
+                    if (can_acquire_gil()) {
+                        const GilAcquire gil;
+                        (void)contain_python_callback(e, PyCallbackPolicy::WarnAndContinue);
+                    }
                 } catch (const std::exception& e) {
-                    LOG_ERROR("Python app store subscriber failed: {}", e.what());
+                    (void)contain_cxx_callback(e.what(), PyCallbackPolicy::WarnAndContinue);
                 }
             });
 
@@ -278,6 +293,8 @@ namespace lfs::python {
                 store.transform_space.set(nb::cast<int>(value));
             else if (field == "pivot_mode")
                 store.pivot_mode.set(nb::cast<int>(value));
+            else if (field == "multi_transform_mode")
+                store.multi_transform_mode.set(nb::cast<int>(value));
             else if (field == "import_overlay_state")
                 store.import_overlay_state.set(import_overlay_state_from_object(value));
             else if (field == "video_export_overlay_state")
@@ -336,6 +353,8 @@ namespace lfs::python {
                 return nb::cast(store.transform_space.get());
             if (field == "pivot_mode")
                 return nb::cast(store.pivot_mode.get());
+            if (field == "multi_transform_mode")
+                return nb::cast(store.multi_transform_mode.get());
             if (field == "import_overlay_state")
                 return import_overlay_state_to_dict(store.import_overlay_state.get());
             if (field == "video_export_overlay_state")
@@ -393,6 +412,8 @@ namespace lfs::python {
                 return subscribe_observable(store.transform_space, std::move(callback));
             if (field == "pivot_mode")
                 return subscribe_observable(store.pivot_mode, std::move(callback));
+            if (field == "multi_transform_mode")
+                return subscribe_observable(store.multi_transform_mode, std::move(callback));
             if (field == "import_overlay_state")
                 return subscribe_observable_as(
                     store.import_overlay_state, std::move(callback), import_overlay_state_to_dict);

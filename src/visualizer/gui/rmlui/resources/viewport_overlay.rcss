@@ -20,6 +20,25 @@ body {
     z-index: 1;
 }
 
+.viewport-frame-border {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 4dp;
+    pointer-events: none;
+    z-index: 1;
+}
+
+.left-dock-resize-indicator {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    pointer-events: none;
+    z-index: 12;
+}
+
 .panel-toolbar-root {
     position: absolute;
     top: 0;
@@ -31,15 +50,6 @@ body {
     display: flex;
     padding: 0;
     gap: 0;
-}
-
-.shelf-background {
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 40dp;
-    pointer-events: none;
 }
 
 .toolbar-vertical {
@@ -56,7 +66,6 @@ body {
     overflow-y: auto;
 }
 
-#secondary-shelf-background,
 #secondary-utility-toolbar {
     left: -20dp;
 }
@@ -464,6 +473,21 @@ body {
     border-radius: 6dp;
     gap: 0;
     min-width: 0;
+}
+
+#gt-compare-mode-block .viewport-gt-compare-panel {
+    padding: 5dp 6dp;
+    border-radius: 6dp;
+    gap: 0;
+    min-width: 0;
+}
+
+#gt-compare-mode-block .viewport-gt-compare-mode-select {
+    width: 120dp;
+    min-width: 120dp;
+    height: 22dp;
+    min-height: 22dp;
+    line-height: 20dp;
 }
 
 .viewport-transform-panel.viewport-export-panel {

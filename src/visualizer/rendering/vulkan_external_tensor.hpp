@@ -24,11 +24,12 @@ namespace lfs::vis {
                                     VulkanContext::ExternalBuffer buffer,
                                     lfs::rendering::CudaVulkanBufferInterop interop,
                                     std::size_t bytes,
+                                    std::string debug_label,
                                     std::shared_ptr<void> extra_owner = {});
 
-        // SUB-VIEW variant — borrows the VkBuffer + CUDA pointer from `parent`
-        // at a fixed (offset, bytes) slice. Multiple sub-views may share one parent
-        // (e.g. the six splat tensors over a single imported exportable block).
+        // SUB-VIEW variant — borrows the VkBuffer and lifetime from `parent` at a
+        // fixed (offset, bytes) slice. Tensor::from_external_owner receives the
+        // corresponding CUDA data pointer separately.
         VulkanExternalTensorStorage(std::shared_ptr<VulkanExternalTensorStorage> parent,
                                     std::size_t offset,
                                     std::size_t bytes);
@@ -40,8 +41,8 @@ namespace lfs::vis {
         VulkanExternalTensorStorage(VulkanExternalTensorStorage&&) = delete;
         VulkanExternalTensorStorage& operator=(VulkanExternalTensorStorage&&) = delete;
 
-        [[nodiscard]] void* cudaPtr() const;
         [[nodiscard]] VkBuffer vkBuffer() const;
+        [[nodiscard]] VkDeviceSize vkBufferSize() const;
         [[nodiscard]] VkDeviceSize vkOffset() const;
         [[nodiscard]] std::size_t bytes() const { return bytes_; }
 
@@ -50,6 +51,7 @@ namespace lfs::vis {
         VulkanContext* context_ = nullptr;
         VulkanContext::ExternalBuffer buffer_{};
         lfs::rendering::CudaVulkanBufferInterop interop_{};
+        const void* registered_cuda_base_ = nullptr;
         // Sub-view members.
         std::shared_ptr<VulkanExternalTensorStorage> parent_;
         std::size_t offset_ = 0;
