@@ -58,7 +58,9 @@ Use the CI-aligned helper when building on Windows:
 .\build_windows_ci.ps1
 ```
 
-By default it uses `-VcpkgRoot`, then `VCPKG_ROOT`, and otherwise bootstraps `../vcpkg`.
+By default it uses `-VcpkgRoot`, then `VCPKG_ROOT`, then
+`E:\LichtFeld-Studio\vcpkg` when `E:` exists, and otherwise bootstraps
+`../vcpkg`.
 It does not auto-select a hidden repo-local `.vcpkg` checkout.
 
 `-VcpkgInstalledDirectory` controls where vcpkg installs built dependencies.
