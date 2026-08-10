@@ -80,8 +80,10 @@ namespace lfs::python {
     /**
      * @brief Load user plugins configured for startup.
      *        This requires a ready Python runtime.
+     * @param wait_for_completion Allow a headless caller to wait even when
+     *        the Python UI module identified the current thread as graphics.
      */
-    [[nodiscard]] bool ensure_plugins_loaded();
+    [[nodiscard]] bool ensure_plugins_loaded(bool wait_for_completion = false);
 
     /**
      * @brief Schedule plugin autoload after startup.
@@ -137,8 +139,6 @@ namespace lfs::python {
      * @brief Check if Python was used in this session.
      * @return true if Python scripts were executed.
      */
-    bool was_python_used();
-
     struct FormatResult {
         std::string code;
         std::string error;
@@ -180,6 +180,28 @@ namespace lfs::python {
      * @brief Check if a frame callback is set.
      */
     bool has_frame_callback();
+
+    /**
+     * @brief Set a callback evaluated at an absolute scene clip time.
+     * @param callback Function(clip_time) called with time in seconds.
+     */
+    void set_scene_time_callback(std::function<void(float)> callback);
+
+    /**
+     * @brief Clear the scene-time callback.
+     */
+    void clear_scene_time_callback();
+
+    /**
+     * @brief Call the scene-time callback if set.
+     * @param clip_time Absolute clip time in seconds.
+     */
+    void tick_scene_time_callback(float clip_time);
+
+    /**
+     * @brief Check if a scene-time callback is set.
+     */
+    bool has_scene_time_callback();
 
     std::filesystem::path get_user_packages_dir();
 

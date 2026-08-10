@@ -59,44 +59,22 @@ namespace lfs::vis {
             return content_type_ == ContentType::Empty && !scene_.hasNodes();
         }
 
-        bool hasSplatFiles() const {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-            return content_type_ == ContentType::SplatFiles;
-        }
-
-        // Legacy compatibility
-        bool hasPLYFiles() const { return hasSplatFiles(); }
-
         bool hasDataset() const {
             std::lock_guard<std::mutex> lock(state_mutex_);
             return content_type_ == ContentType::Dataset;
         }
 
         // Path accessors
-        std::vector<std::filesystem::path> getSplatPaths() const {
-            std::lock_guard<std::mutex> lock(state_mutex_);
-
-            std::vector<std::filesystem::path> values;
-            values.reserve(splat_paths_.size());
-
-            for (const auto& [key, value] : splat_paths_) {
-                values.push_back(value);
-            }
-
-            return values;
-        }
-
-        // Legacy compatibility
-        std::vector<std::filesystem::path> getPLYPaths() const { return getSplatPaths(); }
-
         std::filesystem::path getDatasetPath() const {
             std::lock_guard<std::mutex> lock(state_mutex_);
             return dataset_path_;
         }
-        [[nodiscard]] std::optional<std::filesystem::path> getPlyPath(const std::string& name) const;
-        void setPlyPath(const std::string& name, const std::filesystem::path& path);
-        void clearPlyPath(const std::string& name);
-        void movePlyPath(const std::string& old_name, const std::string& new_name);
+        [[nodiscard]] std::optional<std::filesystem::path> getPlyPath(core::NodeId id) const;
+        [[nodiscard]] std::optional<std::filesystem::path> getPlyPath(std::string name) const;
+        void setPlyPath(core::NodeId id, const std::filesystem::path& path);
+        void setPlyPath(std::string name, const std::filesystem::path& path);
+        void clearPlyPath(core::NodeId id);
+        void clearPlyPath(std::string name);
         void setDatasetPath(const std::filesystem::path& path);
 
         // Scene access
@@ -120,12 +98,12 @@ namespace lfs::vis {
         size_t consolidateNodeModels();
 
         [[nodiscard]] std::expected<void, std::string> canRemoveNode(core::NodeId id) const;
-        [[nodiscard]] std::expected<void, std::string> removePLYWithResult(const std::string& name, bool keep_children = false);
+        [[nodiscard]] std::expected<void, std::string> removePLYWithResult(std::string name, bool keep_children = false);
         [[nodiscard]] std::expected<void, std::string> removeNodesWithResult(const std::vector<std::string>& names,
                                                                              bool keep_children = false);
         size_t publishLiveCameraCount();
-        void removePLY(const std::string& name, bool keep_children = false);
-        void setPLYVisibility(const std::string& name, bool visible);
+        void removePLY(std::string name, bool keep_children = false);
+        void setPLYVisibility(std::string name, bool visible);
         [[nodiscard]] std::expected<void, std::string> removeNodeWithResult(core::NodeId id, bool keep_children = false);
         void removeNode(core::NodeId id, bool keep_children = false);
         void setNodeVisibility(core::NodeId id, bool visible);
@@ -145,7 +123,6 @@ namespace lfs::vis {
         [[nodiscard]] std::vector<std::string> getSelectedNodeNames() const;
         [[nodiscard]] bool hasSelectedNode() const;
         [[nodiscard]] core::NodeType getSelectedNodeType() const;
-        [[nodiscard]] int getSelectedNodeIndex() const;
         [[nodiscard]] std::vector<bool> getSelectedNodeMask() const;
         [[nodiscard]] int getSelectedCameraUid() const;
         [[nodiscard]] const SelectionState& selectionState() const { return selection_; }
@@ -161,10 +138,6 @@ namespace lfs::vis {
         // Node transforms
         void setNodeTransform(const std::string& name, const glm::mat4& transform);
         glm::mat4 getNodeTransform(const std::string& name) const;
-        void setSelectedNodeTranslation(const glm::vec3& translation);
-        glm::vec3 getSelectedNodeTranslation() const;
-        glm::vec3 getSelectedNodeCentroid() const;
-        glm::vec3 getSelectedNodeCenter() const;
 
         // Full transform for selected node (includes rotation and scale)
         void setSelectedNodeTransform(const glm::mat4& transform);
@@ -188,7 +161,6 @@ namespace lfs::vis {
         core::EllipsoidData* getSelectedNodeEllipsoid();
         const core::EllipsoidData* getSelectedNodeEllipsoid() const;
         core::NodeId getActiveSelectionEllipsoidId() const;
-        void syncEllipsoidToRenderSettings();
 
         std::expected<void, std::string> loadDataset(const std::filesystem::path& path,
                                                      const lfs::core::param::TrainingParameters& params);
@@ -229,10 +201,9 @@ namespace lfs::vis {
 
         SceneInfo getSceneInfo() const;
 
-        bool renamePLY(const std::string& old_name, const std::string& new_name);
+        bool renamePLY(std::string old_name, const std::string& new_name);
         bool renameNode(core::NodeId id, const std::string& new_name);
-        void updatePlyPath(const std::string& ply_name, const std::filesystem::path& ply_path);
-        bool reparentNode(const std::string& node_name, const std::string& new_parent_name);
+        bool reparentNode(std::string node_name, std::string new_parent_name);
         bool reparentNode(core::NodeId node_id, core::NodeId new_parent_id);
         bool moveNode(core::NodeId node_id, core::NodeId new_parent_id, int index);
         std::string addGroupNode(const std::string& name, const std::string& parent_name = "");
@@ -245,8 +216,10 @@ namespace lfs::vis {
         // upload background-decoded frames into render-ready storage.
         [[nodiscard]] lfs::io::SplatTensorAllocator makeExternalSplatAllocator() const;
 
-        std::string duplicateNodeTree(const std::string& name);
-        std::string mergeGroupNode(const std::string& name);
+        std::string duplicateNodeTree(core::NodeId id);
+        std::string duplicateNodeTree(std::string name);
+        std::string mergeGroupNode(core::NodeId group_id);
+        std::string mergeGroupNode(std::string name);
 
         // Permanently remove soft-deleted gaussians from all nodes
         size_t applyDeleted();
@@ -328,13 +301,13 @@ namespace lfs::vis {
             ActiveTrainingCamera,
         };
 
-        [[nodiscard]] TrainingRemovalImpact classifyTrainingRemovalImpact(const std::string& name) const;
-        [[nodiscard]] std::expected<void, std::string> validateNodeRemoval(const std::string& name,
+        [[nodiscard]] TrainingRemovalImpact classifyTrainingRemovalImpact(core::NodeId id) const;
+        [[nodiscard]] std::expected<void, std::string> validateNodeRemoval(core::NodeId id,
                                                                            TrainingRemovalImpact impact) const;
-        [[nodiscard]] std::expected<void, std::string> removeNodeImpl(const std::string& name,
+        [[nodiscard]] std::expected<void, std::string> removeNodeImpl(core::NodeId id,
                                                                       bool keep_children,
                                                                       HistoryMode history_mode);
-        [[nodiscard]] std::expected<void, std::string> removeNodeImpl(const std::string& name,
+        [[nodiscard]] std::expected<void, std::string> removeNodeImpl(core::NodeId id,
                                                                       bool keep_children,
                                                                       HistoryMode history_mode,
                                                                       TrainingRemovalImpact impact);
@@ -356,9 +329,9 @@ namespace lfs::vis {
         void handleCropActivePly(const lfs::geometry::BoundingBox& crop_box, bool inverse, core::NodeId target_node_id = core::NULL_NODE);
         void handleCropByEllipsoid(const glm::mat4& world_transform, const glm::vec3& radii, bool inverse, core::NodeId target_node_id = core::NULL_NODE);
         void handleRenamePly(const lfs::core::events::cmd::RenamePLY& event);
-        void handleAddCropBox(const std::string& node_name);
+        void handleAddCropBox(std::string node_name);
         void handleAddCropBox(core::NodeId node_id);
-        void handleAddCropEllipsoid(const std::string& node_name);
+        void handleAddCropEllipsoid(std::string node_name);
         void handleAddCropEllipsoid(core::NodeId node_id);
         void handleResetCropBox();
         void handleResetEllipsoid();
@@ -373,8 +346,7 @@ namespace lfs::vis {
         mutable std::mutex state_mutex_;
 
         ContentType content_type_ = ContentType::Empty;
-        // splat name to splat path
-        std::map<std::string, std::filesystem::path> splat_paths_;
+        std::map<core::NodeId, std::filesystem::path> splat_paths_;
         std::filesystem::path dataset_path_;
 
         // Cache for parameters

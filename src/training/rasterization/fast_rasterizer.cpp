@@ -663,7 +663,7 @@ namespace lfs::training {
         compose_background_in_place(raw_image, ctx.alpha, ctx.bg_color, ctx.bg_image, H, W, stream, true);
 
         fast_lfs::rasterization::FusedAdamSettings fused_adam;
-        const auto optimizer_fused = optimizer.prepare_fastgs_fused_adam(iteration);
+        const auto optimizer_fused = optimizer.prepare_fastgs_fused_adam(iteration, stream);
         auto convert_param = [](const FastGSFusedAdamParam& src) {
             fast_lfs::rasterization::FusedAdamParam dst;
             dst.param = src.param;
@@ -674,6 +674,9 @@ namespace lfs::training {
             dst.frozen_mask = src.frozen_mask;
             dst.frozen_mask_size = src.frozen_mask_size;
             dst.frozen_lr_scale = src.frozen_lr_scale;
+            dst.crop_damping_mask = src.crop_damping_mask;
+            dst.crop_damping_mask_size = src.crop_damping_mask_size;
+            dst.cropbox_lr_scale = src.cropbox_lr_scale;
             dst.n_elements = src.n_elements;
             dst.n_attributes = src.n_attributes;
             dst.step_size = src.step_size;

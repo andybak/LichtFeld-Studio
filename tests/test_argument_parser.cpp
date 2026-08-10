@@ -5,10 +5,15 @@
 #include <gtest/gtest.h>
 
 #include "core/argument_parser.hpp"
+#include "core/optimization_properties.hpp"
+#include "core/property_registry.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <nlohmann/json.hpp>
+#include <set>
 #include <string>
 #include <variant>
 #include <vector>
@@ -22,6 +27,58 @@ namespace {
     }
 
 } // namespace
+
+TEST(ArgumentParserMetadataTest, OptimizationFlagBindingsResolveWithCompatibleTypes) {
+    using lfs::core::args::OptimizationCliParseType;
+    using lfs::core::prop::PropType;
+
+    lfs::core::param::ensure_optimization_properties_registered();
+    std::set<std::string_view> flags;
+    for (const auto& binding : lfs::core::args::optimization_cli_bindings()) {
+        SCOPED_TRACE(binding.flag);
+        EXPECT_TRUE(flags.insert(binding.flag).second);
+
+        const auto meta = lfs::core::prop::PropertyRegistry::instance().get_property(
+            "optimization", std::string(binding.property_id));
+        ASSERT_TRUE(meta.has_value());
+
+        switch (binding.parse_type) {
+        case OptimizationCliParseType::Bool:
+            EXPECT_EQ(meta->type, PropType::Bool);
+            break;
+        case OptimizationCliParseType::Integer:
+            EXPECT_TRUE(meta->type == PropType::Int || meta->type == PropType::SizeT);
+            break;
+        case OptimizationCliParseType::Float:
+            EXPECT_EQ(meta->type, PropType::Float);
+            break;
+        case OptimizationCliParseType::String:
+            EXPECT_EQ(meta->type, PropType::String);
+            break;
+        case OptimizationCliParseType::Enum:
+            EXPECT_EQ(meta->type, PropType::Enum);
+            break;
+        }
+    }
+}
+
+TEST(ArgumentParserMetadataTest, BuiltHelpContainsRegistryDescriptionsAndDefaults) {
+    lfs::core::param::ensure_optimization_properties_registered();
+    for (const std::string_view flag : {"--iter", "--strategy", "--depth-loss-weight"}) {
+        SCOPED_TRACE(flag);
+        const auto binding = std::ranges::find(
+            lfs::core::args::optimization_cli_bindings(), flag,
+            &lfs::core::args::OptimizationCliBinding::flag);
+        ASSERT_NE(binding, lfs::core::args::optimization_cli_bindings().end());
+        const auto meta = lfs::core::prop::PropertyRegistry::instance().get_property(
+            "optimization", std::string(binding->property_id));
+        ASSERT_TRUE(meta.has_value());
+
+        const auto help = lfs::core::args::optimization_cli_help(flag);
+        EXPECT_NE(help.find(meta->description), std::string::npos);
+        EXPECT_NE(help.find("(default: "), std::string::npos);
+    }
+}
 
 TEST(ArgumentParserTest, TrainingDefaultsApplyMaxWidthCap) {
     const auto data_path = make_test_path("lfs_arg_parser_default_data");
@@ -42,6 +99,8 @@ TEST(ArgumentParserTest, TrainingDefaultsApplyMaxWidthCap) {
     EXPECT_EQ((*parsed)->dataset.max_width, 3840);
     EXPECT_EQ((*parsed)->dataset.resize_factor, 1);
     EXPECT_EQ((*parsed)->optimization.depth_loss_mode, "ssi");
+    EXPECT_FLOAT_EQ((*parsed)->optimization.cropbox_lr_scale, 0.1f);
+    EXPECT_FLOAT_EQ((*parsed)->optimization.cropbox_loss_weight, 0.1f);
     EXPECT_FLOAT_EQ((*parsed)->freeze_lr_scale, 0.0f);
 }
 
@@ -83,6 +142,43 @@ TEST(ArgumentParserTest, MaxWidthZeroDisablesCapExplicitly) {
     ASSERT_TRUE(parsed.has_value()) << parsed.error();
 
     EXPECT_EQ((*parsed)->dataset.max_width, 0);
+}
+
+TEST(ArgumentParserTest, CommandLineOverridesConfigAfterLoading) {
+    const auto dir = std::filesystem::path(make_test_path("lfs_arg_parser_config_precedence"));
+    const auto data_path = dir / "data";
+    const auto output_path = dir / "output";
+    const auto config_path = dir / "optimization.json";
+    std::filesystem::create_directories(data_path);
+    std::filesystem::create_directories(output_path);
+
+    auto config = lfs::core::param::OptimizationParameters::mcmc_defaults().to_json();
+    config["iterations"] = 12'345;
+    config["opacity_lr"] = 0.0375f;
+    std::ofstream(config_path) << config.dump(2);
+
+    const auto data_str = data_path.string();
+    const auto output_str = output_path.string();
+    const auto config_str = config_path.string();
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "--headless",
+        "--data-path",
+        data_str.c_str(),
+        "--output-path",
+        output_str.c_str(),
+        "--config",
+        config_str.c_str(),
+        "-i",
+        "777"};
+
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    std::error_code ec;
+    std::filesystem::remove(config_path, ec);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+
+    EXPECT_EQ((*parsed)->optimization.iterations, 777u);
+    EXPECT_FLOAT_EQ((*parsed)->optimization.opacity_lr, 0.0375f);
 }
 
 TEST(ArgumentParserTest, Mesh2SplatParsesOutputPathAndOptions) {
@@ -258,6 +354,90 @@ TEST(ArgumentParserTest, TrainingRejectsFrozenLrScaleOutsideUnitInterval) {
     }
 }
 
+TEST(ArgumentParserTest, TrainingParsesCropBoxLrScale) {
+    const auto data_path = make_test_path("lfs_arg_parser_cropbox_lr_scale_data");
+    const auto output_path = make_test_path("lfs_arg_parser_cropbox_lr_scale_output");
+
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "--headless",
+        "--data-path",
+        data_path.c_str(),
+        "--output-path",
+        output_path.c_str(),
+        "--cropbox-lr-scale",
+        "0.25"};
+
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+    EXPECT_FLOAT_EQ((*parsed)->optimization.cropbox_lr_scale, 0.25f);
+}
+
+TEST(ArgumentParserTest, TrainingRejectsCropBoxLrScaleOutsideUnitInterval) {
+    const auto data_path = make_test_path("lfs_arg_parser_invalid_cropbox_lr_scale_data");
+    const auto output_path = make_test_path("lfs_arg_parser_invalid_cropbox_lr_scale_output");
+
+    for (const char* scale : {"1.5", "-0.1"}) {
+        SCOPED_TRACE(scale);
+        const char* argv[] = {
+            "LichtFeld-Studio",
+            "--headless",
+            "--data-path",
+            data_path.c_str(),
+            "--output-path",
+            output_path.c_str(),
+            "--cropbox-lr-scale",
+            scale};
+
+        auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+        ASSERT_FALSE(parsed.has_value());
+        EXPECT_NE(parsed.error().find("cropbox_lr_scale must be finite and within [0, 1]"), std::string::npos)
+            << parsed.error();
+    }
+}
+
+TEST(ArgumentParserTest, TrainingParsesCropBoxLossWeight) {
+    const auto data_path = make_test_path("lfs_arg_parser_cropbox_loss_weight_data");
+    const auto output_path = make_test_path("lfs_arg_parser_cropbox_loss_weight_output");
+
+    const char* argv[] = {
+        "LichtFeld-Studio",
+        "--headless",
+        "--data-path",
+        data_path.c_str(),
+        "--output-path",
+        output_path.c_str(),
+        "--cropbox-loss-weight",
+        "0.4"};
+
+    auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error();
+    EXPECT_FLOAT_EQ((*parsed)->optimization.cropbox_loss_weight, 0.4f);
+}
+
+TEST(ArgumentParserTest, TrainingRejectsCropBoxLossWeightOutsideUnitInterval) {
+    const auto data_path = make_test_path("lfs_arg_parser_invalid_cropbox_loss_weight_data");
+    const auto output_path = make_test_path("lfs_arg_parser_invalid_cropbox_loss_weight_output");
+
+    for (const char* weight : {"1.5", "-0.1"}) {
+        SCOPED_TRACE(weight);
+        const char* argv[] = {
+            "LichtFeld-Studio",
+            "--headless",
+            "--data-path",
+            data_path.c_str(),
+            "--output-path",
+            output_path.c_str(),
+            "--cropbox-loss-weight",
+            weight};
+
+        auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
+        ASSERT_FALSE(parsed.has_value());
+        EXPECT_NE(parsed.error().find("cropbox_loss_weight must be finite and within [0, 1]"), std::string::npos)
+            << parsed.error();
+    }
+}
+
 TEST(ArgumentParserTest, FreezeMustImmediatelyFollowAddedSplat) {
     const auto dir = make_test_path("lfs_arg_parser_freeze_order");
     const auto data_path = std::filesystem::path(dir) / "data";
@@ -352,7 +532,9 @@ TEST(ArgumentParserTest, TrainingParsesExplicitNormalLossOptions) {
         "--normal-consistency-weight",
         "0.25",
         "--normal-flatten-weight",
-        "5.0"};
+        "5.0",
+        "--normal-loss-space",
+        "world"};
 
     auto parsed = lfs::core::args::parse_args_and_params(static_cast<int>(std::size(argv)), argv);
     ASSERT_TRUE(parsed.has_value()) << parsed.error();
@@ -361,6 +543,7 @@ TEST(ArgumentParserTest, TrainingParsesExplicitNormalLossOptions) {
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_loss_weight, 0.75f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_consistency_weight, 0.25f);
     EXPECT_FLOAT_EQ((*parsed)->optimization.normal_flatten_weight, 5.0f);
+    EXPECT_EQ((*parsed)->optimization.normal_loss_space, lfs::core::param::NormalLossSpace::World);
 }
 
 TEST(ArgumentParserTest, TrainingParsesBackgroundModeModulation) {

@@ -98,11 +98,6 @@ namespace lfs::training {
             bool used_mask = false;
         };
 
-        // Legacy constructor - takes ownership of strategy and shares datasets
-        Trainer(std::shared_ptr<CameraDataset> dataset,
-                std::unique_ptr<IStrategy> strategy,
-                std::optional<std::tuple<std::vector<std::string>, std::vector<std::string>>> provided_splits);
-
         /**
          * @brief Constructor - takes Scene reference (Scene owns all data)
          *
@@ -352,6 +347,7 @@ namespace lfs::training {
             const lfs::core::Tensor& corrected,
             const lfs::core::Tensor& gt_image,
             const lfs::core::Tensor& mask,
+            const lfs::core::Tensor& roi_weight,
             const lfs::core::Tensor& alpha,
             const lfs::core::param::OptimizationParameters& opt_params,
             const lfs::core::Tensor& raw_rendered);
@@ -377,6 +373,9 @@ namespace lfs::training {
 
         std::expected<void, std::string> handle_sparsity_update(const int iter, lfs::core::SplatData& splat_data);
         std::expected<void, std::string> apply_sparsity_pruning(const int iter, lfs::core::SplatData& splat_data);
+        void install_cropbox_step_damping(
+            lfs::core::SplatData& model,
+            AdamOptimizer& optimizer);
 
         // Cleanup method for re-initialization
         void cleanup();
@@ -517,6 +516,7 @@ namespace lfs::training {
         core::Tensor normal_consistency_scalar_;
         core::Tensor normal_consistency_partials_;
         core::Tensor normal_prior_depth_scalar_;
+        core::Tensor roi_weight_map_;
         // Dataset-level normal-prior convention, resolved once at startup
         bool normal_prior_flip_yz_ = false;
         bool normal_prior_world_space_ = false;

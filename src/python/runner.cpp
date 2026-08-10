@@ -1310,7 +1310,7 @@ _add_dll_dirs()
         ensure_builtin_ui_ready_locked();
     }
 
-    bool ensure_plugins_loaded() {
+    bool ensure_plugins_loaded(const bool wait_for_completion) {
         if (!ensure_initialized()) {
             return false;
         }
@@ -1323,7 +1323,7 @@ _add_dll_dirs()
 
         if (g_plugin_preload.state.load(std::memory_order_acquire) ==
             PluginPreloadState::NotStarted) {
-            if (on_graphics_thread()) {
+            if (on_graphics_thread() && !wait_for_completion) {
                 start_plugin_preload_worker();
                 return are_plugins_loaded();
             }
@@ -1343,7 +1343,7 @@ _add_dll_dirs()
                 return true;
         }
 
-        if (on_graphics_thread()) {
+        if (on_graphics_thread() && !wait_for_completion) {
             LOG_ERROR("Synchronous plugin load requested on the graphics thread while startup loading is active");
             return false;
         }
@@ -1484,8 +1484,9 @@ _add_dll_dirs()
         // destructor decrements Python reference counts
         lfs::training::ControlBoundary::instance().clear_all();
 
-        // Clear frame callback if set
+        // Clear animation callbacks if set
         clear_frame_callback();
+        clear_scene_time_callback();
 
         // Clear Python UI registries that hold nb::object references
         // These singletons would otherwise destroy nb::objects during
@@ -1495,10 +1496,6 @@ _add_dll_dirs()
         PyGC_Collect();
 
         // Skip Py_FinalizeEx() - nanobind static destructors need Python alive
-    }
-
-    bool was_python_used() {
-        return get_main_thread_state() != nullptr || Py_IsInitialized();
     }
 
     void install_output_redirect() {
@@ -2108,6 +2105,41 @@ def _lfs_format_code(code):
                 cb(dt);
             } catch (const std::exception& e) {
                 LOG_ERROR("Frame callback error: {}", e.what());
+            }
+        }
+    }
+
+    // Scene-time callback for deterministic animations
+    static std::function<void(float)> g_scene_time_callback;
+    static std::mutex g_scene_time_mutex;
+
+    void set_scene_time_callback(std::function<void(float)> callback) {
+        std::lock_guard lock(g_scene_time_mutex);
+        g_scene_time_callback = std::move(callback);
+    }
+
+    void clear_scene_time_callback() {
+        std::lock_guard lock(g_scene_time_mutex);
+        g_scene_time_callback = nullptr;
+    }
+
+    bool has_scene_time_callback() {
+        std::lock_guard lock(g_scene_time_mutex);
+        return g_scene_time_callback != nullptr;
+    }
+
+    void tick_scene_time_callback(float clip_time) {
+        std::function<void(float)> cb;
+        {
+            std::lock_guard lock(g_scene_time_mutex);
+            cb = g_scene_time_callback;
+        }
+        if (cb) {
+            const GilAcquire gil;
+            try {
+                cb(clip_time);
+            } catch (const std::exception& e) {
+                LOG_ERROR("Scene-time callback error: {}", e.what());
             }
         }
     }

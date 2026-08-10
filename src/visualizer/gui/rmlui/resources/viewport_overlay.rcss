@@ -198,6 +198,49 @@ body {
     top: 5dp;
 }
 
+.crop-roi-popover {
+    position: absolute;
+    top: 42dp;
+    left: 50%;
+    width: 440dp;
+    margin-left: -220dp;
+    padding: 8dp 10dp;
+    display: flex;
+    flex-direction: column;
+    gap: 3dp;
+    border-width: 1dp;
+    border-radius: 6dp;
+    box-sizing: border-box;
+    pointer-events: auto;
+    z-index: 10;
+}
+
+.crop-roi-popover.hidden {
+    display: none;
+}
+
+.crop-roi-popover-title {
+    height: 20dp;
+    line-height: 20dp;
+    font-size: 12dp;
+    font-weight: bold;
+}
+
+.crop-roi-setting-row > .setting-row__label-col {
+    width: 180dp;
+    min-width: 180dp;
+}
+
+.crop-roi-setting-row .setting-slider {
+    height: 22dp;
+    min-height: 22dp;
+}
+
+.crop-roi-setting-row .slider-value {
+    width: 42dp;
+    min-width: 42dp;
+}
+
 .viewport-selection-overlay {
     position: absolute;
     top: 5dp;
@@ -572,15 +615,6 @@ body {
     font-size: 12dp;
     font-weight: bold;
 }
-
-.viewport-transform-meta__target {
-    font-size: 11dp;
-    line-height: 1.1;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
 .viewport-transform-context {
     display: flex;
     align-items: center;
@@ -1140,7 +1174,6 @@ body {
     border-top-width: 1dp;
 }
 
-
 .vram-hud-breakdown-name {
     flex: 1;
     font-size: 11dp;
@@ -1458,62 +1491,6 @@ body {
     font-size: 12dp;
     font-weight: bold;
 }
-
-.vram-hud-topn {
-    display: flex;
-    flex-direction: column;
-    gap: 2dp;
-    padding-bottom: 6dp;
-}
-
-.vram-hud-topn.hidden {
-    display: none;
-}
-
-.vram-hud-topn-header {
-    font-size: 11dp;
-    font-weight: bold;
-    padding: 2dp 3dp;
-}
-
-.vram-hud-topn-rows {
-    display: flex;
-    flex-direction: column;
-    gap: 1dp;
-}
-
-.vram-hud-topn-row {
-    display: flex;
-    gap: 8dp;
-    align-items: baseline;
-    padding: 1dp 3dp;
-}
-
-.vram-hud-topn-name {
-    flex: 1;
-    font-size: 11dp;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.vram-hud-topn-bytes {
-    font-size: 11dp;
-    font-weight: bold;
-    width: 90dp;
-    text-align: right;
-}
-
-.vram-hud-topn-pct {
-    font-size: 11dp;
-}
-
-.vram-hud-topn-pct {
-    width: 52dp;
-    text-align: right;
-}
-
 
 .vram-hud-node-label {
     min-width: 0;

@@ -29,13 +29,17 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         window/window_manager.cpp
         window/vulkan_context.cpp
         window/vulkan_image_barrier_tracker.cpp
+        window/gpu_object_census.cpp
         window/vulkan_loader_probe.cpp
 
         # Rendering
         rendering/camera_interaction_service.cpp
+        rendering/output_image_pool.cpp
+        rendering/output_slot_ring.cpp
+        rendering/readback_ticket_ring.cpp
+        rendering/mesh_offscreen_renderer.cpp
         rendering/rendering_manager.cpp
         rendering/rendering_manager_events.cpp
-        rendering/rendering_manager_frame.cpp
         rendering/rendering_manager_vulkan.cpp
         rendering/rendering_manager_viewport.cpp
         rendering/lod_page_cache.cpp
@@ -45,6 +49,7 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         rendering/split_view_service.cpp
         rendering/viewport_artifact_service.cpp
         rendering/viewport_frame_lifecycle_service.cpp
+        rendering/viewport_interop_service.cpp
         rendering/viewport_appearance_correction.cpp
         rendering/viewport_request_builder.cpp
         rendering/passes/vulkan_scene_image_uploader.cpp
@@ -147,7 +152,6 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         operator/operator_context.cpp
         operator/operator_id.cpp
         operator/operator_registry.cpp
-        operator/property_schema.cpp
         operator/ops/align_ops.cpp
         operator/ops/edit_ops.cpp
         operator/ops/scene_ops.cpp

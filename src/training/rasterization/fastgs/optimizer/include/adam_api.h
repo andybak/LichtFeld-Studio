@@ -35,6 +35,9 @@ namespace fast_lfs::optimizer {
         const bool* frozen_mask,
         int frozen_mask_size,
         float frozen_lr_scale,
+        const bool* crop_damping_mask,
+        int crop_damping_mask_size,
+        float cropbox_lr_scale,
         const int n_rows,
         const int row_size,
         const float lr,
@@ -56,6 +59,9 @@ namespace fast_lfs::optimizer {
         const bool* frozen_mask,
         int frozen_mask_size,
         float frozen_lr_scale,
+        const bool* crop_damping_mask,
+        int crop_damping_mask_size,
+        float cropbox_lr_scale,
         const int n_primitives,
         const int slots_per_primitive,
         const float lr,
@@ -66,7 +72,7 @@ namespace fast_lfs::optimizer {
         const float bias_correction2_sqrt_rcp,
         cudaStream_t stream = nullptr);
 
-    // Quantise existing float moments into uint8 (legacy checkpoint load / set_state).
+    // Quantise existing float moments into uint8 (legacy checkpoint load / legacy checkpoint load).
     void quantize_adam_moments_raw(
         const float* exp_avg,
         const float* exp_avg_sq,

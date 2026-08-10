@@ -7,6 +7,7 @@
 #include "core/splat_data.hpp"
 #include <array>
 #include <cstdint>
+#include <cuda_runtime_api.h>
 #include <string>
 #include <unordered_map>
 
@@ -70,6 +71,9 @@ namespace lfs::training {
         const bool* frozen_mask = nullptr;
         int frozen_mask_size = 0;
         float frozen_lr_scale = 0.0f;
+        const bool* crop_damping_mask = nullptr;
+        int crop_damping_mask_size = 0;
+        float cropbox_lr_scale = 1.0f;
         int n_elements = 0;
         int n_attributes = 0;
         float step_size = 0.0f;
@@ -103,16 +107,21 @@ namespace lfs::training {
         explicit AdamOptimizer(lfs::core::SplatData& splat_data, const AdamConfig& config);
 
         void step(int iteration);
-        FastGSFusedAdamState prepare_fastgs_fused_adam(int iteration);
+        FastGSFusedAdamState prepare_fastgs_fused_adam(int iteration, cudaStream_t execution_stream = nullptr);
         void commit_fastgs_fused_adam(int iteration);
         void set_frozen_mask(lfs::core::Tensor mask);
         void set_frozen_lr_scale(float scale);
+        void set_crop_damping_mask(lfs::core::Tensor mask);
+        void set_cropbox_lr_scale(float scale);
+        [[nodiscard]] const lfs::core::Tensor& crop_damping_mask() const noexcept {
+            return crop_damping_mask_;
+        }
+        [[nodiscard]] float cropbox_lr_scale() const noexcept { return cropbox_lr_scale_; }
 
         // Gradient management
         void allocate_gradients();
         void allocate_gradients(size_t capacity);
         void zero_grad(int iteration);
-        bool has_gradients() const;
         lfs::core::Tensor& get_grad(ParamType type);
 
         // Learning rate
@@ -135,7 +144,6 @@ namespace lfs::training {
         // MCMC operations (atomically update params + optimizer state)
         void add_new_params(ParamType type, const lfs::core::Tensor& new_values, bool validate = false);
         void add_new_params_gather(ParamType type, const lfs::core::Tensor& indices);
-        void relocate_params_at_indices(ParamType type, const std::vector<int64_t>& indices);
         void relocate_params_at_indices_gpu(ParamType type, const int64_t* indices_device, size_t n_indices);
 
         // Low-level state manipulation
@@ -147,7 +155,6 @@ namespace lfs::training {
         const AdamParamState* get_state(ParamType type) const;
         AdamParamState* get_state_mutable(ParamType type);
         int64_t get_step_count(ParamType type) const;
-        void set_state(ParamType type, const AdamParamState& state);
         const AdamConfig& get_config() const { return config_; }
 
         // Serialization
@@ -158,7 +165,6 @@ namespace lfs::training {
 
         // Control notifications for external mutations
         void reset_state(ParamType type);
-        void invalidate_state(ParamType type);
 
     private:
         AdamConfig config_;
@@ -166,6 +172,8 @@ namespace lfs::training {
         std::unordered_map<std::string, AdamParamState> states_;
         lfs::core::Tensor frozen_mask_;
         float frozen_lr_scale_ = 0.0f;
+        lfs::core::Tensor crop_damping_mask_;
+        float cropbox_lr_scale_ = 1.0f;
         int64_t fused_step_iteration_ = -1;
         bool last_step_zeroed_gradients_ = false;
 
@@ -187,6 +195,8 @@ namespace lfs::training {
         size_t scale_row_count(ParamType type) const;
         const bool* frozen_mask_ptr() const;
         int frozen_mask_size() const;
+        const bool* crop_damping_mask_ptr() const;
+        int crop_damping_mask_size() const;
 
         // Translate a primitive-row delta into the actual tensor growth along dim 0.
         // shN (1D swizzled): delta = swizzled_float_count(N + n_new) - swizzled_float_count(N).

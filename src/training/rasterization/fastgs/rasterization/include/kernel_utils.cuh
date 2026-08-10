@@ -187,6 +187,13 @@ namespace fast_lfs::rasterization::kernels {
                 return;
             row_step_size *= param.frozen_lr_scale;
         }
+        if (param.crop_damping_mask != nullptr &&
+            primitive_idx < static_cast<uint>(param.crop_damping_mask_size) &&
+            param.crop_damping_mask[primitive_idx]) {
+            if (param.cropbox_lr_scale == 0.0f)
+                return;
+            row_step_size *= param.cropbox_lr_scale;
+        }
         const uint n_attr = static_cast<uint>(param.n_attributes);
         const uint base = primitive_idx * n_attr;
         if (base >= static_cast<uint>(param.n_elements))
@@ -332,6 +339,13 @@ namespace fast_lfs::rasterization::kernels {
             if (p.frozen_lr_scale == 0.0f)
                 return;
             row_step_size *= p.frozen_lr_scale;
+        }
+        if (p.crop_damping_mask != nullptr &&
+            primitive_idx < static_cast<uint>(p.crop_damping_mask_size) &&
+            p.crop_damping_mask[primitive_idx]) {
+            if (p.cropbox_lr_scale == 0.0f)
+                return;
+            row_step_size *= p.cropbox_lr_scale;
         }
 
         float4* param4 = reinterpret_cast<float4*>(p.param);

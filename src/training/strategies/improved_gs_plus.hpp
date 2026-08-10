@@ -10,7 +10,10 @@
 #include "optimizer/scheduler.hpp"
 #include "trainer.hpp"
 
+#include <cassert>
 #include <vector>
+
+class CropDampingStrategyTest_IgsPlusRejectedRowsAreNeverSampledAtZeroScale_Test;
 
 namespace lfs::training {
 
@@ -44,10 +47,14 @@ namespace lfs::training {
         void remove_gaussians(const lfs::core::Tensor& mask) override;
 
         // IStrategy interface - optimizer access
-        AdamOptimizer& get_optimizer() override { return *_optimizer; }
-        const AdamOptimizer& get_optimizer() const override { return *_optimizer; }
-        ExponentialLR* get_scheduler() { return _scheduler.get(); }
-        const ExponentialLR* get_scheduler() const { return _scheduler.get(); }
+        AdamOptimizer& get_optimizer() override {
+            assert(_optimizer);
+            return *_optimizer;
+        }
+        const AdamOptimizer& get_optimizer() const override {
+            assert(_optimizer);
+            return *_optimizer;
+        }
 
         // Serialization for checkpoints
         void serialize(std::ostream& os) const override;
@@ -77,6 +84,8 @@ namespace lfs::training {
         lfs::core::Tensor get_active_indices() const;
 
     private:
+        friend class ::CropDampingStrategyTest_IgsPlusRejectedRowsAreNeverSampledAtZeroScale_Test;
+
         // Helper Functions
         inline const int64_t get_current_budget() const noexcept { return _budget_schedule[_current_step + 1]; }
         inline const unsigned global_seed() const noexcept { return _current_step; } // for camera sampling
@@ -86,11 +95,12 @@ namespace lfs::training {
 
         const lfs::core::Tensor compute_gaussian_score();
         void ensure_error_score_shape();
+        [[nodiscard]] lfs::core::Tensor damp_densification_scores(
+            const lfs::core::Tensor& scores) const;
         void densify_with_score(const lfs::core::Tensor& edge_scores, const lfs::core::Tensor& error_scores, const int64_t budget);
         void LAS_densify(const lfs::core::Tensor& scores, const int64_t allocation_budget);
 
         void reset_opacity();
-        void prune_post_reset();
         void opacity_prune(const int iter);
         void remove(const lfs::core::Tensor& is_prune);
         void mark_as_free(const lfs::core::Tensor& indices);

@@ -688,8 +688,7 @@ namespace lfs::training {
             active_mask = _free_mask.slice(0, 0, n).logical_not();
         }
         lfs::core::Tensor trainable_mask = make_trainable_mask(*_splat_data, n, _splat_data->means().device());
-        auto refine_candidates = (_refine_weight_max > _params->growth_grad_threshold) &&
-                                 (_vis_count > 0.0f);
+        auto refine_candidates = compute_refine_candidates();
         if (active_mask.is_valid()) {
             refine_candidates = refine_candidates.logical_and(active_mask);
         }
@@ -916,6 +915,11 @@ namespace lfs::training {
         LFS_GAUGE("model.gaussians.capacity", static_cast<double>(_splat_data->size()));
     }
 
+    lfs::core::Tensor MRNF::compute_refine_candidates() const {
+        auto candidate_weights = apply_crop_damping_to_scores(*_optimizer, _refine_weight_max);
+        return (candidate_weights > _params->growth_grad_threshold) && (_vis_count > 0.0f);
+    }
+
     void MRNF::compact_splats(const lfs::core::Tensor& keep_mask) {
         LOG_TIMER("MRNF::compact_splats");
         using namespace lfs::core;
@@ -1108,6 +1112,7 @@ namespace lfs::training {
         auto opacities = _splat_data->get_opacity();
         if (opacities.ndim() == 2 && opacities.shape()[1] == 1)
             opacities = opacities.squeeze(-1);
+        opacities = apply_crop_damping_to_scores(*_optimizer, opacities);
 
         auto seed = static_cast<uint64_t>(
             std::chrono::high_resolution_clock::now().time_since_epoch().count());
@@ -1385,71 +1390,6 @@ namespace lfs::training {
         } else if (_bounds_valid) {
             compute_bounds();
         }
-    }
-
-    lfs::core::Tensor MRNF::compute_edge_scores(const int iter) {
-        const int64_t N = static_cast<int64_t>(_splat_data->size());
-        if (N <= 0 || active_count() == 0 || !_views || !_image_loader || _views->size() == 0) {
-            return {};
-        }
-
-        const int num_cam_dataset = static_cast<int>(_views->size());
-        int num_samples = 0;
-        if (num_cam_dataset < MRNF_EDGE_MIN_VIEW_SAMPLES) {
-            num_samples = num_cam_dataset;
-        } else {
-            const int min_cam_dataset = static_cast<int>(0.08f * static_cast<float>(num_cam_dataset));
-            num_samples = std::max(MRNF_EDGE_MIN_VIEW_SAMPLES, min_cam_dataset);
-        }
-        if (num_samples <= 0) {
-            return {};
-        }
-
-        std::vector<int> view_indices(num_cam_dataset);
-        std::iota(view_indices.begin(), view_indices.end(), 0);
-        std::default_random_engine rng(static_cast<unsigned>(iter));
-        std::shuffle(view_indices.begin(), view_indices.end(), rng);
-        view_indices.resize(num_samples);
-
-        CannyWorkspace canny_ws;
-        auto gaussian_scores = lfs::core::Tensor::zeros(
-            {static_cast<size_t>(N)}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
-
-        for (const int dataset_idx : view_indices) {
-            lfs::core::Camera* cam = _views->get_camera(static_cast<size_t>(dataset_idx));
-
-            lfs::io::LoadParams params;
-            params.resize_factor = _views->get_resize_factor();
-            params.max_width = _views->get_max_width();
-            params.output_uint8 = true;
-            if (cam->is_undistort_prepared()) {
-                params.undistort = &cam->undistort_params();
-            }
-
-            lfs::core::Tensor image = _image_loader->load_image_immediate(cam->image_path(), params);
-            const int img_h = static_cast<int>(image.shape()[1]);
-            const int img_w = static_cast<int>(image.shape()[2]);
-
-            if (cam->image_width() != img_w || cam->image_height() != img_h) {
-                cam->set_image_dimensions(img_w, img_h);
-            }
-
-            if (!canny_ws.nms_output.is_valid() ||
-                img_h != static_cast<int>(canny_ws.nms_output.shape()[0]) ||
-                img_w != static_cast<int>(canny_ws.nms_output.shape()[1])) {
-                canny_ws = create_canny_workspace(img_h, img_w);
-            }
-
-            apply_canny_filter(image, canny_ws);
-            normalize_by_positive_median_inplace(canny_ws.nms_output);
-
-            auto score_render = edge_rasterize(*cam, this->get_model(), canny_ws.nms_output);
-            normalize_by_positive_median_inplace(score_render.edges_score);
-            gaussian_scores.add_(score_render.edges_score);
-        }
-
-        gaussian_scores.div_(static_cast<float>(num_samples));
-        return gaussian_scores;
     }
 
     lfs::core::Tensor MRNF::edge_guidance_factor() const {

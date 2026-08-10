@@ -1898,6 +1898,46 @@ TEST_F(UndoHistoryTest, DeleteKeepChildrenRestoresHierarchyOnUndo) {
     EXPECT_EQ(child->parent_id, lfs::core::NULL_NODE);
 }
 
+TEST_F(UndoHistoryTest, MergeGroupNodeHandlesNameReferenceFromGroupNode) {
+    auto scene_manager = std::make_unique<lfs::vis::SceneManager>();
+    auto rendering_manager = std::make_unique<lfs::vis::RenderingManager>();
+    lfs::vis::services().set(scene_manager.get());
+    lfs::vis::services().set(rendering_manager.get());
+
+    auto& scene = scene_manager->getScene();
+    const auto group_id = scene.addGroup("group");
+    ASSERT_NE(group_id, lfs::core::NULL_NODE);
+    const auto child_a_id = scene.addSplat("child_a", make_test_splat({0.0f, 0.0f, 0.0f}), group_id);
+    const auto child_b_id = scene.addSplat(
+        "child_b",
+        make_test_splat({
+            1.0f,
+            0.0f,
+            0.0f,
+            2.0f,
+            0.0f,
+            0.0f,
+        }),
+        group_id);
+    ASSERT_NE(child_a_id, lfs::core::NULL_NODE);
+    ASSERT_NE(child_b_id, lfs::core::NULL_NODE);
+    scene_manager->changeContentType(lfs::vis::SceneManager::ContentType::SplatFiles);
+
+    const auto* group = scene.getNodeById(group_id);
+    ASSERT_NE(group, nullptr);
+
+    const auto merged_name = scene_manager->mergeGroupNode(group->name);
+
+    EXPECT_EQ(merged_name, "group");
+    const auto* merged = scene.getNode("group");
+    ASSERT_NE(merged, nullptr);
+    EXPECT_EQ(merged->type, lfs::core::NodeType::SPLAT);
+    EXPECT_EQ(scene.getNodeById(child_a_id), nullptr);
+    EXPECT_EQ(scene.getNodeById(child_b_id), nullptr);
+    EXPECT_EQ(merged->gaussian_count.load(std::memory_order_acquire), 3u);
+    EXPECT_EQ(scene.getTotalGaussianCount(), 3u);
+}
+
 TEST_F(UndoHistoryTest, DeleteResultHonorsTrainingRemovalPolicy) {
     auto scene_manager = std::make_unique<lfs::vis::SceneManager>();
     auto rendering_manager = std::make_unique<lfs::vis::RenderingManager>();

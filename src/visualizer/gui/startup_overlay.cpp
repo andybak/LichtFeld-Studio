@@ -342,6 +342,8 @@ namespace lfs::vis::gui {
 
         set_text("supported-text", lichtfeld::Strings::Startup::SUPPORTED_BY);
         set_text("lang-label", lichtfeld::Strings::Preferences::LANGUAGE);
+        set_text("discord-link", lichtfeld::Strings::Startup::DISCORD);
+        set_text("donate-link", lichtfeld::Strings::Startup::DONATE);
         has_applied_plugin_load_state_ = false;
         updateClickHintUI();
     }
@@ -709,6 +711,13 @@ namespace lfs::vis::gui {
             refresh_cache = refresh_cache || input_result.event_forwarded;
             input_event_forwarded = input_result.event_forwarded;
             rml_select_open = rml_select_open || isLanguageSelectOpen();
+        }
+        const auto language_generation_after_input = app_store().language_generation.get();
+        if (language_generation_after_input != last_language_generation_) {
+            updateLocalizedText();
+            last_language_generation_ = language_generation_after_input;
+            has_language_generation_ = true;
+            refresh_cache = true;
         }
         if (input_event_forwarded || (refresh_cache && !updated_this_frame))
             rml_context_->Update();

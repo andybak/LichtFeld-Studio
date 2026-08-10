@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "strategy_utils.hpp"
+#include "core/assert.hpp"
 #include "core/logger.hpp"
 #include "kernels/pruning_kernels.hpp"
 #include <algorithm>
@@ -176,6 +177,33 @@ namespace lfs::training {
         }
     }
 
+    lfs::core::Tensor apply_crop_damping_to_scores(
+        const AdamOptimizer& optimizer,
+        const lfs::core::Tensor& scores) {
+        const auto& crop_mask = optimizer.crop_damping_mask();
+        const float scale = optimizer.cropbox_lr_scale();
+        if (!crop_mask.is_valid() || crop_mask.numel() == 0 || scale == 1.0f) {
+            return scores;
+        }
+
+        LFS_ASSERT_MSG(scores.is_valid(), "crop-damped scores must be valid");
+        LFS_ASSERT_MSG(scores.ndim() == 1, "crop-damped scores must be one-dimensional");
+        LFS_ASSERT_MSG(
+            scores.numel() <= crop_mask.numel(),
+            "crop damping mask must cover every score row");
+        LFS_ASSERT_MSG(
+            scores.device() == crop_mask.device(),
+            "crop damping mask and scores must use the same device");
+
+        const auto active_mask = scores.numel() == crop_mask.numel()
+                                     ? crop_mask
+                                     : crop_mask.slice(0, 0, scores.numel());
+        if (scale == 0.0f) {
+            return scores.masked_fill(active_mask, 0.0f);
+        }
+        return lfs::core::Tensor::where(active_mask, scores * scale, scores);
+    }
+
     size_t frozen_row_count(const lfs::core::SplatData& splat_data, const size_t n) {
         size_t frozen_count = 0;
         (void)build_frozen_vector(splat_data, n, &frozen_count);
@@ -240,90 +268,6 @@ namespace lfs::training {
                             ? kept_old_indices
                             : kept_old_indices.to(lfs::core::DataType::Int64);
         splat_data.remap_frozen_ranges_after_keep(old_size, kept_i64.to_vector_int64());
-    }
-
-    void update_param_with_optimizer(
-        const ParamUpdateFn& param_fn,
-        const OptimizerUpdateFn& optimizer_fn,
-        std::unique_ptr<AdamOptimizer>& optimizer,
-        lfs::core::SplatData& splat_data,
-        std::vector<size_t> param_idxs) {
-
-        // CRITICAL: Ensure CUDA device is set for this thread
-        // Some operations might spawn TBB threads, and those need CUDA context
-        cudaSetDevice(0);
-
-        // Map param index to ParamType
-        auto index_to_param_type = [](size_t idx) -> ParamType {
-            switch (idx) {
-            case 0: return ParamType::Means;
-            case 1: return ParamType::Sh0;
-            case 2: return ParamType::ShN;
-            case 3: return ParamType::Scaling;
-            case 4: return ParamType::Rotation;
-            case 5: return ParamType::Opacity;
-            default:
-                LOG_ERROR("Invalid parameter index: {}", idx);
-                return ParamType::Means;
-            }
-        };
-
-        // Get references to all parameters
-        // (Gradients are now owned by AdamOptimizer, not SplatData)
-        std::array<lfs::core::Tensor*, 6> params = {
-            &splat_data.means(),
-            &splat_data.sh0(),
-            &splat_data.shN(),
-            &splat_data.scaling_raw(),
-            &splat_data.rotation_raw(),
-            &splat_data.opacity_raw()};
-
-        std::array<lfs::core::Tensor, 6> new_params;
-
-        // First pass: Compute new parameters and update optimizer state
-        for (auto i : param_idxs) {
-            auto param = params[i];
-            cudaError_t err_before = cudaGetLastError();
-            if (err_before != cudaSuccess) {
-                LOG_ERROR("CUDA error before param_fn: {}", cudaGetErrorString(err_before));
-            }
-
-            auto param_type = index_to_param_type(i);
-            LOG_DEBUG("Calling param_fn for param {}", i);
-
-            auto new_param = param_fn(i, *param);
-
-            cudaError_t err_after = cudaGetLastError();
-            if (err_after != cudaSuccess) {
-                LOG_ERROR("CUDA error after param_fn({}) [param_type={}]: {}", i, static_cast<int>(param_type), cudaGetErrorString(err_after));
-                throw std::runtime_error(std::string("CUDA error in param_fn (param ") + std::to_string(i) + "): " + cudaGetErrorString(err_after));
-            }
-            new_params[i] = new_param;
-
-            // Modify state in-place (preserves capacity)
-            AdamParamState* state = optimizer->get_state_mutable(param_type);
-            if (state) {
-                optimizer_fn(*state, new_param);
-            }
-        }
-
-        // Second pass: Update parameters in SplatData
-        // (Gradient updates are handled by the optimizer_fn callback which updates optimizer state)
-        for (auto i : param_idxs) {
-            if (i == 0) {
-                splat_data.means() = new_params[i];
-            } else if (i == 1) {
-                splat_data.sh0() = new_params[i];
-            } else if (i == 2) {
-                splat_data.shN() = new_params[i];
-            } else if (i == 3) {
-                splat_data.scaling_raw() = new_params[i];
-            } else if (i == 4) {
-                splat_data.rotation_raw() = new_params[i];
-            } else if (i == 5) {
-                splat_data.opacity_raw() = new_params[i];
-            }
-        }
     }
 
     lfs::core::Tensor compute_dead_mask_from_opacity_and_rotation(

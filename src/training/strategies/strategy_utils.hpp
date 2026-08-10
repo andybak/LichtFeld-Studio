@@ -51,6 +51,12 @@ namespace lfs::training {
         const lfs::core::SplatData& splat_data,
         lfs::core::Tensor& scores);
 
+    // Scale crop-rejected row signals without mutating accumulated statistics.
+    // Invalid crop mask and scale 1 return the original tensor without device work.
+    lfs::core::Tensor apply_crop_damping_to_scores(
+        const AdamOptimizer& optimizer,
+        const lfs::core::Tensor& scores);
+
     size_t frozen_row_count(const lfs::core::SplatData& splat_data, size_t n);
 
     // Refresh the topology-derived mask without changing the configured LR scale.
@@ -68,20 +74,6 @@ namespace lfs::training {
         lfs::core::SplatData& splat_data,
         const lfs::core::Tensor& kept_old_indices,
         size_t old_size);
-
-    // Function types for parameter and optimizer state updates
-    using ParamUpdateFn = std::function<lfs::core::Tensor(const int, const lfs::core::Tensor&)>;
-    using OptimizerUpdateFn = std::function<void(
-        AdamParamState& state,
-        const lfs::core::Tensor& new_param)>;
-
-    // Update parameter with optimizer state synchronization
-    void update_param_with_optimizer(
-        const ParamUpdateFn& param_fn,
-        const OptimizerUpdateFn& optimizer_fn,
-        std::unique_ptr<AdamOptimizer>& optimizer,
-        lfs::core::SplatData& splat_data,
-        std::vector<size_t> param_idxs = {0, 1, 2, 3, 4, 5});
 
     // Returns the fused MCMC-style dead mask:
     // opacity <= min_opacity OR ||rotation||^2 < 1e-8.

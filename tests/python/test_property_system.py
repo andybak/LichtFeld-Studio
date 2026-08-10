@@ -89,22 +89,26 @@ class TestOptimizationParams:
         original_weight = params.normal_loss_weight
         original_consistency = params.normal_consistency_weight
         original_flatten = params.normal_flatten_weight
+        original_space = params.normal_loss_space
 
         try:
             params.use_normal_loss = True
             params.normal_loss_weight = 0.75
             params.normal_consistency_weight = 0.25
             params.normal_flatten_weight = 5.0
+            params.normal_loss_space = "world"
 
             assert params.use_normal_loss is True
             assert params.normal_loss_weight == pytest.approx(0.75)
             assert params.normal_consistency_weight == pytest.approx(0.25)
             assert params.normal_flatten_weight == pytest.approx(5.0)
+            assert params.normal_loss_space == "world"
         finally:
             params.use_normal_loss = original_enabled
             params.normal_loss_weight = original_weight
             params.normal_consistency_weight = original_consistency
             params.normal_flatten_weight = original_flatten
+            params.normal_loss_space = original_space
 
     def test_get_string_property(self, lf):
         """Should be able to read strategy string property."""
@@ -113,6 +117,21 @@ class TestOptimizationParams:
         strategy = params.strategy
         assert isinstance(strategy, str)
         assert strategy in ("mcmc", "mrnf", "igs+")
+
+    def test_registry_strategy_setter_switches_the_strategy_defaults(self, lf):
+        """Generic registry writes must preserve strategy-slot semantics."""
+        params = lf.optimization_params()
+
+        try:
+            params.set_strategy("mrnf")
+            params.set("strategy", "igs+")
+
+            assert params.strategy == "igs+"
+            assert params.max_cap == 4_000_000
+            assert params.means_lr == pytest.approx(1.6e-5)
+            assert params.scaling_lr == pytest.approx(0.02)
+        finally:
+            params.set_strategy("mrnf")
 
     def test_properties_list(self, lf):
         """properties() should return list of property info dicts."""
@@ -179,6 +198,44 @@ class TestOptimizationParams:
         assert "live_update" in info
         assert info["live_update"] is True
 
+    def test_cropbox_lr_scale_property(self, lf):
+        """Crop-box damping should be exposed as a live bounded float."""
+        params = lf.optimization_params()
+        info = params.prop_info("cropbox_lr_scale")
+
+        assert info["name"] == "Rejected splat LR scale"
+        assert info["type"] == "float"
+        assert info["min"] == pytest.approx(0.0)
+        assert info["max"] == pytest.approx(1.0)
+        assert info["default"] == pytest.approx(0.1)
+        assert info["live_update"] is True
+
+        original = params.cropbox_lr_scale
+        try:
+            params.cropbox_lr_scale = 0.25
+            assert params.cropbox_lr_scale == pytest.approx(0.25)
+        finally:
+            params.cropbox_lr_scale = original
+
+    def test_cropbox_loss_weight_property(self, lf):
+        """Crop-box loss weighting should be exposed as a live bounded float."""
+        params = lf.optimization_params()
+        info = params.prop_info("cropbox_loss_weight")
+
+        assert info["name"] == "Outside ROI loss weight"
+        assert info["type"] == "float"
+        assert info["min"] == pytest.approx(0.0)
+        assert info["max"] == pytest.approx(1.0)
+        assert info["default"] == pytest.approx(0.1)
+        assert info["live_update"] is True
+
+        original = params.cropbox_loss_weight
+        try:
+            params.cropbox_loss_weight = 0.4
+            assert params.cropbox_loss_weight == pytest.approx(0.4)
+        finally:
+            params.cropbox_loss_weight = original
+
     def test_prop_info_needs_restart(self, lf):
         """prop_info should indicate needs_restart for certain properties."""
         params = lf.optimization_params()
@@ -217,6 +274,13 @@ class TestOptimizationParams:
 
         with pytest.raises(AttributeError):
             params.headless = True
+
+    def test_reset_readonly_raises(self, lf):
+        """Resetting readonly property should match set() semantics."""
+        params = lf.optimization_params()
+
+        with pytest.raises(RuntimeError, match="read-only"):
+            params.reset("headless")
 
     def test_apply_step_scaling_updates_mrnf_growth_horizon(self, lf):
         """apply_step_scaling() should scale MRNF's grow_until_iter alongside stop_refine."""

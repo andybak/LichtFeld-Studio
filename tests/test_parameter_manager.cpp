@@ -7,6 +7,7 @@
 #include "core/parameters.hpp"
 
 #include <limits>
+#include <nlohmann/json.hpp>
 
 namespace {
 
@@ -19,6 +20,48 @@ namespace {
         EXPECT_EQ(manager.getActiveParams().strategy, "mrnf");
         EXPECT_EQ(lfs::core::param::OptimizationParameters{}.strategy, "mrnf");
         EXPECT_EQ(lfs::core::param::OptimizationParameters::mcmc_defaults().strategy, "mcmc");
+    }
+
+    TEST(ParameterManagerTest, SessionCopyTracksExplicitSourcesAndResetBaseline) {
+        lfs::vis::ParameterManager manager;
+        const auto load_result = manager.ensureLoaded();
+        ASSERT_TRUE(load_result.has_value()) << load_result.error();
+
+        const auto factory_defaults = lfs::core::param::OptimizationParameters::mrnf_defaults();
+        const auto initial_session = manager.copySessionParams();
+        EXPECT_EQ(initial_session.strategy, factory_defaults.strategy);
+        EXPECT_FLOAT_EQ(initial_session.opacity_lr, factory_defaults.opacity_lr);
+        EXPECT_EQ(initial_session.max_cap, factory_defaults.max_cap);
+
+        lfs::core::param::TrainingParameters cli_params;
+        cli_params.optimization = factory_defaults;
+        cli_params.optimization.opacity_lr = 0.123f;
+        cli_params.optimization.max_cap = 1'234'567;
+        manager.setSessionDefaults(cli_params);
+
+        const auto cli_session = manager.copySessionParams();
+        EXPECT_FLOAT_EQ(cli_session.opacity_lr, 0.123f);
+        EXPECT_EQ(cli_session.max_cap, 1'234'567);
+
+        manager.modifyActiveParams([](auto& params) {
+            params.opacity_lr = 0.75f;
+            params.max_cap = 42;
+        });
+        manager.resetToDefaults("mrnf");
+        const auto reset_current = manager.copyActiveParams();
+        EXPECT_FLOAT_EQ(reset_current.opacity_lr, 0.123f);
+        EXPECT_EQ(reset_current.max_cap, 1'234'567);
+
+        lfs::core::param::TrainingParameters checkpoint_params;
+        checkpoint_params.optimization = lfs::core::param::OptimizationParameters::igs_plus_defaults();
+        checkpoint_params.optimization.opacity_lr = 0.321f;
+        checkpoint_params.optimization.max_cap = 765'432;
+        manager.importTrainingParams(checkpoint_params);
+
+        const auto checkpoint_session = manager.copySessionParams();
+        EXPECT_EQ(checkpoint_session.strategy, "igs+");
+        EXPECT_FLOAT_EQ(checkpoint_session.opacity_lr, 0.321f);
+        EXPECT_EQ(checkpoint_session.max_cap, 765'432);
     }
 
     TEST(ParameterManagerTest, ImportTrainingParamsRestoresResolvedCheckpointState) {
@@ -200,6 +243,52 @@ namespace {
         params = {};
         params.means_lr = std::numeric_limits<float>::infinity();
         EXPECT_NE(params.validate().find("means_lr"), std::string::npos);
+        params = {};
+        params.cropbox_lr_scale = std::numeric_limits<float>::quiet_NaN();
+        EXPECT_NE(params.validate().find("cropbox_lr_scale"), std::string::npos);
+        params.cropbox_lr_scale = -0.1f;
+        EXPECT_NE(params.validate().find("cropbox_lr_scale"), std::string::npos);
+        params.cropbox_lr_scale = 1.1f;
+        EXPECT_NE(params.validate().find("cropbox_lr_scale"), std::string::npos);
+        params = {};
+        params.cropbox_loss_weight = std::numeric_limits<float>::quiet_NaN();
+        EXPECT_NE(params.validate().find("cropbox_loss_weight"), std::string::npos);
+        params.cropbox_loss_weight = -0.1f;
+        EXPECT_NE(params.validate().find("cropbox_loss_weight"), std::string::npos);
+        params.cropbox_loss_weight = 1.1f;
+        EXPECT_NE(params.validate().find("cropbox_loss_weight"), std::string::npos);
+    }
+
+    TEST(ParameterValidationTest, CropBoxLrScaleJsonIsBackwardCompatible) {
+        lfs::core::param::OptimizationParameters params;
+        params.cropbox_lr_scale = 0.35f;
+        auto json = params.to_json();
+
+        EXPECT_FLOAT_EQ(json.at("cropbox_lr_scale").get<float>(), 0.35f);
+        EXPECT_FLOAT_EQ(
+            lfs::core::param::OptimizationParameters::from_json(json).cropbox_lr_scale,
+            0.35f);
+
+        json.erase("cropbox_lr_scale");
+        EXPECT_FLOAT_EQ(
+            lfs::core::param::OptimizationParameters::from_json(json).cropbox_lr_scale,
+            0.1f);
+    }
+
+    TEST(ParameterValidationTest, CropBoxLossWeightJsonIsBackwardCompatible) {
+        lfs::core::param::OptimizationParameters params;
+        params.cropbox_loss_weight = 0.45f;
+        auto json = params.to_json();
+
+        EXPECT_FLOAT_EQ(json.at("cropbox_loss_weight").get<float>(), 0.45f);
+        EXPECT_FLOAT_EQ(
+            lfs::core::param::OptimizationParameters::from_json(json).cropbox_loss_weight,
+            0.45f);
+
+        json.erase("cropbox_loss_weight");
+        EXPECT_FLOAT_EQ(
+            lfs::core::param::OptimizationParameters::from_json(json).cropbox_loss_weight,
+            0.1f);
     }
 
     TEST(ParameterValidationTest, RejectsDatasetCadenceAndOddVideoDimensions) {

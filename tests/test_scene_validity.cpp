@@ -889,31 +889,45 @@ namespace lfs::python {
         EXPECT_EQ(after_clear.allocated_bytes, before_pick.allocated_bytes);
     }
 
-    TEST_F(SceneValidityTest, MeshRayPickCacheRejectsReusedObjectAddressAndNodeId) {
+    // Catches the ray-pick CPU cache accepting stale geometry when a new node reuses a mesh address.
+    TEST_F(SceneValidityTest, MeshRayPickCacheRejectsReusedObjectAddressForDifferentNodeId) {
         alignas(core::MeshData) std::byte storage[sizeof(core::MeshData)];
+        bool original_is_live = true;
         lfs::vis::SceneManager scene_manager;
         const auto construct_mesh = [&](const float x_offset) {
-            auto* mesh = std::construct_at(
+            return std::construct_at(
                 reinterpret_cast<core::MeshData*>(storage),
                 make_test_mesh_data(x_offset));
-            return std::shared_ptr<core::MeshData>(mesh, [](core::MeshData* value) {
-                std::destroy_at(value);
-            });
         };
 
-        auto original = construct_mesh(0.0f);
+        auto original = std::shared_ptr<core::MeshData>(
+            construct_mesh(0.0f),
+            [&original_is_live](core::MeshData* value) {
+                if (original_is_live) {
+                    std::destroy_at(value);
+                }
+            });
+        const auto* const original_address = original.get();
+        const uint32_t original_generation = original->generation();
         const core::NodeId original_id = scene_manager.getScene().addMesh("Original", original);
         ASSERT_NE(original_id, core::NULL_NODE);
         ASSERT_EQ(scene_manager.pickNodeByRay({0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}),
                   "Original");
 
-        // Bypass the manager cache clear to exercise the identity guard directly.
         scene_manager.getScene().clear();
-        original.reset();
-        auto replacement = construct_mesh(10.0f);
+        std::destroy_at(original.get());
+        original_is_live = false;
+        auto replacement = std::shared_ptr<core::MeshData>(
+            construct_mesh(10.0f),
+            [](core::MeshData* value) {
+                std::destroy_at(value);
+            });
+        ASSERT_EQ(replacement.get(), original_address);
+        ASSERT_EQ(replacement->generation(), original_generation);
         const core::NodeId replacement_id =
             scene_manager.getScene().addMesh("Replacement", replacement);
-        ASSERT_EQ(replacement_id, original_id);
+        ASSERT_NE(replacement_id, core::NULL_NODE);
+        ASSERT_NE(replacement_id, original_id);
 
         EXPECT_TRUE(scene_manager.pickNodeByRay({0.0f, 0.0f, 1.0f}, {0.0f, 0.0f, -1.0f}).empty());
     }
@@ -1082,6 +1096,48 @@ namespace lfs::python {
 
         EXPECT_EQ(scene.getNodeById(splat)->parent_id, core::NULL_NODE);
         EXPECT_TRUE(scene.getNodeById(group)->children.empty());
+    }
+
+    TEST_F(SceneValidityTest, CameraGroupTrainingCountsTrackEnabledDirectChildren) {
+        lfs::vis::SceneManager sm;
+        auto& scene = sm.getScene();
+        const core::NodeId cameras = scene.addGroup("Cameras");
+        const core::NodeId training = scene.addCameraGroup("Training", cameras, 3);
+        const core::NodeId validation = scene.addCameraGroup("Validation", cameras, 1);
+        const core::NodeId non_camera_child = scene.addGroup("Nested", training);
+        const core::NodeId train_a = scene.addCamera("train_a.png", training, make_test_camera());
+        const core::NodeId train_b = scene.addCamera("train_b.png", training, make_test_camera());
+        const core::NodeId train_c = scene.addCamera("train_c.png", training, make_test_camera());
+        const core::NodeId val_a = scene.addCamera("val_a.png", validation, make_test_camera());
+        ASSERT_NE(non_camera_child, core::NULL_NODE);
+        ASSERT_NE(train_a, core::NULL_NODE);
+        ASSERT_NE(train_b, core::NULL_NODE);
+        ASSERT_NE(train_c, core::NULL_NODE);
+        ASSERT_NE(val_a, core::NULL_NODE);
+
+        auto counts = scene.getCameraTrainingCounts(training);
+        EXPECT_EQ(counts.enabled, 3u);
+        EXPECT_EQ(counts.total, 3u);
+        EXPECT_EQ(scene.getActiveCameraCount(), 4u);
+
+        scene.setCameraTrainingEnabled(train_b, false);
+
+        counts = scene.getCameraTrainingCounts(training);
+        EXPECT_EQ(counts.enabled, 2u);
+        EXPECT_EQ(counts.total, 3u);
+        EXPECT_EQ(scene.getActiveCameraCount(), 3u);
+
+        const auto validation_counts = scene.getCameraTrainingCounts(validation);
+        EXPECT_EQ(validation_counts.enabled, 1u);
+        EXPECT_EQ(validation_counts.total, 1u);
+
+        const auto invalid_counts = scene.getCameraTrainingCounts(core::NULL_NODE);
+        EXPECT_EQ(invalid_counts.enabled, 0u);
+        EXPECT_EQ(invalid_counts.total, 0u);
+
+        const auto non_camera_group_counts = scene.getCameraTrainingCounts(cameras);
+        EXPECT_EQ(non_camera_group_counts.enabled, 0u);
+        EXPECT_EQ(non_camera_group_counts.total, 0u);
     }
 
     TEST_F(SceneValidityTest, SceneManagerBlocksActiveCameraSubtreeAndAllowsInactiveCameraRemoval) {

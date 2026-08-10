@@ -4,6 +4,7 @@
 
 #include "adam_optimizer.hpp"
 #include "adam_api.h" // fast_lfs::optimizer::adam_step_raw
+#include "core/assert.hpp"
 #include "core/checkpoint_format.hpp"
 #include "core/cuda/sh_layout.cuh"
 #include "core/cuda_error.hpp"
@@ -105,6 +106,32 @@ namespace lfs::training {
         frozen_lr_scale_ = scale;
     }
 
+    void AdamOptimizer::set_crop_damping_mask(lfs::core::Tensor mask) {
+        if (mask.is_valid()) {
+            LFS_ASSERT_MSG(
+                mask.dtype() == lfs::core::DataType::Bool && mask.ndim() == 1,
+                "AdamOptimizer crop damping mask must be a 1D bool tensor");
+            LFS_ASSERT_MSG(
+                mask.numel() == static_cast<size_t>(splat_data_.size()),
+                "AdamOptimizer crop damping mask must match the model row count");
+            if (mask.device() != lfs::core::Device::CUDA) {
+                mask = mask.cuda();
+            }
+            if (!mask.is_contiguous()) {
+                mask = mask.contiguous();
+            }
+            mask.set_name("adam.crop_damping_mask");
+        }
+        crop_damping_mask_ = std::move(mask);
+    }
+
+    void AdamOptimizer::set_cropbox_lr_scale(const float scale) {
+        LFS_ASSERT_MSG(
+            std::isfinite(scale) && scale >= 0.0f && scale <= 1.0f,
+            "AdamOptimizer crop box LR scale must be finite and within [0, 1]");
+        cropbox_lr_scale_ = scale;
+    }
+
     void AdamOptimizer::step(const int iteration) {
         LFS_TRACE("kernel.adam.step");
         if (fused_step_iteration_ == iteration) {
@@ -187,15 +214,6 @@ namespace lfs::training {
         LOG_DEBUG("Allocated gradients for {} parameter groups", states_.size());
     }
 
-    bool AdamOptimizer::has_gradients() const {
-        for (const auto& [_, state] : states_) {
-            if (state.grad.is_valid() && state.grad.numel() > 0) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     void AdamOptimizer::zero_grad(int /*iteration*/) {
         if (last_step_zeroed_gradients_) {
             last_step_zeroed_gradients_ = false;
@@ -258,6 +276,18 @@ namespace lfs::training {
     int AdamOptimizer::frozen_mask_size() const {
         return frozen_mask_.is_valid()
                    ? static_cast<int>(frozen_mask_.numel())
+                   : 0;
+    }
+
+    const bool* AdamOptimizer::crop_damping_mask_ptr() const {
+        return crop_damping_mask_.is_valid() && crop_damping_mask_.numel() > 0
+                   ? crop_damping_mask_.ptr<bool>()
+                   : nullptr;
+    }
+
+    int AdamOptimizer::crop_damping_mask_size() const {
+        return crop_damping_mask_.is_valid()
+                   ? static_cast<int>(crop_damping_mask_.numel())
                    : 0;
     }
 
@@ -461,6 +491,9 @@ namespace lfs::training {
         if (frozen_mask_.is_valid()) {
             lfs::core::waitForCUDAStream(execution_stream, frozen_mask_.stream());
         }
+        if (crop_damping_mask_.is_valid()) {
+            crop_damping_mask_.sync_to_stream(execution_stream);
+        }
 
         if (type == ParamType::ShN) {
             const auto layout_rest = static_cast<uint32_t>(splat_data_.max_sh_coeffs_rest());
@@ -475,6 +508,9 @@ namespace lfs::training {
                 frozen_mask_ptr(),
                 frozen_mask_size(),
                 frozen_lr_scale_,
+                crop_damping_mask_ptr(),
+                crop_damping_mask_size(),
+                cropbox_lr_scale_,
                 static_cast<int>(scale_row_count(type)),
                 slots,
                 param_lr,
@@ -504,6 +540,9 @@ namespace lfs::training {
             frozen_mask_ptr(),
             frozen_mask_size(),
             frozen_lr_scale_,
+            crop_damping_mask_ptr(),
+            crop_damping_mask_size(),
+            cropbox_lr_scale_,
             static_cast<int>(state.size),
             static_cast<int>(feature_dim),
             param_lr,
@@ -521,7 +560,13 @@ namespace lfs::training {
         state.grad.set_stream(execution_stream);
     }
 
-    FastGSFusedAdamState AdamOptimizer::prepare_fastgs_fused_adam(const int iteration) {
+    FastGSFusedAdamState AdamOptimizer::prepare_fastgs_fused_adam(
+        const int iteration,
+        const cudaStream_t execution_stream) {
+        if (crop_damping_mask_.is_valid()) {
+            crop_damping_mask_.sync_to_stream(execution_stream);
+        }
+
         FastGSFusedAdamState fused;
         fused.enabled = true;
         fused.beta1 = static_cast<float>(config_.beta1);
@@ -565,6 +610,9 @@ namespace lfs::training {
             out.frozen_mask = frozen_mask_ptr();
             out.frozen_mask_size = frozen_mask_size();
             out.frozen_lr_scale = frozen_lr_scale_;
+            out.crop_damping_mask = crop_damping_mask_ptr();
+            out.crop_damping_mask_size = crop_damping_mask_size();
+            out.cropbox_lr_scale = cropbox_lr_scale_;
             out.n_elements = static_cast<int>(param.numel());
             out.n_attributes = n_attributes;
             out.step_size = static_cast<float>(get_param_lr(type) * bias_correction1_rcp);
@@ -906,19 +954,6 @@ namespace lfs::training {
         return (it != states_.end()) ? it->second.step_count : 0;
     }
 
-    void AdamOptimizer::set_state(ParamType type, const AdamParamState& state) {
-        // Accept legacy fp32 moments by quantising on the way in.
-        if (state.exp_avg.is_valid() && state.exp_avg.dtype() == lfs::core::DataType::Float32) {
-            AdamParamState converted = state;
-            quantize_float_moments(type, converted, state.exp_avg.clone(), state.exp_avg_sq.clone());
-            converted.size = state.size;
-            converted.capacity = state.size;
-            states_[param_name(type)] = std::move(converted);
-            return;
-        }
-        states_[param_name(type)] = state;
-    }
-
     void AdamOptimizer::add_new_params(ParamType type, const lfs::core::Tensor& new_values, const bool validate) {
         auto& param = get_param(type);
 
@@ -1088,26 +1123,6 @@ namespace lfs::training {
         const size_t n_new = indices.numel();
         param.append_gather(indices);
         extend_state_for_new_params(type, n_new);
-    }
-
-    void AdamOptimizer::relocate_params_at_indices(ParamType type, const std::vector<int64_t>& indices) {
-        if (indices.empty())
-            return;
-
-        const auto& param = get_param(type);
-        for (const auto idx : indices) {
-            if (idx < 0 || static_cast<size_t>(idx) >= param.shape()[0]) {
-                throw std::runtime_error("relocate_params_at_indices: index out of bounds");
-            }
-        }
-
-        const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
-        const size_t idx_bytes = indices.size() * sizeof(int64_t);
-        int64_t* d_indices = nullptr;
-        LFS_CUDA_CHECK(cudaMallocAsync(&d_indices, idx_bytes, stream));
-        LFS_CUDA_CHECK(cudaMemcpyAsync(d_indices, indices.data(), idx_bytes, cudaMemcpyHostToDevice, stream));
-        relocate_params_at_indices_gpu(type, d_indices, indices.size());
-        LFS_CUDA_CHECK(cudaFreeAsync(d_indices, stream));
     }
 
     void AdamOptimizer::relocate_params_at_indices_gpu(ParamType type, const int64_t* indices_device, const size_t n_indices) {
@@ -1439,23 +1454,6 @@ namespace lfs::training {
         if (state->exp_avg_sq_scale.is_valid())
             state->exp_avg_sq_scale.zero_();
         state->step_count = 0;
-    }
-
-    void AdamOptimizer::invalidate_state(const ParamType type) {
-        const auto name = param_name(type);
-        auto it = states_.find(name);
-        if (it == states_.end()) {
-            return;
-        }
-
-        it->second.exp_avg = {};
-        it->second.exp_avg_sq = {};
-        it->second.exp_avg_scale = {};
-        it->second.exp_avg_sq_scale = {};
-        it->second.grad = {};
-        it->second.size = 0;
-        it->second.capacity = 0;
-        it->second.step_count = 0;
     }
 
 } // namespace lfs::training
