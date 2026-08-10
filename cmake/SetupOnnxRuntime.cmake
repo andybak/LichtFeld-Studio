@@ -131,6 +131,10 @@ function(lfs_setup_onnxruntime)
     set(_is_x64 FALSE)
     if(_processor MATCHES "^(amd64|x86_64|x64)$")
         set(_is_x64 TRUE)
+    elseif(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+        # CMake 4 with the Ninja generator can leave
+        # CMAKE_SYSTEM_PROCESSOR empty on native Windows builds.
+        set(_is_x64 TRUE)
     endif()
 
     if(LFS_ONNXRUNTIME_USE_PREBUILT AND _is_x64)

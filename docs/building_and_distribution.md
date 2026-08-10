@@ -74,19 +74,31 @@ Use the CI-aligned helper when building on Windows:
 .\build_windows_ci.ps1
 ```
 
-By default it uses `-VcpkgRoot`, then `VCPKG_ROOT`, then
-`E:\LichtFeld-Studio\vcpkg` when `E:` exists, and otherwise bootstraps
+By default it uses `-VcpkgRoot`, then `VCPKG_ROOT`, and otherwise bootstraps
 `../vcpkg`.
 It does not auto-select a hidden repo-local `.vcpkg` checkout.
 
 `-VcpkgInstalledDirectory` controls where vcpkg installs built dependencies.
-On Windows, the helper defaults to `E:\LichtFeld-Studio\vcpkg_installed` when `E:`
-exists; otherwise it uses `build/vcpkg_installed`.
+The helper uses `VCPKG_INSTALLED_DIR` when set and otherwise uses
+`build/vcpkg_installed`.
 
 `-Clean` removes CMake/project outputs and `dist`, but preserves the vcpkg
 installed tree so dependencies are not rebuilt after every clean app build. Use
 `-CleanDependencies` with `-Clean` only when the vcpkg installed tree itself
 needs to be discarded.
+
+The helper builds both target and host ports with the Release-only
+`x64-windows-release` triplet. It retains the installed dependency tree and
+compressed binary packages for reuse. After a successful build it removes
+downloaded vcpkg sources/tools, build trees, and package staging directories;
+the binary packages are sufficient to restore the unchanged dependency tree
+without recompiling it. Set `VCPKG_ROOT`,
+`VCPKG_INSTALLED_DIR`, or `VCPKG_BINARY_SOURCES` when those retained files
+should live somewhere other than their defaults.
+
+When multiple Visual Studio generations are installed, the helper generates a
+build-local overlay triplet that pins vcpkg to the same MSVC toolset selected
+for the application. It never edits the shared vcpkg checkout.
 
 ### 1. Native Build (Development)
 

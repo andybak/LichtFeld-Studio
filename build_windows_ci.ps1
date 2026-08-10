@@ -15,6 +15,7 @@ param(
     [string]$VcpkgRoot,
     [string]$VcpkgInstalledDirectory,
     [string]$CudaPath,
+    [string]$CudnnRoot,
     [switch]$Clean,
     [switch]$CleanDependencies,
     [switch]$SkipPackage,
@@ -27,7 +28,7 @@ Usage: .\build_windows_ci.ps1 [options]
 
 CI-aligned local Windows build script for LichtFeld Studio.
 It mirrors the GitHub nightly packaging workflow locally:
-  1. Verifies CUDA, CMake, Ninja, Git, and MSVC
+  1. Verifies CUDA, cuDNN, CMake, Ninja, Git, MSVC, and clang-cl
   2. Uses -VcpkgRoot or VCPKG_ROOT, otherwise bootstraps ..\vcpkg
   3. Configures with CMake + Ninja
   4. Builds with vcvars64.bat loaded
@@ -44,8 +45,9 @@ Options:
   -InstallDirectory <path>            Install directory (default: dist)
   -PackageOutputDirectory <path>      Zip output directory (default: repo root)
   -VcpkgRoot <path>                   Override VCPKG_ROOT (default: VCPKG_ROOT env var or ..\vcpkg)
-  -VcpkgInstalledDirectory <path>     Override vcpkg installed tree (default: E:\LichtFeld-Studio\vcpkg_installed when E: exists)
+  -VcpkgInstalledDirectory <path>     Override vcpkg installed tree (default: VCPKG_INSTALLED_DIR or build\vcpkg_installed)
   -CudaPath <path>                    Override CUDA root path
+  -CudnnRoot <path>                   Override cuDNN root path (default: CUDNN_ROOT_DIR or the selected CUDA root)
   -Clean                              Remove project build outputs and dist before building; preserves VCPKG_INSTALLED_DIR
   -CleanDependencies                  With -Clean, also remove VCPKG_INSTALLED_DIR
   -SkipPackage                        Build and install only; do not create zip
@@ -81,6 +83,17 @@ function Get-CommandPathOrNull {
     }
 
     return $null
+}
+
+function Get-EnvironmentValue {
+    param([string]$Name)
+
+    $processValue = [Environment]::GetEnvironmentVariable($Name, 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($processValue)) {
+        return $processValue
+    }
+
+    return [Environment]::GetEnvironmentVariable($Name, 'User')
 }
 
 function Resolve-AbsolutePath {
@@ -182,6 +195,25 @@ function Get-VcVarsPath {
     }
 
     return $bestCandidate.Path
+}
+
+function Get-ClangClPathForVcVarsPath {
+    param([string]$VcVarsPath)
+
+    $commandPath = Get-CommandPathOrNull -Name 'clang-cl'
+    if (-not [string]::IsNullOrWhiteSpace($commandPath)) {
+        return $commandPath
+    }
+
+    $visualStudioRoot = Split-Path (Split-Path (Split-Path (Split-Path $VcVarsPath -Parent) -Parent) -Parent) -Parent
+    $candidatePaths = @(
+        (Join-Path $visualStudioRoot 'VC\Tools\Llvm\x64\bin\clang-cl.exe'),
+        (Join-Path $visualStudioRoot 'VC\Tools\Llvm\bin\clang-cl.exe')
+    )
+
+    return $candidatePaths |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        Select-Object -First 1
 }
 
 function Get-LatestMsvcToolsetVersion {
@@ -375,8 +407,9 @@ function Get-EffectiveVcpkgRoot {
         return Resolve-AbsolutePath -BasePath $ProjectRoot -Path $RequestedVcpkgRoot
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($env:VCPKG_ROOT)) {
-        return [System.IO.Path]::GetFullPath($env:VCPKG_ROOT)
+    $configuredVcpkgRoot = Get-EnvironmentValue -Name 'VCPKG_ROOT'
+    if (-not [string]::IsNullOrWhiteSpace($configuredVcpkgRoot)) {
+        return [System.IO.Path]::GetFullPath($configuredVcpkgRoot)
     }
 
     return [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $ProjectRoot) 'vcpkg'))
@@ -393,12 +426,9 @@ function Get-EffectiveVcpkgInstalledDirectory {
         return Resolve-AbsolutePath -BasePath $ProjectRoot -Path $RequestedVcpkgInstalledDirectory
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($env:VCPKG_INSTALLED_DIR)) {
-        return [System.IO.Path]::GetFullPath($env:VCPKG_INSTALLED_DIR)
-    }
-
-    if (Test-Path 'E:\') {
-        return 'E:\LichtFeld-Studio\vcpkg_installed'
+    $configuredInstalledDirectory = Get-EnvironmentValue -Name 'VCPKG_INSTALLED_DIR'
+    if (-not [string]::IsNullOrWhiteSpace($configuredInstalledDirectory)) {
+        return [System.IO.Path]::GetFullPath($configuredInstalledDirectory)
     }
 
     return [System.IO.Path]::GetFullPath((Join-Path $BuildDirectory 'vcpkg_installed'))
@@ -612,6 +642,14 @@ if (-not [string]::IsNullOrWhiteSpace($vcpkgPlatformToolset)) {
 Write-Host "Windows SDK: $($windowsSdkInfo.Version)"
 Write-Host "CUDA_PATH_V12_8: $resolvedCudaPath"
 
+$clangClPath = Get-ClangClPathForVcVarsPath -VcVarsPath $vcVarsPath
+if ([string]::IsNullOrWhiteSpace($clangClPath)) {
+    $selectedVisualStudioRoot = Split-Path (Split-Path (Split-Path (Split-Path $vcVarsPath -Parent) -Parent) -Parent) -Parent
+    throw "clang-cl was not found. In Visual Studio Installer, modify '$selectedVisualStudioRoot' and add the 'C++ Clang Compiler for Windows' individual component."
+}
+Add-ToPathIfMissing -Entry (Split-Path -Parent $clangClPath)
+Write-Host "clang-cl: $clangClPath"
+
 if ($Clean) {
     Write-Section 'Clean'
     Clear-BuildDirectory -BuildDirectory $BuildDirectory -VcpkgInstalledDirectory $VcpkgInstalledDirectory -RemoveDependencies:$CleanDependencies
@@ -665,9 +703,30 @@ if (-not (Test-Path $resolvedCudaPath)) {
 }
 
 $env:CUDA_PATH_V12_8 = $resolvedCudaPath
+$env:CUDA_PATH = $resolvedCudaPath
+$env:CUDACXX = Join-Path $resolvedCudaPath 'bin\nvcc.exe'
 Add-ToPathIfMissing -Entry (Join-Path $resolvedCudaPath 'bin')
 Add-ToPathIfMissing -Entry (Join-Path $resolvedCudaPath 'bin\x64')
 Add-ToPathIfMissing -Entry (Join-Path $resolvedCudaPath 'libnvvp')
+
+$resolvedCudnnRoot = $null
+if (-not [string]::IsNullOrWhiteSpace($CudnnRoot)) {
+    $resolvedCudnnRoot = [System.IO.Path]::GetFullPath($CudnnRoot)
+} else {
+    $configuredCudnnRoot = Get-EnvironmentValue -Name 'CUDNN_ROOT_DIR'
+    if (-not [string]::IsNullOrWhiteSpace($configuredCudnnRoot)) {
+        $resolvedCudnnRoot = [System.IO.Path]::GetFullPath($configuredCudnnRoot)
+    }
+}
+if ([string]::IsNullOrWhiteSpace($resolvedCudnnRoot) -and (Test-Path (Join-Path $resolvedCudaPath 'include\cudnn.h'))) {
+    $resolvedCudnnRoot = $resolvedCudaPath
+}
+
+if ([string]::IsNullOrWhiteSpace($resolvedCudnnRoot) -or -not (Test-Path $resolvedCudnnRoot)) {
+    throw 'cuDNN was not found. Pass -CudnnRoot or set CUDNN_ROOT_DIR to a cuDNN 9 installation.'
+}
+$env:CUDNN_ROOT_DIR = $resolvedCudnnRoot
+Write-Host "cuDNN root: $resolvedCudnnRoot"
 
 Initialize-VcpkgRoot -VcpkgRoot $VcpkgRoot -GitPath $gitPath
 
@@ -683,36 +742,47 @@ if (-not (Test-Path $vcpkgExe)) {
 
 $env:VCPKG_ROOT = $VcpkgRoot
 $env:VCPKG_INSTALLED_DIR = $VcpkgInstalledDirectory
+$configuredBinarySources = Get-EnvironmentValue -Name 'VCPKG_BINARY_SOURCES'
+if ([string]::IsNullOrWhiteSpace($configuredBinarySources)) {
+    $vcpkgBinaryCacheDirectory = Join-Path $env:LOCALAPPDATA 'vcpkg\archives\lichtfeld-release'
+    New-Item -ItemType Directory -Force -Path $vcpkgBinaryCacheDirectory | Out-Null
+    $env:VCPKG_BINARY_SOURCES = "clear;files,$vcpkgBinaryCacheDirectory,readwrite"
+} else {
+    $env:VCPKG_BINARY_SOURCES = $configuredBinarySources
+}
+Write-Host "vcpkg binary sources: $($env:VCPKG_BINARY_SOURCES)"
+$vcpkgBuildtreesDirectory = Join-Path $env:LOCALAPPDATA 'vcpkg\buildtrees\lichtfeld'
+New-Item -ItemType Directory -Force -Path $vcpkgBuildtreesDirectory | Out-Null
+Write-Host "vcpkg transient build trees: $vcpkgBuildtreesDirectory"
+$vcpkgPackagesDirectory = Join-Path $env:LOCALAPPDATA 'vcpkg\packages\lichtfeld'
+New-Item -ItemType Directory -Force -Path $vcpkgPackagesDirectory | Out-Null
+Write-Host "vcpkg transient package staging: $vcpkgPackagesDirectory"
+$vcpkgDownloadsDirectory = Join-Path $env:LOCALAPPDATA 'vcpkg\downloads\lichtfeld'
+New-Item -ItemType Directory -Force -Path $vcpkgDownloadsDirectory | Out-Null
+Write-Host "vcpkg downloads and tools: $vcpkgDownloadsDirectory"
+$vcpkgTargetTriplet = 'x64-windows-release'
+$vcpkgHostTriplet = 'x64-windows-release'
+Write-Host "vcpkg target triplet: $vcpkgTargetTriplet"
+Write-Host "vcpkg host triplet: $vcpkgHostTriplet"
 $vcpkgToolchainFile = Join-Path $VcpkgRoot 'scripts\buildsystems\vcpkg.cmake'
-$tripletFile = Join-Path $VcpkgRoot 'triplets\x64-windows.cmake'
 if (-not (Test-Path $vcpkgToolchainFile)) {
     throw "vcpkg toolchain file was not found at $vcpkgToolchainFile"
 }
-if (-not (Test-Path $tripletFile)) {
-    throw "vcpkg triplet file not found: $tripletFile"
-}
 
-if (-not (Select-String -Path $tripletFile -Pattern 'VCPKG_MAX_CONCURRENCY' -Quiet)) {
-    Add-Content -Path $tripletFile -Value 'set(VCPKG_MAX_CONCURRENCY 2)'
-}
-
+$vcpkgTripletsDirectory = Join-Path $BuildDirectory 'vcpkg-triplets'
+New-Item -ItemType Directory -Force -Path $vcpkgTripletsDirectory | Out-Null
+$tripletFile = Join-Path $vcpkgTripletsDirectory "$vcpkgTargetTriplet.cmake"
+$tripletLines = @(
+    'set(VCPKG_TARGET_ARCHITECTURE x64)',
+    'set(VCPKG_CRT_LINKAGE dynamic)',
+    'set(VCPKG_LIBRARY_LINKAGE dynamic)',
+    'set(VCPKG_BUILD_TYPE release)'
+)
 if (-not [string]::IsNullOrWhiteSpace($vcpkgPlatformToolset)) {
-    $tripletContent = Get-Content -Path $tripletFile -Raw
-    $toolsetLine = "set(VCPKG_PLATFORM_TOOLSET $vcpkgPlatformToolset)"
-
-    if ($tripletContent -match 'set\(VCPKG_PLATFORM_TOOLSET\s+([^)]+)\)') {
-        if ($Matches[1].Trim() -ne $vcpkgPlatformToolset) {
-            $updatedTripletContent = [regex]::Replace(
-                $tripletContent,
-                'set\(VCPKG_PLATFORM_TOOLSET\s+([^)]+)\)',
-                $toolsetLine
-            )
-            Set-Content -Path $tripletFile -Value $updatedTripletContent
-        }
-    } else {
-        Add-Content -Path $tripletFile -Value $toolsetLine
-    }
+    $tripletLines += "set(VCPKG_PLATFORM_TOOLSET $vcpkgPlatformToolset)"
 }
+Set-Content -LiteralPath $tripletFile -Value $tripletLines -Encoding utf8
+Write-Host "vcpkg overlay triplet: $tripletFile"
 
 New-Item -ItemType Directory -Force -Path $PackageOutputDirectory | Out-Null
 
@@ -722,13 +792,22 @@ $configureArguments = @(
     '-G', 'Ninja',
     "-DCMAKE_TOOLCHAIN_FILE=$vcpkgToolchainFile",
     "-DVCPKG_INSTALLED_DIR=$VcpkgInstalledDirectory",
+    "-DVCPKG_TARGET_TRIPLET=$vcpkgTargetTriplet",
+    "-DVCPKG_HOST_TRIPLET=$vcpkgHostTriplet",
+    "-DVCPKG_OVERLAY_TRIPLETS=$vcpkgTripletsDirectory",
     "-DCMAKE_BUILD_TYPE=$Configuration",
+    "-DCMAKE_MAKE_PROGRAM=$ninjaPath",
+    "-DCMAKE_CUDA_COMPILER=$($env:CUDACXX)",
+    "-DCUDAToolkit_ROOT=$resolvedCudaPath",
+    "-DCUDNN_ROOT_DIR=$resolvedCudnnRoot",
+    '-DCMAKE_INSTALL_MESSAGE=LAZY',
+    "-DVCPKG_INSTALL_OPTIONS=--x-buildtrees-root=$vcpkgBuildtreesDirectory;--x-packages-root=$vcpkgPackagesDirectory;--downloads-root=$vcpkgDownloadsDirectory;--clean-buildtrees-after-build;--clean-packages-after-build;--no-print-usage",
     '-DBUILD_PORTABLE=ON',
     '-DBUILD_PYTHON_STUBS=OFF',
     '-DCUDA_DEVICE_DEBUG=OFF'
 )
 
-$configureCommand = 'cmake ' + (Join-CmdArguments -Arguments $configureArguments)
+$configureCommand = (Join-CmdArguments -Arguments @($cmakePath)) + ' ' + (Join-CmdArguments -Arguments $configureArguments)
 $retryablePatterns = @(
     'status code 5\d\d',
     'timed out',
@@ -738,8 +817,8 @@ $retryablePatterns = @(
     'temporarily unavailable',
     'curl operation failed',
     'Download failed',
-    'tls',
-    'ssl'
+    'TLS (connection|handshake|certificate|error|failure)',
+    'SSL (connection|handshake|certificate|error|failure)'
 )
 
 Write-Section 'Configure'
@@ -773,12 +852,12 @@ for ($attempt = 1; $attempt -le 3; $attempt++) {
 
 Write-Section 'Build'
 $buildArguments = @('--build', $BuildDirectory, '-j', '%NUMBER_OF_PROCESSORS%')
-$buildCommand = 'cmake ' + (Join-CmdArguments -Arguments $buildArguments)
+$buildCommand = (Join-CmdArguments -Arguments @($cmakePath)) + ' ' + (Join-CmdArguments -Arguments $buildArguments)
 Invoke-VcCommand -VcVarsPath $vcVarsPath -WorkingDirectory $ProjectRoot -Command $buildCommand -ToolsetVersion $msvcToolsetVersion -WindowsSdkInfo $windowsSdkInfo
 
 Write-Section 'Install'
 $installArguments = @('--install', $BuildDirectory, '--prefix', $InstallDirectory)
-$installCommand = 'cmake ' + (Join-CmdArguments -Arguments $installArguments)
+$installCommand = (Join-CmdArguments -Arguments @($cmakePath)) + ' ' + (Join-CmdArguments -Arguments $installArguments)
 Invoke-VcCommand -VcVarsPath $vcVarsPath -WorkingDirectory $ProjectRoot -Command $installCommand -ToolsetVersion $msvcToolsetVersion -WindowsSdkInfo $windowsSdkInfo
 
 $packagePath = $null
@@ -817,6 +896,14 @@ if (-not $SkipPackage) {
     Write-Host "Package version: $resolvedPackageVersion"
     Write-Host "Package path: $packagePath"
     Write-Host "Checksum path: $checksumPath"
+}
+
+Write-Section 'Dependency Cleanup'
+foreach ($transientPath in @($vcpkgBuildtreesDirectory, $vcpkgPackagesDirectory, $vcpkgDownloadsDirectory)) {
+    if (Test-Path -LiteralPath $transientPath) {
+        Write-Host "Removing transient vcpkg data: $transientPath"
+        Remove-Item -LiteralPath $transientPath -Recurse -Force
+    }
 }
 
 Write-Section 'Done'

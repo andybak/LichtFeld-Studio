@@ -13,6 +13,10 @@ endif()
 
 cmake_minimum_required(VERSION 3.30)
 
+if(POLICY CMP0207)
+    cmake_policy(SET CMP0207 NEW)
+endif()
+
 # Manifest-mode vcpkg runs only while CMake configures. Track overlay-port
 # contents explicitly so the usual `cmake --build` regeneration also reruns
 # vcpkg when a portfile, patch or overlay manifest changes.
@@ -1548,14 +1552,29 @@ if(BUILD_PORTABLE)
             set(_type "EXECUTABLES")
         endif()
         install(CODE "
+            if(POLICY CMP0207)
+                cmake_policy(SET CMP0207 NEW)
+            endif()
             file(GET_RUNTIME_DEPENDENCIES
                 ${_type} \"${TARGET_FILE}\"
                 RESOLVED_DEPENDENCIES_VAR _deps
                 DIRECTORIES ${_SEARCH_DIRS_STR}
                 PRE_EXCLUDE_REGEXES ${_PRE_EXCLUDE}
                 POST_EXCLUDE_REGEXES ${_POST_EXCLUDE})
+            set(_bundle_destination \"\${CMAKE_INSTALL_PREFIX}/${_BUNDLE_DEST}\")
+            file(MAKE_DIRECTORY \"\${_bundle_destination}\")
             foreach(_d IN LISTS _deps)
-                file(INSTALL \"\${_d}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${_BUNDLE_DEST}\" FOLLOW_SYMLINK_CHAIN)
+                if(WIN32)
+                    get_filename_component(_dep_name \"\${_d}\" NAME)
+                    file(COPY_FILE
+                        \"\${_d}\"
+                        \"\${_bundle_destination}/\${_dep_name}\"
+                        ONLY_IF_DIFFERENT)
+                else()
+                    file(INSTALL \"\${_d}\"
+                        DESTINATION \"\${_bundle_destination}\"
+                        FOLLOW_SYMLINK_CHAIN)
+                endif()
             endforeach()
         " COMPONENT runtime)
     endfunction()
