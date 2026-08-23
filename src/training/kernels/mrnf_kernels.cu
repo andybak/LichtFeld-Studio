@@ -70,11 +70,15 @@ namespace lfs::training::mrnf_strategy {
         if (weight < 1e-12f)
             return;
 
-        curandState rng;
+        // Philox: counter-setup only (no XORWOW skip-ahead). curand_normal4
+        // yields 3 usable normals + 1 discarded — matches microbench.
+        curandStatePhilox4_32_10_t rng;
         curand_init(seed, idx, 0, &rng);
+        const float4 n = curand_normal4(&rng);
+        const float noise_xyz[3] = {n.x, n.y, n.z};
 
         for (int d = 0; d < 3; ++d) {
-            const float noise = curand_normal(&rng) * weight;
+            const float noise = noise_xyz[d] * weight;
             const float clamped_noise = fminf(fmaxf(noise, -median_scale), median_scale);
             means[idx * 3 + d] += clamped_noise;
         }
@@ -183,6 +187,40 @@ namespace lfs::training::mrnf_strategy {
         LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.elementwise_add");
     }
 
+    __global__ void fold_densification_and_zero_kernel(
+        float* __restrict__ vis_count,
+        float* __restrict__ refine_weight_max,
+        float* __restrict__ densification_info,
+        size_t N) {
+
+        const size_t idx = threadIdx.x + blockIdx.x * static_cast<size_t>(blockDim.x);
+        if (idx >= N)
+            return;
+
+        const float vis = densification_info[idx];
+        const float err = densification_info[N + idx];
+        vis_count[idx] += vis;
+        refine_weight_max[idx] = fmaxf(refine_weight_max[idx], err);
+        densification_info[idx] = 0.f;
+        densification_info[N + idx] = 0.f;
+    }
+
+    void launch_fold_densification_and_zero(
+        float* vis_count,
+        float* refine_weight_max,
+        float* densification_info,
+        size_t N,
+        void* stream) {
+        if (N == 0)
+            return;
+        constexpr int threads = 256;
+        const int blocks = static_cast<int>((N + threads - 1) / threads);
+        cudaStream_t s = resolve_stream(stream);
+        fold_densification_and_zero_kernel<<<blocks, threads, 0, s>>>(
+            vis_count, refine_weight_max, densification_info, N);
+        LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.fold_densification_and_zero");
+    }
+
     __global__ void extract_axis_kernel(
         const float* __restrict__ means,
         float* __restrict__ output,
@@ -282,7 +320,7 @@ namespace lfs::training::mrnf_strategy {
             return;
         }
 
-        curandState rng;
+        curandStatePhilox4_32_10_t rng;
         curand_init(seed, idx, 0, &rng);
         float u = curand_uniform(&rng);
         u = fmaxf(u, 1e-10f);
@@ -305,7 +343,7 @@ namespace lfs::training::mrnf_strategy {
         const int64_t src_idx = indices[idx];
         const float w = weights[src_idx];
 
-        curandState rng;
+        curandStatePhilox4_32_10_t rng;
         curand_init(seed, idx, 0, &rng);
         float u = curand_uniform(&rng);
         u = fmaxf(u, 1e-10f);
@@ -333,18 +371,16 @@ namespace lfs::training::mrnf_strategy {
 
         if (K == N) {
             auto out_ptr = thrust::device_pointer_cast(output_indices);
-            lfs::core::tensor_ops::run_with_thrust_policy(s, [&](auto policy) {
-                thrust::sequence(policy, out_ptr, out_ptr + N);
-            });
+            // Caller may consume output_indices via a Tensor whose home stream
+            // is not `s` (scratch allocated earlier). Keep the host wait.
+            thrust::sequence(thrust::cuda::par.on(s), out_ptr, out_ptr + N);
             return;
         }
 
         auto weights_ptr = thrust::device_pointer_cast(weights);
-        size_t active_count = 0;
-        lfs::core::tensor_ops::run_with_thrust_policy(s, [&](auto policy) {
-            active_count = static_cast<size_t>(
-                thrust::count_if(policy, weights_ptr, weights_ptr + N, positive_weight{}));
-        });
+        size_t active_count = static_cast<size_t>(
+            thrust::count_if(thrust::cuda::par.on(s), weights_ptr, weights_ptr + N,
+                             positive_weight{}));
 
         const bool compact_active = active_count >= K && active_count < N;
         const size_t sort_count = compact_active ? active_count : N;
@@ -369,15 +405,13 @@ namespace lfs::training::mrnf_strategy {
         if (compact_active) {
             auto indices_ptr = thrust::device_pointer_cast(d_indices);
             auto counting_begin = thrust::make_counting_iterator<int64_t>(0);
-            lfs::core::tensor_ops::run_with_thrust_policy(s, [&](auto policy) {
-                thrust::copy_if(
-                    policy,
-                    counting_begin,
-                    counting_begin + static_cast<std::ptrdiff_t>(N),
-                    weights_ptr,
-                    indices_ptr,
-                    positive_weight{});
-            });
+            thrust::copy_if(
+                thrust::cuda::par.on(s),
+                counting_begin,
+                counting_begin + static_cast<std::ptrdiff_t>(N),
+                weights_ptr,
+                indices_ptr,
+                positive_weight{});
             gumbel_key_for_indices_kernel<<<blocks, threads, 0, s>>>(
                 weights, d_indices, d_keys, sort_count, seed);
             LFS_CUDA_LAUNCH_CHECK(s, "training.mrnf.gumbel_keys_indices");

@@ -15,6 +15,7 @@
 #include "gui/string_keys.hpp"
 #include "gui/translation_gizmo.hpp"
 #include "input/input_router.hpp"
+#include "input/input_types.hpp"
 #include "input/key_codes.hpp"
 #include "input/sdl_key_mapping.hpp"
 #include "io/loader.hpp"
@@ -33,8 +34,10 @@
 #include "training/training_manager.hpp"
 #include "visualizer/gui_capabilities.hpp"
 #include "visualizer/scene_coordinate_utils.hpp"
+#include "visualizer/visualizer.hpp"
 #include <SDL3/SDL.h>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <format>
 #include <limits>
@@ -1595,7 +1598,16 @@ namespace lfs::vis {
             return;
         }
 
-        if (lfs::python::has_keyboard_capture_request()) {
+        const auto tool_mode = getCurrentToolMode();
+        auto bound_action = bindings_.getActionForKey(tool_mode, logical_key, mods);
+        if (bound_action == input::Action::NONE) {
+            bound_action = resolveCrossToolActivationShortcut(bindings_, tool_mode, logical_key, mods);
+        }
+
+        const bool is_mcp_runtime_action =
+            bound_action == input::Action::TOGGLE_MCP_SERVER ||
+            bound_action == input::Action::TOGGLE_MCP_BINDING;
+        if (lfs::python::has_keyboard_capture_request() && !is_mcp_runtime_action) {
             return;
         }
 
@@ -1604,11 +1616,6 @@ namespace lfs::vis {
         SDL_GetMouseState(&mx_f, &my_f);
         double mx = mx_f, my = my_f;
         const bool over_gui_hover = isPointerOverUiHover(mx, my);
-        const auto tool_mode = getCurrentToolMode();
-        auto bound_action = bindings_.getActionForKey(tool_mode, logical_key, mods);
-        if (bound_action == input::Action::NONE) {
-            bound_action = resolveCrossToolActivationShortcut(bindings_, tool_mode, logical_key, mods);
-        }
         if (action == input::ACTION_PRESS &&
             dispatchSelectionActionToModal(bound_action, mods, mx, my)) {
             return;
@@ -1647,6 +1654,13 @@ namespace lfs::vis {
 
         if (modal_open)
             return;
+
+        if (action == input::ACTION_PRESS &&
+            logical_key == input::KEY_S &&
+            mods == input::KEYMOD_CTRL) {
+            cmd::ProjectSave{}.emit();
+            return;
+        }
 
         switch (input::shortcutScopeForAction(bound_action)) {
         case input::ShortcutScope::Viewport:
@@ -1693,10 +1707,31 @@ namespace lfs::vis {
                 cmd::ToggleGTComparison{}.emit();
                 return;
 
+            case input::Action::OPEN_PREFERENCES:
+                if (gui)
+                    gui->openPreferences();
+                return;
+
+            case input::Action::TOGGLE_MCP_SERVER:
+                toggleMcpRuntimeEnabled();
+                return;
+
+            case input::Action::TOGGLE_MCP_BINDING:
+                toggleMcpRuntimeBinding();
+                return;
+
             case input::Action::TOGGLE_CAMERA_FRUSTUMS:
                 if (auto* rendering_manager = services().renderingOrNull()) {
                     auto settings = rendering_manager->getSettings();
                     settings.show_camera_frustums = !settings.show_camera_frustums;
+                    rendering_manager->updateSettings(settings);
+                }
+                return;
+
+            case input::Action::TOGGLE_GRID:
+                if (auto* rendering_manager = services().renderingOrNull()) {
+                    auto settings = rendering_manager->getSettings();
+                    settings.show_grid = !settings.show_grid;
                     rendering_manager->updateSettings(settings);
                 }
                 return;
@@ -1860,6 +1895,10 @@ namespace lfs::vis {
 
             case input::Action::CUT_SELECTION:
                 cmd::CutSelection{}.emit();
+                return;
+
+            case input::Action::TOGGLE_PERFORMANCE_HUD:
+                lfs::core::events::ui::ToggleVramHud{}.emit();
                 return;
 
             case input::Action::PASTE_SELECTION:
@@ -2227,6 +2266,23 @@ namespace lfs::vis {
 
         if (paths.size() == 1) {
             const std::filesystem::path dropped_path = lfs::core::utf8_to_path(paths.front());
+            auto extension = dropped_path.extension().string();
+            std::ranges::transform(
+                extension, extension.begin(),
+                [](const unsigned char character) {
+                    return static_cast<char>(
+                        std::tolower(character));
+                });
+            if (extension == ".licht") {
+                // Unpublished *.tmp.licht names still emit ProjectOpen so
+                // lifecycle can reject with unpublishedLichtUserMessage.
+                cmd::ProjectOpen{.path = dropped_path}.emit();
+                LOG_INFO(
+                    "Opening project via drag-and-drop: {}",
+                    lfs::core::path_to_utf8(
+                        dropped_path.filename()));
+                return;
+            }
             if (lfs::io::video::is_supported_video_extension(dropped_path.extension().string())) {
                 cmd::ShowVideoExtractor{.video_path = dropped_path}.emit();
                 LOG_INFO("Opening video extractor via drag-and-drop: {}",
@@ -2244,14 +2300,14 @@ namespace lfs::vis {
 
             if (ext == ".resume") {
                 cmd::ShowResumeCheckpointPopup{.checkpoint_path = filepath}.emit();
-                return;
+                continue;
             } else if (ext == ".json") {
                 if (lfs::io::Loader::isDatasetPath(filepath)) {
                     dataset_path = filepath;
                 } else {
                     cmd::LoadConfigFile{.path = filepath}.emit();
                     LOG_INFO("Loading config via drag-and-drop: {}", lfs::core::path_to_utf8(filepath.filename()));
-                    return;
+                    continue;
                 }
             } else if (isEnvironmentMapExtension(ext)) {
                 if (!environment_map_path) {
@@ -2275,7 +2331,7 @@ namespace lfs::vis {
                     if (lfs::io::Loader::isColmapSparsePath(parent)) {
                         cmd::ImportColmapCameras{.sparse_path = parent}.emit();
                         LOG_INFO("Importing COLMAP cameras from: {}", lfs::core::path_to_utf8(parent));
-                        return;
+                        continue;
                     }
                 }
                 unrecognized_files.push_back(lfs::core::path_to_utf8(filepath));
@@ -2290,7 +2346,7 @@ namespace lfs::vis {
                     // COLMAP sparse folder - cameras only (no images required)
                     cmd::ImportColmapCameras{.sparse_path = filepath}.emit();
                     LOG_INFO("Importing COLMAP cameras from: {}", lfs::core::path_to_utf8(filepath));
-                    return;
+                    continue;
                 } else {
                     // Check if it's a SOG directory (WebP-based format)
                     if (std::filesystem::exists(filepath / "meta.json") &&
@@ -2307,13 +2363,26 @@ namespace lfs::vis {
         }
 
         // Load splat and mesh files supported by the generic loader path.
-        for (const auto& splat : splat_files) {
-            auto event = cmd::LoadFile{};
-            event.path = splat;
-            event.is_dataset = false;
-            event.emit();
-            LOG_INFO("Loading {} via drag-and-drop: {}",
-                     lfs::core::path_to_utf8(splat.extension()), lfs::core::path_to_utf8(splat.filename()));
+        if (!splat_files.empty() && viewer_ &&
+            viewer_->loadFileWipeWouldNeedConfirmation(
+                false, false, false)) {
+            cmd::ShowLoadFileConfirmation{
+                .paths = splat_files,
+                .is_dataset = false,
+                .replace = false}
+                .emit();
+            LOG_INFO(
+                "Requesting confirmation before loading {} dropped splat/mesh file(s)",
+                splat_files.size());
+        } else {
+            for (const auto& splat : splat_files) {
+                auto event = cmd::LoadFile{};
+                event.path = splat;
+                event.is_dataset = false;
+                event.emit();
+                LOG_INFO("Loading {} via drag-and-drop: {}",
+                         lfs::core::path_to_utf8(splat.extension()), lfs::core::path_to_utf8(splat.filename()));
+            }
         }
 
         if (dataset_path) {
@@ -2327,7 +2396,7 @@ namespace lfs::vis {
 
         if (!unrecognized_files.empty() && splat_files.empty() && !dataset_path && !environment_map_path) {
             const std::string supported_formats = std::format(
-                "Supported formats: .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .obj, .fbx, .gltf, .glb, .stl, .dae, .hdr, .exr, .json, .resume, {}, or dataset directories",
+                "Supported formats: .licht, .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .obj, .fbx, .gltf, .glb, .stl, .dae, .hdr, .exr, .json, .resume, {}, or dataset directories",
                 lfs::io::video::supported_video_extensions_display());
             LOG_DEBUG("Dropped {} unrecognized file(s)", unrecognized_files.size());
             state::FileDropFailed{.files = unrecognized_files, .error = supported_formats}.emit();
@@ -3008,18 +3077,15 @@ namespace lfs::vis {
                 rendering && rendering->isGTComparisonActive()) {
                 cmd::ToggleGTComparison{}.emit();
             }
-
-            if (auto* trainer_mgr = services().trainerOrNull();
-                trainer_mgr && trainer_mgr->pauseTrainingTemporaryIfActive()) {
-                training_was_paused_by_camera_ = true;
-            }
+            // Training continues during camera motion. Viewer re-renders zero-copy
+            // bindings per frame (try-lock skip-and-retain on refine exclusive).
         } else {
             last_camera_movement_time_ = now;
         }
     }
 
     void InputController::onCameraMovementEnd() {
-        // Don't immediately resume - let the timeout handle it
+        // Don't clear camera_is_moving_ immediately — let the timeout handle it.
         last_camera_movement_time_ = std::chrono::steady_clock::now();
     }
 
@@ -3031,13 +3097,6 @@ namespace lfs::vis {
         auto now = std::chrono::steady_clock::now();
         if (now - last_camera_movement_time_ >= camera_movement_timeout_) {
             camera_is_moving_ = false;
-
-            // Resume training if we paused it
-            if (training_was_paused_by_camera_ && services().trainerOrNull() && services().trainerOrNull()->isRunning()) {
-                services().trainerOrNull()->resumeTrainingTemporary();
-                training_was_paused_by_camera_ = false;
-                LOG_DEBUG("Camera movement stopped - resumed temporary training pause");
-            }
         }
     }
 

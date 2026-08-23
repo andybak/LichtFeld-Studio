@@ -14,6 +14,7 @@
 #include "gui/rmlui/sdl_rml_key_mapping.hpp"
 #include "gui/string_keys.hpp"
 #include "internal/resource_paths.hpp"
+#include "preferences.hpp"
 #include "theme/theme.hpp"
 #include "visualizer/app_store.hpp"
 
@@ -70,8 +71,10 @@ namespace lfs::vis::gui {
                 return;
 
             const auto& lang = available[idx];
-            if (loc.setLanguage(lang))
+            if (loc.setLanguage(lang)) {
+                lfs::vis::saveLanguagePreference(lang);
                 lfs::vis::publish_language_generation();
+            }
             if (mgr_ && (lang == "ja" || lang == "ko" || lang == "zh"))
                 mgr_->ensureCjkFontsLoaded();
         }
@@ -85,7 +88,9 @@ namespace lfs::vis::gui {
         ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL);
 #else
         std::string cmd = "xdg-open \"" + std::string(url) + "\" &";
-        std::system(cmd.c_str());
+        if (const int status = std::system(cmd.c_str()); status != 0) {
+            LOG_WARN("StartupOverlay: xdg-open failed for '{}': status {}", url, status);
+        }
 #endif
     }
 
@@ -200,6 +205,11 @@ namespace lfs::vis::gui {
     }
 
     void StartupOverlay::dismiss() {
+        if (lfs::vis::loadLanguagePreference().empty()) {
+            const auto& language = lfs::event::LocalizationManager::getInstance().getCurrentLanguage();
+            if (!language.empty())
+                lfs::vis::saveLanguagePreference(language);
+        }
         visible_ = false;
         input_ = nullptr;
         last_mouse_valid_ = false;
@@ -313,6 +323,9 @@ namespace lfs::vis::gui {
             return;
 
         auto& loc = lfs::event::LocalizationManager::getInstance();
+        if (auto* row = document_->GetElementById("lang-row")) {
+            row->SetProperty("display", lfs::vis::loadLanguagePreference().empty() ? "flex" : "none");
+        }
         const auto langs = loc.getAvailableLanguages();
         const auto names = loc.getAvailableLanguageNames();
         const auto& current = loc.getCurrentLanguage();
@@ -769,10 +782,10 @@ namespace lfs::vis::gui {
 
             if (key_action) {
                 LOG_DEBUG("StartupOverlay: dismissed by key action");
-                visible_ = false;
+                dismiss();
             } else if (mouse_clicked) {
                 LOG_DEBUG("StartupOverlay: dismissed by mouse click");
-                visible_ = false;
+                dismiss();
             }
         }
     }

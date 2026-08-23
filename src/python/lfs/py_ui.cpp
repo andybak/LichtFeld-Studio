@@ -4,14 +4,18 @@
 
 #include "py_ui.hpp"
 #include "control/command_api.hpp"
+#include "core/environment.hpp"
 #include "core/event_bridge/command_center_bridge.hpp"
+#include "core/event_bridge/event_bridge.hpp"
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/events.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/property_registry.hpp"
+#include "core/provenance.hpp"
 #include "core/scene.hpp"
+#include "core/user_paths.hpp"
 #include "gui/global_context_menu.hpp"
 #include "gui/gui_focus_state.hpp"
 #include "gui/rml_menu_bar.hpp"
@@ -20,6 +24,8 @@
 #include "gui/vulkan_ui_texture.hpp"
 #include "internal/resource_paths.hpp"
 #include "io/exporter.hpp"
+#include "mcp/mcp_http_server.hpp"
+#include "preferences.hpp"
 #include "py_command.hpp"
 #include "py_gizmo.hpp"
 #include "py_keymap.hpp"
@@ -35,11 +41,13 @@
 #include "python/python_runtime.hpp"
 #include "python/ui_hooks.hpp"
 #include "rendering/render_constants.hpp"
+#include "rendering/scene_upscaler_registry.hpp"
 #include "rendering/screen_overlay_renderer.hpp"
 #include "visualizer/app_store.hpp"
 #include "visualizer/core/editor_context.hpp"
 #include "visualizer/gui/gui_manager.hpp"
 #include "visualizer/gui/panel_registry.hpp"
+#include "visualizer/ipc/view_context.hpp"
 #include "visualizer/operation/undo_history.hpp"
 #include "visualizer/operator/operator_context.hpp"
 #include "visualizer/operator/operator_registry.hpp"
@@ -48,6 +56,7 @@
 #include "visualizer/theme/theme.hpp"
 #include "visualizer/tools/unified_tool_registry.hpp"
 #include "visualizer/training/training_manager.hpp"
+#include <typeinfo>
 
 #include "config.h"
 #include "git_version.h"
@@ -243,6 +252,13 @@ namespace lfs::python {
         nb::object g_show_dataset_popup_callback;
         nb::object g_show_resume_popup_callback;
         nb::object g_request_exit_callback;
+        lfs::event::HandlerId g_request_exit_handler_id = 0;
+        nb::object
+            g_project_switch_confirmation_callback;
+        nb::object
+            g_show_load_file_confirmation_callback;
+        nb::object
+            g_stop_training_confirmation_callback;
         nb::object g_open_camera_preview_callback;
         nb::object g_save_asset_callback;
 
@@ -2702,7 +2718,15 @@ namespace lfs::python {
 
         // Hot-reload redraw request functions
         m.def(
-            "request_redraw", []() { lfs::python::request_redraw(); }, "Request a UI redraw on next frame");
+            "request_redraw",
+            [](double delay) {
+                if (delay <= 0.0)
+                    lfs::python::request_redraw();
+                else
+                    lfs::python::request_redraw_after(delay);
+            },
+            nb::arg("delay") = 0.0,
+            "Request a UI redraw; with delay > 0, schedule it no later than that many seconds from now.");
         m.def(
             "consume_redraw_request", []() {
                 return lfs::python::consume_redraw_request();
@@ -3607,19 +3631,146 @@ namespace lfs::python {
             "on_request_exit",
             [](nb::object callback) {
                 g_request_exit_callback = callback;
-                lfs::core::events::cmd::RequestExit::when([](const auto&) {
-                    if (g_request_exit_callback && !g_request_exit_callback.is_none()) {
-                        nb::gil_scoped_acquire guard;
-                        try {
-                            g_request_exit_callback();
-                        } catch (const std::exception& ex) {
-                            LOG_ERROR("RequestExit callback error: {}", ex.what());
-                        }
-                    }
-                });
+                if (g_request_exit_handler_id != 0) {
+                    lfs::event::EventBridge::instance()
+                        .unsubscribe(
+                            typeid(lfs::core::events::cmd::
+                                       ShowExitConfirmation),
+                            g_request_exit_handler_id);
+                    g_request_exit_handler_id = 0;
+                }
+                g_request_exit_handler_id =
+                    lfs::core::events::cmd::
+                        ShowExitConfirmation::when(
+                            [](const auto& event) {
+                                if (g_request_exit_callback &&
+                                    !g_request_exit_callback
+                                         .is_none()) {
+                                    nb::gil_scoped_acquire
+                                        guard;
+                                    try {
+                                        g_request_exit_callback(
+                                            event
+                                                .training_in_progress);
+                                    } catch (
+                                        const std::
+                                            exception&
+                                                ex) {
+                                        LOG_ERROR(
+                                            "RequestExit callback error: {}",
+                                            ex.what());
+                                    }
+                                }
+                            });
             },
             nb::arg("callback"),
-            "Register callback for RequestExit event");
+            "Register callback for the close-decision prompt "
+            "(receives training_in_progress: bool)");
+
+        m.def(
+            "on_project_switch_confirmation",
+            [](nb::object callback) {
+                g_project_switch_confirmation_callback =
+                    callback;
+                lfs::core::events::cmd::
+                    ShowProjectSwitchConfirmation::
+                        when([](const auto& event) {
+                            if (g_project_switch_confirmation_callback &&
+                                !g_project_switch_confirmation_callback
+                                     .is_none()) {
+                                nb::gil_scoped_acquire
+                                    guard;
+                                try {
+                                    g_project_switch_confirmation_callback(
+                                        event.new_project,
+                                        lfs::core::
+                                            path_to_utf8(
+                                                event.path));
+                                } catch (
+                                    const std::
+                                        exception& error) {
+                                    LOG_ERROR(
+                                        "Project switch confirmation callback error: {}",
+                                        error.what());
+                                }
+                            }
+                        });
+            },
+            nb::arg("callback"),
+            "Register callback for a dirty project-switch decision");
+
+        m.def(
+            "on_show_load_file_confirmation",
+            [](nb::object callback) {
+                g_show_load_file_confirmation_callback =
+                    callback;
+                lfs::core::events::cmd::
+                    ShowLoadFileConfirmation::
+                        when([](const auto& event) {
+                            if (g_show_load_file_confirmation_callback &&
+                                !g_show_load_file_confirmation_callback
+                                     .is_none()) {
+                                nb::gil_scoped_acquire
+                                    guard;
+                                try {
+                                    nb::list paths;
+                                    for (const auto& path :
+                                         event.paths) {
+                                        paths.append(
+                                            lfs::core::
+                                                path_to_utf8(
+                                                    path));
+                                    }
+                                    g_show_load_file_confirmation_callback(
+                                        paths,
+                                        event.is_dataset,
+                                        event.replace);
+                                } catch (
+                                    const std::
+                                        exception& error) {
+                                    LOG_ERROR(
+                                        "Load-file confirmation callback error: {}",
+                                        error.what());
+                                }
+                            }
+                        });
+            },
+            nb::arg("callback"),
+            "Register callback for a load-file wipe confirmation "
+            "(receives paths: list[str], is_dataset: bool, replace: bool)");
+
+        m.def(
+            "on_stop_training_confirmation",
+            [](nb::object callback) {
+                g_stop_training_confirmation_callback =
+                    callback;
+                lfs::core::events::cmd::
+                    ShowStopTrainingConfirmation::
+                        when([](const auto& event) {
+                            if (g_stop_training_confirmation_callback &&
+                                !g_stop_training_confirmation_callback
+                                     .is_none()) {
+                                nb::gil_scoped_acquire
+                                    guard;
+                                try {
+                                    g_stop_training_confirmation_callback(
+                                        event.new_project,
+                                        lfs::core::
+                                            path_to_utf8(
+                                                event.path),
+                                        event.discard_changes);
+                                } catch (
+                                    const std::
+                                        exception& error) {
+                                    LOG_ERROR(
+                                        "Stop-training confirmation callback error: {}",
+                                        error.what());
+                                }
+                            }
+                        });
+            },
+            nb::arg("callback"),
+            "Register callback for a stop-training project-switch decision");
 
         m.def(
             "on_open_camera_preview",
@@ -3641,7 +3792,12 @@ namespace lfs::python {
 
         m.def(
             "set_exit_popup_open",
-            [](bool open) { set_exit_popup_open(open); },
+            [](bool open) {
+                set_exit_popup_open(open);
+                if (auto* gui = get_gui_manager()) {
+                    gui->noteExitPopupMirror(open);
+                }
+            },
             nb::arg("open"),
             "Set exit popup open state (for window close callback)");
 
@@ -3666,6 +3822,14 @@ namespace lfs::python {
                 }
             },
             "Get the currently active tool id from C++ EditorContext");
+
+        m.def(
+            "consume_tool_restore_guard", []() -> bool {
+                auto* editor = get_editor_context();
+                return editor &&
+                       editor->consumeToolRestoreGuard();
+            },
+            "Consume the one-shot native tool restore guard");
 
         m.def(
             "is_tool_available", [](const std::string& id) -> bool {
@@ -4144,7 +4308,8 @@ namespace lfs::python {
                 const lfs::io::PlySaveOptions options{
                     .output_path = path,
                     .binary = true,
-                    .async = false};
+                    .async = false,
+                    .provenance = lfs::core::make_provenance_stamp()};
 
                 lfs::io::Result<void> result = std::unexpected(
                     lfs::io::Error{lfs::io::ErrorCode::INTERNAL_ERROR, "uninitialized"});
@@ -4175,6 +4340,7 @@ namespace lfs::python {
                               node_name,
                               lfs::core::path_to_utf8(path),
                               result.error().message);
+                    lfs::core::events::state::ExportFailed{.error = result.error().message}.emit();
                 } else {
                     LOG_INFO("Saved '{}' to {}", node_name, lfs::core::path_to_utf8(path));
                 }
@@ -4466,19 +4632,23 @@ namespace lfs::python {
 
         m.def(
             "export_video",
-            [](int width, int height, int framerate, int crf, const std::string& path) {
+            [](int width, int height, int framerate, int crf, const std::string& path,
+               bool include_provenance) {
                 lfs::core::events::cmd::SequencerExportVideo{
                     .width = width,
                     .height = height,
                     .framerate = framerate,
                     .crf = crf,
-                    .path = path}
+                    .path = path,
+                    .include_provenance = include_provenance}
                     .emit();
             },
             nb::arg("width"), nb::arg("height"), nb::arg("framerate"), nb::arg("crf"),
             nb::arg("path") = std::string{},
+            nb::arg("include_provenance") = true,
             "Export video with specified settings. Without a path a save dialog opens, "
-            "which a script cannot answer; pass one to export directly.");
+            "which a script cannot answer; pass one to export directly. "
+            "include_provenance (default true) writes a full provenance stamp into the video comment; when false, a minimal build stamp is still embedded.");
 
         m.def(
             "add_keyframe",
@@ -4533,6 +4703,15 @@ namespace lfs::python {
               "Toggle system console visibility");
 
         m.def(
+            "toggle_vram_hud", []() { lfs::core::events::ui::ToggleVramHud{}.emit(); },
+            "Toggle the VRAM diagnostics HUD overlay");
+
+        m.def(
+            "is_perf_hud_visible",
+            []() -> bool { return lfs::vis::app_store().perf_hud.get().visible; },
+            "True when the performance HUD is currently shown");
+
+        m.def(
             "is_windows_platform", []() -> bool {
 #ifdef WIN32
                 return true;
@@ -4546,7 +4725,7 @@ namespace lfs::python {
             "register_file_associations", []() -> bool {
                 return lfs::vis::gui::registerFileAssociations();
             },
-            "Register LichtFeld Studio as a supported handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz files (Windows only)");
+            "Register LichtFeld Studio as a supported handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .licht files (Windows only)");
 
         m.def(
             "open_file_association_settings", []() -> bool {
@@ -4558,13 +4737,13 @@ namespace lfs::python {
             "unregister_file_associations", []() -> bool {
                 return lfs::vis::gui::unregisterFileAssociations();
             },
-            "Remove LichtFeld Studio file associations for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz (Windows only)");
+            "Remove LichtFeld Studio file associations for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .licht (Windows only)");
 
         m.def(
             "are_file_associations_registered", []() -> bool {
                 return lfs::vis::gui::areFileAssociationsRegistered();
             },
-            "Check if LichtFeld Studio is the default handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz (Windows only)");
+            "Check if LichtFeld Studio is the default handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .licht (Windows only)");
 
         m.def("get_pivot_mode", &get_pivot_mode, "Get pivot mode (0=Origin, 1=Bounds)");
 
@@ -4711,6 +4890,237 @@ namespace lfs::python {
             "Get saved UI scale preference (0.0 = auto)");
 
         m.def(
+            "get_scene_reconstruction_options",
+            [] {
+                nb::list backends;
+                for (const auto& descriptor : vis::sceneUpscalerDescriptors()) {
+                    nb::dict backend;
+                    backend["id"] = std::string(descriptor.id);
+                    backend["label_key"] = std::string(descriptor.label_key);
+                    nb::list presets;
+                    for (const auto& preset : descriptor.presets) {
+                        nb::dict item;
+                        item["id"] = std::string(preset.id);
+                        item["label_key"] = std::string(preset.label_key);
+                        item["input_scale"] = preset.input_scale;
+                        presets.append(item);
+                    }
+                    backend["presets"] = presets;
+                    backends.append(backend);
+                }
+                return backends;
+            },
+            "Get registered scene reconstruction backends and their presets");
+
+        m.def(
+            "get_scene_reconstruction_preset_preference",
+            [](const std::string& backend_id) {
+                nb::gil_scoped_release release;
+                return vis::loadSceneUpscalerPresetPreference(backend_id);
+            },
+            nb::arg("backend_id"),
+            "Get the saved preset for a scene reconstruction backend");
+
+        m.def(
+            "set_scene_reconstruction",
+            [](const std::string& backend_id, const std::string& preset_id) {
+                const auto backend = vis::sceneUpscalerBackendFromId(backend_id);
+                if (!backend || !vis::sceneUpscalerPreset(*backend, preset_id))
+                    return false;
+                nb::gil_scoped_release release;
+                auto settings = vis::get_render_settings();
+                if (!settings)
+                    return false;
+                settings->scene_upscaler = backend_id;
+                settings->scene_upscaler_preset = preset_id;
+                vis::update_render_settings(*settings);
+                return true;
+            },
+            nb::arg("backend_id"), nb::arg("preset_id"),
+            "Atomically select a scene reconstruction backend and preset");
+
+        m.def(
+            "reset_scene_reconstruction_preferences",
+            [] {
+                nb::gil_scoped_release release;
+                vis::clearSceneUpscalerPreference();
+            },
+            "Clear all saved scene reconstruction backend and preset preferences");
+
+        m.def(
+            "get_mcp_preferences",
+            [] {
+                vis::McpPreferenceState state;
+                bool safe_mode = false;
+                {
+                    nb::gil_scoped_release release;
+                    state = vis::loadMcpPreferences();
+                    safe_mode = core::environment::flag("LFS_SAFE_MODE", false);
+                }
+                nb::dict result;
+                result["enabled"] = !safe_mode && state.enabled;
+                result["expose_network"] = state.expose_network;
+                result["port"] = state.port;
+                result["request_logging"] = !safe_mode && state.request_logging;
+                result["safe_mode"] = safe_mode;
+                return result;
+            },
+            "Get effective MCP HTTP server preferences");
+
+        m.def(
+            "set_mcp_preferences",
+            [](const bool enabled, const bool expose_network, const int port,
+               const bool request_logging) {
+                if (port < 1 || port > 65535)
+                    throw nb::value_error("MCP port must be between 1 and 65535");
+                nb::gil_scoped_release release;
+                const vis::McpPreferenceState state{
+                    .enabled = enabled,
+                    .expose_network = expose_network,
+                    .port = port,
+                    .request_logging = request_logging,
+                };
+                vis::saveMcpPreferences(state);
+                return mcp::applyActiveMcpHttpConfig({
+                    .enabled = state.enabled,
+                    .expose_network = state.expose_network,
+                    .port = state.port,
+                    .request_logging = state.request_logging,
+                });
+            },
+            nb::arg("enabled"), nb::arg("expose_network"), nb::arg("port"),
+            nb::arg("request_logging") = false,
+            "Persist and immediately apply MCP HTTP server preferences");
+
+        m.def(
+            "get_working_directory",
+            []() -> std::string {
+                nb::gil_scoped_release release;
+                return lfs::core::path_to_utf8(vis::loadWorkingDirectoryPreference());
+            },
+            "Get the effective working folder (absolute). Empty preference uses the default root.");
+
+        m.def(
+            "get_working_directory_preference",
+            []() -> std::string {
+                nb::gil_scoped_release release;
+                return lfs::core::path_to_utf8(vis::workingDirectoryPreferenceRaw());
+            },
+            "Get the raw working folder preference. Empty string means the default root.");
+
+        m.def(
+            "get_default_working_directory",
+            []() -> std::string {
+                nb::gil_scoped_release release;
+                return lfs::core::path_to_utf8(vis::defaultWorkingDirectory());
+            },
+            "Get the default working folder (UserPaths root).");
+
+        m.def(
+            "get_temp_project_directory",
+            []() -> std::string {
+                nb::gil_scoped_release release;
+                return lfs::core::path_to_utf8(vis::tempProjectDirectoryPreference());
+            },
+            "Get the temp project directory for the next untitled session (<working folder>/tmp).");
+
+        m.def(
+            "set_working_directory",
+            [](const std::string& path) -> std::string {
+                lfs::Status result;
+                {
+                    nb::gil_scoped_release release;
+                    result = vis::setWorkingDirectoryPreference(
+                        lfs::core::utf8_to_path(path));
+                }
+                if (!result)
+                    return std::string(result.error().user_message());
+                return {};
+            },
+            nb::arg("path"),
+            "Set the working folder. Returns an empty string on success, or a user-facing error.");
+
+        m.def(
+            "clear_working_directory",
+            [] {
+                nb::gil_scoped_release release;
+                vis::clearWorkingDirectoryPreference();
+            },
+            "Clear the working folder preference so the default root is used.");
+
+        m.def(
+            "get_mcp_status",
+            [] {
+                mcp::McpHttpStatus status;
+                bool safe_mode = false;
+                {
+                    nb::gil_scoped_release release;
+                    status = mcp::activeMcpHttpStatus();
+                    safe_mode = core::environment::flag("LFS_SAFE_MODE", false);
+                }
+                nb::dict result;
+                result["enabled"] = status.enabled;
+                result["running"] = status.running;
+                result["safe_mode"] = safe_mode;
+                switch (status.phase) {
+                case mcp::McpHttpPhase::Disabled: result["phase"] = "disabled"; break;
+                case mcp::McpHttpPhase::Starting: result["phase"] = "starting"; break;
+                case mcp::McpHttpPhase::Running: result["phase"] = "running"; break;
+                case mcp::McpHttpPhase::Stopping: result["phase"] = "stopping"; break;
+                case mcp::McpHttpPhase::Failed: result["phase"] = "failed"; break;
+                }
+                result["expose_network"] = status.expose_network;
+                result["port"] = status.port;
+                result["request_count"] = status.request_count;
+                result["success_count"] = status.success_count;
+                result["error_count"] = status.error_count;
+                result["endpoints"] = status.endpoints;
+                result["request_logging"] = status.request_logging;
+                result["log_file"] = status.log_file;
+                result["error"] = status.error;
+                switch (status.error_kind) {
+                case mcp::McpHttpErrorKind::None: result["error_kind"] = "none"; break;
+                case mcp::McpHttpErrorKind::InvalidPort:
+                    result["error_kind"] = "invalid_port";
+                    break;
+                case mcp::McpHttpErrorKind::BindFailed:
+                    result["error_kind"] = "bind_failed";
+                    break;
+                case mcp::McpHttpErrorKind::ListenerFailed:
+                    result["error_kind"] = "listener_failed";
+                    break;
+                }
+                result["error_address"] = status.error_address;
+                result["error_port"] = status.error_port;
+                return result;
+            },
+            "Get current MCP HTTP server runtime status");
+
+        m.def(
+            "get_mcp_log_directory",
+            [] {
+                std::string path;
+                std::string error;
+                {
+                    nb::gil_scoped_release release;
+                    const auto paths = core::UserPaths::resolve();
+                    if (paths)
+                        path = core::path_to_utf8(paths->mcpLogDir());
+                    else
+                        error = lfs::format_for_developer(paths.error());
+                }
+                if (!error.empty())
+                    throw std::runtime_error(error);
+                return path;
+            },
+            "Return the MCP per-session log directory");
+
+        m.def(
+            "take_preferences_section_request",
+            [] { return vis::gui::consumePreferencesSectionRequest(); },
+            "Consume a requested Preferences section name");
+
+        m.def(
             "set_clipboard_text",
             [](const std::string& text) { SDL_SetClipboardText(text.c_str()); },
             nb::arg("text"), "Copy text to the system clipboard");
@@ -4759,6 +5169,7 @@ namespace lfs::python {
             "set_language",
             [](const std::string& lang_code) {
                 if (lfs::event::LocalizationManager::getInstance().setLanguage(lang_code)) {
+                    lfs::vis::saveLanguagePreference(lang_code);
                     if (lang_code == "ja" || lang_code == "ko" || lang_code == "zh")
                         if (auto* const gui_manager = get_gui_manager())
                             gui_manager->ensureCjkFontsLoaded();
@@ -4779,6 +5190,10 @@ namespace lfs::python {
         m.def(
             "get_languages",
             []() -> std::vector<std::tuple<std::string, std::string>> {
+                // The language list itself contains CJK names even when the
+                // active language is Latin-script.
+                if (auto* const gui_manager = get_gui_manager())
+                    gui_manager->ensureCjkFontsLoaded();
                 auto& loc = lfs::event::LocalizationManager::getInstance();
                 auto codes = loc.getAvailableLanguages();
                 auto names = loc.getAvailableLanguageNames();
@@ -4798,7 +5213,6 @@ namespace lfs::python {
             nb::arg("key"), "Translate a string key");
 
         // Menu bar UI functions (for Python-driven menus)
-        m.def("show_input_settings", &show_input_settings, "No-op stub; open input settings via lfs.input_settings panel");
         m.def("show_python_console", &show_python_console, "Show Python console");
         m.def(
             "get_time",
@@ -4835,6 +5249,7 @@ namespace lfs::python {
                 info.label = item.label.c_str();
                 info.operator_id = item.operator_id.c_str();
                 info.shortcut = item.shortcut.c_str();
+                info.tooltip = item.tooltip.c_str();
                 info.enabled = item.enabled;
                 info.selected = item.selected;
                 info.callback_index = item.callback_index;
@@ -4867,6 +5282,20 @@ namespace lfs::python {
             g_show_dataset_popup_callback = nb::object();
             g_show_resume_popup_callback = nb::object();
             g_request_exit_callback = nb::object();
+            if (g_request_exit_handler_id != 0) {
+                lfs::event::EventBridge::instance()
+                    .unsubscribe(
+                        typeid(lfs::core::events::cmd::
+                                   ShowExitConfirmation),
+                        g_request_exit_handler_id);
+                g_request_exit_handler_id = 0;
+            }
+            g_project_switch_confirmation_callback =
+                nb::object();
+            g_show_load_file_confirmation_callback =
+                nb::object();
+            g_stop_training_confirmation_callback =
+                nb::object();
             g_open_camera_preview_callback = nb::object();
         };
         set_bridge(bridge);

@@ -104,6 +104,11 @@ namespace lfs::io {
         return fs::is_directory(path, ec);
     }
 
+    inline bool safe_is_regular_file(const fs::path& path) {
+        std::error_code ec;
+        return fs::is_regular_file(path, ec);
+    }
+
     // Case-insensitive file finding
     inline fs::path find_file_ci(const fs::path& dir, const std::string& target) {
         if (!safe_exists(dir) || !safe_is_directory(dir))
@@ -188,8 +193,13 @@ namespace lfs::io {
                 if (rel.empty())
                     continue;
 
+                raw_entries_.emplace(rel.generic_string(), entry.path());
+
                 const std::string rel_key = detail::normalize_lookup_key(rel);
-                exact_entries_.emplace(rel_key, entry.path());
+                if (auto [it_exact, inserted] = exact_entries_.emplace(rel_key, entry.path());
+                    !inserted && it_exact->second != entry.path()) {
+                    ambiguous_exact_.insert(rel_key);
+                }
 
                 const std::string basename_key =
                     detail::normalize_lookup_key(entry.path().filename());
@@ -244,8 +254,15 @@ namespace lfs::io {
             if (relative_or_name.empty())
                 return {};
 
+            if (auto it = raw_entries_.find(relative_or_name.generic_string());
+                it != raw_entries_.end()) {
+                return FileLookupResult{LookupStatus::Found, it->second};
+            }
+
             const std::string exact_key =
                 detail::normalize_lookup_key(relative_or_name);
+            if (ambiguous_exact_.contains(exact_key))
+                return FileLookupResult{LookupStatus::Ambiguous, {}};
             if (auto it = exact_entries_.find(exact_key);
                 it != exact_entries_.end()) {
                 return FileLookupResult{LookupStatus::Found, it->second};
@@ -272,8 +289,10 @@ namespace lfs::io {
         }
 
     private:
+        std::unordered_map<std::string, fs::path> raw_entries_;
         std::unordered_map<std::string, fs::path> exact_entries_;
         std::unordered_map<std::string, fs::path> basename_entries_;
+        std::unordered_set<std::string> ambiguous_exact_;
         std::unordered_set<std::string> ambiguous_basenames_;
         std::unordered_map<std::string, fs::path> digit_entries_;
         std::unordered_set<std::string> ambiguous_digits_;

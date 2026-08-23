@@ -75,6 +75,8 @@ class Action(enum.Enum):
 
     CUT_SELECTION = 76
 
+    TOGGLE_PERFORMANCE_HUD = 77
+
     PASTE_SELECTION = 33
 
     DEPTH_ADJUST_FAR = 34
@@ -154,6 +156,14 @@ class Action(enum.Enum):
     HISTOGRAM_ZOOM_MARKED = 71
 
     TOGGLE_CAMERA_FRUSTUMS = 72
+
+    OPEN_PREFERENCES = 78
+
+    TOGGLE_MCP_SERVER = 79
+
+    TOGGLE_MCP_BINDING = 80
+
+    TOGGLE_GRID = 81
 
 class ToolMode(enum.Enum):
     GLOBAL = 0

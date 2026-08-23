@@ -217,6 +217,18 @@ def set_theme_vignette_intensity(arg: float, /) -> None:
 def set_theme_vignette_style(arg0: float, arg1: float, arg2: float, /) -> None:
     """Set vignette intensity, radius, and softness"""
 
+def remember_camera_navigation() -> bool:
+    """Return whether camera navigation is persisted between launches"""
+
+def set_remember_camera_navigation(enabled: bool) -> None:
+    """Enable or disable camera navigation persistence"""
+
+def remember_camera_view_snap() -> bool:
+    """Return whether camera view snap is persisted between launches"""
+
+def set_remember_camera_view_snap(enabled: bool) -> None:
+    """Enable or disable camera view snap persistence"""
+
 class PanelSpace(enum.Enum):
     SIDE_PANEL = 0
 
@@ -299,6 +311,12 @@ class Panel:
 
     def on_scene_changed(self, doc): ...
 
+    def capture_chrome(self):
+        """Optional per-panel GUIL payload. Return a dict or None."""
+
+    def apply_chrome(self, payload):
+        """Restore capture_chrome() output. Missing keys keep defaults."""
+
 class PanelSummary:
     @property
     def id(self) -> str: ...
@@ -357,6 +375,16 @@ def get_panel_names(space: PanelSpace = PanelSpace.FLOATING) -> list[str]:
 
 def set_panel_enabled(panel_id: str, enabled: bool) -> None:
     """Enable or disable a panel by id"""
+
+def reset_layout() -> str:
+    """
+    Reset the saved UI layout and apply the default dock arrangement immediately.
+    """
+
+def reset_window_state() -> str:
+    """
+    Reset persisted window geometry and apply the default geometry immediately.
+    """
 
 def is_panel_enabled(panel_id: str) -> bool:
     """Check if a panel is enabled"""
@@ -905,8 +933,20 @@ def input_dialog(title: str, message: str, default_value: str = '', callback: ob
 def message_dialog(title: str, message: str, style: str = 'info', callback: object | None = None) -> None:
     """Show a message dialog (style: 'info', 'warning', or 'error')"""
 
-def request_redraw() -> None:
-    """Request a UI redraw on next frame"""
+def modal_get() -> dict | None:
+    """
+    Return the currently shown modal dialog as a dict, or None if none is open
+    """
+
+def modal_press(label: str) -> bool:
+    """
+    Press an enabled modal button by label. Returns False if no matching enabled button.
+    """
+
+def request_redraw(delay: float = 0.0) -> None:
+    """
+    Request a UI redraw; with delay > 0, schedule it no later than that many seconds from now.
+    """
 
 def consume_redraw_request() -> bool:
     """Consume and return pending redraw request flag"""
@@ -2025,7 +2065,20 @@ def on_show_resume_checkpoint_popup(callback: object) -> None:
     """Register callback for ShowResumeCheckpointPopup event"""
 
 def on_request_exit(callback: object) -> None:
-    """Register callback for RequestExit event"""
+    """
+    Register callback for the close-decision prompt (receives training_in_progress: bool)
+    """
+
+def on_project_switch_confirmation(callback: object) -> None:
+    """Register callback for a dirty project-switch decision"""
+
+def on_show_load_file_confirmation(callback: object) -> None:
+    """
+    Register callback for a load-file wipe confirmation (receives paths: list[str], is_dataset: bool, replace: bool)
+    """
+
+def on_stop_training_confirmation(callback: object) -> None:
+    """Register callback for a stop-training project-switch decision"""
 
 def on_open_camera_preview(callback: object) -> None:
     """Register callback for OpenCameraPreview event"""
@@ -2035,6 +2088,9 @@ def set_exit_popup_open(open: bool) -> None:
 
 def get_active_tool() -> str:
     """Get the currently active tool id from C++ EditorContext"""
+
+def consume_tool_restore_guard() -> bool:
+    """Consume the one-shot native tool restore guard"""
 
 def is_tool_available(id: str) -> bool:
     """Check whether a builtin tool is currently available"""
@@ -2351,9 +2407,9 @@ def clear_keyframes() -> None:
 def set_playback_speed(speed: float) -> None:
     """Set sequencer playback speed"""
 
-def export_video(width: int, height: int, framerate: int, crf: int, path: str = '') -> None:
+def export_video(width: int, height: int, framerate: int, crf: int, path: str = '', include_provenance: bool = True) -> None:
     """
-    Export video with specified settings. Without a path a save dialog opens, which a script cannot answer; pass one to export directly.
+    Export video with specified settings. Without a path a save dialog opens, which a script cannot answer; pass one to export directly. include_provenance (default true) writes a full provenance stamp into the video comment; when false, a minimal build stamp is still embedded.
     """
 
 def add_keyframe() -> None:
@@ -2388,12 +2444,18 @@ def draw_console_button() -> None:
 def toggle_system_console() -> None:
     """Toggle system console visibility"""
 
+def toggle_vram_hud() -> None:
+    """Toggle the VRAM diagnostics HUD overlay"""
+
+def is_perf_hud_visible() -> bool:
+    """True when the performance HUD is currently shown"""
+
 def is_windows_platform() -> bool:
     """Returns true on Windows"""
 
 def register_file_associations() -> bool:
     """
-    Register LichtFeld Studio as a supported handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz files (Windows only)
+    Register LichtFeld Studio as a supported handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .licht files (Windows only)
     """
 
 def open_file_association_settings() -> bool:
@@ -2403,12 +2465,12 @@ def open_file_association_settings() -> bool:
 
 def unregister_file_associations() -> bool:
     """
-    Remove LichtFeld Studio file associations for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz (Windows only)
+    Remove LichtFeld Studio file associations for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .licht (Windows only)
     """
 
 def are_file_associations_registered() -> bool:
     """
-    Check if LichtFeld Studio is the default handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz (Windows only)
+    Check if LichtFeld Studio is the default handler for .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz, .licht (Windows only)
     """
 
 def get_pivot_mode() -> int:
@@ -2511,6 +2573,59 @@ def get_ui_scale() -> float:
 def get_ui_scale_preference() -> float:
     """Get saved UI scale preference (0.0 = auto)"""
 
+def get_scene_reconstruction_options() -> list:
+    """Get registered scene reconstruction backends and their presets"""
+
+def get_scene_reconstruction_preset_preference(backend_id: str) -> str:
+    """Get the saved preset for a scene reconstruction backend"""
+
+def set_scene_reconstruction(backend_id: str, preset_id: str) -> bool:
+    """Atomically select a scene reconstruction backend and preset"""
+
+def reset_scene_reconstruction_preferences() -> None:
+    """Clear all saved scene reconstruction backend and preset preferences"""
+
+def get_mcp_preferences() -> dict:
+    """Get effective MCP HTTP server preferences"""
+
+def set_mcp_preferences(enabled: bool, expose_network: bool, port: int, request_logging: bool = False) -> bool:
+    """Persist and immediately apply MCP HTTP server preferences"""
+
+def get_working_directory() -> str:
+    """
+    Get the effective working folder (absolute). Empty preference uses the default root.
+    """
+
+def get_working_directory_preference() -> str:
+    """
+    Get the raw working folder preference. Empty string means the default root.
+    """
+
+def get_default_working_directory() -> str:
+    """Get the default working folder (UserPaths root)."""
+
+def get_temp_project_directory() -> str:
+    """
+    Get the temp project directory for the next untitled session (<working folder>/tmp).
+    """
+
+def set_working_directory(path: str) -> str:
+    """
+    Set the working folder. Returns an empty string on success, or a user-facing error.
+    """
+
+def clear_working_directory() -> None:
+    """Clear the working folder preference so the default root is used."""
+
+def get_mcp_status() -> dict:
+    """Get current MCP HTTP server runtime status"""
+
+def get_mcp_log_directory() -> str:
+    """Return the MCP per-session log directory"""
+
+def take_preferences_section_request() -> str:
+    """Consume a requested Preferences section name"""
+
 def set_clipboard_text(text: str) -> None:
     """Copy text to the system clipboard"""
 
@@ -2536,9 +2651,6 @@ def get_current_language() -> str:
 
 def get_languages() -> list[tuple[str, str]]:
     """Get available languages as list of (code, name) tuples"""
-
-def show_input_settings() -> None:
-    """No-op stub; open input settings via lfs.input_settings panel"""
 
 def show_python_console() -> None:
     """Show Python console"""

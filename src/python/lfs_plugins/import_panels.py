@@ -144,6 +144,7 @@ from .asset_manager_integration import (
 from .asset_index import resolve_asset_manager_storage_path
 from .types import Panel
 from .rml_keys import KI_ESCAPE, KI_RETURN
+from .training_confirm import confirm_discard_work_then
 from .ui import RuntimeState
 from .url_downloader import (
     URLDownloadError,
@@ -873,6 +874,7 @@ class DatasetImportPanel(_ImportDialogPanel):
     label = "Load Dataset"
     space = lf.ui.PanelSpace.FLOATING
     order = 11
+    options = {lf.ui.PanelOption.DEFAULT_CLOSED}
     template = "rmlui/dataset_import_panel.rml"
     height_mode = lf.ui.PanelHeightMode.CONTENT
     size = (560, 0)
@@ -1184,29 +1186,43 @@ class DatasetImportPanel(_ImportDialogPanel):
         init_path = self._init_path.strip()
         ppisp_sidecar_path = self._ppisp_sidecar_path.strip()
         centralize_dataset = self._centralize_dataset
-
-        params = lf.optimization_params()
-        if params and params.has_params():
-            params.ppisp_sidecar_path = ppisp_sidecar_path
-            params.ppisp_freeze_from_sidecar = bool(ppisp_sidecar_path)
-            if ppisp_sidecar_path:
-                params.ppisp = True
-
-        lf.ui.set_panel_enabled(self.id, False)
-        register_catalog_asset_path(dataset_path, is_dataset=True, select=True)
+        output_path = self._output_path.strip()
+        max_width = self._max_width
+        apply_auto_crop = self._apply_auto_crop
+        min_track_length = self._min_track_length
         clear_scene_on_load = self._clear_scene_on_load
-        self._clear_scene_on_load = False
-        if clear_scene_on_load:
-            lf.clear_scene()
-        lf.load_file(
-            dataset_path,
-            is_dataset=True,
-            output_path=self._output_path.strip(),
-            init_path=init_path,
-            centralize_dataset=centralize_dataset,
-            max_width=self._max_width,
-            apply_auto_crop=self._apply_auto_crop,
-            min_track_length=self._min_track_length,
+
+        def _commit(stop_training: bool) -> None:
+            params = lf.optimization_params()
+            if params and params.has_params():
+                params.ppisp_sidecar_path = ppisp_sidecar_path
+                params.ppisp_freeze_from_sidecar = bool(ppisp_sidecar_path)
+                if ppisp_sidecar_path:
+                    params.ppisp = True
+
+            self._clear_scene_on_load = False
+            lf.ui.set_panel_enabled(self.id, False)
+            register_catalog_asset_path(dataset_path, is_dataset=True, select=True)
+            if clear_scene_on_load:
+                lf.clear_scene()
+            load_kwargs = {
+                "path": dataset_path,
+                "is_dataset": True,
+                "output_path": output_path,
+                "init_path": init_path,
+                "centralize_dataset": centralize_dataset,
+                "max_width": max_width,
+                "apply_auto_crop": apply_auto_crop,
+                "min_track_length": min_track_length,
+                "discard_changes": True,
+            }
+            if stop_training:
+                load_kwargs["stop_training"] = True
+            lf.load_file(**load_kwargs)
+
+        confirm_discard_work_then(
+            lf.ui.tr("load_dataset_popup.save_title"),
+            _commit,
         )
 
     def _on_do_cancel(self, _handle=None, _ev=None, _args=None):
@@ -1221,6 +1237,7 @@ class ResumeCheckpointPanel(_ImportDialogPanel):
     label = "Resume Checkpoint"
     space = lf.ui.PanelSpace.FLOATING
     order = 12
+    options = {lf.ui.PanelOption.DEFAULT_CLOSED}
     template = "rmlui/resume_checkpoint_panel.rml"
     height_mode = lf.ui.PanelHeightMode.CONTENT
     size = (580, 0)
@@ -1363,18 +1380,29 @@ class ResumeCheckpointPanel(_ImportDialogPanel):
         if not self._dataset_valid or not self._checkpoint_path:
             return
 
-        lf.ui.set_panel_enabled(self.id, False)
-        register_catalog_asset_path(self._dataset_path, is_dataset=True)
-        register_catalog_asset_path(
-            self._checkpoint_path,
-            asset_type="checkpoint",
-            role="training_checkpoint",
-            select=True,
-        )
-        lf.load_checkpoint_for_training(
-            self._checkpoint_path,
-            self._dataset_path,
-            self._output_path,
+        checkpoint_path = self._checkpoint_path
+        dataset_path = self._dataset_path
+        output_path = self._output_path
+
+        def _commit(stop_training: bool) -> None:
+            del stop_training
+            lf.ui.set_panel_enabled(self.id, False)
+            register_catalog_asset_path(dataset_path, is_dataset=True)
+            register_catalog_asset_path(
+                checkpoint_path,
+                asset_type="checkpoint",
+                role="training_checkpoint",
+                select=True,
+            )
+            lf.load_checkpoint_for_training(
+                checkpoint_path,
+                dataset_path,
+                output_path,
+            )
+
+        confirm_discard_work_then(
+            lf.ui.tr("resume_checkpoint_popup.title"),
+            _commit,
         )
 
     def _on_do_cancel(self, _handle=None, _ev=None, _args=None):
@@ -1388,6 +1416,7 @@ class URLImportPanel(_ImportDialogPanel):
     label = "Import from URL"
     space = lf.ui.PanelSpace.FLOATING
     order = 13
+    options = {lf.ui.PanelOption.DEFAULT_CLOSED}
     template = "rmlui/url_import_panel.rml"
     height_mode = lf.ui.PanelHeightMode.FILL
     size = (560, 360)

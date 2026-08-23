@@ -8,6 +8,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _rule_body(rcss: str, selector: str) -> str:
+    return rcss.split(f"{selector} {{", 1)[1].split("}", 1)[0]
+
+
 def test_menubar_submenus_are_stacked_above_overlay_and_hit_testable():
     rml = (
         PROJECT_ROOT
@@ -50,11 +54,28 @@ def test_menubar_submenus_are_stacked_above_overlay_and_hit_testable():
     assert "z-index: 3;" in rcss
     assert "#dropdown-container {\n    display: none;\n    position: absolute;\n    top: 0;" in rcss
     assert "width: 100%;" in rcss and "height: 100%;" in rcss
-    assert ".dropdown-popup" in rcss and "overflow: visible;" in rcss
+    dropdown_rule = _rule_body(rcss, ".dropdown-popup")
+    assert "min-width: 200dp;" in dropdown_rule
+    assert "max-width: 360dp;" in dropdown_rule
+    assert "overflow: visible;" in dropdown_rule
+    submenu_rule = _rule_body(rcss, ".submenu-popup")
+    assert "min-width: 200dp;" in submenu_rule
+    assert "max-width: 420dp;" in submenu_rule
+    assert "overflow: hidden;" in submenu_rule
+    menu_item_rule = _rule_body(rcss, ".menu-item")
+    assert "flex-shrink: 0;" in menu_item_rule
+    assert "white-space: nowrap;" in menu_item_rule
+    label_rule = _rule_body(rcss, ".menu-item .label")
+    assert "min-width: 0;" in label_rule
+    assert "white-space: nowrap;" in label_rule
+    assert "overflow: hidden;" in label_rule
+    assert "text-overflow: ellipsis;" in label_rule
     assert ".submenu-container:hover" not in rcss
     assert ".submenu-popup:hover" not in rcss
     assert ".submenu-container.open > .submenu-popup" in rcss
     assert "pointer-events: auto;" in rcss
+    assert 'data-attr-title="item.tooltip"' in rml
+    assert 'data-attr-title="child.tooltip"' in rml
     assert ".menu-item.active" in theme_rcss
     assert 'id="menu-window-fullscreen"' not in rml
     assert 'data-action="window_toggle_fullscreen"' not in rml
@@ -68,6 +89,8 @@ def test_menubar_submenus_are_stacked_above_overlay_and_hit_testable():
     assert rml.index('data-for="button : menu_render_buttons"') < rml.index(
         'data-for="button : menu_projection_buttons"'
     )
+    toolbar_button_rule = _rule_body(rcss, ".menu-toolbar-btn")
+    assert "transition: none;" in toolbar_button_rule
 
 
 def test_rml_tooltips_request_only_pending_animation_frames():
@@ -130,6 +153,14 @@ def test_menu_bar_uses_retained_bounds_for_submenu_hover():
     assert "RmlMenuBar::dropdownElementAtPoint" in menu_bar_cpp
     assert "GetAbsoluteOffset(Rml::BoxArea::Border)" in menu_bar_cpp
     assert "setOpenSubmenu(submenuIndexForElement(hit_element))" in menu_bar_cpp
+    assert "tooltip_.setHover(resolveRmlTooltip(hit_element), hit_element)" in menu_bar_cpp
+    assert "void sizeOpenDropdowns();" in menu_bar_header
+    assert "RmlMenuBar::sizeOpenDropdowns" in menu_bar_cpp
+    assert "GetScrollWidth()" in menu_bar_cpp
+    assert 'GetElementsByClassName(submenus, "submenu-popup")' in menu_bar_cpp
+    assert "element->GetDisplay() == Rml::Style::Display::None" in menu_bar_cpp
+    assert "tested against the previous submenu geometry" in menu_bar_cpp
+    assert "a fast following click cannot hit the previous menu's rows" in menu_bar_cpp
     assert "rml_context_->GetElementAtPoint" not in menu_bar_cpp
     assert 'action == "window_toggle_fullscreen"' not in menu_bar_cpp
     assert 'ctor.Bind("menu_camera_buttons", &camera_buttons_)' in menu_bar_cpp
@@ -196,6 +227,19 @@ def test_scene_header_hosts_asset_manager_launcher():
     assert 'id="asset-manager-button"' in scene_rml
     assert 'data-tooltip="toolbar.asset_manager"' in scene_rml
     assert ".scene-header-icon-button" in scene_rcss
+    header_rule = _rule_body(scene_rcss, ".scene-header-row")
+    assert "min-width: 0;" in header_rule
+    tab_bar_rule = _rule_body(scene_rcss, ".scene-tab-bar")
+    assert "min-width: 0;" in tab_bar_rule
+    assert "flex-grow: 1;" in tab_bar_rule
+    assert "flex-shrink: 1;" in tab_bar_rule
+    tab_rule = _rule_body(scene_rcss, ".scene-tab")
+    assert "min-width: 0;" in tab_rule
+    assert "flex-grow: 1;" in tab_rule
+    assert "flex-shrink: 1;" in tab_rule
+    assert "text-overflow: ellipsis;" in tab_rule
+    asset_button_rule = _rule_body(scene_rcss, ".scene-header-icon-button")
+    assert "flex-shrink: 0;" in asset_button_rule
     assert "width: 30dp;" in scene_rcss
     assert "height: 30dp;" in scene_rcss
     assert "width: 20dp;" in scene_rcss

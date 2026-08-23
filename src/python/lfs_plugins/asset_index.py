@@ -15,7 +15,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
-from .environment import value as environment_value
+from .environment import flag as environment_flag, value as environment_value
 
 _log = logging.getLogger(__name__)
 _T = TypeVar("_T")
@@ -64,11 +64,11 @@ def _storage_candidates() -> List[Path]:
     if env_value:
         candidates.append(Path(env_value))
 
-    candidates.append(LEGACY_STORAGE_PATH)
+    resolved_value = environment_value("LFS_RESOLVED_ASSET_LIBRARY_DIR")
+    if resolved_value:
+        candidates.append(Path(resolved_value))
 
-    xdg_data_home = environment_value("XDG_DATA_HOME")
-    if xdg_data_home:
-        candidates.append(Path(xdg_data_home) / "LichtFeldStudio" / "asset_manager")
+    candidates.append(LEGACY_STORAGE_PATH)
 
     appdata = environment_value("APPDATA")
     if appdata:
@@ -78,9 +78,6 @@ def _storage_candidates() -> List[Path]:
     if local_appdata:
         candidates.append(Path(local_appdata) / "LichtFeldStudio" / "asset_manager")
 
-    candidates.append(
-        Path.home() / ".local" / "share" / "LichtFeldStudio" / "asset_manager"
-    )
     candidates.append(Path(tempfile.gettempdir()) / "LichtFeldStudio" / "asset_manager")
     return _dedupe_paths(candidates)
 
@@ -149,7 +146,11 @@ def _copy_existing_storage(source_dir: Path, target_dir: Path) -> None:
 
 
 def resolve_asset_manager_storage_path() -> Path:
-    for candidate in _storage_candidates():
+    candidates = _storage_candidates()
+    if environment_flag("LFS_SAFE_MODE", False):
+        return candidates[0] if candidates else LEGACY_STORAGE_PATH
+
+    for candidate in candidates:
         if _path_accepts_writes(candidate):
             if candidate != LEGACY_STORAGE_PATH:
                 _copy_existing_storage(LEGACY_STORAGE_PATH, candidate)
@@ -227,7 +228,7 @@ class Scene:
         """Create from dictionary."""
         return cls(
             id=data["id"],
-            folder_id=data["folder_id"],
+            folder_id=data.get("folder_id") or DEFAULT_FOLDER_ID,
             name=data["name"],
             description=data.get("description", ""),
             created_at=data.get("created_at", datetime.now().isoformat()),
@@ -296,7 +297,7 @@ class AssetIndex:
         """Initialize with path to library.json.
 
         Args:
-            library_path: Path to library.json. Defaults to ~/.lichtfeld/asset_manager/library.json
+            library_path: Path to library.json. Defaults to the resolved Asset Manager data directory.
         """
         self._library_path = library_path or resolve_asset_manager_library_path()
         self._library_path.parent.mkdir(parents=True, exist_ok=True)
@@ -365,6 +366,21 @@ class AssetIndex:
             with open(self._library_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
+            # Shape-based migration from pre-#1265 schema (projects -> folders).
+            # Legacy files still claim version "1.0.0", so this must not rely on version.
+            migrated = False
+            if "folders" not in data and "projects" in data:
+                data["folders"] = data.pop("projects")
+                migrated = True
+            for scene_data in data.get("scenes", {}).values():
+                if "folder_id" not in scene_data and "project_id" in scene_data:
+                    scene_data["folder_id"] = scene_data.pop("project_id")
+                    migrated = True
+            for asset_data in data.get("assets", {}).values():
+                if "folder_id" not in asset_data and "project_id" in asset_data:
+                    asset_data["folder_id"] = asset_data.pop("project_id")
+                    migrated = True
+
             self._version = data.get("version", LIBRARY_VERSION)
             self._created_at = data.get("created_at", datetime.now().isoformat())
             self._modified_at = data.get("modified_at", datetime.now().isoformat())
@@ -396,6 +412,15 @@ class AssetIndex:
                 len(self._scenes),
                 len(self._assets),
             )
+            if migrated:
+                _log.info(
+                    "Migrated legacy library.json schema (projects -> folders)"
+                )
+                if not self.save():
+                    _log.error(
+                        "Failed to persist migrated library.json schema at %s",
+                        self._library_path,
+                    )
             return True
 
         except json.JSONDecodeError as exc:
@@ -412,6 +437,7 @@ class AssetIndex:
         Returns:
             True if saved successfully, False otherwise.
         """
+        temp_path_str: Optional[str] = None
         try:
             self._modified_at = datetime.now().isoformat()
 
@@ -452,18 +478,28 @@ class AssetIndex:
                     pass
                 raise
 
-            # Rotate: move current to backup if it still exists.
-            # Use a try/except to tolerate the race where the file disappears
-            # between the exists() check and the move.
+            # Refresh the backup without moving the live catalog away. The
+            # final os.replace therefore always replaces a valid destination
+            # atomically, including on Windows.
             backup_path = self._library_path.with_suffix(".json.bak")
+            backup_temp: Optional[Path] = None
             try:
                 if self._library_path.exists():
-                    shutil.move(str(self._library_path), str(backup_path))
+                    backup_temp = backup_path.with_suffix(backup_path.suffix + ".tmp")
+                    shutil.copy2(self._library_path, backup_temp)
+                    os.replace(backup_temp, backup_path)
             except FileNotFoundError:
                 pass  # Nothing to back up — proceed with the new file
+            finally:
+                if backup_temp is not None:
+                    try:
+                        backup_temp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
-            # Atomic rename temp -> final
-            os.rename(temp_path_str, str(self._library_path))
+            # Atomic replacement preserves the previous destination until the
+            # new catalog has been fully flushed.
+            os.replace(temp_path_str, self._library_path)
 
             _log.info(
                 "Saved library to %s (%d folders, %d scenes, %d assets)",
@@ -475,6 +511,11 @@ class AssetIndex:
             return True
 
         except Exception as exc:
+            if temp_path_str is not None:
+                try:
+                    Path(temp_path_str).unlink(missing_ok=True)
+                except OSError:
+                    pass
             _log.error(
                 "Failed to save library to %s: %s",
                 self._library_path,

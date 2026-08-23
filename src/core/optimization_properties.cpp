@@ -15,7 +15,8 @@ namespace lfs::core::param {
     using namespace lfs::core::prop;
 
     void register_optimization_properties() {
-        const OptimizationParameters d{};
+        // Registry defaults match the default strategy (MRNF), not bare struct {}.
+        const OptimizationParameters d = OptimizationParameters::mrnf_defaults();
         PropertyGroupBuilder<OptimizationParameters>("optimization", "Optimization")
             // Training control
             .size_prop(&OptimizationParameters::iterations,
@@ -187,6 +188,14 @@ namespace lfs::core::param {
             .json_required()
             .locale("training.refinement.stop_refine")
             .tooltip("training.tooltip.stop_refine")
+            .precision(0)
+            .ui_step(1000)
+            .all_strategies()
+            .size_prop(&OptimizationParameters::morton_reorder_interval,
+                       "morton_reorder_interval", "Morton Reorder", d.morton_reorder_interval, 0, 30000,
+                       "Reorder Gaussians by 3D Morton code every N iterations (0 disables)")
+            .locale("training.refinement.morton_reorder_interval")
+            .tooltip("training.tooltip.morton_reorder_interval")
             .precision(0)
             .ui_step(1000)
             .all_strategies()
@@ -503,6 +512,12 @@ namespace lfs::core::param {
             .json_key("use_ppisp")
             .locale("training_params.ppisp")
             .tooltip("training.tooltip.ppisp")
+            .all_strategies()
+            .bool_prop(&OptimizationParameters::ppisp_exposure_from_exif,
+                       "ppisp_exposure_from_exif", "EXIF Exposure", d.ppisp_exposure_from_exif,
+                       "Seed per-frame PPISP exposure from image EXIF")
+            .locale("training_params.ppisp_exposure_from_exif")
+            .tooltip("training.tooltip.ppisp_exposure_from_exif")
             .all_strategies()
             .float_prop(&OptimizationParameters::ppisp_lr,
                         "ppisp_lr", "PPISP Learning Rate", d.ppisp_lr, 0.0f, 0.1f,

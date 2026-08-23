@@ -156,6 +156,14 @@ namespace lfs::core {
         const std::filesystem::path& mask_path() const noexcept { return _mask_path; }
         const std::filesystem::path& depth_path() const noexcept { return _depth_path; }
         const std::filesystem::path& normal_path() const noexcept { return _normal_path; }
+
+        // Rewrites image/mask/depth/normal paths that live under old_root to the same
+        // relative location under new_root. Paths outside old_root are left unchanged.
+        // Sidecar caches and in-memory masks (set_mask_tensor) are not cleared: a
+        // dataset relocation keeps the same files, and injected masks do not originate
+        // from _mask_path.
+        void rebase_asset_paths(const std::filesystem::path& old_root,
+                                const std::filesystem::path& new_root);
         bool has_in_memory_mask() const noexcept { return _in_memory_mask_raw.is_valid(); }
         bool has_mask() const noexcept {
             return has_in_memory_mask() ||
@@ -169,6 +177,11 @@ namespace lfs::core {
         }
         bool has_alpha() const noexcept { return _has_alpha; }
         void set_has_alpha(bool v) noexcept { _has_alpha = v; }
+        // Set at dataset load when the bound image file is absent. Independent of
+        // scene-graph training_enabled (user disable). Dummy/test cameras keep the
+        // default true even if image_path does not exist.
+        bool has_image() const noexcept { return _has_image; }
+        void set_has_image(bool v) noexcept { _has_image = v; }
         CameraSplit split() const noexcept { return _split; }
         void set_split(const CameraSplit split) noexcept {
             assert((split == CameraSplit::Train || split == CameraSplit::Eval) && "Camera split must be Train or Eval");
@@ -216,6 +229,7 @@ namespace lfs::core {
         std::filesystem::path _depth_path;
         std::filesystem::path _normal_path;
         bool _has_alpha = false;
+        bool _has_image = true;
         CameraSplit _split = CameraSplit::Train;
         int _camera_width = 0;
         int _camera_height = 0;

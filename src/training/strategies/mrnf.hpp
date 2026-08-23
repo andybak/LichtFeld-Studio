@@ -10,6 +10,7 @@
 #include "kernels/mrnf_kernels.hpp"
 #include "optimizer/adam_optimizer.hpp"
 #include "optimizer/scheduler.hpp"
+#include "strategy_utils.hpp"
 #include <cassert>
 #include <memory>
 
@@ -18,6 +19,7 @@ class MRNFStrategyTest_GrowAndSplitResetsOptimizerStateForParents_Test;
 class MRNFStrategyTest_SHDegree0KeepsShNEmptyAndFusedAdamUsableAfterGrowth_Test;
 class MRNFStrategyTest_GrowAndSplitUsesIgsPlusSplitRule_Test;
 class MRNFStrategyTest_GrowAndSplitWithoutMaxCapExtendsBookkeepingMasks_Test;
+class MRNFStrategyTest_DeletedMaskCapacityGrowthPreservesExistingRows_Test;
 class MRNFStrategyTest_GrowAndSplitReplacementSkipsZeroWeightCandidates_Test;
 class MRNFStrategyTest_GrowAndSplitReusesFreeSlotsBeforeAppending_Test;
 class MRNFStrategyTest_SerializeRoundTripPreservesFreeMask_Test;
@@ -27,6 +29,7 @@ class MRNFStrategyTest_SetOptimizationParamsRecomputesDecayFromCurrentState_Test
 class MRNFStrategyTest_DegenerateBoundsStayInvalidAndKeepFiniteMeanLearningRate_Test;
 class MRNFStrategyTest_LineBoundsUseFiniteSceneScaleForMeanLearningRate_Test;
 class CropDampingStrategyTest_MrnfRejectedRowsAreNotRefineCandidatesAtZeroScale_Test;
+class MRNFStrategyTest_CompactSplatsCorrectAndPeakBelowThreeX_Test;
 
 namespace lfs::training {
 
@@ -45,6 +48,7 @@ namespace lfs::training {
         void post_backward(int iter, RenderOutput& render_output) override;
         bool is_refining(int iter) const override;
         void step(int iter) override;
+        void permute_gaussian_rows(const lfs::core::Tensor& perm) override;
 
         lfs::core::SplatData& get_model() override { return *_splat_data; }
         const lfs::core::SplatData& get_model() const override { return *_splat_data; }
@@ -78,6 +82,7 @@ namespace lfs::training {
         friend class ::MRNFStrategyTest_SHDegree0KeepsShNEmptyAndFusedAdamUsableAfterGrowth_Test;
         friend class ::MRNFStrategyTest_GrowAndSplitUsesIgsPlusSplitRule_Test;
         friend class ::MRNFStrategyTest_GrowAndSplitWithoutMaxCapExtendsBookkeepingMasks_Test;
+        friend class ::MRNFStrategyTest_DeletedMaskCapacityGrowthPreservesExistingRows_Test;
         friend class ::MRNFStrategyTest_GrowAndSplitReplacementSkipsZeroWeightCandidates_Test;
         friend class ::MRNFStrategyTest_GrowAndSplitReusesFreeSlotsBeforeAppending_Test;
         friend class ::MRNFStrategyTest_SerializeRoundTripPreservesFreeMask_Test;
@@ -87,6 +92,7 @@ namespace lfs::training {
         friend class ::MRNFStrategyTest_DegenerateBoundsStayInvalidAndKeepFiniteMeanLearningRate_Test;
         friend class ::MRNFStrategyTest_LineBoundsUseFiniteSceneScaleForMeanLearningRate_Test;
         friend class ::CropDampingStrategyTest_MrnfRejectedRowsAreNotRefineCandidatesAtZeroScale_Test;
+        friend class ::MRNFStrategyTest_CompactSplatsCorrectAndPeakBelowThreeX_Test;
 
         void refine(int iter);
         void grow_and_split(int iter, int pruned_count);
@@ -102,6 +108,7 @@ namespace lfs::training {
         [[nodiscard]] bool should_accumulate_edge_sample(int iter) const;
         [[nodiscard]] int edge_target_samples_per_refine_window() const;
         void reset_edge_accumulator();
+        void publish_vram_attribution() noexcept;
         size_t active_count() const;
         size_t free_count() const;
         [[nodiscard]] lfs::core::Tensor get_active_indices() const;
@@ -134,6 +141,18 @@ namespace lfs::training {
         int _edge_sample_count = 0;
         int _edge_last_sample_iter = -1;
         lfs::core::Tensor _free_mask;
+
+        DensifyChildWorkspace _densify_ws;
+        DensifyNScratch _densify_n_scratch;
+        lfs::core::Tensor _refine_counts_dev;
+        lfs::core::Tensor _refine_counts_host; // pinned staging optional; use vector
+
+        std::size_t _strategy_required_peak_bytes = 0;
+        std::size_t _strategy_allocated_peak_bytes = 0;
+        std::size_t _densify_n_required_peak_bytes = 0;
+        std::size_t _densify_n_allocated_peak_bytes = 0;
+        std::size_t _densify_child_required_peak_bytes = 0;
+        std::size_t _densify_child_allocated_peak_bytes = 0;
 
         mrnf_strategy::MRNFBounds _bounds = {};
         bool _bounds_valid = false;

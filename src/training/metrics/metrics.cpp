@@ -10,6 +10,7 @@
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
+#include "core/provenance.hpp"
 #include "core/splat_data.hpp"
 #include "io/cuda/image_format_kernels.cuh"
 #include "lfs/kernels/ssim.cuh"
@@ -17,6 +18,8 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <ctime>
+#include <iomanip>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
@@ -250,8 +253,14 @@ namespace lfs::training {
 
         // Get current time
         const auto now = std::chrono::system_clock::now();
-        const auto time_t = std::chrono::system_clock::to_time_t(now);
-        report_file << "Generated: " << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S") << "\n\n";
+        const auto time_t_val = std::chrono::system_clock::to_time_t(now);
+        std::tm tm{};
+#ifdef _WIN32
+        localtime_s(&tm, &time_t_val);
+#else
+        localtime_r(&time_t_val, &tm);
+#endif
+        report_file << "Generated: " << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "\n\n";
 
         // Summary statistics
         if (!all_metrics_.empty()) {
@@ -481,6 +490,9 @@ namespace lfs::training {
             } else {
                 r_output = fast_rasterize(*cam, splatData_mutable, background, _params.optimization.mip_filter);
             }
+            if (appearance_ && r_output.image.is_valid()) {
+                r_output.image = appearance_(r_output.image, *cam);
+            }
             r_output.image = r_output.image.clamp(0.0f, 1.0f);
 
             float psnr = 0.0f;
@@ -518,21 +530,28 @@ namespace lfs::training {
                     render_vis = r_output.image * mask_3d;
                 }
                 const std::vector<lfs::core::Tensor> rgb_images = {gt_vis, render_vis};
+                auto stamp = _params.include_provenance ? lfs::core::make_provenance_stamp()
+                                                        : lfs::core::make_minimal_provenance_stamp();
+                if (_params.include_provenance) {
+                    stamp.iteration = iteration;
+                    const auto strategy = lfs::core::param::canonical_strategy_name(_params.optimization.strategy);
+                    if (!strategy.empty())
+                        stamp.strategy = std::string(strategy);
+                }
                 lfs::core::image_io::save_images_async(
                     eval_dir / (std::to_string(image_idx) + ".png"),
                     rgb_images,
                     true, // horizontal
-                    4);   // separator width
+                    4,    // separator width
+                    lfs::core::provenance_to_json(stamp));
                 saved_images++;
             }
         }
 
-        // Wait for all images to be saved before computing final timing
+        // Wait for queued eval PNGs before returning so callers can read them
+        // without racing the BatchImageSaver workers.
         if (_params.optimization.enable_save_eval_images) {
-            const auto pending = lfs::core::image_io::BatchImageSaver::pending_count_if_initialized();
-            if (pending > 0) {
-                lfs::core::image_io::wait_for_pending_saves();
-            }
+            lfs::core::image_io::wait_for_pending_saves();
         }
 
         const auto end_time = std::chrono::steady_clock::now();

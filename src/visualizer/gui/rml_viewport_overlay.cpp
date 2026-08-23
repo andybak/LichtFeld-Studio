@@ -7,6 +7,7 @@
 #include "gui/gui_focus_state.hpp"
 #include "gui/panel_layout.hpp"
 #include "gui/rmlui/rml_document_utils.hpp"
+#include "gui/rmlui/rml_input_utils.hpp"
 #include "gui/rmlui/rml_theme.hpp"
 #include "gui/rmlui/rml_tooltip.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
@@ -21,7 +22,9 @@
 #include <RmlUi/Core/Input.h>
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <format>
+#include <limits>
 #include <vector>
 
 namespace lfs::vis::gui {
@@ -54,8 +57,10 @@ namespace lfs::vis::gui {
 
         [[nodiscard]] const Rml::Element* viewportOverlayHoverRoot(
             const Rml::Element* const element) {
-            for (auto* node = element; isInteractiveViewportOverlayElement(node);
-                 node = node->GetParentNode()) {
+            // Walk parents with an explicit null stop (matches isElementOrDescendantOf).
+            for (auto* node = element; node; node = node->GetParentNode()) {
+                if (!isInteractiveViewportOverlayElement(node))
+                    break;
                 if (isViewportOverlayHoverRoot(node))
                     return node;
             }
@@ -69,6 +74,17 @@ namespace lfs::vis::gui {
                     return true;
             }
             return false;
+        }
+
+        // Keep guiFocusState in sync with the overlay's live RmlUi focus so
+        // InputController shortcut dispatch sees text editing on the next key.
+        bool publishOverlayTextFocus(Rml::Element* focused) {
+            if (!rml_input::wantsTextInput(focused))
+                return false;
+            auto& focus = guiFocusState();
+            focus.want_capture_keyboard = true;
+            focus.want_text_input = true;
+            return true;
         }
 
     } // namespace
@@ -433,12 +449,18 @@ namespace lfs::vis::gui {
         gt_metrics_config_ = store.gt_metrics_overlay_config.get();
         camera_metrics_ = store.camera_metrics.get();
 
-        const auto vram_hud_state = store.vram_hud.get();
-        RmlViewportOverlay::VramHudOverlayState overlay_state;
-        if (vram_hud_state.visible && vram_hud_state.snapshot) {
-            overlay_state.visible = true;
-            overlay_state.snapshot = *vram_hud_state.snapshot;
-        }
+        const auto make_overlay_state = [&store]() {
+            RmlViewportOverlay::VramHudOverlayState overlay_state;
+            const auto vram_hud_state = store.vram_hud.get();
+            const auto perf_hud_state = store.perf_hud.get();
+            if (vram_hud_state.visible && vram_hud_state.snapshot) {
+                overlay_state.visible = true;
+                overlay_state.snapshot = *vram_hud_state.snapshot;
+            }
+            overlay_state.perf_hud = perf_hud_state;
+            return overlay_state;
+        };
+        const auto overlay_state = make_overlay_state();
         setVramHudOverlay(std::move(overlay_state));
 
         gt_metrics_config_subscription_ = store.gt_metrics_overlay_config.subscribe(
@@ -458,7 +480,19 @@ namespace lfs::vis::gui {
                     overlay.visible = true;
                     overlay.snapshot = *state.snapshot;
                 }
+                overlay.perf_hud = lfs::vis::app_store().perf_hud.get();
                 setVramHudOverlay(std::move(overlay));
+            });
+        perf_hud_subscription_ = store.perf_hud.subscribe(
+            [this](const lfs::vis::AppStore::PerfHud& state) {
+                auto overlay = lfs::vis::app_store().vram_hud.get();
+                VramHudOverlayState combined;
+                combined.perf_hud = state;
+                if (overlay.visible && overlay.snapshot) {
+                    combined.visible = true;
+                    combined.snapshot = *overlay.snapshot;
+                }
+                setVramHudOverlay(std::move(combined));
             });
 
         auto mark_document_dirty = [this](const auto&) {
@@ -700,10 +734,7 @@ namespace lfs::vis::gui {
             !input.text_inputs.empty() || input.has_text_editing;
         const bool vram_drag_capture = vram_hud_ && vram_hud_->isCapturingPointer();
         auto* const focused_before = rml_context_->GetFocusElement();
-        const bool focused_text_target =
-            focused_before &&
-            (focused_before->GetTagName() == "input" ||
-             focused_before->GetTagName() == "textarea");
+        const bool focused_text_target = rml_input::wantsTextInput(focused_before);
         if (mouse_pos_valid_ && !mouse_moved && !pointer_event && !pointer_drag &&
             !keyboard_event && !vram_drag_capture) {
             wants_input_ = hovered_interactive_ || focused_text_target;
@@ -716,8 +747,7 @@ namespace lfs::vis::gui {
             } else {
                 tooltip_.setHover({}, nullptr);
             }
-            if (focused_text_target)
-                guiFocusState().want_capture_keyboard = true;
+            publishOverlayTextFocus(focused_before);
             return;
         }
         auto* const point_element = is_inside
@@ -816,11 +846,8 @@ namespace lfs::vis::gui {
         // (e.g. the Annotations / Drill-down filter <input>). This must run regardless of
         // over_interactive, because a text input keeps focus even when the mouse roams away.
         if (auto* focused = rml_context_->GetFocusElement()) {
-            const auto tag = focused->GetTagName();
-            const bool is_text_target = tag == "input" || tag == "textarea";
-            if (is_text_target) {
+            if (publishOverlayTextFocus(focused)) {
                 wants_input_ = true;
-                guiFocusState().want_capture_keyboard = true;
                 // Numpad digit and period scancodes must be suppressed from
                 // ProcessKeyDown / ProcessKeyUp when a text input is focused,
                 // otherwise RmlUi treats them as navigation keys (Home, End,
@@ -908,6 +935,10 @@ namespace lfs::vis::gui {
         wrapper_ptr->SetProperty("width", "100%");
         wrapper_ptr->SetProperty("height", "100%");
         auto* wrapper = body->AppendChild(std::move(wrapper_ptr));
+        if (!wrapper) {
+            LOG_ERROR("RmlViewportOverlay: AppendChild failed for data-model wrapper");
+            return;
+        }
         markRenderNeeded(RenderReason::DataModelBinding);
 
         std::vector<Rml::Element*> children_to_move;
@@ -1000,7 +1031,9 @@ namespace lfs::vis::gui {
             rml_context_->SetDimensions(Rml::Vector2i(w, h));
             rml_context_->Update();
             queueCachedVulkanContext(true);
-            animation_active_ = (rml_context_->GetNextUpdateDelay() == 0);
+            const double next_delay = rml_context_->GetNextUpdateDelay();
+            next_update_delay_ = next_delay;
+            animation_active_ = (next_delay == 0.0);
             return;
         }
         const bool can_reuse = theme_current && !render_needed_ && !animation_active_ &&
@@ -1117,12 +1150,20 @@ namespace lfs::vis::gui {
         queueCachedVulkanContext(true);
         {
             LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.render.update.next_delay", 0.25);
-            animation_active_ = (rml_context_->GetNextUpdateDelay() == 0);
+            const double next_delay = rml_context_->GetNextUpdateDelay();
+            next_update_delay_ = next_delay;
+            animation_active_ = (next_delay == 0.0);
         }
         render_needed_ = false;
         render_reason_bits_ = 0;
         last_render_w_ = w;
         last_render_h_ = h;
+    }
+
+    std::optional<double> RmlViewportOverlay::nextScheduledUpdateDelay() const {
+        if (std::isfinite(next_update_delay_) && next_update_delay_ > 0.0)
+            return next_update_delay_;
+        return std::nullopt;
     }
 
 } // namespace lfs::vis::gui

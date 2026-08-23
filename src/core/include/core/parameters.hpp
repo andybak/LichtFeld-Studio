@@ -139,6 +139,8 @@ namespace lfs::core {
             size_t refine_every = 100;
             size_t start_refine = 500;
             size_t stop_refine = 25'000;
+            // 0 disables. Applied until stop_refine, at the densify-safe mutation point.
+            size_t morton_reorder_interval = 5'000;
             int sh_degree = 3;
             float opacity_reg = 0.01f;
             float scale_reg = 0.01f;
@@ -147,7 +149,7 @@ namespace lfs::core {
             int max_cap = 1000000;
 
             std::vector<size_t> eval_steps = {7'000, 30'000};  // Steps to evaluate the model
-            std::vector<size_t> save_steps = {7'000, 30'000};  // Steps to save the model
+            std::vector<size_t> save_steps = {7'000, 30'000};  // Steps at which to save the project (project.licht)
             bool bg_modulation = false;                        // Enable sinusoidal background modulation
             bool enable_eval = false;                          // Only evaluate when explicitly enabled
             bool enable_save_eval_images = true;               // Save during evaluation images
@@ -196,6 +198,7 @@ namespace lfs::core {
 
             // PPISP (Physically-Plausible ISP) parameters
             bool use_ppisp = false;
+            bool ppisp_exposure_from_exif = true;
             float ppisp_lr = 2e-3f;
             float ppisp_reg_weight = 0.001f;
             int ppisp_warmup_steps = 500;
@@ -235,6 +238,12 @@ namespace lfs::core {
             float init_rho = 0.0005f;
             float prune_ratio = 0.6f;
 
+            // Perf / profiling instruments (CLI-only; no env toggles)
+            bool perf_bench = false;     // --perf-bench → write perf_bench.json
+            int perf_bench_warmup = 200; // --perf-bench-warmup=N
+            int profile_start_iter = -1; // --profile-window=START:STOP
+            int profile_stop_iter = -1;  // one-past-last profiled iteration
+
             std::string config_file = "";
 
             void scale_steps(float ratio);
@@ -259,7 +268,6 @@ namespace lfs::core {
             bool use_cpu_memory = true;
             float min_cpu_free_memory_ratio = 0.1f; // make sure at least 10% RAM is free
             float min_cpu_free_GB = 1.0f;           // min GB we want to be free
-            bool use_fs_cache = true;
             bool print_cache_status = true;
             int print_status_freq_num = 500; // every print_status_freq_num calls for load print cache status
             bool use_16bit_color = false;
@@ -284,7 +292,8 @@ namespace lfs::core {
             bool invert_masks = false;
             float mask_threshold = 0.5f;
 
-            // Not serialized — UI-controlled per import.
+            // PRMS-authoritative pending import option (ownership matrix).
+            // DatasetConfig::to_json omits it; project PRMS round-trips it.
             std::string centralize_dataset = "off";
 
             nlohmann::json to_json() const;
@@ -310,12 +319,21 @@ namespace lfs::core {
             int height = 1080;
             int fps = 30;
             int crf = 18;
+            bool include_provenance = true; // always written to the format's metadata slot; caller chooses full vs minimal, writers fall back to minimal
         };
 
         struct LFS_CORE_API TrainingParameters {
             DatasetConfig dataset;
             OptimizationParameters optimization;
             ServerConfig server;
+
+            // Process-local startup policy. These flags deliberately do not
+            // belong to OptimizationParameters: saved training configurations
+            // must not make a later normal launch enter safe mode.
+            bool safe_mode = false;
+            bool reset_preferences = false;
+            bool reset_layout = false;
+            bool reset_all_settings = false;
 
             // Viewer mode: splat files to load (.ply, .sog, .spz, .usd, .usda, .usdc, .usdz, .resume)
             std::vector<std::filesystem::path> view_paths;
@@ -331,9 +349,24 @@ namespace lfs::core {
             std::vector<bool> add_splat_freeze;
             float freeze_lr_scale = 0.0f;
             bool exclude_frozen_add_splats_from_export = false;
+            bool include_provenance = true; // always written to the format's metadata slot; caller chooses full vs minimal, writers fall back to minimal
 
             // Checkpoint to resume training from
             std::optional<std::filesystem::path> resume_checkpoint = std::nullopt;
+
+            // Project to open as the GUI lifecycle document.
+            std::optional<std::filesystem::path> project_path = std::nullopt;
+
+            // Embedded CKPT project to resume training from. The display model
+            // is hydrated first; full trainer state must be loaded before
+            // train() is allowed to start.
+            std::optional<std::filesystem::path> resume_project = std::nullopt;
+
+            // Headless/integration-test trigger for the production training
+            // snapshot path. Empty unless the user passed --save-project-path;
+            // the trainer then falls back to the bound project destination.
+            std::optional<size_t> save_project_at_iteration = std::nullopt;
+            std::filesystem::path save_project_path;
 
             // Headless camera-path -> video render mode (see --render-camera-path)
             std::optional<RenderPathConfig> render_path = std::nullopt;
@@ -343,6 +376,9 @@ namespace lfs::core {
 
             // True when --bg-color was provided on the command line.
             bool cli_bg_color_set = false;
+            // True when -i/--iter was provided. Resume adapters use this to
+            // distinguish an explicit continuation target from the default.
+            bool cli_iterations_set = false;
 
             std::vector<int> disabled_camera_uids;
 
@@ -375,13 +411,15 @@ namespace lfs::core {
             OutputFormat format = OutputFormat::PLY;
             int sh_degree = 3; // 0-3, -1 = keep original
             int sog_iterations = 10;
+            int spz_version = 4; // SPZ container version: 4 (zstd) or 3 (legacy gzip)
             // PLY -> RAD only: replicate the source across an AxB ground-plane
             // grid instead of pre-tiling the input file.
             std::uint32_t tiles_x = 1;
             std::uint32_t tiles_y = 1;
             LodBuilder lod_builder = LodBuilder::BHATT;
             RadExportMode rad_export_mode = RadExportMode::Stream;
-            bool overwrite = false; // Skip overwrite prompts
+            bool overwrite = false;         // Skip overwrite prompts
+            bool include_provenance = true; // always written to the format's metadata slot; caller chooses full vs minimal, writers fall back to minimal
         };
 
         // Parameters for the mesh2splat command
@@ -392,7 +430,9 @@ namespace lfs::core {
             std::vector<OutputFormat> formats{OutputFormat::PLY};
             Mesh2SplatOptions options;
             int sog_iterations = 10;
+            int spz_version = 4; // SPZ container version: 4 (zstd) or 3 (legacy gzip)
             bool overwrite = false;
+            bool include_provenance = true; // always written to the format's metadata slot; caller chooses full vs minimal, writers fall back to minimal
         };
 
         enum class PreprocessOutputMode { Depth,

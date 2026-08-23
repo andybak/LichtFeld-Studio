@@ -9,10 +9,13 @@
 #include "core/parameters.hpp"
 #include "core/path_utils.hpp"
 #include "core/property_registry.hpp"
+#include "core/user_paths.hpp"
+#include "io/project_path.hpp"
 #include <algorithm>
 #include <any>
 #include <args.hxx>
 #include <array>
+#include <cctype>
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
@@ -38,6 +41,7 @@ namespace lfs::core::args {
             OptimizationCliBinding{"--strategy", "strategy", String, false, "; legacy aliases: mnrf, lfs"},
             OptimizationCliBinding{"--sh-degree", "sh_degree", Integer},
             OptimizationCliBinding{"--sh-degree-interval", "sh_degree_interval", Integer},
+            OptimizationCliBinding{"--morton-reorder-interval", "morton_reorder_interval", Integer},
             OptimizationCliBinding{"--max-cap", "max_cap", Integer},
             OptimizationCliBinding{"--min-opacity", "min_opacity", Float},
             OptimizationCliBinding{"--cropbox-lr-scale", "cropbox_lr_scale", Float},
@@ -69,6 +73,7 @@ namespace lfs::core::args {
             OptimizationCliBinding{"--enable-mip", "mip_filter", Bool},
             OptimizationCliBinding{"--bilateral-grid", "use_bilateral_grid", Bool},
             OptimizationCliBinding{"--ppisp", "ppisp", Bool},
+            OptimizationCliBinding{"--no-ppisp-exif-exposure", "ppisp_exposure_from_exif", Bool, true},
             OptimizationCliBinding{"--ppisp-controller", "ppisp_use_controller", Bool},
             OptimizationCliBinding{"--ppisp-freeze", "ppisp_freeze_from_sidecar", Bool},
             OptimizationCliBinding{"--gut", "gut", Bool},
@@ -284,6 +289,62 @@ namespace {
         return lfs::core::LogLevel::Info; // Default
     }
 
+    std::expected<void, std::string> apply_view_path(
+        lfs::core::param::TrainingParameters& params, const std::string& view_path_str) {
+        const std::filesystem::path view_path = lfs::core::utf8_to_path(view_path_str);
+
+        if (!std::filesystem::exists(view_path)) {
+            return std::unexpected(
+                std::format("Path does not exist: {}", lfs::core::path_to_utf8(view_path)));
+        }
+
+        constexpr std::array<std::string_view, 13> SUPPORTED_EXTENSIONS = {
+            ".ply", ".sog", ".spz", ".rad", ".resume",
+            ".obj", ".fbx", ".gltf", ".glb", ".stl", ".dae", ".3ds", ".blend"};
+        const auto is_supported = [&](const std::filesystem::path& p) {
+            auto ext = p.extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            return std::ranges::find(SUPPORTED_EXTENSIONS, ext) != SUPPORTED_EXTENSIONS.end();
+        };
+
+        if (std::filesystem::is_directory(view_path)) {
+            for (const auto& entry : std::filesystem::directory_iterator(view_path)) {
+                if (entry.is_regular_file() && is_supported(entry.path())) {
+                    params.view_paths.push_back(entry.path());
+                }
+            }
+            std::ranges::sort(params.view_paths);
+
+            if (params.view_paths.empty()) {
+                return std::unexpected(std::format(
+                    "No supported files found in: {}", lfs::core::path_to_utf8(view_path)));
+            }
+            LOG_DEBUG("Found {} view files in directory", params.view_paths.size());
+            return {};
+        }
+
+        auto extension = view_path.extension().string();
+        std::ranges::transform(
+            extension, extension.begin(),
+            [](const unsigned char character) {
+                return static_cast<char>(std::tolower(character));
+            });
+        if (extension == ".licht") {
+            if (!lfs::io::project::isPublishedLichtPath(view_path)) {
+                return std::unexpected(
+                    lfs::io::project::unpublishedLichtUserMessage(view_path));
+            }
+            params.project_path = view_path;
+            return {};
+        }
+        if (!is_supported(view_path)) {
+            return std::unexpected(std::format(
+                "Unsupported file format: {}", lfs::core::path_to_utf8(view_path)));
+        }
+        params.view_paths.push_back(view_path);
+        return {};
+    }
+
     std::expected<std::tuple<ParseResult, std::function<void()>>, std::string> parse_arguments(
         const std::vector<std::string>& args,
         lfs::core::param::TrainingParameters& params) {
@@ -302,6 +363,9 @@ namespace {
                 "\n"
                 "EXAMPLES:\n"
                 "lichtfeld-studio -d ./data -o ./output\n"
+                "lichtfeld-studio -v session.licht\n"
+                "lichtfeld-studio --headless --resume session.licht\n"
+                "lichtfeld-studio -d ./data -o ./output --save-project-at-iter 7000\n"
                 "lichtfeld-studio --resume checkpoint.resume\n"
                 "lichtfeld-studio --render-camera-path path.json --render-load model.ply --render-output out.mp4\n"
                 "lichtfeld-studio -v model.ply\n"
@@ -320,8 +384,8 @@ namespace {
             ::args::Group mode_group(parser, "MODE SELECTION:");
             ::args::HelpFlag help(mode_group, "help", "Display help menu", {'h', "help"});
             ::args::Flag version(mode_group, "version", "Display version information", {'V', "version"});
-            ::args::ValueFlag<std::string> view_ply(mode_group, "path", "View file(s). Supports splat (.ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz) and mesh (.obj, .fbx, .gltf, .glb, .stl) formats. If directory, loads all.", {'v', "view"});
-            ::args::ValueFlag<std::string> resume_checkpoint(mode_group, "checkpoint", "Resume training from checkpoint file", {"resume"});
+            ::args::ValueFlag<std::string> view_ply(mode_group, "path", "View file(s). Supports projects (.licht), splat (.ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz) and mesh (.obj, .fbx, .gltf, .glb, .stl) formats. If directory, loads all.", {'v', "view"});
+            ::args::ValueFlag<std::string> resume_checkpoint(mode_group, "checkpoint", "Resume training from a .resume checkpoint or .licht project", {"resume"});
             ::args::ValueFlag<std::string> render_camera_path(mode_group, "path", "Render a JSON camera-keyframe path to video, headless (no GUI/window). Requires --render-load and --render-output; see RENDER PATH options.", {"render-camera-path"});
             ::args::CompletionFlag completion(parser, {"complete"});
 
@@ -339,6 +403,7 @@ namespace {
             ::args::CounterFlag freeze(paths_group, "freeze", "Freeze the immediately preceding --add-splat rows from optimizer gradients and densification", {"freeze"});
             ::args::ValueFlag<float> freeze_lr_scale(paths_group, "scale", "Learning-rate scale for frozen splats (0 = fully frozen, default; try 0.01-0.1 to let frozen splats absorb small appearance mismatch)", {"freeze-lr-scale"});
             ::args::Flag exclude_export(paths_group, "exclude_export", "Exclude frozen --add-splat rows from PLY exports", {"exclude-export"});
+            ::args::Flag no_provenance(paths_group, "no-provenance", "Strip identifying metadata (export id, timestamps, training info) from outputs; a minimal build stamp is always embedded", {"no-provenance"});
 
             ::args::ValueFlag<std::string> import_cameras(paths_group, "path", "Import COLMAP cameras from sparse folder (no images required)", {"import-cameras"});
 
@@ -353,6 +418,7 @@ namespace {
             ::args::ValueFlag<int> render_height(render_path_group, "height", "Output height (default 1080)", {"render-height"});
             ::args::ValueFlag<int> render_fps(render_path_group, "fps", "Output framerate (default 30)", {"render-fps"});
             ::args::ValueFlag<int> render_crf(render_path_group, "crf", "Video quality, lower=better (default 18)", {"render-crf"});
+            ::args::Group render_path_provenance_note(render_path_group, "  Metadata: videos always embed a minimal build stamp; --no-provenance strips identifying metadata");
 
             // =============================================================================
             // TRAINING PARAMETERS
@@ -363,6 +429,7 @@ namespace {
             ::args::ValueFlag<std::string> strategy(training_group, "strategy", lfs::core::args::optimization_cli_help("--strategy"), {"strategy"});
             ::args::ValueFlag<int> sh_degree(training_group, "sh_degree", lfs::core::args::optimization_cli_help("--sh-degree"), {"sh-degree"});
             ::args::ValueFlag<int> sh_degree_interval(training_group, "sh_degree_interval", lfs::core::args::optimization_cli_help("--sh-degree-interval"), {"sh-degree-interval"});
+            ::args::ValueFlag<int> morton_reorder_interval(training_group, "morton_reorder_interval", lfs::core::args::optimization_cli_help("--morton-reorder-interval"), {"morton-reorder-interval"});
             ::args::ValueFlag<int> max_cap(training_group, "max_cap", lfs::core::args::optimization_cli_help("--max-cap"), {"max-cap"});
             ::args::ValueFlag<float> min_opacity(training_group, "min_opacity", lfs::core::args::optimization_cli_help("--min-opacity"), {"min-opacity"});
             ::args::ValueFlag<float> cropbox_lr_scale(training_group, "scale", lfs::core::args::optimization_cli_help("--cropbox-lr-scale"), {"cropbox-lr-scale"});
@@ -402,7 +469,6 @@ namespace {
             ::args::ValueFlag<int> max_width(dataset_group, "max_width", "Max width of images in px; 0 disables the cap (default: 3840)", {"max-width"});
             ::args::ValueFlag<int> min_track_length(dataset_group, "min_track_length", "Minimum point track length for COLMAP sparse point import; 0 disables filtering", {"min-track-length"});
             ::args::Flag no_cpu_cache(dataset_group, "no_cpu_cache", "Disable CPU memory caching (default: enabled)", {"no-cpu-cache"});
-            ::args::Flag no_fs_cache(dataset_group, "no_fs_cache", "Disable filesystem caching (default: enabled)", {"no-fs-cache"});
             ::args::Flag use_16bit(dataset_group, "use_16bit", "Train with 16-bit color images (HDR); caches losslessly as JPEG 2000 (default: 8-bit)", {"use-16bit"});
             ::args::Flag undistort(dataset_group, "undistort", lfs::core::args::optimization_cli_help("--undistort"), {"undistort"});
             ::args::MapFlag<std::string, std::string> centralize(dataset_group, "mode",
@@ -456,6 +522,7 @@ namespace {
             ::args::Flag enable_mip(rendering_group, "enable_mip", lfs::core::args::optimization_cli_help("--enable-mip"), {"enable-mip"});
             ::args::Flag use_bilateral_grid(rendering_group, "bilateral_grid", lfs::core::args::optimization_cli_help("--bilateral-grid"), {"bilateral-grid"});
             ::args::Flag use_ppisp(rendering_group, "ppisp", lfs::core::args::optimization_cli_help("--ppisp"), {"ppisp"});
+            ::args::Flag no_ppisp_exif_exposure(rendering_group, "no_ppisp_exif_exposure", lfs::core::args::optimization_cli_help("--no-ppisp-exif-exposure"), {"no-ppisp-exif-exposure"});
             ::args::Flag ppisp_controller(rendering_group, "ppisp_controller", lfs::core::args::optimization_cli_help("--ppisp-controller"), {"ppisp-controller"});
             ::args::Flag ppisp_freeze_from_sidecar(rendering_group, "ppisp_freeze", lfs::core::args::optimization_cli_help("--ppisp-freeze"), {"ppisp-freeze"});
             ::args::ValueFlag<std::string> ppisp_sidecar_path(rendering_group, "path", "Path to PPISP sidecar (.ppisp) used for frozen PPISP training", {"ppisp-sidecar"});
@@ -470,6 +537,14 @@ namespace {
             ::args::Flag no_save_eval_images(output_group, "no_save_eval_images", "Disable saving of evaluation comparison images (GT vs rendered) during eval (default: enabled)", {"no-save-eval-images"});
             ::args::ValueFlagList<std::string> timelapse_images(output_group, "timelapse_images", "Image filenames to render timelapse images for", {"timelapse-images"});
             ::args::ValueFlag<int> timelapse_every(output_group, "timelapse_every", "Render timelapse image every N iterations (default: 50)", {"timelapse-every"});
+            ::args::ValueFlag<uint32_t> save_project_at_iteration(
+                output_group, "iteration",
+                "Save a .licht project through the training snapshot service at this iteration",
+                {"save-project-at-iter"});
+            ::args::ValueFlag<std::string> save_project_path(
+                output_group, "path",
+                "Destination for --save-project-at-iter. If omitted, the bound project path is used",
+                {"save-project-path"});
 
             // =============================================================================
             // UI OPTIONS
@@ -478,11 +553,30 @@ namespace {
             ::args::Group ui_group(parser, "UI OPTIONS:");
             ::args::Flag headless(ui_group, "headless", lfs::core::args::optimization_cli_help("--headless"), {"headless"});
             ::args::Flag auto_train(ui_group, "train", "Start training immediately on startup", {"train"});
+            ::args::Flag safe_mode(ui_group, "safe_mode", "Start with user plugins disabled (recovery mode)", {"safe-mode"});
+            ::args::Flag reset_preferences(ui_group, "reset_preferences", "Back up and reset application preferences", {"reset-preferences"});
+            ::args::Flag reset_layout(ui_group, "reset_layout", "Back up and reset the UI layout", {"reset-layout"});
+            ::args::Flag reset_all_settings(ui_group, "reset_all_settings", "Back up and reset application preferences, UI layout, and window state", {"reset-all-settings"});
 #ifndef LFS_BUILD_PORTABLE
             ::args::Flag no_splash(ui_group, "no_splash", "Skip splash screen on startup", {"no-splash"});
 #endif
             ::args::Flag debug_python(ui_group, "debug_python", "Start debugpy listener on port 5678 for plugin debugging", {"debug-python"});
             ::args::ValueFlag<int> debug_python_port(ui_group, "port", "Port for debugpy listener (default: 5678)", {"debug-python-port"});
+
+            // =============================================================================
+            // PERF / PROFILING
+            // =============================================================================
+            ::args::Group perf_sep(parser, " ");
+            ::args::Group perf_group(parser, "PERF / PROFILING:");
+            ::args::Flag perf_bench(perf_group, "perf_bench",
+                                    "Enable in-process perf bench collector (writes output/perf_bench.json)",
+                                    {"perf-bench"});
+            ::args::ValueFlag<int> perf_bench_warmup(perf_group, "N",
+                                                     "Warmup iterations excluded from steady-state metrics (default: 200)",
+                                                     {"perf-bench-warmup"});
+            ::args::ValueFlag<std::string> profile_window(perf_group, "START:STOP",
+                                                          "cudaProfilerStart/Stop window [START, STOP); enables per-iter NVTX ranges",
+                                                          {"profile-window"});
 
             // =============================================================================
             // LOGGING
@@ -547,7 +641,11 @@ namespace {
                     filter_pattern = ::args::get(log_filter);
                 }
 
-                lfs::core::Logger::get().init(level, log_file_path, filter_pattern);
+                std::string default_log_root;
+                if (const auto paths = lfs::core::UserPaths::resolve())
+                    default_log_root = lfs::core::path_to_utf8(paths->logDir().parent_path());
+                lfs::core::Logger::get().init(
+                    level, log_file_path, filter_pattern, false, default_log_root);
 
                 LOG_DEBUG("Logger initialized with level: {}", static_cast<int>(level));
                 if (!filter_pattern.empty()) {
@@ -563,50 +661,45 @@ namespace {
                 return std::make_tuple(ParseResult::Help, std::function<void()>{});
             }
 
+            // Validate --profile-window early (START:STOP integers, START < STOP).
+            std::optional<int> parsed_profile_start;
+            std::optional<int> parsed_profile_stop;
+            if (profile_window) {
+                const auto win = ::args::get(profile_window);
+                const auto colon = win.find(':');
+                if (colon == std::string::npos) {
+                    return std::unexpected(
+                        "--profile-window expects START:STOP (e.g. 200:500)");
+                }
+                try {
+                    parsed_profile_start = std::stoi(win.substr(0, colon));
+                    parsed_profile_stop = std::stoi(win.substr(colon + 1));
+                } catch (const std::exception&) {
+                    return std::unexpected(
+                        "--profile-window expects integer START:STOP (e.g. 200:500)");
+                }
+                if (*parsed_profile_start < 0 || *parsed_profile_stop < 0 ||
+                    *parsed_profile_stop <= *parsed_profile_start) {
+                    return std::unexpected(
+                        "--profile-window requires 0 <= START < STOP");
+                }
+            }
+
+            params.include_provenance = !no_provenance;
+
             // NO ARGUMENTS = VIEWER MODE (empty)
             if (args.size() == 1) {
                 return std::make_tuple(ParseResult::Success, std::function<void()>{});
             }
 
-            // Viewer mode: file or directory
+            // Viewer mode: file or directory. Bare positional paths are rewritten to
+            // -v in parse_args_and_params so they share this branch.
             if (view_ply) {
                 const auto& view_path_str = ::args::get(view_ply);
                 if (!view_path_str.empty()) {
-                    const std::filesystem::path view_path = lfs::core::utf8_to_path(view_path_str);
-
-                    if (!std::filesystem::exists(view_path)) {
-                        return std::unexpected(std::format("Path does not exist: {}", lfs::core::path_to_utf8(view_path)));
-                    }
-
-                    constexpr std::array<std::string_view, 13> SUPPORTED_EXTENSIONS = {
-                        ".ply", ".sog", ".spz", ".rad", ".resume",
-                        ".obj", ".fbx", ".gltf", ".glb", ".stl", ".dae", ".3ds", ".blend"};
-                    const auto is_supported = [&](const std::filesystem::path& p) {
-                        auto ext = p.extension().string();
-                        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                        return std::ranges::find(SUPPORTED_EXTENSIONS, ext) != SUPPORTED_EXTENSIONS.end();
-                    };
-
-                    if (std::filesystem::is_directory(view_path)) {
-                        for (const auto& entry : std::filesystem::directory_iterator(view_path)) {
-                            if (entry.is_regular_file() && is_supported(entry.path())) {
-                                params.view_paths.push_back(entry.path());
-                            }
-                        }
-                        std::ranges::sort(params.view_paths);
-
-                        if (params.view_paths.empty()) {
-                            return std::unexpected(std::format(
-                                "No supported files found in: {}", lfs::core::path_to_utf8(view_path)));
-                        }
-                        LOG_DEBUG("Found {} view files in directory", params.view_paths.size());
-                    } else {
-                        if (!is_supported(view_path)) {
-                            return std::unexpected(std::format(
-                                "Unsupported file format: {}", lfs::core::path_to_utf8(view_path)));
-                        }
-                        params.view_paths.push_back(view_path);
-                    }
+                    const auto applied = apply_view_path(params, view_path_str);
+                    if (!applied)
+                        return std::unexpected(applied.error());
                 }
 
                 if (gut) {
@@ -651,6 +744,7 @@ namespace {
                 if (render_crf) {
                     cfg.crf = ::args::get(render_crf);
                 }
+                cfg.include_provenance = params.include_provenance;
                 params.render_path = cfg;
 
                 return std::make_tuple(ParseResult::Success, std::function<void()>{});
@@ -680,10 +774,27 @@ namespace {
                     if (!std::filesystem::exists(ckpt_path)) {
                         return std::unexpected(std::format("Checkpoint file does not exist: {}", ckpt_path_str));
                     }
-                    params.resume_checkpoint = ckpt_path;
+                    auto extension = ckpt_path.extension().string();
+                    std::ranges::transform(
+                        extension, extension.begin(),
+                        [](const unsigned char character) {
+                            return static_cast<char>(
+                                std::tolower(character));
+                        });
+                    if (extension == ".licht") {
+                        if (!lfs::io::project::isPublishedLichtPath(
+                                ckpt_path)) {
+                            return std::unexpected(
+                                lfs::io::project::
+                                    unpublishedLichtUserMessage(
+                                        ckpt_path));
+                        }
+                        params.resume_project = ckpt_path;
+                    } else {
+                        params.resume_checkpoint = ckpt_path;
+                    }
                 }
             }
-
             if (init_path) {
                 const auto path_str = ::args::get(init_path);
                 params.init_path = path_str;
@@ -716,12 +827,16 @@ namespace {
             // Training mode
             const bool has_data_path = data_path && !::args::get(data_path).empty();
             const bool has_output_path = output_path && !::args::get(output_path).empty();
-            const bool has_resume = params.resume_checkpoint.has_value();
+            const bool has_resume =
+                params.resume_checkpoint.has_value() ||
+                params.resume_project.has_value();
 
-            // If headless mode, require data path or resume checkpoint
+            // If headless mode, require data path or resume
+            // (--resume accepts both .resume checkpoints and .licht projects).
             if (headless && !has_data_path && !has_resume) {
                 return std::unexpected(std::format(
-                    "ERROR: Headless mode requires --data-path or --resume\n\n{}",
+                    "ERROR: Headless mode requires --data-path or --resume "
+                    "(--resume file.licht counts as a project source)\n\n{}",
                     parser.Help()));
             }
 
@@ -811,6 +926,13 @@ namespace {
                 }
             }
 
+            if (morton_reorder_interval) {
+                const int interval = ::args::get(morton_reorder_interval);
+                if (interval < 0) {
+                    return std::unexpected("ERROR: --morton-reorder-interval must be >= 0 (0 disables)");
+                }
+            }
+
             // Validate min_opacity (0.0-1.0)
             if (min_opacity) {
                 float opacity = ::args::get(min_opacity);
@@ -882,7 +1004,6 @@ namespace {
                                         max_width_val = max_width ? std::optional<int>(::args::get(max_width)) : std::optional<int>(3840),
                                         min_track_length_val = cli_option_present({"--min-track-length"}) ? std::optional<int>(::args::get(min_track_length)) : std::optional<int>(),
                                         no_cpu_cache_flag = static_cast<bool>(no_cpu_cache),
-                                        no_fs_cache_flag = static_cast<bool>(no_fs_cache),
                                         use_16bit_flag = static_cast<bool>(use_16bit),
                                         tcp_server_connection_port_val = tcp_server_connection_port ? std::optional<int>(::args::get(tcp_server_connection_port)) : std::optional<int>(),
                                         tcp_broadcast_connection_port_val = tcp_broadcast_connection_port ? std::optional<int>(::args::get(tcp_broadcast_connection_port)) : std::optional<int>(),
@@ -893,6 +1014,7 @@ namespace {
                                         test_every_val = cli_option_present({"--test-every"}) ? std::optional<int>(::args::get(test_every)) : std::optional<int>(),
                                         steps_scaler_val = cli_option_present({"--steps-scaler"}) ? std::optional<float>(::args::get(steps_scaler)) : std::optional<float>(),
                                         sh_degree_interval_val = cli_option_present({"--sh-degree-interval"}) ? std::optional<int>(::args::get(sh_degree_interval)) : std::optional<int>(),
+                                        morton_reorder_interval_val = cli_option_present({"--morton-reorder-interval"}) ? std::optional<int>(::args::get(morton_reorder_interval)) : std::optional<int>(),
                                         sh_degree_val = cli_option_present({"--sh-degree"}) ? std::optional<int>(::args::get(sh_degree)) : std::optional<int>(),
                                         min_opacity_val = cli_option_present({"--min-opacity"}) ? std::optional<float>(::args::get(min_opacity)) : std::optional<float>(),
                                         cropbox_lr_scale_val = cli_option_present({"--cropbox-lr-scale"}) ? std::optional<float>(::args::get(cropbox_lr_scale)) : std::optional<float>(),
@@ -906,6 +1028,11 @@ namespace {
                                         sparsify_steps_val = cli_option_present({"--sparsify-steps"}) ? std::optional<int>(::args::get(sparsify_steps)) : std::optional<int>(),
                                         init_rho_val = cli_option_present({"--init-rho"}) ? std::optional<float>(::args::get(init_rho)) : std::optional<float>(),
                                         prune_ratio_val = cli_option_present({"--prune-ratio"}) ? std::optional<float>(::args::get(prune_ratio)) : std::optional<float>(),
+                                        // Perf / profiling
+                                        perf_bench_flag = bool(perf_bench),
+                                        perf_bench_warmup_val = cli_option_present({"--perf-bench-warmup"}) ? std::optional<int>(::args::get(perf_bench_warmup)) : std::optional<int>(),
+                                        profile_start_val = parsed_profile_start,
+                                        profile_stop_val = parsed_profile_stop,
                                         // Mask parameters
                                         mask_mode_val = cli_option_present({"--mask-mode"}) ? std::optional<lfs::core::param::MaskMode>(::args::get(mask_mode)) : std::optional<lfs::core::param::MaskMode>(),
                                         depth_loss_weight_val = cli_option_present({"--depth-loss-weight"}) ? std::optional<float>(::args::get(depth_loss_weight)) : std::optional<float>(),
@@ -921,12 +1048,17 @@ namespace {
                                         enable_mip_flag = bool(enable_mip),
                                         use_bilateral_grid_flag = bool(use_bilateral_grid),
                                         use_ppisp_flag = bool(use_ppisp),
+                                        no_ppisp_exif_exposure_flag = bool(no_ppisp_exif_exposure),
                                         ppisp_controller_flag = bool(ppisp_controller),
                                         ppisp_freeze_from_sidecar_flag = bool(ppisp_freeze_from_sidecar),
                                         ppisp_sidecar_path_val = cli_option_present({"--ppisp-sidecar"}) ? std::optional<std::string>(::args::get(ppisp_sidecar_path)) : std::optional<std::string>(),
                                         enable_eval_flag = bool(enable_eval),
                                         headless_flag = bool(headless),
                                         auto_train_flag = bool(auto_train),
+                                        safe_mode_flag = bool(safe_mode),
+                                        reset_preferences_flag = bool(reset_preferences),
+                                        reset_layout_flag = bool(reset_layout),
+                                        reset_all_settings_flag = bool(reset_all_settings),
 #ifdef LFS_BUILD_PORTABLE
                                         no_splash_flag = false,
 #else
@@ -950,6 +1082,14 @@ namespace {
                                         no_edge_map_flag = bool(no_edge_map),
                                         freeze_lr_scale_val = cli_option_present({"--freeze-lr-scale"}) ? std::optional<float>(::args::get(freeze_lr_scale)) : std::optional<float>(),
                                         exclude_export_flag = bool(exclude_export),
+                                        save_project_at_iteration_val =
+                                            cli_option_present({"--save-project-at-iter"})
+                                                ? std::optional<uint32_t>(::args::get(save_project_at_iteration))
+                                                : std::optional<uint32_t>(),
+                                        save_project_path_val =
+                                            cli_option_present({"--save-project-path"})
+                                                ? std::optional<std::string>(::args::get(save_project_path))
+                                                : std::optional<std::string>(),
                                         output_name_val = cli_option_present({"--output-name"}) ? std::optional<std::string>(::args::get(output_name)) : std::optional<std::string>()]() {
                 auto& opt = params.optimization;
                 auto& svs = params.server;
@@ -968,13 +1108,13 @@ namespace {
 
                 // Apply all overrides
                 setVal(iterations_val, opt.iterations);
+                params.cli_iterations_set =
+                    iterations_val.has_value();
                 setVal(resize_factor_val, ds.resize_factor);
                 setVal(max_width_val, ds.max_width);
                 setVal(min_track_length_val, ds.min_track_length);
                 if (no_cpu_cache_flag)
                     ds.loading_params.use_cpu_memory = false;
-                if (no_fs_cache_flag)
-                    ds.loading_params.use_fs_cache = false;
                 setFlag(use_16bit_flag, ds.loading_params.use_16bit_color);
                 setVal(max_cap_val, opt.max_cap);
                 setVal(tcp_server_connection_port_val, svs.tcp_server_connection_port);
@@ -984,6 +1124,9 @@ namespace {
                 setVal(test_every_val, ds.test_every);
                 setVal(steps_scaler_val, opt.steps_scaler);
                 setVal(sh_degree_interval_val, opt.sh_degree_interval);
+                if (morton_reorder_interval_val) {
+                    opt.morton_reorder_interval = static_cast<size_t>(*morton_reorder_interval_val);
+                }
                 setVal(sh_degree_val, opt.sh_degree);
                 setVal(min_opacity_val, opt.min_opacity);
                 setVal(cropbox_lr_scale_val, opt.cropbox_lr_scale);
@@ -994,15 +1137,31 @@ namespace {
                 setVal(timelapse_images_val, ds.timelapse_images);
                 setVal(timelapse_every_val, ds.timelapse_every);
                 setVal(output_name_val, ds.output_name);
+                if (save_project_at_iteration_val) {
+                    params.save_project_at_iteration =
+                        static_cast<size_t>(*save_project_at_iteration_val);
+                }
+                if (save_project_path_val) {
+                    params.save_project_path =
+                        lfs::core::utf8_to_path(*save_project_path_val);
+                }
 
                 // Sparsity parameters
                 setVal(sparsify_steps_val, opt.sparsify_steps);
                 setVal(init_rho_val, opt.init_rho);
                 setVal(prune_ratio_val, opt.prune_ratio);
 
+                // Perf / profiling
+                setFlag(perf_bench_flag, opt.perf_bench);
+                setVal(perf_bench_warmup_val, opt.perf_bench_warmup);
+                setVal(profile_start_val, opt.profile_start_iter);
+                setVal(profile_stop_val, opt.profile_stop_iter);
+
                 setFlag(enable_mip_flag, opt.mip_filter);
                 setFlag(use_bilateral_grid_flag, opt.use_bilateral_grid);
                 setFlag(use_ppisp_flag, opt.use_ppisp);
+                if (no_ppisp_exif_exposure_flag)
+                    opt.ppisp_exposure_from_exif = false;
                 setFlag(ppisp_controller_flag, opt.ppisp_use_controller);
                 setFlag(ppisp_freeze_from_sidecar_flag, opt.ppisp_freeze_from_sidecar);
                 if (ppisp_sidecar_path_val) {
@@ -1015,6 +1174,10 @@ namespace {
                 setFlag(enable_eval_flag, opt.enable_eval);
                 setFlag(headless_flag, opt.headless);
                 setFlag(auto_train_flag, opt.auto_train);
+                setFlag(safe_mode_flag, params.safe_mode);
+                setFlag(reset_preferences_flag, params.reset_preferences);
+                setFlag(reset_layout_flag, params.reset_layout);
+                setFlag(reset_all_settings_flag, params.reset_all_settings);
                 setFlag(no_splash_flag, opt.no_splash);
                 setFlag(debug_python_flag, opt.debug_python);
                 setVal(debug_python_port_val, opt.debug_python_port);
@@ -1177,12 +1340,16 @@ namespace {
         "\n"
         "EXAMPLES:\n"
         "  LichtFeld-Studio convert input.ply output.spz --sh-degree 0\n"
+        "  LichtFeld-Studio convert input.ply output.spz --spz-version 3\n"
         "  LichtFeld-Studio convert input.ply -f html\n"
         "  LichtFeld-Studio convert ./splats/ -f sog --sh-degree 2\n"
+        "  LichtFeld-Studio convert project.licht output.ply\n"
         "\n"
         "SUPPORTED FORMATS:\n"
-        "  Input:  .ply, .sog, .spz, .usd, .usda, .usdc, .usdz, .resume (checkpoint)\n"
+        "  Input:  .ply, .sog, .spz, .usd, .usda, .usdc, .usdz, .resume (checkpoint), .licht (project)\n"
         "  Output: .ply, .sog, .spz, .usd, .usda, .usdc, .html, .rad\n"
+        "  SPZ:    --spz-version 4 (default, zstd) or 3 (legacy gzip)\n"
+        "  Metadata: --no-provenance strips identifying metadata; a minimal build stamp is always embedded\n"
         "\n";
 
     constexpr const char* MESH2SPLAT_HELP_HEADER = "LichtFeld Studio - Convert mesh files to Gaussian splats\n";
@@ -1198,6 +1365,7 @@ namespace {
         "  Input:  .obj, .fbx, .gltf, .glb, .stl, .dae, .3ds, .ply\n"
         "  Output: .ply, .sog, .spz, .usd, .usda, .usdc, .html, .rad\n"
         "  Multiple output formats: pass a comma-separated list to --format\n"
+        "  Metadata: --no-provenance strips identifying metadata; a minimal build stamp is always embedded\n"
         "\n";
 
     constexpr const char* PREPROCESS_HELP_HEADER = "LichtFeld Studio - Generate dataset depth and normal maps with MoGe-2 ONNX\n";
@@ -1279,6 +1447,8 @@ namespace {
         ::args::Positional<std::string> output(parser, "output", "Output file (optional)");
         ::args::ValueFlag<int> sh_degree(parser, "degree", "SH degree [0-3], -1 to keep original (default: -1)", {"sh-degree"});
         ::args::ValueFlag<std::string> format(parser, "format", "Output format: ply, sog, spz, html, usd, usda, usdc, rad", {'f', "format"});
+        ::args::ValueFlag<int> spz_version(parser, "version", "SPZ container version: 3 (legacy gzip) or 4 (zstd, default)", {"spz-version"});
+        ::args::Flag no_provenance(parser, "no-provenance", "Strip identifying metadata (export id, timestamps, training info) from outputs; a minimal build stamp is always embedded", {"no-provenance"});
         ::args::ValueFlag<int> sog_iter(parser, "iterations", "K-means iterations for SOG (default: 10)", {"sog-iterations"});
         ::args::ValueFlag<std::string> tiles(parser, "AxB", "Replicate a PLY source across an AxB ground-plane grid (RAD output only)", {"tiles"});
         ::args::ValueFlag<std::string> lod_builder(parser, "builder", "PLY->RAD LOD tree builder: bhatt (default) or octree (hybrid: octree fine levels + similarity-ordered bhatt top, much faster)", {"lod-builder"});
@@ -1306,6 +1476,8 @@ namespace {
         param::ConvertParameters params;
         params.input_path = lfs::core::utf8_to_path(::args::get(input));
         params.sh_degree = sh_degree ? ::args::get(sh_degree) : -1;
+        params.spz_version = spz_version ? ::args::get(spz_version) : 4;
+        params.include_provenance = !no_provenance;
 
         if (!std::filesystem::exists(params.input_path)) {
             return std::unexpected(std::format("Input not found: {}", lfs::core::path_to_utf8(params.input_path)));
@@ -1313,6 +1485,9 @@ namespace {
 
         if (params.sh_degree < -1 || params.sh_degree > 3) {
             return std::unexpected("SH degree must be -1 (keep) or 0-3");
+        }
+        if (params.spz_version != 3 && params.spz_version != 4) {
+            return std::unexpected("--spz-version must be 3 or 4");
         }
 
         if (output)
@@ -1394,6 +1569,8 @@ namespace {
         ::args::Positional<std::string> output(parser, "output", "Output file or directory (optional)");
         ::args::ValueFlag<std::string> output_flag(parser, "path", "Output file or directory", {'o', "output"});
         ::args::ValueFlag<std::string> format(parser, "formats", "Output format(s): ply, sog, spz, html, usd, usda, usdc, rad. Use commas for multiple outputs", {'f', "format"});
+        ::args::ValueFlag<int> spz_version(parser, "version", "SPZ container version: 3 (legacy gzip) or 4 (zstd, default)", {"spz-version"});
+        ::args::Flag no_provenance(parser, "no-provenance", "Strip identifying metadata (export id, timestamps, training info) from outputs; a minimal build stamp is always embedded", {"no-provenance"});
         ::args::ValueFlag<int> resolution(parser, "pixels", "Mesh2Splat raster resolution target (default: 1024)", {"resolution"});
         ::args::ValueFlag<float> sigma(parser, "scale", "Gaussian scale sigma (default: 0.65)", {"sigma"});
         ::args::ValueFlag<int> sog_iter(parser, "iterations", "K-means iterations for SOG/HTML output (default: 10)", {"sog-iterations"});
@@ -1421,9 +1598,14 @@ namespace {
 
         param::Mesh2SplatParameters params;
         params.input_path = lfs::core::utf8_to_path(::args::get(input));
+        params.spz_version = spz_version ? ::args::get(spz_version) : 4;
+        params.include_provenance = !no_provenance;
 
         if (!std::filesystem::exists(params.input_path)) {
             return std::unexpected(std::format("Input not found: {}", lfs::core::path_to_utf8(params.input_path)));
+        }
+        if (params.spz_version != 3 && params.spz_version != 4) {
+            return std::unexpected("--spz-version must be 3 or 4");
         }
 
         if (output_flag) {
