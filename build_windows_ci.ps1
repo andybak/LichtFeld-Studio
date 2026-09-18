@@ -19,6 +19,10 @@ param(
     [switch]$Clean,
     [switch]$CleanDependencies,
     [switch]$SkipPackage,
+    [string]$PinnedToolsRoot,
+    [switch]$RefreshPinnedTools,
+    [switch]$RebuildDependencies,
+    [int]$PruneBinaryCacheDays = 0,
     [switch]$Help
 )
 
@@ -34,6 +38,15 @@ It mirrors the GitHub nightly packaging workflow locally:
   4. Builds with vcvars64.bat loaded
   5. Installs to dist
   6. Optionally creates a zip package and .sha256 sidecar
+
+Caching:
+  Dependencies are cached in VCPKG_INSTALLED_DIR and reused while the dependency
+  fingerprint (vcpkg.json, vcpkg commit, triplet, pinned PowerShell/CMake, Visual Studio
+  instance, MSVC toolset, Windows SDK, CUDA, cuDNN) is unchanged. While it is unchanged
+  the vcpkg manifest install is skipped entirely, so vcpkg ABI tags such as the detected
+  PowerShell or CMake version cannot force a dependency rebuild. PowerShell and CMake are
+  used from pinned copies under -PinnedToolsRoot; pass -RefreshPinnedTools to move to the
+  currently installed versions on purpose.
 
 Options:
   -Configuration <Release|Debug>      Build type (default: Release)
@@ -51,6 +64,10 @@ Options:
   -Clean                              Remove project build outputs and dist before building; preserves VCPKG_INSTALLED_DIR
   -CleanDependencies                  With -Clean, also remove VCPKG_INSTALLED_DIR
   -SkipPackage                        Build and install only; do not create zip
+  -PinnedToolsRoot <path>             Where the pinned PowerShell/CMake copies live (default: <vcpkg parent>\tools)
+  -RefreshPinnedTools                 Re-copy the pinned PowerShell/CMake from the current system installs
+  -RebuildDependencies                Force the vcpkg manifest install even if the dependency fingerprint is unchanged
+  -PruneBinaryCacheDays <n>           Delete vcpkg binary-cache entries older than n days (0 = keep everything)
   -Help                               Show this message
 
 Examples:
@@ -610,6 +627,268 @@ function Get-PackageVersionValue {
     return "$targetVersion.dev$dateStamp+$shortSha"
 }
 
+function Get-VisualStudioRootFromVcVars {
+    param([string]$VcVarsPath)
+
+    # <root>\<year>\<edition>\VC\Auxiliary\Build\vcvars64.bat -> <root>\<year>\<edition>
+    return (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $VcVarsPath))))
+}
+
+function Get-StringSha256 {
+    param([string]$Value)
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
+        return ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant()
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-FileSha256 {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return ''
+    }
+
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-VcpkgCheckoutCommit {
+    param(
+        [string]$VcpkgRoot,
+        [string]$GitPath
+    )
+
+    try {
+        $commit = & $GitPath -C $VcpkgRoot rev-parse HEAD 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($commit)) {
+            return ([string]$commit).Trim()
+        }
+    } catch {
+    }
+
+    return ''
+}
+
+function Initialize-PinnedToolDirectory {
+    param(
+        [string]$SourceDirectory,
+        [string]$DestinationDirectory,
+        [string]$ExecutableRelativePath,
+        [switch]$Refresh
+    )
+
+    $executablePath = Join-Path $DestinationDirectory $ExecutableRelativePath
+    $created = $false
+
+    if ($Refresh -or -not (Test-Path -LiteralPath $executablePath)) {
+        if (-not (Test-Path -LiteralPath $SourceDirectory)) {
+            throw "Cannot pin build tool: source directory not found: $SourceDirectory"
+        }
+
+        if (Test-Path -LiteralPath $DestinationDirectory) {
+            Remove-Item -LiteralPath $DestinationDirectory -Recurse -Force
+        }
+
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $DestinationDirectory) | Out-Null
+        Copy-Item -LiteralPath $SourceDirectory -Destination $DestinationDirectory -Recurse -Force
+        $created = $true
+    }
+
+    if (-not (Test-Path -LiteralPath $executablePath)) {
+        throw "Pinned build tool is missing after copy: $executablePath"
+    }
+
+    return [pscustomobject]@{
+        Path = $executablePath
+        Created = $created
+    }
+}
+
+function Get-PowerShellVersionFrom {
+    param([string]$PowerShellPath)
+
+    try {
+        $version = & $PowerShellPath -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' 2>$null
+        if (-not [string]::IsNullOrWhiteSpace($version)) {
+            return ([string]$version).Trim()
+        }
+    } catch {
+    }
+
+    return 'unknown'
+}
+
+function Get-CMakeVersionFrom {
+    param([string]$CMakePath)
+
+    try {
+        $firstLine = & $CMakePath --version 2>$null | Select-Object -First 1
+        if (-not [string]::IsNullOrWhiteSpace($firstLine)) {
+            return ([string]$firstLine).Trim()
+        }
+    } catch {
+    }
+
+    return 'unknown'
+}
+
+function Test-VcpkgInstalledTree {
+    param(
+        [string]$InstalledDirectory,
+        [string]$Triplet
+    )
+
+    if ([string]::IsNullOrWhiteSpace($InstalledDirectory) -or -not (Test-Path -LiteralPath $InstalledDirectory)) {
+        return $false
+    }
+
+    $shareRoot = Join-Path $InstalledDirectory "$Triplet\share"
+    if (-not (Test-Path -LiteralPath $shareRoot)) {
+        return $false
+    }
+
+    return (Get-ChildItem -LiteralPath $shareRoot -Directory -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0
+}
+
+function Write-VcpkgOverlayTriplet {
+    param(
+        [string]$TripletsDirectory,
+        [string]$TargetTriplet,
+        [string]$PlatformToolset
+    )
+
+    New-Item -ItemType Directory -Force -Path $TripletsDirectory | Out-Null
+    $tripletFile = Join-Path $TripletsDirectory "$TargetTriplet.cmake"
+    $tripletLines = @(
+        'set(VCPKG_TARGET_ARCHITECTURE x64)',
+        'set(VCPKG_CRT_LINKAGE dynamic)',
+        'set(VCPKG_LIBRARY_LINKAGE dynamic)',
+        'set(VCPKG_BUILD_TYPE release)'
+    )
+    if (-not [string]::IsNullOrWhiteSpace($PlatformToolset)) {
+        $tripletLines += "set(VCPKG_PLATFORM_TOOLSET $PlatformToolset)"
+    }
+
+    Set-Content -LiteralPath $tripletFile -Value $tripletLines -Encoding utf8
+    return $tripletFile
+}
+
+function Get-VcpkgPlanSummary {
+    param([string[]]$PlanLines)
+
+    $sections = [System.Collections.Generic.List[object]]::new()
+    $currentTitle = $null
+    $currentCount = 0
+
+    foreach ($line in $PlanLines) {
+        if ($line -match '^The following packages.*:$') {
+            if ($null -ne $currentTitle) {
+                $sections.Add([pscustomobject]@{ Title = $currentTitle; Count = $currentCount })
+            }
+
+            $currentTitle = $line.Trim()
+            $currentCount = 0
+        } elseif ($null -ne $currentTitle -and $line -match '^\s{2,}\S') {
+            $currentCount++
+        } elseif ($null -ne $currentTitle -and $line -notmatch '^\s*$') {
+            $sections.Add([pscustomobject]@{ Title = $currentTitle; Count = $currentCount })
+            $currentTitle = $null
+            $currentCount = 0
+        }
+    }
+
+    if ($null -ne $currentTitle) {
+        $sections.Add([pscustomobject]@{ Title = $currentTitle; Count = $currentCount })
+    }
+
+    return $sections
+}
+
+function Invoke-VcpkgPlanProbe {
+    param(
+        [string]$VcpkgExe,
+        [string]$VcVarsPath,
+        [string]$WorkingDirectory,
+        [string]$TargetTriplet,
+        [string]$HostTriplet,
+        [string]$OverlayTripletsDirectory,
+        [string]$ToolsetVersion,
+        [pscustomobject]$WindowsSdkInfo
+    )
+
+    $logPath = Join-Path $env:TEMP ('lfs-vcpkg-plan-' + [guid]::NewGuid().ToString('N') + '.log')
+    $command = '"{0}" install --triplet {1} --host-triplet {2} --overlay-triplets "{3}" --dry-run > "{4}" 2>&1' -f `
+        $VcpkgExe, $TargetTriplet, $HostTriplet, $OverlayTripletsDirectory, $logPath
+
+    $probeFailed = $false
+    try {
+        Invoke-VcCommand -VcVarsPath $VcVarsPath -WorkingDirectory $WorkingDirectory -Command $command -ToolsetVersion $ToolsetVersion -WindowsSdkInfo $WindowsSdkInfo
+    } catch {
+        $probeFailed = $true
+    }
+
+    if (-not (Test-Path -LiteralPath $logPath)) {
+        return $null
+    }
+
+    $planLines = Get-Content -LiteralPath $logPath
+    Remove-Item -LiteralPath $logPath -Force
+
+    return [pscustomobject]@{
+        Failed = $probeFailed
+        Compiler = ($planLines | Where-Object { $_ -match '^Compiler found: ' } | Select-Object -First 1)
+        Sections = (Get-VcpkgPlanSummary -PlanLines $planLines)
+    }
+}
+
+function Clear-StaleBinaryCacheEntries {
+    param(
+        [int]$Days,
+        [string]$BinarySources
+    )
+
+    if ($Days -le 0 -or [string]::IsNullOrWhiteSpace($BinarySources)) {
+        return
+    }
+
+    $cutoff = (Get-Date).AddDays(-$Days)
+    $cachePaths = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($source in ($BinarySources -split ';')) {
+        $trimmed = $source.Trim()
+        if ($trimmed -notmatch '^files\s*,\s*(?<path>[^,]+)(?<modifiers>(,[^,]*)*)$') {
+            continue
+        }
+
+        $modifiers = $Matches['modifiers']
+        if ($modifiers -notmatch 'write') {
+            continue
+        }
+
+        $cachePaths.Add($Matches['path'].Trim().Trim('"'))
+    }
+
+    foreach ($cachePath in ($cachePaths | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $cachePath)) {
+            continue
+        }
+
+        $stale = @(Get-ChildItem -LiteralPath $cachePath -Recurse -File -Filter '*.zip' -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $cutoff })
+        if ($stale.Count -eq 0) {
+            continue
+        }
+
+        $staleBytes = ($stale | Measure-Object -Sum Length).Sum
+        $stale | Remove-Item -Force
+        Write-Host ("Pruned {0} binary-cache entries older than {1} days ({2:N2} GB) from {3}" -f $stale.Count, $Days, ($staleBytes / 1GB), $cachePath)
+    }
+}
+
 $script:ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ProjectRoot
 
@@ -643,12 +922,23 @@ Write-Host "Windows SDK: $($windowsSdkInfo.Version)"
 Write-Host "CUDA_PATH_V12_8: $resolvedCudaPath"
 
 $clangClPath = Get-ClangClPathForVcVarsPath -VcVarsPath $vcVarsPath
+$visualStudioRoot = Get-VisualStudioRootFromVcVars -VcVarsPath $vcVarsPath
 if ([string]::IsNullOrWhiteSpace($clangClPath)) {
-    $selectedVisualStudioRoot = Split-Path (Split-Path (Split-Path (Split-Path $vcVarsPath -Parent) -Parent) -Parent) -Parent
-    throw "clang-cl was not found. In Visual Studio Installer, modify '$selectedVisualStudioRoot' and add the 'C++ Clang Compiler for Windows' individual component."
+    throw "clang-cl was not found. In Visual Studio Installer, modify '$visualStudioRoot' and add the 'C++ Clang Compiler for Windows' individual component."
 }
 Add-ToPathIfMissing -Entry (Split-Path -Parent $clangClPath)
 Write-Host "clang-cl: $clangClPath"
+
+# Pin vcpkg to this Visual Studio instance. Without the pin vcpkg can resolve the MSVC
+# toolset from a different, newer instance: that changes the compiler part of the ABI and,
+# when the other instance has no clang-cl, fails the libplacebo port outright.
+$visualStudioClangCl = Join-Path $visualStudioRoot 'VC\Tools\Llvm\x64\bin\clang-cl.exe'
+if (-not (Test-Path -LiteralPath $visualStudioClangCl)) {
+    throw "The selected Visual Studio instance has no clang-cl: $visualStudioRoot. The libplacebo port requires clang-cl; add the 'C++ Clang Compiler for Windows' individual component in the Visual Studio Installer."
+}
+$env:VCPKG_VISUAL_STUDIO_PATH = $visualStudioRoot
+Write-Host "Visual Studio root: $visualStudioRoot"
+Write-Host "vcpkg Visual Studio pin: $env:VCPKG_VISUAL_STUDIO_PATH"
 
 if ($Clean) {
     Write-Section 'Clean'
@@ -697,6 +987,60 @@ if ([string]::IsNullOrWhiteSpace($ninjaPath)) {
     throw 'ninja was not found in PATH or standard install locations.'
 }
 Write-Host "ninja: $ninjaPath"
+
+Write-Section 'Pinned build tools'
+if ([string]::IsNullOrWhiteSpace($PinnedToolsRoot)) {
+    $PinnedToolsRoot = Join-Path (Split-Path -Parent $VcpkgRoot) 'tools'
+}
+$PinnedToolsRoot = Resolve-AbsolutePath -BasePath $ProjectRoot -Path $PinnedToolsRoot
+New-Item -ItemType Directory -Force -Path $PinnedToolsRoot | Out-Null
+
+$powerShellSourceDirectory = $null
+$pwshCommandPath = Get-CommandPathOrNull -Name 'pwsh'
+if (-not [string]::IsNullOrWhiteSpace($pwshCommandPath)) {
+    $powerShellSourceDirectory = Split-Path -Parent $pwshCommandPath
+}
+if ([string]::IsNullOrWhiteSpace($powerShellSourceDirectory)) {
+    $defaultPowerShellRoot = Join-Path $env:ProgramFiles 'PowerShell\7'
+    if (Test-Path -LiteralPath $defaultPowerShellRoot) {
+        $powerShellSourceDirectory = $defaultPowerShellRoot
+    }
+}
+if ([string]::IsNullOrWhiteSpace($powerShellSourceDirectory)) {
+    throw 'PowerShell 7 (pwsh) was not found. It is pinned so that the vcpkg ABI tags for PowerShell stay stable.'
+}
+
+$pinnedPowerShell = Initialize-PinnedToolDirectory `
+    -SourceDirectory $powerShellSourceDirectory `
+    -DestinationDirectory (Join-Path $PinnedToolsRoot 'pwsh') `
+    -ExecutableRelativePath 'pwsh.exe' `
+    -Refresh:$RefreshPinnedTools
+$pinnedPowerShellVersion = Get-PowerShellVersionFrom -PowerShellPath $pinnedPowerShell.Path
+
+$cmakeInstallRoot = Split-Path -Parent (Split-Path -Parent $cmakePath)
+if (-not (Test-Path -LiteralPath (Join-Path $cmakeInstallRoot 'bin\cmake.exe'))) {
+    $defaultCMakeRoot = Join-Path $env:ProgramFiles 'CMake'
+    if (Test-Path -LiteralPath (Join-Path $defaultCMakeRoot 'bin\cmake.exe')) {
+        $cmakeInstallRoot = $defaultCMakeRoot
+    } else {
+        throw "Could not determine the CMake installation directory from '$cmakePath'."
+    }
+}
+$pinnedCMake = Initialize-PinnedToolDirectory `
+    -SourceDirectory $cmakeInstallRoot `
+    -DestinationDirectory (Join-Path $PinnedToolsRoot 'cmake') `
+    -ExecutableRelativePath 'bin\cmake.exe' `
+    -Refresh:$RefreshPinnedTools
+$pinnedCMakeVersion = Get-CMakeVersionFrom -CMakePath $pinnedCMake.Path
+
+Add-ToPathIfMissing -Entry (Split-Path -Parent $pinnedPowerShell.Path)
+Add-ToPathIfMissing -Entry (Split-Path -Parent $pinnedCMake.Path)
+$cmakePath = $pinnedCMake.Path
+$env:Z_VCPKG_POWERSHELL_PATH = $pinnedPowerShell.Path
+
+Write-Host "Pinned tools root: $PinnedToolsRoot"
+Write-Host "pwsh: $($pinnedPowerShell.Path) [$pinnedPowerShellVersion]$(if ($pinnedPowerShell.Created) { ' (copied)' })"
+Write-Host "cmake: $($pinnedCMake.Path) [$pinnedCMakeVersion]$(if ($pinnedCMake.Created) { ' (copied)' })"
 
 if (-not (Test-Path $resolvedCudaPath)) {
     throw "CUDA path does not exist: $resolvedCudaPath"
@@ -770,19 +1114,72 @@ if (-not (Test-Path $vcpkgToolchainFile)) {
 }
 
 $vcpkgTripletsDirectory = Join-Path $BuildDirectory 'vcpkg-triplets'
-New-Item -ItemType Directory -Force -Path $vcpkgTripletsDirectory | Out-Null
-$tripletFile = Join-Path $vcpkgTripletsDirectory "$vcpkgTargetTriplet.cmake"
-$tripletLines = @(
-    'set(VCPKG_TARGET_ARCHITECTURE x64)',
-    'set(VCPKG_CRT_LINKAGE dynamic)',
-    'set(VCPKG_LIBRARY_LINKAGE dynamic)',
-    'set(VCPKG_BUILD_TYPE release)'
-)
-if (-not [string]::IsNullOrWhiteSpace($vcpkgPlatformToolset)) {
-    $tripletLines += "set(VCPKG_PLATFORM_TOOLSET $vcpkgPlatformToolset)"
-}
-Set-Content -LiteralPath $tripletFile -Value $tripletLines -Encoding utf8
+$tripletFile = Write-VcpkgOverlayTriplet -TripletsDirectory $vcpkgTripletsDirectory -TargetTriplet $vcpkgTargetTriplet -PlatformToolset $vcpkgPlatformToolset
 Write-Host "vcpkg overlay triplet: $tripletFile"
+
+if ($PruneBinaryCacheDays -gt 0) {
+    Write-Section 'Binary cache pruning'
+    Clear-StaleBinaryCacheEntries -Days $PruneBinaryCacheDays -BinarySources $env:VCPKG_BINARY_SOURCES
+}
+
+Write-Section 'Dependency cache'
+$dependencyFingerprintFile = Join-Path (Join-Path $PinnedToolsRoot 'state') ("{0}-{1}.deps-fingerprint" -f (Split-Path -Leaf $ProjectRoot), (Get-StringSha256 -Value $ProjectRoot).Substring(0, 8))
+$dependencyFingerprint = Get-StringSha256 -Value (@(
+        "manifest=$(Get-FileSha256 -Path (Join-Path $ProjectRoot 'vcpkg.json'))",
+        "manifest-configuration=$(Get-FileSha256 -Path (Join-Path $ProjectRoot 'vcpkg-configuration.json'))",
+        "vcpkg-commit=$(Get-VcpkgCheckoutCommit -VcpkgRoot $VcpkgRoot -GitPath $gitPath)",
+        "triplet=$vcpkgTargetTriplet",
+        "triplet-file=$(Get-FileSha256 -Path $tripletFile)",
+        "installed-directory=$VcpkgInstalledDirectory",
+        "configuration=$Configuration",
+        "cmake=$pinnedCMakeVersion",
+        "powershell=$pinnedPowerShellVersion",
+        "visual-studio=$visualStudioRoot",
+        "msvc-toolset=$msvcToolsetVersion",
+        "windows-sdk=$($windowsSdkInfo.Version)",
+        "cuda=$resolvedCudaPath",
+        "cudnn=$resolvedCudnnRoot"
+    ) -join '|')
+
+$recordedFingerprint = $null
+if (Test-Path -LiteralPath $dependencyFingerprintFile) {
+    $recordedFingerprint = (Get-Content -LiteralPath $dependencyFingerprintFile -Raw).Trim()
+}
+
+$reuseInstalledDependencies = $false
+if ($RebuildDependencies) {
+    Write-Host 'Dependency reuse disabled: -RebuildDependencies was specified.'
+} elseif ($recordedFingerprint -ne $dependencyFingerprint) {
+    Write-Host 'Dependency inputs changed or were never recorded; the vcpkg manifest install will run.'
+} elseif (-not (Test-VcpkgInstalledTree -InstalledDirectory $VcpkgInstalledDirectory -Triplet $vcpkgTargetTriplet)) {
+    Write-Host "Installed dependency tree is incomplete at $VcpkgInstalledDirectory; the vcpkg manifest install will run."
+} else {
+    $reuseInstalledDependencies = $true
+    Write-Host 'Dependency inputs unchanged; reusing the installed vcpkg tree without invoking vcpkg.'
+    Write-Host '  vcpkg ABI tags such as the detected PowerShell or CMake version cannot invalidate this build.'
+}
+
+$manifestInstallValue = if ($reuseInstalledDependencies) { 'OFF' } else { 'ON' }
+
+if (-not $reuseInstalledDependencies) {
+    Write-Section 'Dependency preflight'
+    $planProbe = Invoke-VcpkgPlanProbe -VcpkgExe $vcpkgExe -VcVarsPath $vcVarsPath -WorkingDirectory $ProjectRoot `
+        -TargetTriplet $vcpkgTargetTriplet -HostTriplet $vcpkgHostTriplet -OverlayTripletsDirectory $vcpkgTripletsDirectory `
+        -ToolsetVersion $msvcToolsetVersion -WindowsSdkInfo $windowsSdkInfo
+    if ($null -eq $planProbe) {
+        Write-Host 'Dependency preflight produced no output; continuing with the configure step.' -ForegroundColor Yellow
+    } else {
+        if (-not [string]::IsNullOrWhiteSpace($planProbe.Compiler)) {
+            Write-Host $planProbe.Compiler
+        }
+        foreach ($section in $planProbe.Sections) {
+            Write-Host ("{0} {1}" -f $section.Title, $section.Count)
+        }
+        if ($planProbe.Failed) {
+            Write-Host 'Dependency preflight returned a non-zero exit code; continuing anyway.' -ForegroundColor Yellow
+        }
+    }
+}
 
 New-Item -ItemType Directory -Force -Path $PackageOutputDirectory | Out-Null
 
@@ -804,7 +1201,9 @@ $configureArguments = @(
     "-DVCPKG_INSTALL_OPTIONS=--x-buildtrees-root=$vcpkgBuildtreesDirectory;--x-packages-root=$vcpkgPackagesDirectory;--downloads-root=$vcpkgDownloadsDirectory;--clean-buildtrees-after-build;--clean-packages-after-build;--no-print-usage",
     '-DBUILD_PORTABLE=ON',
     '-DBUILD_PYTHON_STUBS=OFF',
-    '-DCUDA_DEVICE_DEBUG=OFF'
+    '-DCUDA_DEVICE_DEBUG=OFF',
+    "-DVCPKG_MANIFEST_INSTALL=$manifestInstallValue",
+    "-DZ_VCPKG_POWERSHELL_PATH=$($pinnedPowerShell.Path)"
 )
 
 $configureCommand = (Join-CmdArguments -Arguments @($cmakePath)) + ' ' + (Join-CmdArguments -Arguments $configureArguments)
@@ -846,8 +1245,19 @@ for ($attempt = 1; $attempt -le 3; $attempt++) {
 
         Write-Host 'Retryable configure failure detected. Cleaning project build outputs before retry.' -ForegroundColor Yellow
         Clear-BuildDirectory -BuildDirectory $BuildDirectory -VcpkgInstalledDirectory $VcpkgInstalledDirectory
+        # The clean above removes the overlay triplet directory. Without recreating it vcpkg
+        # falls back to the built-in x64-windows-release triplet, resolves a different MSVC
+        # toolset and invalidates the ABI of every dependency.
+        $tripletFile = Write-VcpkgOverlayTriplet -TripletsDirectory $vcpkgTripletsDirectory -TargetTriplet $vcpkgTargetTriplet -PlatformToolset $vcpkgPlatformToolset
+        Write-Host "Recreated vcpkg overlay triplet after clean: $tripletFile"
         Start-Sleep -Seconds (15 * $attempt)
     }
+}
+
+if (-not $reuseInstalledDependencies) {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dependencyFingerprintFile) | Out-Null
+    Set-Content -LiteralPath $dependencyFingerprintFile -Value $dependencyFingerprint -Encoding ascii
+    Write-Host "Recorded dependency fingerprint: $dependencyFingerprintFile"
 }
 
 Write-Section 'Build'
