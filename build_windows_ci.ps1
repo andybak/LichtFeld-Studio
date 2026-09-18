@@ -64,7 +64,7 @@ Options:
   -Clean                              Remove project build outputs and dist before building; preserves VCPKG_INSTALLED_DIR
   -CleanDependencies                  With -Clean, also remove VCPKG_INSTALLED_DIR
   -SkipPackage                        Build and install only; do not create zip
-  -PinnedToolsRoot <path>             Where the pinned PowerShell/CMake copies live (default: <vcpkg parent>\tools)
+  -PinnedToolsRoot <path>             Where the pinned PowerShell/CMake copies live (default: %LOCALAPPDATA%\LichtFeld\pinned-tools)
   -RefreshPinnedTools                 Re-copy the pinned PowerShell/CMake from the current system installs
   -RebuildDependencies                Force the vcpkg manifest install even if the dependency fingerprint is unchanged
   -PruneBinaryCacheDays <n>           Delete vcpkg binary-cache entries older than n days (0 = keep everything)
@@ -1021,7 +1021,7 @@ Write-Host "ninja: $ninjaPath"
 
 Write-Section 'Pinned build tools'
 if ([string]::IsNullOrWhiteSpace($PinnedToolsRoot)) {
-    $PinnedToolsRoot = Join-Path (Split-Path -Parent $VcpkgRoot) 'tools'
+    $PinnedToolsRoot = Join-Path (Get-EnvironmentValue -Name 'LOCALAPPDATA') 'LichtFeld\pinned-tools'
 }
 $PinnedToolsRoot = Resolve-AbsolutePath -BasePath $ProjectRoot -Path $PinnedToolsRoot
 New-Item -ItemType Directory -Force -Path $PinnedToolsRoot | Out-Null
