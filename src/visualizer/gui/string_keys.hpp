@@ -30,6 +30,8 @@ namespace lichtfeld::Strings {
             inline constexpr const char* MENU = "menu.tools";
             inline constexpr const char* PYTHON_CONSOLE = "menu.tools.python_console";
             inline constexpr const char* PLUGIN_MARKETPLACE = "menu.tools.plugin_marketplace";
+            inline constexpr const char* GALLERY = "menu.tools.gallery";
+            inline constexpr const char* GALLERY_TRANSFERS = "menu.tools.gallery_transfers";
         } // namespace Tools
 
         namespace View {
@@ -152,6 +154,9 @@ namespace lichtfeld::Strings {
             inline constexpr const char* SH_DEGREE = "training.tooltip.sh_degree";
             inline constexpr const char* STEPS_SCALER = "training.tooltip.steps_scaler";
             inline constexpr const char* BILATERAL_GRID = "training.tooltip.bilateral_grid";
+            inline constexpr const char* EXPOSURE_CORRECTION = "training.tooltip.exposure_correction";
+            inline constexpr const char* EXPOSURE_CORRECTION_GRID_START =
+                "training.tooltip.exposure_correction_grid_start";
             inline constexpr const char* MASK_MODE = "training.tooltip.mask_mode";
             inline constexpr const char* USE_ALPHA_AS_MASK = "training.tooltip.use_alpha_as_mask";
             inline constexpr const char* SPARSITY = "training.tooltip.sparsity";
@@ -214,7 +219,15 @@ namespace lichtfeld::Strings {
         inline constexpr const char* ADD_GROUP_ELLIPSIS = "scene.add_group_ellipsis";
         inline constexpr const char* EXPORT = "scene.export";
         inline constexpr const char* DELETE_ITEM = "scene.delete";
+        inline constexpr const char* DELETE_CONFIRMATION_TITLE = "scene.delete_confirmation_title";
+        inline constexpr const char* DELETE_CONFIRMATION_SINGLE = "scene.delete_confirmation_single";
+        inline constexpr const char* DELETE_CONFIRMATION_MULTIPLE = "scene.delete_confirmation_multiple";
+        inline constexpr const char* SELECTED_COUNT = "scene.selected_count";
+        inline constexpr const char* SHOW_SELECTED = "scene.show_selected";
+        inline constexpr const char* HIDE_SELECTED = "scene.hide_selected";
         inline constexpr const char* RENAME = "scene.rename";
+        inline constexpr const char* RENAME_CONFLICT_TITLE = "scene.rename_conflict_title";
+        inline constexpr const char* RENAME_CONFLICT_MESSAGE = "scene.rename_conflict_message";
         inline constexpr const char* DUPLICATE_ITEM = "scene.duplicate";
         inline constexpr const char* GO_TO_CAMERA_VIEW = "scene.go_to_camera_view";
         inline constexpr const char* GO_TO_IMAGE = "scene.go_to_image";
@@ -245,7 +258,6 @@ namespace lichtfeld::Strings {
         inline constexpr const char* KEYFRAME_EASING_EASE_IN_OUT = "scene.keyframe_easing.ease_in_out";
         inline constexpr const char* PLY_SEQUENCE_LABEL = "scene.ply_sequence_label";
         inline constexpr const char* KEYFRAME_NODE_LABEL = "scene.keyframe_node_label";
-        inline constexpr const char* SAVE_ASSET = "scene.save_asset";
         inline constexpr const char* SAVE_TO_DISK = "scene.save_to_disk";
         inline constexpr const char* HISTORY = "scene.history";
         inline constexpr const char* LOGGING = "scene.logging";
@@ -323,6 +335,7 @@ namespace lichtfeld::Strings {
         inline constexpr const char* ETA = "status.eta";
         inline constexpr const char* PSNR = "status.psnr";
         inline constexpr const char* SSIM = "status.ssim";
+        inline constexpr const char* LPIPS = "status.lpips";
         inline constexpr const char* UNKNOWN = "status.unknown";
     } // namespace Status
 
@@ -438,6 +451,20 @@ namespace lichtfeld::Strings {
         inline constexpr const char* NODES_SELECTED = "transform.nodes_selected";
     } // namespace Transform
 
+    namespace Align {
+        inline constexpr const char* CLICK_1ST = "align.click_1st";
+        inline constexpr const char* CLICK_2ND = "align.click_2nd";
+        inline constexpr const char* CLICK_3RD = "align.click_3rd";
+        inline constexpr const char* POINTS_COUNT = "align.points_count";
+        inline constexpr const char* UP = "align.up";
+        inline constexpr const char* SNAPPED = "align.snapped";
+        inline constexpr const char* HINT_PICKING = "align.hint_picking";
+        inline constexpr const char* HINT_REVIEW = "align.hint_review";
+        inline constexpr const char* STATUS_COLINEAR = "align.status_colinear";
+        inline constexpr const char* STATUS_NO_SURFACE = "align.status_no_surface";
+        inline constexpr const char* STATUS_NO_TARGET = "align.status_no_target";
+    } // namespace Align
+
     namespace Ellipsoid {
         inline constexpr const char* TITLE = "ellipsoid.title";
         inline constexpr const char* NOT_VISIBLE = "ellipsoid.not_visible";
@@ -498,17 +525,6 @@ namespace lichtfeld::Strings {
         inline constexpr const char* UNSAVED_WARNING = "exit_popup.unsaved_warning";
         inline constexpr const char* DISCARD = "exit_popup.discard";
     } // namespace ExitPopup
-
-    namespace LoadDatasetPopup {
-        inline constexpr const char* TITLE = "load_dataset_popup.title";
-        inline constexpr const char* CONFIGURE_PATHS = "load_dataset_popup.configure_paths";
-        inline constexpr const char* IMAGES_DIR = "load_dataset_popup.images_dir";
-        inline constexpr const char* SPARSE_DIR = "load_dataset_popup.sparse_dir";
-        inline constexpr const char* MASKS_DIR = "load_dataset_popup.masks_dir";
-        inline constexpr const char* OUTPUT_DIR = "load_dataset_popup.output_dir";
-        inline constexpr const char* INIT_FILE = "load_dataset_popup.init_file";
-        inline constexpr const char* HELP_TEXT = "load_dataset_popup.help_text";
-    } // namespace LoadDatasetPopup
 
     namespace Notification {
         inline constexpr const char* DROPPED_NOT_RECOGNIZED = "notification.dropped_not_recognized";
@@ -776,6 +792,7 @@ namespace lichtfeld::Strings {
         inline constexpr const char* DELETE_KEYFRAME = "sequencer.delete_keyframe";
         inline constexpr const char* ADD_KEYFRAME_HERE = "sequencer.add_keyframe_here";
         inline constexpr const char* EDIT_KEYFRAME_TIME = "sequencer.edit_keyframe_time";
+        inline constexpr const char* SET_TIME = "sequencer.edit_time";
         inline constexpr const char* APPLY_U = "sequencer.apply_u";
         inline constexpr const char* REVERT_ESC = "sequencer.revert_esc";
         inline constexpr const char* EDITING_KEYFRAME = "sequencer.editing_keyframe";
@@ -839,6 +856,7 @@ namespace lichtfeld::Strings {
         inline constexpr const char* OUT_OF_GPU_MEMORY = "error_modal.out_of_gpu_memory";
         inline constexpr const char* DATASET_LOAD_FAILED = "error_modal.dataset_load_failed";
         inline constexpr const char* EXPORT_FAILED = "error_modal.export_failed";
+        inline constexpr const char* EXPORT_WARNING = "error_modal.export_warning";
         inline constexpr const char* VIDEO_EXPORT_FAILED = "error_modal.video_export_failed";
         inline constexpr const char* MESH2SPLAT_FAILED = "error_modal.mesh2splat_failed";
         inline constexpr const char* CONFIG_INVALID = "error_modal.config_invalid";

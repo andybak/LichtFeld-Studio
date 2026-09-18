@@ -181,7 +181,7 @@ __device__ __forceinline__ float ppisp_exposure_value(const float raw) {
 }
 
 // Color correction pinv blocks (constant memory)
-__constant__ float PPISP_COLOR_PINV_BLOCKS[4][4] = {
+static __constant__ float PPISP_COLOR_PINV_BLOCKS[4][4] = {
     {0.0480542f, -0.0043631f, -0.0043631f, 0.0481283f},
     {0.0580570f, -0.0179872f, -0.0179872f, 0.0431061f},
     {0.0433336f, -0.0180537f, -0.0180537f, 0.0580500f},
@@ -316,12 +316,16 @@ __device__ __forceinline__ void ppisp_apply_color_correction(const float3& rgb_i
                                                              const ColorPPISPParams* color_params, float3& rgb_out) {
     float3x3 H = ppisp_compute_homography(color_params);
 
-    float intensity = rgb_in.x + rgb_in.y + rgb_in.z;
-    float3 rgi_in = make_float3(rgb_in.x, rgb_in.y, intensity);
+    // SH evaluation can produce negative radiance. Chromaticity normalization
+    // requires nonnegative channels; a negative intensity would otherwise be
+    // divided by epsilon and turn dark pixels into saturated colors.
+    const float3 rgb = make_float3(fmaxf(rgb_in.x, 0.0f), fmaxf(rgb_in.y, 0.0f), fmaxf(rgb_in.z, 0.0f));
+    float intensity = rgb.x + rgb.y + rgb.z;
+    float3 rgi_in = make_float3(rgb.x, rgb.y, intensity);
 
     float3 rgi_out = H * rgi_in;
 
-    float norm_factor = __fdividef(intensity, rgi_out.z + 1.0e-5f);
+    float norm_factor = __fdividef(intensity, fmaxf(rgi_out.z, 0.0f) + 1.0e-5f);
     rgi_out = rgi_out * norm_factor;
 
     rgb_out = make_float3(rgi_out.x, rgi_out.y, rgi_out.z - rgi_out.x - rgi_out.y);

@@ -4,6 +4,7 @@
 #include "core/crash_handler.hpp"
 #include "core/cuda_error.hpp"
 #include "core/logger.hpp"
+#include "core/nn/activation_arena.hpp"
 #include "core/pinned_memory_allocator.hpp"
 #include "core/tensor_trace.hpp"
 #include "internal/cuda_stream_context.hpp"
@@ -384,6 +385,17 @@ namespace lfs::core {
 
             if (result.device_ == Device::CUDA) {
                 cudaStream_t s = result.stream();
+                if (auto* arena = nn::ActivationArena::current()) {
+                    if (void* arena_ptr = arena->try_alloc(bytes)) {
+                        auto owner = arena->owner();
+                        result.adopt_storage(arena_ptr, [owner](void*) { (void)owner; });
+                        result.data_ = result.data_owner_.get();
+                        result.compute_alignment();
+                        result.storage_meta_->external_kind = "nn.arena";
+                        result.storage_meta_->external_owner = std::move(owner);
+                        return result;
+                    }
+                }
                 void* ptr = allocate_cuda_storage(bytes, s);
                 // Do not call CudaMemoryPool::instance() from the
                 // deleter — after ordered process teardown the Meyers singleton
@@ -474,7 +486,8 @@ namespace lfs::core {
             if (result.device_ == Device::CUDA) {
                 if (result.dtype_ == DataType::Float32) {
                     if (value == 0.0f) {
-                        LFS_CUDA_CHECK_MSG(cudaMemset(result.data_, 0, result.bytes()),
+                        LFS_CUDA_CHECK_MSG(cudaMemsetAsync(result.data_, 0, result.bytes(),
+                                                           result.stream()),
                                            "constant Float32 CUDA memset");
                     } else {
                         tensor_ops::launch_load_op(
@@ -489,7 +502,8 @@ namespace lfs::core {
                     }
                 } else if (result.dtype_ == DataType::Float16) {
                     if (value == 0.0f) {
-                        LFS_CUDA_CHECK_MSG(cudaMemset(result.data_, 0, result.bytes()),
+                        LFS_CUDA_CHECK_MSG(cudaMemsetAsync(result.data_, 0, result.bytes(),
+                                                           result.stream()),
                                            "constant Float16 CUDA memset");
                     } else {
                         // Create Float16 values on CPU, then copy to GPU
@@ -501,11 +515,13 @@ namespace lfs::core {
                     }
                 } else if (result.dtype_ == DataType::Bool) {
                     unsigned char fill_val = (value != 0.0f) ? 1 : 0;
-                    LFS_CUDA_CHECK_MSG(cudaMemset(result.data_, fill_val, result.bytes()),
+                    LFS_CUDA_CHECK_MSG(cudaMemsetAsync(result.data_, fill_val, result.bytes(),
+                                                       result.stream()),
                                        "constant Bool CUDA memset");
                 } else if (result.dtype_ == DataType::Int32) {
                     if (value == 0.0f) {
-                        LFS_CUDA_CHECK_MSG(cudaMemset(result.data_, 0, result.bytes()),
+                        LFS_CUDA_CHECK_MSG(cudaMemsetAsync(result.data_, 0, result.bytes(),
+                                                           result.stream()),
                                            "constant Int32 CUDA memset");
                     } else {
                         std::vector<int> temp(result.numel(), static_cast<int>(value));
@@ -516,7 +532,8 @@ namespace lfs::core {
                     }
                 } else if (result.dtype_ == DataType::Int64) {
                     if (value == 0.0f) {
-                        LFS_CUDA_CHECK_MSG(cudaMemset(result.data_, 0, result.bytes()),
+                        LFS_CUDA_CHECK_MSG(cudaMemsetAsync(result.data_, 0, result.bytes(),
+                                                           result.stream()),
                                            "constant Int64 CUDA memset");
                     } else {
                         std::vector<int64_t> temp(result.numel(), static_cast<int64_t>(value));
@@ -527,7 +544,8 @@ namespace lfs::core {
                     }
                 } else if (result.dtype_ == DataType::UInt8) {
                     const uint8_t fill_val = static_cast<uint8_t>(std::clamp(value, 0.0f, 255.0f));
-                    LFS_CUDA_CHECK_MSG(cudaMemset(result.data_, fill_val, result.bytes()),
+                    LFS_CUDA_CHECK_MSG(cudaMemsetAsync(result.data_, fill_val, result.bytes(),
+                                                       result.stream()),
                                        "constant UInt8 CUDA memset");
                 }
             } else {
@@ -1597,6 +1615,9 @@ namespace lfs::core {
         }
 
         auto result = Tensor::empty(TensorShape(out_shape), input->device_, out_dtype);
+        if (input->device_ == Device::CUDA) {
+            result.set_stream(getCurrentCUDAStream());
+        }
 
         if (input->device_ == Device::CUDA) {
             pin_operands({input});

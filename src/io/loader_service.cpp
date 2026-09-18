@@ -5,6 +5,7 @@
 #include "io/loader_service.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
+#include "core/sh_value_quant.hpp"
 #include "core/splat_data.hpp"
 #include "io/error.hpp"
 #include "io/formats/rad.hpp"
@@ -16,6 +17,7 @@
 #include "io/loaders/rad_loader.hpp"
 #include "io/loaders/sogs_loader.hpp"
 #include "io/loaders/spz_loader.hpp"
+#include "io/loaders/ssog_loader.hpp"
 #include "io/loaders/usd_loader.hpp"
 
 #include <algorithm>
@@ -31,6 +33,7 @@ namespace lfs::io {
         // Register default loaders
         registry_->registerLoader(std::make_unique<PLYLoader>());
         registry_->registerLoader(std::make_unique<SogLoader>());
+        registry_->registerLoader(std::make_unique<SsogLoader>());
         registry_->registerLoader(std::make_unique<SpzLoader>());
         registry_->registerLoader(std::make_unique<USDLoader>());
         registry_->registerLoader(std::make_unique<RadLoader>());
@@ -81,12 +84,24 @@ namespace lfs::io {
                      model.lod_tree->chunk_count());
             return {};
         }
-        if (splatTensorsRendererReady(model)) {
-            model.set_tensor_allocator(allocator);
-            return {};
-        }
-
         try {
+            const bool shN_is_float16 = model.shN_raw().is_valid() &&
+                                        model.shN_raw().dtype() == lfs::core::DataType::Float16;
+            if (!lfs::core::sh_value_quant::enabled() && shN_is_float16) {
+                const size_t capacity = model.means_raw().is_valid()
+                                            ? std::max(model.means_raw().capacity(), static_cast<size_t>(model.size()))
+                                            : static_cast<size_t>(model.size());
+                if (model.shN_value_quantized()) {
+                    model.shN_set_from_canonical(model.shN_canonical(), capacity);
+                } else {
+                    model.shN_raw() = model.shN_raw().to(lfs::core::DataType::Float32);
+                }
+            }
+            if (splatTensorsRendererReady(model)) {
+                model.set_tensor_allocator(allocator);
+                return {};
+            }
+
             const auto copy_to_allocator =
                 [&](const lfs::core::Tensor& source, const std::string_view name) -> lfs::core::Tensor {
                 lfs::core::Tensor source_contiguous = source.is_contiguous() ? source : source.contiguous();
@@ -94,17 +109,7 @@ namespace lfs::io {
                 const size_t capacity = shape.rank() > 0 ? shape[0] : source_contiguous.numel();
                 lfs::core::Tensor dst = allocator(shape, capacity, source_contiguous.dtype(), name);
                 dst.set_name(std::string{name});
-
-                // Viewer splat tensors are read directly by Vulkan. Match the PLY
-                // loader's known-good host-to-external upload path instead of
-                // relying on CUDA device-to-device copies into imported Vk memory.
-                if (dst.is_external_storage() &&
-                    dst.external_storage_kind() == "vulkan_external_buffer" &&
-                    source_contiguous.device() == lfs::core::Device::CUDA) {
-                    dst.copy_from(source_contiguous.cpu());
-                } else {
-                    dst.copy_from(source_contiguous);
-                }
+                dst.copy_from(source_contiguous);
                 return dst;
             };
 
@@ -112,12 +117,21 @@ namespace lfs::io {
             const int active_sh = model.get_active_sh_degree();
             const float scene_scale = model.get_scene_scale();
             const bool shN_q16 = model.shN_value_quantized();
+            const bool encode_q16 = lfs::core::sh_value_quant::enabled() && !shN_q16;
             lfs::core::Tensor deleted = model.has_deleted_mask() ? model.deleted() : lfs::core::Tensor{};
 
             lfs::core::Tensor shN;
             lfs::core::Tensor shN_bounds;
-            if (model.shN_raw().is_valid() && model.shN_raw().numel() > 0) {
-                shN = copy_to_allocator(model.shN_raw(), "SplatData.shN");
+            const auto& shN_src = model.shN_raw();
+            if (shN_src.is_valid() && shN_src.numel() > 0) {
+                if (encode_q16) {
+                    // Keep the source float/f16 workspace; encode into allocator
+                    // q16 after the migrate so we do not import a full-size float
+                    // rest buffer just to throw it away.
+                    shN = shN_src;
+                } else {
+                    shN = copy_to_allocator(shN_src, "SplatData.shN");
+                }
             }
             if (shN_q16) {
                 shN_bounds = copy_to_allocator(
@@ -140,6 +154,9 @@ namespace lfs::io {
             model = std::move(migrated);
             model.lod_tree = std::move(lod_tree);
             model.set_tensor_allocator(allocator);
+            if (encode_q16) {
+                (void)model.apply_shN_value_quant();
+            }
             lfs::core::Tensor::trim_memory_pool();
         } catch (const std::exception& e) {
             return make_error(ErrorCode::CORRUPTED_DATA,
@@ -182,6 +199,7 @@ namespace lfs::io {
                 message = std::format(
                     "Cannot open '{}' - unsupported file format.\n\n"
                     "Supported formats:\n"
+                    "  - SSOG (.ssog, lod-meta.json): bundle or directory\n"
                     "  - Gaussian Splat files: .ply, .sog, .spz, .rad, .usd, .usda, .usdc, .usdz\n"
                     "  - Mesh files: .obj, .fbx, .gltf, .glb, .stl, .dae\n"
                     "  - Training checkpoints: .resume\n"

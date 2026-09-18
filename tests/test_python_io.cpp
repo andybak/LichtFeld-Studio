@@ -7,8 +7,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <future>
 #include <gtest/gtest.h>
@@ -21,7 +23,9 @@
 #include <vector>
 
 #include "core/camera_types.h"
+#include "core/error.hpp"
 #include "core/image_io.hpp"
+#include "core/path_utils.hpp"
 #include "core/point_cloud.hpp"
 #include "core/splat_data.hpp"
 #include "io/exporter.hpp"
@@ -31,6 +35,11 @@
 #include "io/loader.hpp"
 #include "io/nvcodec_image_loader.hpp"
 #include "io/pipelined_image_loader.hpp"
+#include "io/project_container.hpp"
+#include "io/project_document.hpp"
+#include "licht_test_support.hpp"
+#include "python/gil.hpp"
+#include "python/runner.hpp"
 #include "tinyply.hpp"
 
 namespace fs = std::filesystem;
@@ -647,6 +656,225 @@ TEST_F(PythonIOTest, RejectsMalformedTransformsCameraContractsBeforeCameraConstr
     invalid = valid;
     invalid["frames"][0]["transform_matrix"][3] = nlohmann::json::array({0.0, 0.0, 1.0, 1.0});
     expect_rejected(std::move(invalid));
+}
+
+class TransformsMaskTest : public PythonIOTest {
+protected:
+    void write_dataset(const fs::path& root, nlohmann::json frames) const {
+        const nlohmann::json identity = {
+            {1, 0, 0, 0},
+            {0, 1, 0, 0},
+            {0, 0, 1, 0},
+            {0, 0, 0, 1}};
+        for (auto& frame : frames)
+            frame["transform_matrix"] = identity;
+        write_text_file(root / "transforms.json", nlohmann::json{
+                                                      {"w", 2},
+                                                      {"h", 2},
+                                                      {"fl_x", 2},
+                                                      {"fl_y", 2},
+                                                      {"frames", std::move(frames)}}
+                                                      .dump());
+        // Avoid random initialization so the fixture has only two known points.
+        write_text_file(root / "pointcloud.ply",
+                        "ply\nformat ascii 1.0\nelement vertex 2\n"
+                        "property float x\nproperty float y\nproperty float z\n"
+                        "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+                        "end_header\n0 0 -2 255 0 0\n1 0 -2 0 255 0\n");
+    }
+};
+
+TEST_F(TransformsMaskTest, ExplicitPathsOverrideDiscoveryForFolderAndJson) {
+    const auto root = temp_dir / "explicit_masks";
+    write_dataset(root, {{{"file_path", "images/front/000001.png"}, {"mask_path", "labels/front.png"}},
+                         {{"file_path", "images/back/000001.png"}, {"mask_path", "labels/back.png"}}});
+    for (const auto* side : {"front", "back"}) {
+        write_png(root / "images" / side / "000001.png", 2, 2);
+        write_png(root / "labels" / (std::string(side) + ".png"), 2, 2);
+        // A guessed mask must not win over explicit metadata or fail dimension validation.
+        write_png(root / "masks" / side / "000001.png", 1, 1);
+    }
+    auto loader = Loader::create();
+    for (const auto& source : {root, root / "transforms.json"}) {
+        SCOPED_TRACE(lfs::core::path_to_utf8(source));
+        auto result = loader->load(source, {.load_masks = true});
+        ASSERT_TRUE(result) << result.error().format();
+        const auto& cameras = std::get<LoadedScene>(result->data).cameras;
+        ASSERT_EQ(cameras.size(), 2u);
+        EXPECT_EQ(cameras[0]->mask_path(), root / "labels/front.png");
+        EXPECT_EQ(cameras[1]->mask_path(), root / "labels/back.png");
+        EXPECT_EQ(cameras[0]->image_name(), "000001.png");
+    }
+}
+
+TEST_F(TransformsMaskTest, ImplicitMasksRetainCameraSubdirectories) {
+    const auto root = temp_dir / "implicit_masks";
+    write_dataset(root, {{{"file_path", "./images/front/000001.png"}},
+                         {{"file_path", "images/back/000001.png"}}});
+    for (const auto* side : {"front", "back"}) {
+        write_png(root / "images" / side / "000001.png", 2, 2);
+        write_png(root / "masks" / side / "000001.png", 2, 2);
+    }
+    auto result = Loader::create()->load(root, {.load_masks = true});
+    ASSERT_TRUE(result) << result.error().format();
+    const auto& cameras = std::get<LoadedScene>(result->data).cameras;
+    ASSERT_EQ(cameras.size(), 2u);
+    EXPECT_EQ(cameras[0]->mask_path(), root / "masks/front/000001.png");
+    EXPECT_EQ(cameras[1]->mask_path(), root / "masks/back/000001.png");
+}
+
+TEST_F(TransformsMaskTest, AbsoluteImagePathRetainsRelativeMaskLookup) {
+    const auto root = temp_dir / "absolute_image";
+    const auto image = root / "images/front/000001.png";
+    write_dataset(root, {{{"file_path", lfs::core::path_to_utf8(image)}}});
+    write_png(image, 2, 2);
+    write_png(root / "masks/front/000001.png", 2, 2);
+    write_png(root / "masks/back/000001.png", 1, 1);
+    auto result = Loader::create()->load(root, {.load_masks = true});
+    ASSERT_TRUE(result) << result.error().format();
+    EXPECT_EQ(std::get<LoadedScene>(result->data).cameras.front()->mask_path(), root / "masks/front/000001.png");
+}
+
+TEST_F(TransformsMaskTest, ExtensionlessBlenderImageKeepsUniqueBasenameFallback) {
+    const auto root = temp_dir / "blender_masks";
+    write_dataset(root, {{{"file_path", "./train/r_0"}}});
+    write_png(root / "train/r_0.png", 2, 2);
+    write_png(root / "masks/r_0.png", 2, 2);
+    auto result = Loader::create()->load(root, {.load_masks = true});
+    ASSERT_TRUE(result) << result.error().format();
+    EXPECT_EQ(std::get<LoadedScene>(result->data).cameras.front()->mask_path(), root / "masks/r_0.png");
+}
+
+TEST_F(TransformsMaskTest, ExplicitAndImplicitMasksCanBeMixed) {
+    const auto root = temp_dir / "mixed_masks";
+    write_dataset(root, {{{"file_path", "images/front/000001.png"}, {"mask_path", "labels/front.png"}},
+                         {{"file_path", "images/back/000001.png"}}});
+    write_png(root / "images/front/000001.png", 2, 2);
+    write_png(root / "images/back/000001.png", 2, 2);
+    write_png(root / "labels/front.png", 2, 2);
+    write_png(root / "masks/back/000001.png", 2, 2);
+    auto result = Loader::create()->load(root, {.load_masks = true});
+    ASSERT_TRUE(result) << result.error().format();
+    const auto& cameras = std::get<LoadedScene>(result->data).cameras;
+    ASSERT_EQ(cameras.size(), 2u);
+    EXPECT_EQ(cameras[0]->mask_path(), root / "labels/front.png");
+    EXPECT_EQ(cameras[1]->mask_path(), root / "masks/back/000001.png");
+}
+
+TEST_F(TransformsMaskTest, ExplicitMaskPathsResolveFromJsonAndAllowAbsolutePaths) {
+    const auto root = temp_dir / "json_location";
+    const auto mask = temp_dir / "shared_masks/mask.png";
+    write_png(root / "images/frame.png", 2, 2);
+    write_png(mask, 2, 2);
+    for (const auto& mask_text : {std::string("../shared_masks/mask.png"), lfs::core::path_to_utf8(mask)}) {
+        SCOPED_TRACE(mask_text);
+        write_dataset(root, {{{"file_path", "images/frame.png"}, {"mask_path", mask_text}}});
+        auto result = Loader::create()->load(root / "transforms.json", {.load_masks = true});
+        ASSERT_TRUE(result) << result.error().format();
+        EXPECT_TRUE(fs::equivalent(std::get<LoadedScene>(result->data).cameras.front()->mask_path(), mask));
+    }
+}
+
+TEST_F(TransformsMaskTest, UnicodePathsWorkForExplicitAndImplicitMasks) {
+    const auto root = temp_dir / fs::path(u8"dataset \u00e8 \u6d4b\u8bd5");
+    const auto relative_image = fs::path(u8"images/cam \u00e8/frame \u6d4b\u8bd5.png");
+    const auto relative_mask = fs::path(u8"masks/cam \u00e8/frame \u6d4b\u8bd5.png");
+    write_png(root / relative_image, 2, 2);
+    write_png(root / relative_mask, 2, 2);
+    for (const bool explicit_path : {true, false}) {
+        nlohmann::json frame = {{"file_path", lfs::core::path_to_utf8(relative_image)}};
+        if (explicit_path)
+            frame["mask_path"] = lfs::core::path_to_utf8(relative_mask);
+        write_dataset(root, nlohmann::json::array({frame}));
+        auto result = Loader::create()->load(root, {.load_masks = true});
+        ASSERT_TRUE(result) << result.error().format();
+        EXPECT_EQ(std::get<LoadedScene>(result->data).cameras.front()->mask_path(), root / relative_mask);
+    }
+}
+
+TEST_F(TransformsMaskTest, MissingExplicitMaskNeverFallsBackToGuessedMask) {
+    const auto root = temp_dir / "missing_explicit_mask";
+    write_dataset(root, {{{"file_path", "images/frame.png"}, {"mask_path", "labels/missing.png"}}});
+    write_png(root / "images/frame.png", 2, 2);
+    write_png(root / "masks/frame.png", 2, 2);
+    auto loader = Loader::create();
+    auto enabled = loader->load(root, {.load_masks = true});
+    ASSERT_FALSE(enabled);
+    EXPECT_EQ(enabled.error().code, ErrorCode::MISSING_REQUIRED_FILES);
+    EXPECT_EQ(enabled.error().path, root / "labels/missing.png");
+
+    auto disabled = loader->load(root, {.load_masks = false});
+    ASSERT_TRUE(disabled) << disabled.error().format();
+    const auto& camera = std::get<LoadedScene>(disabled->data).cameras.front();
+    EXPECT_EQ(camera->mask_path(), root / "labels/missing.png");
+    EXPECT_FALSE(camera->has_mask());
+}
+
+TEST_F(TransformsMaskTest, ExplicitMaskDimensionsAreCheckedOnlyWhenEnabled) {
+    const auto root = temp_dir / "mask_dimensions";
+    write_dataset(root, {{{"file_path", "images/frame.png"}, {"mask_path", "labels/mask.png"}}});
+    write_png(root / "images/frame.png", 2, 2);
+    write_png(root / "labels/mask.png", 1, 1);
+    auto loader = Loader::create();
+    auto enabled = loader->load(root, {.load_masks = true});
+    ASSERT_FALSE(enabled);
+    EXPECT_EQ(enabled.error().code, ErrorCode::MASK_SIZE_MISMATCH);
+    auto disabled = loader->load(root, {.load_masks = false});
+    ASSERT_TRUE(disabled) << disabled.error().format();
+    EXPECT_EQ(std::get<LoadedScene>(disabled->data).cameras.front()->mask_path(), root / "labels/mask.png");
+}
+
+TEST_F(TransformsMaskTest, BrokenExplicitMaskIsValidatedOnlyWhenEnabled) {
+    const auto root = temp_dir / "broken_explicit_mask";
+    write_dataset(root, {{{"file_path", "images/frame.png"}, {"mask_path", "labels/mask.png"}}});
+    write_png(root / "images/frame.png", 2, 2);
+    write_text_file(root / "labels/mask.png", "not an image");
+    auto loader = Loader::create();
+    auto enabled = loader->load(root, {.load_masks = true});
+    EXPECT_FALSE(enabled);
+    auto disabled = loader->load(root, {.load_masks = false});
+    ASSERT_TRUE(disabled) << disabled.error().format();
+    EXPECT_EQ(std::get<LoadedScene>(disabled->data).cameras.front()->mask_path(), root / "labels/mask.png");
+}
+
+TEST_F(TransformsMaskTest, MissingImageDoesNotRequireItsExplicitMask) {
+    const auto root = temp_dir / "missing_image_mask";
+    write_dataset(root, {{{"file_path", "images/present.png"}},
+                         {{"file_path", "images/missing.png"}, {"mask_path", "labels/missing.png"}}});
+    write_png(root / "images/present.png", 2, 2);
+    auto result = Loader::create()->load(root, {.load_masks = true});
+    ASSERT_TRUE(result) << result.error().format();
+    const auto& cameras = std::get<LoadedScene>(result->data).cameras;
+    ASSERT_EQ(cameras.size(), 2u);
+    EXPECT_FALSE(cameras[1]->has_image());
+    EXPECT_EQ(cameras[1]->mask_path(), root / "labels/missing.png");
+}
+
+TEST_F(TransformsMaskTest, AmbiguousImplicitMasksRemainAnErrorWhenEnabled) {
+    const auto root = temp_dir / "ambiguous_masks";
+    write_dataset(root, {{{"file_path", "images/frame.png"}}});
+    write_png(root / "images/frame.png", 2, 2);
+    write_png(root / "masks/front/frame.png", 2, 2);
+    write_png(root / "masks/back/frame.png", 2, 2);
+    auto loader = Loader::create();
+    auto enabled = loader->load(root, {.load_masks = true});
+    ASSERT_FALSE(enabled);
+    EXPECT_EQ(enabled.error().code, ErrorCode::INVALID_DATASET);
+    auto disabled = loader->load(root, {.load_masks = false});
+    ASSERT_TRUE(disabled) << disabled.error().format();
+    EXPECT_TRUE(std::get<LoadedScene>(disabled->data).cameras.front()->mask_path().empty());
+}
+
+TEST_F(TransformsMaskTest, InvalidMaskMetadataIsRejectedBeforeCameraAssembly) {
+    const auto root = temp_dir / "invalid_mask_metadata";
+    const std::vector<nlohmann::json> invalid = {
+        nullptr, 42, true, nlohmann::json::array({"mask.png"}), nlohmann::json::object(),
+        "", std::string(4097, 'x'), std::string("mask\0.png", 9)};
+    for (const auto& mask_path : invalid) {
+        SCOPED_TRACE(mask_path.dump());
+        write_dataset(root, {{{"file_path", "images/frame.png"}, {"mask_path", mask_path}}});
+        EXPECT_THROW((void)read_transforms_cameras_and_images(root / "transforms.json"), std::runtime_error);
+    }
 }
 
 TEST_F(PythonIOTest, LoadTransformsPerFrameIntrinsics) {
@@ -1424,10 +1652,14 @@ TEST_F(PythonIOTest, HtmlExport) {
         << "Should be valid HTML";
     EXPECT_TRUE(content.find("window.__lfsInitMeasureTool") != std::string::npos)
         << "Should embed the measure tool init hook";
+    EXPECT_TRUE(content.find("window.__lfsInitLabelTool") != std::string::npos)
+        << "Should embed the label tool init hook";
     EXPECT_TRUE(content.find("export { Gizmo, TranslateGizmo };") == std::string::npos)
         << "Gizmo export statement should be stripped";
     EXPECT_TRUE(content.find("export { initMeasureTool };") == std::string::npos)
         << "Measure-tool export statement should be stripped";
+    EXPECT_TRUE(content.find("export { initLabelTool };") == std::string::npos)
+        << "Label-tool export statement should be stripped";
 }
 
 TEST_F(PythonIOTest, HtmlExportCancellationKeepsExistingTarget) {
@@ -1982,4 +2214,306 @@ TEST_F(PythonIOTest, PipelinedLoaderShutdownReleasesQueuedGpuTensorsBeforeDecode
     ASSERT_EQ(cudaMallocAsync(&probe, 4096, nullptr), cudaSuccess);
     ASSERT_EQ(cudaFreeAsync(probe, nullptr), cudaSuccess);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+}
+
+namespace {
+    bool containsLichtfeldModule(const fs::path& dir) {
+        std::error_code ec;
+        if (!fs::exists(dir, ec)) {
+            return false;
+        }
+        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            std::error_code file_ec;
+            if (!it->is_regular_file(file_ec) || file_ec) {
+                continue;
+            }
+            const auto filename = it->path().filename().string();
+            const auto ext = it->path().extension().string();
+            if ((ext == ".so" || ext == ".pyd") && filename.rfind("lichtfeld", 0) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fs::path findPythonModuleDir() {
+        std::error_code ec;
+        const auto cwd = fs::current_path(ec);
+        const auto project_root = fs::path(PROJECT_ROOT_PATH);
+        for (const auto& candidate : {
+                 cwd / "src" / "python",
+                 cwd.parent_path() / "src" / "python",
+                 project_root / "build" / "src" / "python",
+             }) {
+            if (containsLichtfeldModule(candidate)) {
+                return candidate;
+            }
+        }
+        return {};
+    }
+
+    void prependPythonPath(const fs::path& path) {
+        const auto value = path.string();
+        const char* existing = std::getenv("PYTHONPATH");
+#ifdef _WIN32
+        const char separator = ';';
+#else
+        const char separator = ':';
+#endif
+        const std::string combined =
+            existing && *existing ? value + separator + std::string(existing) : value;
+#ifdef _WIN32
+        _putenv_s("PYTHONPATH", combined.c_str());
+#else
+        setenv("PYTHONPATH", combined.c_str(), 1);
+#endif
+    }
+
+    std::string consumePythonError() {
+        if (!PyErr_Occurred()) {
+            return "unknown Python error";
+        }
+        PyObject* type = nullptr;
+        PyObject* value = nullptr;
+        PyObject* traceback = nullptr;
+        PyErr_Fetch(&type, &value, &traceback);
+        PyErr_NormalizeException(&type, &value, &traceback);
+        std::string message = "unknown Python error";
+        if (value) {
+            PyObject* as_str = PyObject_Str(value);
+            if (as_str) {
+                if (const char* utf8 = PyUnicode_AsUTF8(as_str)) {
+                    message = utf8;
+                }
+                Py_DECREF(as_str);
+            }
+        }
+        Py_XDECREF(type);
+        Py_XDECREF(value);
+        Py_XDECREF(traceback);
+        return message;
+    }
+} // namespace
+
+TEST_F(PythonIOTest, InspectProjectFromTwoThreadsReturnsSameUuid) {
+    using namespace lfs::io::project;
+    using namespace lfs::test::licht;
+
+    const auto container_path = temp_dir / "concurrent_inspect.licht";
+    const auto project_uuid = fixed_uuid(11);
+    const auto payload = byte_vector("inspect-concurrency");
+    {
+        auto created = ProjectWriter::create(
+            container_path,
+            CreateOptions{
+                .project_uuid = project_uuid,
+                .file_uuid = fixed_uuid(12),
+                .role = ContainerRole::Master,
+                .creation_time_unix_ns = 1'735'689'600'000'000'000,
+                .index_compression = IndexCompression::StoredForDeterministicTests,
+                .disk_reserve_bytes = 0,
+            });
+        ASSERT_TRUE(created) << lfs::format_for_developer(created.error());
+        auto writer = std::move(*created);
+        auto planned = writer.plan_commit(CommitOptions{
+            .kind = CommitKind::Explicit,
+            .commit_uuid = fixed_uuid(13),
+            .snapshot_uuid = fixed_uuid(14),
+            .wallclock_unix_ns = 1'735'689'601'000'000'000,
+        });
+        ASSERT_TRUE(planned) << lfs::format_for_developer(planned.error());
+        auto preflighted = writer.preflight(payload.size());
+        ASSERT_TRUE(preflighted) << lfs::format_for_developer(preflighted.error());
+        auto written = writer.write_chunk(fixed_key("TEST", 15), payload);
+        ASSERT_TRUE(written) << lfs::format_for_developer(written.error());
+        auto committed = writer.commit();
+        ASSERT_TRUE(committed) << lfs::format_for_developer(committed.error());
+    }
+
+    const auto module_dir = findPythonModuleDir();
+    ASSERT_FALSE(module_dir.empty()) << "Could not locate built lichtfeld module";
+    prependPythonPath(module_dir);
+    const auto init = lfs::python::ensure_initialized();
+    ASSERT_TRUE(init) << lfs::format_for_developer(init.error());
+
+    const auto script = std::format(R"PY(
+import threading
+import lichtfeld as lf
+path = r"{}"
+uuids = [None, None]
+errors = [None, None]
+
+def worker(index):
+    try:
+        uuids[index] = lf.io.inspect_project(path).project_uuid
+    except Exception as exc:
+        errors[index] = repr(exc)
+
+threads = [
+    threading.Thread(target=worker, args=(0,)),
+    threading.Thread(target=worker, args=(1,)),
+]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join(timeout=30)
+result_alive = any(thread.is_alive() for thread in threads)
+result_errors = [error for error in errors if error is not None]
+result_uuid_a = uuids[0]
+result_uuid_b = uuids[1]
+)PY",
+                                    container_path.generic_string());
+
+    const lfs::python::GilAcquire gil;
+    PyObject* namespace_dict = PyDict_New();
+    ASSERT_TRUE(namespace_dict);
+    PyDict_SetItemString(namespace_dict, "__builtins__", PyEval_GetBuiltins());
+    PyObject* exec_result =
+        PyRun_String(script.c_str(), Py_file_input, namespace_dict, namespace_dict);
+    if (!exec_result) {
+        const auto python_error = consumePythonError();
+        Py_DECREF(namespace_dict);
+        FAIL() << python_error;
+    }
+    Py_DECREF(exec_result);
+
+    auto* const alive_obj = PyDict_GetItemString(namespace_dict, "result_alive");
+    auto* const errors_obj = PyDict_GetItemString(namespace_dict, "result_errors");
+    auto* const uuid_a_obj = PyDict_GetItemString(namespace_dict, "result_uuid_a");
+    auto* const uuid_b_obj = PyDict_GetItemString(namespace_dict, "result_uuid_b");
+    ASSERT_TRUE(alive_obj);
+    ASSERT_TRUE(errors_obj);
+    ASSERT_TRUE(uuid_a_obj);
+    ASSERT_TRUE(uuid_b_obj);
+    EXPECT_FALSE(PyObject_IsTrue(alive_obj)) << "inspect_project hung on a worker thread";
+    EXPECT_EQ(PyList_Size(errors_obj), 0);
+    ASSERT_TRUE(PyUnicode_Check(uuid_a_obj));
+    ASSERT_TRUE(PyUnicode_Check(uuid_b_obj));
+    const std::string uuid_a = PyUnicode_AsUTF8(uuid_a_obj);
+    const std::string uuid_b = PyUnicode_AsUTF8(uuid_b_obj);
+    EXPECT_EQ(uuid_a, uuid_b);
+    EXPECT_EQ(uuid_a, project_uuid.to_string());
+
+    Py_DECREF(namespace_dict);
+}
+
+TEST_F(PythonIOTest, InspectProjectFallbackPreviewPath) {
+    using namespace lfs::io::project;
+    using namespace lfs::test::licht;
+
+    const auto dataset_root = temp_dir / "fallback_dataset";
+    const auto images_dir = dataset_root / "images";
+    const auto container_path = temp_dir / "fallback_inspect.licht";
+    fs::create_directories(dataset_root);
+
+    auto document = make_empty_document(fixed_uuid(21), 100);
+    auto snapshot = require_result(document->parameters().snapshot());
+    snapshot.dataset.images = "images";
+    require_status(document->edit_parameters().set_snapshot(snapshot));
+    const auto dataset_uuid = require_result(upsert_path_reference(
+        document->edit_references(), {}, dataset_root, "dataset.root", "dataset"));
+    require_status(document->edit_project().set_dataset_reference(dataset_uuid));
+    auto options = deterministic_document_save_options(0x70000000, 22, 300);
+    auto saved = document->save(container_path, options);
+    ASSERT_TRUE(saved) << lfs::format_for_developer(saved.error());
+
+    fs::create_directories(images_dir);
+    write_png(images_dir / "zulu.png", 8, 8);
+    write_png(images_dir / "alpha.png", 8, 8);
+
+    const auto module_dir = findPythonModuleDir();
+    ASSERT_FALSE(module_dir.empty()) << "Could not locate built lichtfeld module";
+    prependPythonPath(module_dir);
+    const auto init = lfs::python::ensure_initialized();
+    ASSERT_TRUE(init) << lfs::format_for_developer(init.error());
+
+    const auto script = std::format(R"PY(
+import lichtfeld as lf
+i = lf.io.inspect_project(r"{}")
+result_has_preview = i.has_preview
+result_fallback = i.fallback_preview_path
+)PY",
+                                    container_path.generic_string());
+
+    const lfs::python::GilAcquire gil;
+    PyObject* namespace_dict = PyDict_New();
+    ASSERT_TRUE(namespace_dict);
+    PyDict_SetItemString(namespace_dict, "__builtins__", PyEval_GetBuiltins());
+    PyObject* exec_result =
+        PyRun_String(script.c_str(), Py_file_input, namespace_dict, namespace_dict);
+    if (!exec_result) {
+        const auto python_error = consumePythonError();
+        Py_DECREF(namespace_dict);
+        FAIL() << python_error;
+    }
+    Py_DECREF(exec_result);
+
+    auto* const has_preview_obj = PyDict_GetItemString(namespace_dict, "result_has_preview");
+    auto* const fallback_obj = PyDict_GetItemString(namespace_dict, "result_fallback");
+    ASSERT_TRUE(has_preview_obj);
+    ASSERT_TRUE(fallback_obj);
+    EXPECT_FALSE(PyObject_IsTrue(has_preview_obj));
+    ASSERT_TRUE(PyUnicode_Check(fallback_obj));
+    const fs::path fallback = PyUnicode_AsUTF8(fallback_obj);
+    EXPECT_EQ(fallback.filename(), "alpha.png");
+    EXPECT_TRUE(fs::equivalent(fallback, images_dir / "alpha.png"));
+    Py_DECREF(namespace_dict);
+}
+
+TEST_F(PythonIOTest, InspectProjectFallbackEmptyWhenPreviewEmbedded) {
+    using namespace lfs::io::project;
+    using namespace lfs::test::licht;
+
+    const auto dataset_root = temp_dir / "embedded_dataset";
+    const auto images_dir = dataset_root / "images";
+    fs::create_directories(images_dir);
+    write_png(images_dir / "scene.png", 16, 16);
+
+    const auto container_path = temp_dir / "embedded_inspect.licht";
+    auto document = make_empty_document(fixed_uuid(31), 100);
+    auto snapshot = require_result(document->parameters().snapshot());
+    snapshot.dataset.images = "images";
+    require_status(document->edit_parameters().set_snapshot(snapshot));
+    const auto dataset_uuid = require_result(upsert_path_reference(
+        document->edit_references(), {}, dataset_root, "dataset.root", "dataset"));
+    require_status(document->edit_project().set_dataset_reference(dataset_uuid));
+    auto options = deterministic_document_save_options(0x70000000, 32, 300);
+    auto saved = document->save(container_path, options);
+    ASSERT_TRUE(saved) << lfs::format_for_developer(saved.error());
+
+    const auto module_dir = findPythonModuleDir();
+    ASSERT_FALSE(module_dir.empty()) << "Could not locate built lichtfeld module";
+    prependPythonPath(module_dir);
+    const auto init = lfs::python::ensure_initialized();
+    ASSERT_TRUE(init) << lfs::format_for_developer(init.error());
+
+    const auto script = std::format(R"PY(
+import lichtfeld as lf
+i = lf.io.inspect_project(r"{}")
+result_has_preview = i.has_preview
+result_fallback = i.fallback_preview_path
+)PY",
+                                    container_path.generic_string());
+
+    const lfs::python::GilAcquire gil;
+    PyObject* namespace_dict = PyDict_New();
+    ASSERT_TRUE(namespace_dict);
+    PyDict_SetItemString(namespace_dict, "__builtins__", PyEval_GetBuiltins());
+    PyObject* exec_result =
+        PyRun_String(script.c_str(), Py_file_input, namespace_dict, namespace_dict);
+    if (!exec_result) {
+        const auto python_error = consumePythonError();
+        Py_DECREF(namespace_dict);
+        FAIL() << python_error;
+    }
+    Py_DECREF(exec_result);
+
+    auto* const has_preview_obj = PyDict_GetItemString(namespace_dict, "result_has_preview");
+    auto* const fallback_obj = PyDict_GetItemString(namespace_dict, "result_fallback");
+    ASSERT_TRUE(has_preview_obj);
+    ASSERT_TRUE(fallback_obj);
+    EXPECT_TRUE(PyObject_IsTrue(has_preview_obj));
+    ASSERT_TRUE(PyUnicode_Check(fallback_obj));
+    EXPECT_STREQ(PyUnicode_AsUTF8(fallback_obj), "");
+    Py_DECREF(namespace_dict);
 }

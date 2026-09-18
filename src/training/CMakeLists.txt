@@ -8,9 +8,6 @@ add_subdirectory(rasterization/fastgs)
 # Add LibTorch-free gsplat backend
 add_subdirectory(rasterization/gsplat)
 
-# Add igs+ edge-compute rasterizer
-add_subdirectory(rasterization/edge_compute)
-
 # LibTorch-free CUDA kernels
 set(LFS_TRAINING_KERNEL_SOURCES
     kernels/loss_tensor_contract.cpp
@@ -28,7 +25,6 @@ set(LFS_TRAINING_KERNEL_SOURCES
     kernels/mrnf_kernels.cu
     kernels/densification_kernels.cu
     kernels/morton_reorder_kernels.cu
-    kernels/sh_value_quant_kernels.cu
     kernels/grad_alpha.cu
     kernels/depth_loss.cu
     kernels/normal_loss.cu
@@ -52,6 +48,7 @@ target_link_libraries(lfs_training_kernels
     PUBLIC
         lfs_core         # For lfs::core::Tensor (tensor merged into lfs_core)
         CUDA::cudart
+        lfs_core_cuda    # q16 encode/decode kernels
 )
 
 set_target_properties(lfs_training_kernels PROPERTIES
@@ -99,7 +96,6 @@ set(TRAINING_NEW_SOURCES
     strategies/improved_gs_plus.cpp
     rasterization/fast_rasterizer.cpp
     rasterization/gsplat_rasterizer.cpp
-    rasterization/edge_rasterizer.cpp
     components/config_serialization.cpp
     components/bilateral_grid.cpp
     components/ppisp.cpp
@@ -108,6 +104,7 @@ set(TRAINING_NEW_SOURCES
     components/ppisp_file.cpp
     components/sparsity_optimizer.cpp
     control/command_api.cpp
+    metrics/eval_mask.cpp
     metrics/metrics.cpp
         checkpoint.cpp
         project_snapshot_chapters.cpp
@@ -115,6 +112,7 @@ set(TRAINING_NEW_SOURCES
         progress.cpp
         training_cropbox_mask.cpp
         trainer.cpp
+        normal_auto_generate.cpp
         vram_ledger.cpp
         perf_bench.cpp
     training_setup.cpp
@@ -135,8 +133,6 @@ target_include_directories(lfs_training
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/rasterization/include  # For rasterization_api.h
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/optimizer/include
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/fastgs/utils
-	${CMAKE_CURRENT_SOURCE_DIR}/rasterization/edge_compute/rasterization/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/rasterization/edge_compute/utils
         ${CMAKE_CURRENT_SOURCE_DIR}/rasterization  # For gsplat headers
 )
 # indicators.hpp is an implementation detail of progress.cpp.
@@ -154,9 +150,9 @@ target_link_libraries(lfs_training
         lfs_training_kernels    # LibTorch-free SSIM kernels
         fastlfs_backend         # LibTorch-free FastGS rasterization and optimizer kernels
         gsplat_backend_lfs      # LibTorch-free gsplat rasterization backend
-	edge_compute_backend    # For igs+ edge score rasterization
     PRIVATE
         lfs_depth_anchor        # Shared depth-anchor fit + sidecar cache
+        lfs_preprocessing       # MoGe-2 normal auto-generate
         lfs_python_utils
 )
 

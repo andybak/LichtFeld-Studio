@@ -40,6 +40,35 @@ namespace lfs::vis {
     } // namespace
 
     void EditorContext::update(const SceneManager* scene_manager, const TrainerManager* trainer_manager) {
+        const auto scene_generation = app_store().scene_generation.get();
+        const auto selection_generation = app_store().selection_generation.get();
+        const bool has_scene_manager = scene_manager != nullptr;
+        const bool has_trainer_manager = trainer_manager != nullptr;
+        const bool trainer_running = trainer_manager && trainer_manager->isTrainingActive();
+        const bool trainer_paused = trainer_manager && trainer_manager->isPaused();
+        const bool trainer_finished = trainer_manager && trainer_manager->isFinished();
+        const std::size_t scene_node_count = scene_manager ? scene_manager->getScene().getNodeCount() : 0;
+        if (state_initialized_ &&
+            scene_generation == last_scene_generation_ &&
+            selection_generation == last_selection_generation_ &&
+            has_scene_manager == last_has_scene_manager_ &&
+            has_trainer_manager == last_has_trainer_manager_ &&
+            trainer_running == last_trainer_running_ &&
+            trainer_paused == last_trainer_paused_ &&
+            trainer_finished == last_trainer_finished_ &&
+            scene_node_count == last_scene_node_count_)
+            return;
+
+        last_scene_generation_ = scene_generation;
+        last_selection_generation_ = selection_generation;
+        last_has_scene_manager_ = has_scene_manager;
+        last_has_trainer_manager_ = has_trainer_manager;
+        last_trainer_running_ = trainer_running;
+        last_trainer_paused_ = trainer_paused;
+        last_trainer_finished_ = trainer_finished;
+        last_scene_node_count_ = scene_node_count;
+        state_initialized_ = true;
+
         if (!scene_manager) {
             mode_ = EditorMode::EMPTY;
             has_selection_ = false;
@@ -47,6 +76,8 @@ namespace lfs::vis {
             has_editable_transform_selection_ = false;
             has_splat_selection_ = false;
             has_editable_splat_selection_ = false;
+            has_editable_align_selection_ = false;
+            has_locked_align_selection_ = false;
             transform_selection_error_.clear();
             selected_node_type_ = core::NodeType::SPLAT;
             return;
@@ -54,7 +85,7 @@ namespace lfs::vis {
 
         // Determine mode based on training state
         if (trainer_manager) {
-            if (trainer_manager->isRunning()) {
+            if (trainer_manager->isTrainingActive()) {
                 mode_ = EditorMode::TRAINING;
             } else if (trainer_manager->isPaused()) {
                 mode_ = EditorMode::PAUSED;
@@ -80,11 +111,13 @@ namespace lfs::vis {
         }
 
         // Update selection state
-        const auto selected_node_names = scene_manager->getSelectedNodeNames();
-        has_selection_ = !selected_node_names.empty();
+        const auto selected_node_ids = scene_manager->getSelectedNodeIds();
+        has_selection_ = !selected_node_ids.empty();
         has_editable_transform_selection_ = false;
         has_splat_selection_ = false;
         has_editable_splat_selection_ = false;
+        has_editable_align_selection_ = false;
+        has_locked_align_selection_ = false;
         transform_selection_error_.clear();
         selected_node_type_ = core::NodeType::SPLAT;
 
@@ -95,8 +128,8 @@ namespace lfs::vis {
             bool has_editable_transform_target = false;
             bool selected_type_initialized = false;
 
-            for (const auto& name : selected_node_names) {
-                const auto* const node = scene.getNode(name);
+            for (const auto id : selected_node_ids) {
+                const auto* const node = scene.getNodeById(id);
                 if (!node)
                     continue;
 
@@ -119,6 +152,14 @@ namespace lfs::vis {
                     has_splat_selection_ = true;
                     if (!locked)
                         has_editable_splat_selection_ = true;
+                }
+
+                if (cap::isAlignTransformTargetType(node->type)) {
+                    if (locked) {
+                        has_locked_align_selection_ = true;
+                    } else {
+                        has_editable_align_selection_ = true;
+                    }
                 }
             }
 
@@ -164,7 +205,7 @@ namespace lfs::vis {
         case ToolType::Scale:
             return canTransformSelectedNode();
         case ToolType::Align:
-            return has_editable_splat_selection_;
+            return has_editable_align_selection_;
         }
         return false;
     }
@@ -195,11 +236,11 @@ namespace lfs::vis {
                 return nullptr;
             return transform_selection_error_.empty() ? "select parent node" : transform_selection_error_.c_str();
         case ToolType::Align:
-            if (has_editable_splat_selection_)
+            if (has_editable_align_selection_)
                 return nullptr;
-            if (has_splat_selection_)
+            if (has_locked_align_selection_)
                 return "selection is locked";
-            return "select PLY node";
+            return "select transformable node";
         }
         return nullptr;
     }

@@ -47,6 +47,7 @@ NUMBER_PROPS = (
     "bilateral_grid_y",
     "bilateral_grid_w",
     "bilateral_grid_lr",
+    "exposure_correction_grid_start_iter",
     "mask_opacity_penalty_weight",
     "mask_opacity_penalty_power",
     "mask_threshold",
@@ -54,6 +55,8 @@ NUMBER_PROPS = (
     "normal_loss_weight",
     "normal_consistency_weight",
     "normal_flatten_weight",
+    "normal_start_fraction",
+    "normal_end_fraction",
     "opacity_reg",
     "scale_reg",
     "tv_loss_weight",
@@ -68,11 +71,13 @@ NUMBER_PROPS = (
 )
 
 BOOL_PROPS = (
+    "use_exposure_correction",
     "use_bilateral_grid",
     "invert_masks",
     "use_alpha_as_mask",
     "use_depth_loss",
     "use_normal_loss",
+    "normal_auto_generate",
     "enable_sparsity",
     "gut",
     "undistort",
@@ -84,6 +89,7 @@ BOOL_PROPS = (
     "ppisp_freeze_gaussians",
     "random",
     "enable_eval",
+    "background_improvements",
 )
 
 SELECT_PROPS = ("mask_mode", "bg_mode", "normal_loss_space")
@@ -106,6 +112,11 @@ BESPOKE_OR_HIDDEN = {
 
 AUTO_ADVANCED_RUN_ID = "advanced_registry"
 
+# Per-row visibility inside a run (auto-advanced rows have no run-level condition).
+PROP_VISIBILITY_CONDITION_IDS = {
+    "ppisp_reg_weight": "dep_show_ppisp_reg_weight",
+}
+
 
 def _run(
     run_id,
@@ -123,9 +134,17 @@ def _run(
 
 BASIC_RUNS = (
     _run("basic_struct", "iterations", "max_cap"),
+    _run("basic_background", "background_improvements", visibility_condition_id="dep_mrnf"),
+    _run(
+        "basic_exposure_correction",
+        "use_exposure_correction",
+    ),
+    _run(
+        "basic_bilateral_toggle",
+        "use_bilateral_grid",
+    ),
     _run(
         "basic_live_start",
-        "use_bilateral_grid",
         "mask_mode",
         "use_depth_loss",
     ),
@@ -137,9 +156,12 @@ BASIC_RUNS = (
     _run("basic_normal_toggle", "use_normal_loss"),
     _run(
         "basic_normal_weights",
+        "normal_auto_generate",
         "normal_loss_weight",
         "normal_consistency_weight",
         "normal_flatten_weight",
+        "normal_start_fraction",
+        "normal_end_fraction",
         "normal_loss_space",
         visibility_condition_id="dep_normal_loss",
     ),
@@ -162,10 +184,18 @@ BASIC_RUNS = (
     ),
     _run("basic_sparsity_toggle", "enable_sparsity"),
     _run("basic_gut", "gut", disabled_condition_id="gut_disabled"),
-    _run("basic_after_gut", "undistort", "mip_filter", "ppisp"),
+    _run("basic_after_gut", "undistort", "mip_filter"),
+    _run(
+        "basic_ppisp_toggle",
+        "ppisp",
+    ),
+    _run(
+        "ppisp_exif",
+        "ppisp_exposure_from_exif",
+        visibility_condition_id="dep_ppisp_params",
+    ),
     _run(
         "ppisp_freeze",
-        "ppisp_exposure_from_exif",
         "ppisp_freeze_from_sidecar",
         visibility_condition_id="dep_ppisp",
     ),
@@ -230,6 +260,11 @@ BILATERAL_RUNS = (
         "bilateral_grid_w",
         "bilateral_grid_lr",
         visibility_condition_id="dep_bilateral",
+    ),
+    _run(
+        "exposure_grid_start",
+        "exposure_correction_grid_start_iter",
+        visibility_condition_id="dep_exposure_correction",
     ),
 )
 
@@ -301,6 +336,8 @@ _ENUM_OPTION_TOOLTIP_KEYS = {
     ("mask_mode", 2): "training.tooltip.opt.mask_mode.ignore",
     ("mask_mode", 3): "training.tooltip.opt.mask_mode.segment_and_ignore",
     ("mask_mode", 4): "training.tooltip.opt.mask_mode.alpha_consistent",
+    ("densify_error_map", 0): "training.tooltip.opt.densify_error_map.ssim",
+    ("densify_error_map", 1): "training.tooltip.opt.densify_error_map.ssim_cs",
     ("bg_mode", 0): "training.tooltip.opt.bg_mode.color",
     ("bg_mode", 1): "training.tooltip.opt.bg_mode.modulation",
     ("bg_mode", 2): "training.tooltip.opt.bg_mode.image",
@@ -744,10 +781,12 @@ class SectionBinding:
         if row is None:
             return False
         if row["kind"] == "checkbox":
-            if isinstance(value, str):
-                value = value.strip().lower() in {"1", "true", "yes", "on"}
-            else:
-                value = bool(value)
+            # Only the click binding produces booleans. String payloads are
+            # creation-time change echoes from the row template's data-if'd
+            # select element carrying this row's id; committing them corrupts
+            # the parameter (e.g. normal_auto_generate flipped off at startup).
+            if not isinstance(value, bool):
+                return False
         elif row["kind"] == "select":
             try:
                 value = int(value)
@@ -772,6 +811,10 @@ class SectionBinding:
             allowed_strategies = row.get("strategies", ())
             if allowed_strategies and active_strategy not in allowed_strategies:
                 continue
+            prop_condition = PROP_VISIBILITY_CONDITION_IDS.get(row["id"])
+            if prop_condition and callable(self._visibility_predicate):
+                if not bool(self._visibility_predicate(prop_condition)):
+                    continue
             label = _localized(row["label_key"], row["name"])
             if not row_matches_query(row["id"], label, query):
                 continue

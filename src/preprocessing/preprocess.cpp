@@ -4,19 +4,21 @@
 
 #include "preprocessing/preprocess.hpp"
 
+#include "core/cuda_error.hpp"
+#include "core/environment.hpp"
+#include "core/image_io.hpp"
 #include "core/logger.hpp"
+#include "core/nn/models/moge2.hpp"
 #include "core/path_utils.hpp"
 #include "core/point_cloud.hpp"
 #include "core/tensor.hpp"
 #include "depth_anchor_cache.hpp"
+
 #include "io/loader.hpp"
+#include <cuda_runtime.h>
 
 #include "indicators.hpp"
-#include <OpenImageIO/imagebuf.h>
-#include <OpenImageIO/imagebufalgo.h>
-#include <OpenImageIO/imageio.h>
 #include <curl/curl.h>
-#include <onnxruntime_cxx_api.h>
 #include <openssl/evp.h>
 
 #ifdef _WIN32
@@ -52,19 +54,26 @@
 #include <system_error>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace fs = std::filesystem;
 
 namespace {
 
-    constexpr std::string_view kDefaultModelFile = "moge-2-vitb-normal.onnx";
+    constexpr std::string_view kDefaultModelFile = "moge-2-vitb-normal.lfw";
     constexpr std::string_view kDefaultModelUrl =
-        "https://github.com/MrNeRF/LichtFeld-Studio/releases/download/model-moge2-v1/moge-2-vitb-normal.onnx";
-    constexpr std::string_view kFallbackModelUrl =
-        "https://huggingface.co/Ruicheng/moge-2-vitb-normal-onnx/resolve/main/model.onnx";
+        "https://github.com/MrNeRF/LichtFeld-Studio/releases/download/model-moge2-v1/moge-2-vitb-normal.lfw";
     constexpr std::string_view kDefaultModelSha256 =
-        "bbf14e07a30f11e69d36ab861590123f5598ababcbc8946a063eb4a966f35a21";
+        "db1fbe8dcd6ff91f6cdb0369c3a31f9f04e1a71a8114573ef189593f10de9cd9";
+    constexpr std::string_view kLpipsModelFile = "lpips-vgg16-v0.1.lfw";
+    constexpr std::string_view kLpipsModelUrl =
+        "https://github.com/MrNeRF/LichtFeld-Studio/releases/download/model-lpips-v1/lpips-vgg16-v0.1.lfw";
+    constexpr std::string_view kLpipsModelSha256 =
+        "ea2f01796fbcf9950f9454f19b42e45568f166d879ec141ec100b9897a8cc769";
+
+    void remove_file_if_exists(const fs::path& path);
+    void replace_file(const fs::path& source, const fs::path& destination);
 
     bool stdout_is_tty() {
 #ifdef _WIN32
@@ -115,7 +124,7 @@ namespace {
         std::vector<float> xyz_hwc;
     };
 
-    struct OrtOutputs {
+    struct HeadMaps {
         SpatialMap mask;
         VectorMap points;
         VectorMap normals;
@@ -141,15 +150,15 @@ namespace {
 
     fs::path home_directory() {
 #ifdef _WIN32
-        if (const char* profile = std::getenv("USERPROFILE"); profile && profile[0])
-            return fs::path(profile);
-        const char* drive = std::getenv("HOMEDRIVE");
-        const char* homepath = std::getenv("HOMEPATH");
-        if (drive && drive[0] && homepath && homepath[0])
-            return fs::path(std::string(drive) + homepath);
+        if (const auto profile = lfs::core::environment::value("USERPROFILE"))
+            return lfs::core::utf8_to_path(*profile);
+        const auto drive = lfs::core::environment::value("HOMEDRIVE");
+        const auto homepath = lfs::core::environment::value("HOMEPATH");
+        if (drive && homepath)
+            return lfs::core::utf8_to_path(*drive + *homepath);
 #else
-        if (const char* home = std::getenv("HOME"); home && home[0])
-            return fs::path(home);
+        if (const auto home = lfs::core::environment::value("HOME"))
+            return lfs::core::utf8_to_path(*home);
 #endif
         return fs::temp_directory_path();
     }
@@ -158,20 +167,99 @@ namespace {
         return home_directory() / ".lichtfeld" / "onnx" / std::string(kDefaultModelFile);
     }
 
+    fs::path lfw_path_for_onnx(const fs::path& onnx_path) {
+        fs::path out = onnx_path;
+        out.replace_extension(".lfw");
+        return out;
+    }
+
+    const char* backend_name(lfs::core::param::InferenceBackend) {
+        return "native";
+    }
+
+    fs::path find_nn_export_script() {
+        if (const auto env = lfs::core::environment::value("LFS_NN_EXPORT"))
+            return lfs::core::utf8_to_path(*env);
+        std::error_code ec;
+        std::vector<fs::path> roots;
+#ifdef __linux__
+        const auto exe = fs::read_symlink("/proc/self/exe", ec);
+        if (!ec)
+            roots.push_back(exe.parent_path());
+#endif
+        roots.push_back(fs::current_path());
+        for (const auto& root : roots) {
+            fs::path cursor = root;
+            for (int i = 0; i < 6; ++i) {
+                const auto candidate = cursor / "tools" / "nn_export" / "export_onnx_weights.py";
+                if (fs::is_regular_file(candidate))
+                    return candidate;
+                if (!cursor.has_parent_path() || cursor.parent_path() == cursor)
+                    break;
+                cursor = cursor.parent_path();
+            }
+        }
+        return {};
+    }
+
+    fs::path find_python_for_export(const fs::path& script) {
+        if (const auto env = lfs::core::environment::value("LFS_PYTHON"))
+            return lfs::core::utf8_to_path(*env);
+        if (!script.empty()) {
+            const auto vcpkg = script.parent_path().parent_path().parent_path() / "build" /
+                               "vcpkg_installed" / "x64-linux" / "tools" / "python3" / "python3";
+            if (fs::is_regular_file(vcpkg))
+                return vcpkg;
+        }
+        return "python3";
+    }
+
+    void convert_onnx_to_lfw(const fs::path& onnx_path, const fs::path& lfw_path) {
+        const auto script = find_nn_export_script();
+        if (script.empty()) {
+            throw std::runtime_error(
+                "Native inference needs " + path_to_string(lfw_path) +
+                " next to the ONNX. Could not find tools/nn_export/export_onnx_weights.py. Run:\n"
+                "  python3 tools/nn_export/export_onnx_weights.py --onnx " +
+                path_to_string(onnx_path) + " --out " + path_to_string(lfw_path) +
+                " --fp16 --moge2");
+        }
+        const auto python = find_python_for_export(script);
+        fs::path tmp = lfw_path;
+        tmp += ".tmp";
+        const std::string cmd =
+            path_to_string(python) + " " + path_to_string(script) +
+            " --onnx " + path_to_string(onnx_path) + " --out " +
+            path_to_string(tmp) + " --fp16 --moge2";
+        std::cout << "Converting ONNX weights to " << path_to_string(lfw_path) << "\n";
+#ifdef _WIN32
+        const int rc = _wsystem(lfs::core::utf8_to_wstring(cmd).c_str());
+#else
+        const int rc = std::system(cmd.c_str());
+#endif
+        if (rc != 0 || !fs::is_regular_file(tmp)) {
+            remove_file_if_exists(tmp);
+            throw std::runtime_error(
+                "ONNX to .lfw conversion failed (status " + std::to_string(rc) +
+                "). Install the `onnx` package in that Python and run:\n  " + cmd);
+        }
+        replace_file(tmp, lfw_path);
+    }
+
     fs::path legacy_model_path() {
         fs::path root;
 #ifdef _WIN32
-        if (const char* local = std::getenv("LOCALAPPDATA"); local && local[0])
-            root = fs::path(local) / "LichtFeld";
-        else if (const char* temp = std::getenv("TEMP"); temp && temp[0])
-            root = fs::path(temp) / "LichtFeld";
+        if (const auto local = lfs::core::environment::value("LOCALAPPDATA"))
+            root = lfs::core::utf8_to_path(*local) / "LichtFeld";
+        else if (const auto temp = lfs::core::environment::value("TEMP"))
+            root = lfs::core::utf8_to_path(*temp) / "LichtFeld";
         else
             root = fs::temp_directory_path() / "LichtFeld";
 #else
-        if (const char* xdg = std::getenv("XDG_CACHE_HOME"); xdg && xdg[0])
-            root = fs::path(xdg) / "lichtfeld";
-        else if (const char* home = std::getenv("HOME"); home && home[0])
-            root = fs::path(home) / ".cache" / "lichtfeld";
+        if (const auto xdg = lfs::core::environment::value("XDG_CACHE_HOME"))
+            root = lfs::core::utf8_to_path(*xdg) / "lichtfeld";
+        else if (const auto home = lfs::core::environment::value("HOME"))
+            root = lfs::core::utf8_to_path(*home) / ".cache" / "lichtfeld";
         else
             root = fs::temp_directory_path() / "lichtfeld";
 #endif
@@ -294,11 +382,14 @@ namespace {
 
     void download_verified_file(std::string_view url,
                                 const fs::path& destination,
-                                std::string_view expected_hash) {
+                                std::string_view expected_hash,
+                                std::string_view label) {
         fs::create_directories(destination.parent_path());
-        const fs::path tmp_path = destination.string() + ".tmp";
+        fs::path tmp_path = destination;
+        tmp_path += ".tmp";
 
-        std::ofstream output(tmp_path, std::ios::binary | std::ios::trunc);
+        std::ofstream output;
+        lfs::core::open_file_for_write(tmp_path, std::ios::binary | std::ios::trunc, output);
         if (!output)
             throw std::runtime_error("Could not open " + path_to_string(tmp_path) + " for writing");
 
@@ -315,6 +406,9 @@ namespace {
         curl_easy_setopt(curl, CURLOPT_URL, url_string.c_str());
         curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
         curl_easy_setopt(curl, CURLOPT_USERAGENT, "LichtFeld-Studio/preprocess");
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &output);
@@ -349,13 +443,59 @@ namespace {
         }
 
         try {
-            require_sha256(tmp_path, expected_hash, "Downloaded model");
+            require_sha256(tmp_path, expected_hash, label);
         } catch (...) {
             remove_file_if_exists(tmp_path);
             throw;
         }
 
         replace_file(tmp_path, destination);
+    }
+
+    fs::path cached_model_path(const std::string_view filename) {
+        return home_directory() / ".lichtfeld" / "onnx" / std::string(filename);
+    }
+
+    lfs::Result<fs::path> ensure_cached_model(const std::string_view filename,
+                                              const std::string_view url,
+                                              const std::string_view expected_hash,
+                                              const bool allow_download,
+                                              const std::string_view label) {
+        try {
+            const fs::path path = cached_model_path(filename);
+            if (fs::is_regular_file(path)) {
+                try {
+                    require_sha256(path, expected_hash, std::string("Cached ") + std::string(label));
+                    return path;
+                } catch (const DownloadIntegrityError& e) {
+                    if (!allow_download)
+                        throw;
+                    std::cerr << e.what() << "\n";
+                    remove_file_if_exists(path);
+                    std::cerr << "Removed untrusted cached " << label << "; re-downloading "
+                              << path_to_string(path) << "\n";
+                }
+            }
+            if (!allow_download)
+                throw std::runtime_error(std::string(label) + " is not cached: " + path_to_string(path));
+
+            std::cout << "Downloading " << label << " weights to " << path_to_string(path) << "\n";
+            download_verified_file(url, path, expected_hash,
+                                   std::string("Downloaded ") + std::string(label));
+            require_sha256(path, expected_hash, std::string("Cached ") + std::string(label));
+            std::cout << "Verified " << label << " SHA-256: " << expected_hash << "\n";
+            return path;
+        } catch (const std::exception& e) {
+            // LFS-CENSUS-OK(empty-catch): converts the exception text to a returned Result error.
+            return lfs::Result<fs::path>(lfs::make_legacy_error(
+                e.what(),
+                lfs::LegacyErrorContext{
+                    .code = lfs::ErrorCode::Unavailable,
+                    .domain = lfs::ErrorDomain::Preprocess,
+                    .operation = "ensure_cached_model",
+                    .source = LFS_SOURCE_SITE_CURRENT(),
+                }));
+        }
     }
 
     fs::path ensure_default_model(bool no_download) {
@@ -397,99 +537,35 @@ namespace {
             }
         }
 
-        std::cout << "Downloading MoGe-2 ViT-B normal model (MIT license, (c) Microsoft) to "
-                  << path_to_string(path) << "\n";
-        try {
-            download_verified_file(kDefaultModelUrl, path, kDefaultModelSha256);
-        } catch (const DownloadIntegrityError&) {
-            throw;
-        } catch (const std::exception& e) {
-            std::cerr << "Primary download failed (" << e.what() << "); retrying from "
-                      << kFallbackModelUrl << "\n";
-            download_verified_file(kFallbackModelUrl, path, kDefaultModelSha256);
-        }
-        require_sha256(path, kDefaultModelSha256, "Cached model");
-        return path;
+        auto ensured = ensure_cached_model(kDefaultModelFile, kDefaultModelUrl, kDefaultModelSha256,
+                                           !no_download, "MoGe-2 ViT-B normal model");
+        if (!ensured)
+            throw std::runtime_error(std::string(ensured.error().detail()));
+        return std::move(*ensured);
     }
 
     Image load_image_rgb(const fs::path& path) {
-        auto input = OIIO::ImageInput::open(path_to_string(path));
-        if (!input)
-            throw std::runtime_error("Failed to open image: " + path_to_string(path) + ": " + OIIO::geterror());
-
-        const OIIO::ImageSpec spec = input->spec();
-        if (spec.width <= 0 || spec.height <= 0 || spec.nchannels <= 0)
-            throw std::runtime_error("Invalid image shape for " + path_to_string(path));
-
+        auto [pixels, width, height, channels] = lfs::core::load_image_float(path);
+        if (!pixels || width <= 0 || height <= 0 || channels <= 0)
+            throw std::runtime_error("Failed to load image: " + path_to_string(path));
         Image out;
-        out.width = spec.width;
-        out.height = spec.height;
+        out.width = width;
+        out.height = height;
         out.rgb_hwc.resize(static_cast<std::size_t>(out.width) * out.height * 3);
-
-        auto fill_rgb = [&](const auto& raw, float scale) {
-            for (int y = 0; y < out.height; ++y) {
-                for (int x = 0; x < out.width; ++x) {
-                    const std::size_t src = (static_cast<std::size_t>(y) * out.width + x) * spec.nchannels;
-                    const std::size_t dst = (static_cast<std::size_t>(y) * out.width + x) * 3;
-                    out.rgb_hwc[dst + 0] = static_cast<float>(raw[src + 0]) * scale;
-                    out.rgb_hwc[dst + 1] = static_cast<float>(spec.nchannels > 1 ? raw[src + 1] : raw[src + 0]) * scale;
-                    out.rgb_hwc[dst + 2] = static_cast<float>(spec.nchannels > 2 ? raw[src + 2] : raw[src + 0]) * scale;
-                }
-            }
-        };
-
-        const std::size_t raw_values = static_cast<std::size_t>(spec.width) * spec.height * spec.nchannels;
-        if (spec.format == OIIO::TypeDesc::UINT8) {
-            std::vector<std::uint8_t> raw(raw_values);
-            if (!input->read_image(0, 0, 0, spec.nchannels, OIIO::TypeDesc::UINT8, raw.data())) {
-                const auto error = input->geterror();
-                input->close();
-                throw std::runtime_error("Failed to read image: " + path_to_string(path) + ": " + error);
-            }
-            input->close();
-            fill_rgb(raw, 1.0f / 255.0f);
-            return out;
+        for (size_t pixel = 0, count = static_cast<size_t>(width) * height; pixel < count; ++pixel) {
+            const size_t source = pixel * channels;
+            const size_t destination = pixel * 3;
+            out.rgb_hwc[destination + 0] = pixels[source];
+            out.rgb_hwc[destination + 1] = channels > 1 ? pixels[source + 1] : pixels[source];
+            out.rgb_hwc[destination + 2] = channels > 2 ? pixels[source + 2] : pixels[source];
         }
-
-        if (spec.format == OIIO::TypeDesc::UINT16) {
-            std::vector<std::uint16_t> raw(raw_values);
-            if (!input->read_image(0, 0, 0, spec.nchannels, OIIO::TypeDesc::UINT16, raw.data())) {
-                const auto error = input->geterror();
-                input->close();
-                throw std::runtime_error("Failed to read image: " + path_to_string(path) + ": " + error);
-            }
-            input->close();
-            fill_rgb(raw, 1.0f / 65535.0f);
-            return out;
-        }
-
-        std::vector<float> raw(raw_values);
-        if (!input->read_image(0, 0, 0, spec.nchannels, OIIO::TypeDesc::FLOAT, raw.data())) {
-            const auto error = input->geterror();
-            input->close();
-            throw std::runtime_error("Failed to read image: " + path_to_string(path) + ": " + error);
-        }
-        input->close();
-
-        float max_channel = 0.0f;
-        for (int y = 0; y < out.height; ++y) {
-            for (int x = 0; x < out.width; ++x) {
-                const std::size_t src = (static_cast<std::size_t>(y) * out.width + x) * spec.nchannels;
-                const std::size_t dst = (static_cast<std::size_t>(y) * out.width + x) * 3;
-                out.rgb_hwc[dst + 0] = raw[src + 0];
-                out.rgb_hwc[dst + 1] = spec.nchannels > 1 ? raw[src + 1] : raw[src + 0];
-                out.rgb_hwc[dst + 2] = spec.nchannels > 2 ? raw[src + 2] : raw[src + 0];
-                max_channel = std::max({max_channel, out.rgb_hwc[dst + 0], out.rgb_hwc[dst + 1], out.rgb_hwc[dst + 2]});
-            }
-        }
-
-        const float scale = max_channel > 255.5f ? (1.0f / 65535.0f)
-                            : max_channel > 1.5f ? (1.0f / 255.0f)
+        const float max_channel = *std::max_element(out.rgb_hwc.begin(), out.rgb_hwc.end());
+        const float scale = max_channel > 255.5f ? 1.0f / 65535.0f
+                            : max_channel > 1.5f ? 1.0f / 255.0f
                                                  : 1.0f;
-        if (scale != 1.0f) {
-            for (float& channel : out.rgb_hwc)
-                channel = std::clamp(channel * scale, 0.0f, 1.0f);
-        }
+        for (float& channel : out.rgb_hwc)
+            channel = std::clamp(channel * scale, 0.0f, 1.0f);
+        lfs::core::free_image_float(pixels);
         return out;
     }
 
@@ -529,13 +605,8 @@ namespace {
         resized.height = new_height;
         resized.rgb_hwc.resize(static_cast<std::size_t>(new_width) * new_height * 3);
 
-        OIIO::ImageBuf src(OIIO::ImageSpec(image.width, image.height, 3, OIIO::TypeDesc::FLOAT),
-                           const_cast<float*>(image.rgb_hwc.data()));
-        OIIO::ImageBuf dst(OIIO::ImageSpec(new_width, new_height, 3, OIIO::TypeDesc::FLOAT),
-                           resized.rgb_hwc.data());
-        OIIO::ROI roi(0, new_width, 0, new_height, 0, 1, 0, 3);
-        if (!OIIO::ImageBufAlgo::resample(dst, src, true, roi, 0))
-            throw std::runtime_error("Image resize failed: " + dst.geterror());
+        lfs::core::resample_bilinear_f32(image.rgb_hwc.data(), image.width, image.height, 3,
+                                         resized.rgb_hwc.data(), new_width, new_height);
         return resized;
     }
 
@@ -586,6 +657,11 @@ namespace {
                              const fs::path& image_path,
                              const fs::path& images_dir) {
         fs::path rel = image_path.lexically_relative(images_dir);
+        const auto first = rel.begin();
+        if (rel.empty() || rel == "." || rel == ".." ||
+            (first != rel.end() && *first == fs::path(".."))) {
+            rel = image_path.filename();
+        }
         rel.replace_extension(".png");
         return dataset_root / std::string(folder) / rel;
     }
@@ -598,261 +674,119 @@ namespace {
                    const std::vector<PixelT>& data,
                    int png_compression) {
         static_assert(std::is_same_v<PixelT, uint8_t> || std::is_same_v<PixelT, uint16_t>);
-        constexpr auto kFormat = std::is_same_v<PixelT, uint16_t> ? OIIO::TypeDesc::UINT16
-                                                                  : OIIO::TypeDesc::UINT8;
         if (channels < 1 || channels > 4)
             throw std::runtime_error("Internal error: invalid image channel count");
         if (data.size() != static_cast<std::size_t>(width) * height * channels)
             throw std::runtime_error("Internal error: image buffer has wrong size");
 
         fs::create_directories(path.parent_path());
-        auto output = OIIO::ImageOutput::create(path_to_string(path));
-        if (!output)
-            throw std::runtime_error("Failed to create image output: " + path_to_string(path));
-
-        OIIO::ImageSpec spec(width, height, channels, kFormat);
         const int compression = std::clamp(png_compression, 0, 9);
-        spec.attribute("png:compressionLevel", compression);
-        if (compression == 0) {
-            spec.attribute("compression", "none");
-        } else if (compression == 1) {
-            spec.attribute("compression", "pngfast");
-        }
-        if (!output->open(path_to_string(path), spec)) {
-            const auto error = output->geterror();
-            output->close();
-            throw std::runtime_error("Failed to open image output: " + path_to_string(path) + ": " + error);
-        }
-        if (!output->write_image(kFormat, data.data())) {
-            const auto error = output->geterror();
-            output->close();
-            throw std::runtime_error("Failed to write image output: " + path_to_string(path) + ": " + error);
-        }
-        output->close();
+        const int bit_depth = std::is_same_v<PixelT, uint16_t> ? 16 : 8;
+        if (!lfs::core::save_png(path, data.data(), width, height, channels, bit_depth, compression))
+            throw std::runtime_error("Failed to write image output: " + path_to_string(path));
     }
 
-    std::vector<std::string> get_input_names(Ort::Session& session) {
-        Ort::AllocatorWithDefaultOptions allocator;
-        std::vector<std::string> names;
-        const auto count = session.GetInputCount();
-        names.reserve(count);
-        for (std::size_t i = 0; i < count; ++i) {
-            auto name = session.GetInputNameAllocated(i, allocator);
-            names.emplace_back(name.get());
-        }
-        return names;
-    }
-
-    std::vector<std::string> get_output_names(Ort::Session& session) {
-        Ort::AllocatorWithDefaultOptions allocator;
-        std::vector<std::string> names;
-        const auto count = session.GetOutputCount();
-        names.reserve(count);
-        for (std::size_t i = 0; i < count; ++i) {
-            auto name = session.GetOutputNameAllocated(i, allocator);
-            names.emplace_back(name.get());
-        }
-        return names;
-    }
-
-    std::vector<int64_t> tensor_shape(const Ort::Value& value) {
-        return value.GetTensorTypeAndShapeInfo().GetShape();
-    }
-
-    std::size_t tensor_element_count(const Ort::Value& value) {
-        return value.GetTensorTypeAndShapeInfo().GetElementCount();
-    }
-
-    SpatialMap extract_mask(const Ort::Value& value, int fallback_width, int fallback_height) {
-        const auto shape = tensor_shape(value);
-        const auto count = tensor_element_count(value);
-        const float* data = value.GetTensorData<float>();
-
+    VectorMap tensor_to_vector3(const lfs::core::Tensor& tensor, int fallback_width,
+                                int fallback_height) {
+        auto cpu = tensor.to(lfs::core::DataType::Float32)
+                       .to(lfs::core::Device::CPU)
+                       .contiguous();
+        const auto shape = cpu.shape();
         int width = fallback_width;
         int height = fallback_height;
-
-        if (shape.size() == 2) {
-            height = static_cast<int>(shape[0]);
-            width = static_cast<int>(shape[1]);
-        } else if (shape.size() == 3) {
-            height = static_cast<int>(shape[shape.size() - 2]);
-            width = static_cast<int>(shape[shape.size() - 1]);
-        } else if (shape.size() == 4) {
-            if (shape[3] == 1) {
-                height = static_cast<int>(shape[1]);
-                width = static_cast<int>(shape[2]);
-            } else if (shape[1] == 1) {
-                height = static_cast<int>(shape[2]);
-                width = static_cast<int>(shape[3]);
-            }
-        }
-
-        const std::size_t expected = static_cast<std::size_t>(width) * height;
-        if (count < expected)
-            throw std::runtime_error("Mask output has fewer elements than expected");
-
-        SpatialMap mask;
-        mask.width = width;
-        mask.height = height;
-        mask.values.assign(data, data + expected);
-        return mask;
-    }
-
-    VectorMap extract_vector3(const Ort::Value& value,
-                              int fallback_width,
-                              int fallback_height,
-                              std::string_view label) {
-        const auto shape = tensor_shape(value);
-        const auto count = tensor_element_count(value);
-        const float* data = value.GetTensorData<float>();
-
-        int width = fallback_width;
-        int height = fallback_height;
-        bool chw = false;
-
-        if (shape.size() == 3 && shape[2] == 3) {
-            height = static_cast<int>(shape[0]);
-            width = static_cast<int>(shape[1]);
-        } else if (shape.size() == 4 && shape[3] == 3) {
+        if (shape.rank() == 4 && shape[3] == 3) {
             height = static_cast<int>(shape[1]);
             width = static_cast<int>(shape[2]);
-        } else if (shape.size() == 4 && shape[1] == 3) {
-            chw = true;
+        } else if (shape.rank() == 3 && shape[2] == 3) {
+            height = static_cast<int>(shape[0]);
+            width = static_cast<int>(shape[1]);
+        }
+        auto values = cpu.to_vector();
+        const std::size_t pixels = static_cast<std::size_t>(width) * height;
+        if (values.size() < pixels * 3)
+            throw std::runtime_error("Native normal/points tensor is smaller than expected");
+        values.resize(pixels * 3);
+        return VectorMap{.width = width, .height = height, .xyz_hwc = std::move(values)};
+    }
+
+    SpatialMap tensor_to_mask(const lfs::core::Tensor& tensor, int fallback_width,
+                              int fallback_height) {
+        auto cpu = tensor.to(lfs::core::DataType::Float32)
+                       .to(lfs::core::Device::CPU)
+                       .contiguous();
+        const auto shape = cpu.shape();
+        int width = fallback_width;
+        int height = fallback_height;
+        if (shape.rank() == 3) {
+            height = static_cast<int>(shape[shape.rank() - 2]);
+            width = static_cast<int>(shape[shape.rank() - 1]);
+        } else if (shape.rank() == 2) {
+            height = static_cast<int>(shape[0]);
+            width = static_cast<int>(shape[1]);
+        } else if (shape.rank() == 4) {
             height = static_cast<int>(shape[2]);
             width = static_cast<int>(shape[3]);
         }
-
-        const std::size_t pixels = static_cast<std::size_t>(width) * height;
-        if (count < pixels * 3)
-            throw std::runtime_error(std::string(label) + " output has fewer elements than expected");
-
-        VectorMap out;
-        out.width = width;
-        out.height = height;
-        out.xyz_hwc.resize(pixels * 3);
-
-        if (!chw) {
-            std::copy(data, data + pixels * 3, out.xyz_hwc.begin());
-        } else {
-            for (std::size_t i = 0; i < pixels; ++i) {
-                out.xyz_hwc[i * 3 + 0] = data[i];
-                out.xyz_hwc[i * 3 + 1] = data[pixels + i];
-                out.xyz_hwc[i * 3 + 2] = data[2 * pixels + i];
-            }
-        }
-        return out;
+        auto values = cpu.to_vector();
+        const std::size_t expected = static_cast<std::size_t>(width) * height;
+        if (values.size() < expected)
+            throw std::runtime_error("Native mask tensor is smaller than expected");
+        values.resize(expected);
+        return SpatialMap{.width = width, .height = height, .values = std::move(values)};
     }
 
-    Ort::SessionOptions make_session_options(int thread_count, bool use_cuda) {
-        Ort::SessionOptions session_options;
-        session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-        session_options.SetIntraOpNumThreads(thread_count);
-        if (use_cuda) {
-            OrtCUDAProviderOptions cuda_options{};
-            cuda_options.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
-            cuda_options.do_copy_in_default_stream = 1;
-            session_options.AppendExecutionProvider_CUDA(cuda_options);
-        }
-        return session_options;
-    }
-
-    class MogeOnnxSession {
+    class NativeMogeSession {
     public:
-        MogeOnnxSession(const fs::path& model_path, int thread_count, bool force_cpu)
-            : env_(ORT_LOGGING_LEVEL_WARNING, "LichtFeld-Studio-preprocess") {
-#ifdef _WIN32
-            const auto model_string = model_path.wstring();
-#else
-            const auto model_string = path_to_string(model_path);
-#endif
-            bool use_cuda = !force_cpu;
-            while (!session_) {
-                try {
-                    const auto session_options = make_session_options(thread_count, use_cuda);
-                    session_ = std::make_unique<Ort::Session>(env_, model_string.c_str(), session_options);
-                } catch (const Ort::Exception& e) {
-                    if (!use_cuda)
-                        throw;
-                    std::cerr << "CUDA execution provider unavailable, falling back to CPU: " << e.what() << "\n";
-                    use_cuda = false;
-                }
+        explicit NativeMogeSession(const fs::path& lfw_path) {
+            auto loaded = lfs::core::nn::models::Moge2::load(lfw_path, lfs::core::Device::CUDA);
+            if (!loaded)
+                throw std::runtime_error("Failed to load native MoGe-2 weights from " +
+                                         path_to_string(lfw_path) + ": " +
+                                         std::string(loaded.error().detail()));
+            model_ = std::move(*loaded);
+            int device = 0;
+            cudaDeviceProp properties{};
+            if (cudaGetDevice(&device) != cudaSuccess ||
+                cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+                throw std::runtime_error("Failed to query native MoGe CUDA device");
             }
-            provider_ = use_cuda ? "CUDA" : "CPU";
-            input_names_ = get_input_names(*session_);
-            output_names_ = get_output_names(*session_);
-
-            bool has_image = false;
-            for (const auto& name : input_names_)
-                has_image = has_image || name == "image";
-            if (!has_image)
-                throw std::runtime_error("ONNX model has no 'image' input");
+            LOG_INFO("Normal estimation: native engine on CUDA device {} ({})", device, properties.name);
         }
 
-        OrtOutputs run(const Image& image, int64_t num_tokens) {
-            std::vector<float> chw = hwc_to_nchw(image);
-            std::array<int64_t, 4> image_shape = {1, 3, image.height, image.width};
-            std::vector<int64_t> scalar_shape;
-            Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-
-            std::vector<Ort::Value> input_values;
-            input_values.reserve(input_names_.size());
-            for (const auto& name : input_names_) {
-                if (name == "image") {
-                    input_values.emplace_back(Ort::Value::CreateTensor<float>(
-                        memory_info, chw.data(), chw.size(), image_shape.data(), image_shape.size()));
-                } else if (name == "num_tokens") {
-                    input_values.emplace_back(Ort::Value::CreateTensor<int64_t>(
-                        memory_info, &num_tokens, 1, nullptr, scalar_shape.size()));
-                } else {
-                    throw std::runtime_error("Unsupported ONNX input: " + name);
-                }
+        HeadMaps run(const Image& image, int64_t num_tokens) {
+            auto chw = hwc_to_nchw(image);
+            const auto shape = lfs::core::TensorShape(std::vector<std::size_t>{
+                1, 3, static_cast<std::size_t>(image.height),
+                static_cast<std::size_t>(image.width)});
+            if (!input_.is_valid() || input_.dtype() != lfs::core::DataType::Float32 ||
+                input_.ndim() != 4 || input_.shape()[2] != static_cast<std::size_t>(image.height) ||
+                input_.shape()[3] != static_cast<std::size_t>(image.width)) {
+                input_ = lfs::core::Tensor::empty(shape, lfs::core::Device::CUDA,
+                                                  lfs::core::DataType::Float32);
             }
-
-            std::vector<const char*> input_name_ptrs;
-            input_name_ptrs.reserve(input_names_.size());
-            for (const auto& name : input_names_)
-                input_name_ptrs.push_back(name.c_str());
-
-            std::vector<const char*> output_name_ptrs;
-            output_name_ptrs.reserve(output_names_.size());
-            for (const auto& name : output_names_)
-                output_name_ptrs.push_back(name.c_str());
-
-            Ort::RunOptions run_options;
-            auto outputs = session_->Run(run_options,
-                                         input_name_ptrs.data(),
-                                         input_values.data(),
-                                         input_values.size(),
-                                         output_name_ptrs.data(),
-                                         output_name_ptrs.size());
-
-            std::unordered_map<std::string, std::size_t> output_index;
-            for (std::size_t i = 0; i < output_names_.size(); ++i)
-                output_index.emplace(output_names_[i], i);
-
-            auto get_output = [&](std::string_view name) -> const Ort::Value& {
-                const auto it = output_index.find(std::string(name));
-                if (it == output_index.end())
-                    throw std::runtime_error("ONNX model did not produce '" + std::string(name) + "'");
-                return outputs[it->second];
-            };
-
-            return OrtOutputs{
-                .mask = extract_mask(get_output("mask"), image.width, image.height),
-                .points = extract_vector3(get_output("points"), image.width, image.height, "points"),
-                .normals = extract_vector3(get_output("normal"), image.width, image.height, "normal"),
+            LFS_CUDA_CHECK(cudaMemcpyAsync(input_.data_ptr(), chw.data(), input_.bytes(),
+                                           cudaMemcpyHostToDevice, input_.stream()));
+            auto result = model_.forward(input_, num_tokens);
+            if (!result)
+                throw std::runtime_error("Native MoGe-2 forward failed: " +
+                                         std::string(result.error().detail()));
+            return HeadMaps{
+                .mask = tensor_to_mask(result->mask, image.width, image.height),
+                .points = tensor_to_vector3(result->points, image.width, image.height),
+                .normals = tensor_to_vector3(result->normal, image.width, image.height),
             };
         }
-
-        std::string_view provider() const { return provider_; }
 
     private:
-        Ort::Env env_;
-        std::unique_ptr<Ort::Session> session_;
-        std::vector<std::string> input_names_;
-        std::vector<std::string> output_names_;
-        std::string_view provider_;
+        lfs::core::nn::models::Moge2 model_;
+        lfs::core::Tensor input_;
     };
+
+    void ensure_native_weights(const fs::path& lfw_path, const fs::path& onnx_path) {
+        if (fs::is_regular_file(lfw_path))
+            return;
+        convert_onnx_to_lfw(onnx_path, lfw_path);
+    }
 
     template <typename PixelT>
     std::vector<PixelT> build_depth_png(const SpatialMap& mask,
@@ -1107,6 +1041,19 @@ namespace {
         if (plan.images.empty())
             throw std::runtime_error("No images found under " + path_to_string(plan.images_dir));
 
+        if (!params.image_paths.empty()) {
+            std::unordered_set<std::string> requested;
+            requested.reserve(params.image_paths.size());
+            for (const auto& path : params.image_paths)
+                requested.insert(path_to_string(fs::weakly_canonical(path)));
+            std::erase_if(plan.images, [&requested](const fs::path& path) {
+                return !requested.contains(path_to_string(fs::weakly_canonical(path)));
+            });
+            if (plan.images.empty())
+                throw std::runtime_error("None of the requested image_paths are under " +
+                                         path_to_string(plan.images_dir));
+        }
+
         plan.jobs.reserve(plan.images.size());
         for (const auto& image_path : plan.images) {
             PreprocessJob job{
@@ -1131,15 +1078,30 @@ namespace {
         std::cout << "Images: " << plan.images.size() << " under " << path_to_string(plan.images_dir) << "\n";
         std::cout << "Threads: " << resolve_thread_count(params.threads) << "\n";
         std::cout << "PNG compression: " << params.png_compression << "\n";
+        std::cout << "Inference backend: " << backend_name(params.inference_backend) << "\n";
     }
 
     void process_dataset(const lfs::core::param::PreprocessParameters& params,
                          const fs::path& model_path,
-                         const PreprocessPlan& plan) {
-        print_plan_summary(params, plan, &model_path);
+                         const PreprocessPlan& plan,
+                         const lfs::preprocessing::PreprocessProgressCallback& progress) {
+        if (!progress)
+            print_plan_summary(params, plan, &model_path);
 
-        MogeOnnxSession session(model_path, resolve_thread_count(params.threads), params.force_cpu);
-        std::cout << "Execution provider: " << session.provider() << "\n";
+        int cuda_devices = 0;
+        if (cudaGetDeviceCount(&cuda_devices) != cudaSuccess || cuda_devices <= 0) {
+            throw std::runtime_error("Native MoGe-2 inference requires a CUDA device");
+        }
+
+        const fs::path lfw_path = lfw_path_for_onnx(model_path);
+        ensure_native_weights(lfw_path, model_path);
+        NativeMogeSession native_session(lfw_path);
+        if (!progress)
+            std::cout << "Weights: " << path_to_string(lfw_path) << "\n";
+
+        const auto run_inference = [&](const Image& image, int64_t num_tokens) {
+            return native_session.run(image, num_tokens);
+        };
 
         const auto load_job = [&params](const PreprocessJob& job) {
             LoadedImage loaded{.original = load_image_rgb(job.image_path)};
@@ -1151,7 +1113,7 @@ namespace {
         std::deque<std::future<void>> writes;
 
         std::optional<PreprocessProgressBar> bar;
-        if (stdout_is_tty() && !plan.jobs.empty())
+        if (!progress && stdout_is_tty() && !plan.jobs.empty())
             bar.emplace(plan.jobs.size());
 
         std::deque<std::future<LoadedImage>> pending_loads;
@@ -1166,19 +1128,25 @@ namespace {
 
         for (std::size_t i = 0; i < plan.jobs.size(); ++i) {
             const PreprocessJob& job = plan.jobs[i];
-            if (!bar)
-                std::cout << "[" << (i + 1) << "/" << plan.jobs.size() << "] " << path_to_string(job.image_path) << "\n";
+            if (!bar && !progress) {
+                std::cout << "[" << (i + 1) << "/" << plan.jobs.size() << "] "
+                          << path_to_string(job.image_path) << "\n";
+            }
 
             const LoadedImage loaded = pending_loads.front().get();
             pending_loads.pop_front();
             top_up_loads();
 
             const auto inference_start = std::chrono::steady_clock::now();
-            auto outputs = std::make_shared<const OrtOutputs>(session.run(loaded.inference, params.num_tokens));
+            auto outputs = std::make_shared<const HeadMaps>(run_inference(loaded.inference, params.num_tokens));
             const double inference_ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - inference_start).count();
             if (bar)
                 bar->report(i + 1, job.image_path.filename().string(), inference_ms);
+            else if (!progress)
+                std::cout << "  inference " << inference_ms << " ms\n";
+            if (progress)
+                progress(i + 1, plan.jobs.size(), job.image_path.filename().string());
 
             while (!writes.empty() && writes.front().wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
                 writes.front().get();
@@ -1222,30 +1190,35 @@ namespace {
 
         if (bar)
             bar->complete();
-        std::cout << "Done. processed=" << plan.jobs.size() << " skipped=" << plan.skipped << "\n";
+        if (!progress)
+            std::cout << "Done. processed=" << plan.jobs.size() << " skipped=" << plan.skipped << "\n";
     }
 
-} // namespace
-
-namespace lfs::preprocessing {
-
-    int run_preprocess(const lfs::core::param::PreprocessParameters& params) {
+    lfs::preprocessing::PreprocessRunResult execute_preprocess(
+        const lfs::core::param::PreprocessParameters& params,
+        const lfs::preprocessing::PreprocessProgressCallback& progress) {
+        lfs::preprocessing::PreprocessRunResult result;
         try {
             if (params.download_only) {
                 fs::path model_path = params.model_path;
                 if (model_path.empty())
                     model_path = ensure_default_model(params.no_download);
-                std::cout << "Cached model: " << path_to_string(model_path) << "\n";
-                return 0;
+                if (!progress)
+                    std::cout << "Cached model: " << path_to_string(model_path) << "\n";
+                return result;
             }
 
             const PreprocessPlan plan = build_preprocess_plan(params);
+            result.skipped = plan.skipped;
             if (plan.jobs.empty()) {
-                print_plan_summary(params, plan, nullptr);
-                std::cout << "No outputs need preprocessing; model inference skipped.\n";
+                if (!progress) {
+                    print_plan_summary(params, plan, nullptr);
+                    std::cout << "No outputs need preprocessing; model inference skipped.\n";
+                }
                 precompute_depth_anchors(params);
-                std::cout << "Done. processed=0 skipped=" << plan.skipped << "\n";
-                return 0;
+                if (!progress)
+                    std::cout << "Done. processed=0 skipped=" << plan.skipped << "\n";
+                return result;
             }
 
             fs::path model_path = params.model_path;
@@ -1255,13 +1228,41 @@ namespace lfs::preprocessing {
             if (!fs::is_regular_file(model_path))
                 throw std::runtime_error("Model file does not exist: " + path_to_string(model_path));
 
-            process_dataset(params, model_path, plan);
+            process_dataset(params, model_path, plan, progress);
+            result.processed = plan.jobs.size();
             precompute_depth_anchors(params);
-            return 0;
+            return result;
         } catch (const std::exception& e) {
-            std::cerr << "preprocess: " << e.what() << "\n";
+            result.ok = false;
+            result.error = e.what();
+            return result;
+        }
+    }
+
+} // namespace
+
+namespace lfs::preprocessing {
+
+    lfs::Result<std::filesystem::path> ensure_lpips_weights(const bool allow_download) {
+        return ensure_cached_model(kLpipsModelFile, kLpipsModelUrl, kLpipsModelSha256,
+                                   allow_download, "LPIPS");
+    }
+
+    PreprocessRunResult run_preprocess_ex(const lfs::core::param::PreprocessParameters& params,
+                                          const PreprocessProgressCallback& progress) {
+        return execute_preprocess(params, progress);
+    }
+
+    int run_preprocess(const lfs::core::param::PreprocessParameters& params) {
+        // The standalone CLI bypasses training's logger setup.
+        if (!lfs::core::Logger::get().is_ready())
+            lfs::core::Logger::get().init();
+        const auto result = run_preprocess_ex(params, {});
+        if (!result.ok) {
+            std::cerr << "preprocess: " << result.error << "\n";
             return 1;
         }
+        return 0;
     }
 
 } // namespace lfs::preprocessing

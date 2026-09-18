@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <stop_token>
 #include <string_view>
 #include <vulkan/vulkan.h>
@@ -149,6 +150,7 @@ namespace lfs::rendering {
         PFN_vkCmdPipelineBarrier2 cmd_pipeline_barrier2 = nullptr;
         PFN_vkCmdResetQueryPool cmd_reset_query_pool = nullptr;
         PFN_vkCmdWriteTimestamp cmd_write_timestamp = nullptr;
+        PFN_vkGetQueryPoolResults get_query_pool_results = nullptr;
         PFN_vkQueueSubmit queue_submit = nullptr;
         PFN_vkQueueWaitIdle queue_wait_idle = nullptr;
 
@@ -166,6 +168,22 @@ namespace lfs::rendering {
         // Production symbols. Safe to call once; returns a fully filled table.
         [[nodiscard]] static VulkanDispatch real() noexcept;
     };
+
+    // External queue synchronization for the graphics/present queue. Sparse
+    // binds may be issued from the training thread.
+    LFS_RENDERING_API void set_graphics_queue_external_sync(std::mutex* mutex,
+                                                            VkQueue graphics,
+                                                            VkQueue present) noexcept;
+    LFS_RENDERING_API VkResult vk_queue_submit_synced(VkQueue queue,
+                                                      uint32_t submit_count,
+                                                      const VkSubmitInfo* submits,
+                                                      VkFence fence);
+    LFS_RENDERING_API VkResult vk_queue_present_synced(VkQueue queue, const VkPresentInfoKHR* present_info);
+    LFS_RENDERING_API VkResult vk_queue_wait_idle_synced(VkQueue queue);
+    LFS_RENDERING_API VkResult vk_queue_bind_sparse_synced(VkQueue queue,
+                                                           uint32_t bind_info_count,
+                                                           const VkBindSparseInfo* bind_infos,
+                                                           VkFence fence);
 
     // Injectable clock for fake-time unit tests (spec §4.2 / AMB 9).
     using ClockNow = std::function<std::chrono::steady_clock::time_point()>;

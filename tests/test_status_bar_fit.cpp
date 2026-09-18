@@ -88,13 +88,26 @@ namespace {
         void SetScissorRegion(Rml::Rectanglei) override {}
     };
 
+    // Keep this test model in sync with RmlStatusBar::ModelState in rml_status_bar.hpp.
     struct StatusBarModel {
         bool safe_mode = false;
         std::string safe_mode_text = "Safe Mode";
         std::string mode_text = "Training (Default/3DGS)";
         std::string mode_color = "#ffffff";
         bool show_training = true;
+        bool progress_miner = false;
+        bool miner_raised = false;
+        bool miner_step_a = false;
+        bool miner_strike = false;
+        bool miner_step_b = false;
+        bool miner_smoke_1 = false;
+        bool miner_smoke_2 = false;
+        bool miner_smoke_3 = false;
+        bool miner_smoke_4 = false;
+        bool miner_smoke_5 = false;
+        bool miner_smoke_6 = false;
         std::string progress_width = "50%";
+        std::string progress_text_left = "0dp";
         std::string progress_text = "50%";
         std::string step_label = "Step:";
         std::string step_value = "15000/30000";
@@ -122,12 +135,6 @@ namespace {
         std::string zoom_text = "Zoom: 100";
         std::string zoom_color = "#ffffff";
         std::string zoom_sep_color = "#ffffff";
-        std::string account_label = "LichtFeld Account";
-        std::string account_tier = "Professional";
-        std::string account_tooltip;
-        std::string account_color = "#ffffff";
-        bool account_show_tier = true;
-        bool account_membership_required = false;
         std::string lfs_mem_text = "LFS 12.34 GiB";
         std::string lfs_mem_color = "#ffffff";
         bool show_gpu_model = true;
@@ -220,7 +227,19 @@ namespace {
             bound &= constructor.Bind("mode_text", &model_.mode_text);
             bound &= constructor.Bind("mode_color", &model_.mode_color);
             bound &= constructor.Bind("show_training", &model_.show_training);
+            bound &= constructor.Bind("progress_miner", &model_.progress_miner);
+            bound &= constructor.Bind("miner_raised", &model_.miner_raised);
+            bound &= constructor.Bind("miner_step_a", &model_.miner_step_a);
+            bound &= constructor.Bind("miner_strike", &model_.miner_strike);
+            bound &= constructor.Bind("miner_step_b", &model_.miner_step_b);
+            bound &= constructor.Bind("miner_smoke_1", &model_.miner_smoke_1);
+            bound &= constructor.Bind("miner_smoke_2", &model_.miner_smoke_2);
+            bound &= constructor.Bind("miner_smoke_3", &model_.miner_smoke_3);
+            bound &= constructor.Bind("miner_smoke_4", &model_.miner_smoke_4);
+            bound &= constructor.Bind("miner_smoke_5", &model_.miner_smoke_5);
+            bound &= constructor.Bind("miner_smoke_6", &model_.miner_smoke_6);
             bound &= constructor.Bind("progress_width", &model_.progress_width);
+            bound &= constructor.Bind("progress_text_left", &model_.progress_text_left);
             bound &= constructor.Bind("progress_text", &model_.progress_text);
             bound &= constructor.Bind("step_label", &model_.step_label);
             bound &= constructor.Bind("step_value", &model_.step_value);
@@ -248,12 +267,6 @@ namespace {
             bound &= constructor.Bind("zoom_text", &model_.zoom_text);
             bound &= constructor.Bind("zoom_color", &model_.zoom_color);
             bound &= constructor.Bind("zoom_sep_color", &model_.zoom_sep_color);
-            bound &= constructor.Bind("account_label", &model_.account_label);
-            bound &= constructor.Bind("account_tier", &model_.account_tier);
-            bound &= constructor.Bind("account_tooltip", &model_.account_tooltip);
-            bound &= constructor.Bind("account_color", &model_.account_color);
-            bound &= constructor.Bind("account_show_tier", &model_.account_show_tier);
-            bound &= constructor.Bind("account_membership_required", &model_.account_membership_required);
             bound &= constructor.Bind("lfs_mem_text", &model_.lfs_mem_text);
             bound &= constructor.Bind("lfs_mem_color", &model_.lfs_mem_color);
             bound &= constructor.Bind("show_gpu_model", &model_.show_gpu_model);

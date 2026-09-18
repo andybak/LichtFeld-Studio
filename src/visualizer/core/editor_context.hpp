@@ -134,6 +134,15 @@ namespace lfs::vis {
         bool dispatchModalEvent(const ModalEvent& evt) const override { return modal_event_cb_ ? modal_event_cb_(evt) : false; }
 
     private:
+        std::uint64_t last_scene_generation_ = 0;
+        std::uint64_t last_selection_generation_ = 0;
+        bool last_has_scene_manager_ = false;
+        bool last_has_trainer_manager_ = false;
+        bool last_trainer_running_ = false;
+        bool last_trainer_paused_ = false;
+        bool last_trainer_finished_ = false;
+        std::size_t last_scene_node_count_ = 0;
+        bool state_initialized_ = false;
         EditorMode mode_ = EditorMode::EMPTY;
         core::NodeType selected_node_type_ = core::NodeType::SPLAT;
         ToolType active_tool_ = ToolType::None;
@@ -142,6 +151,8 @@ namespace lfs::vis {
         bool has_editable_transform_selection_ = false;
         bool has_splat_selection_ = false;
         bool has_editable_splat_selection_ = false;
+        bool has_editable_align_selection_ = false;
+        bool has_locked_align_selection_ = false;
         bool tool_restore_guard_ = false;
         std::string transform_selection_error_;
 

@@ -8,6 +8,9 @@
 # Tensor CUDA kernels (STATIC, linked privately)
 add_subdirectory(tensor)
 
+# Neural inference kernels (STATIC, linked privately)
+add_subdirectory(nn)
+
 # Core CUDA library (STATIC, linked privately)
 add_subdirectory(cuda)
 
@@ -43,6 +46,11 @@ set(TENSOR_SOURCES
         tensor/tensor_nn_ops.cpp
         tensor/pinned_memory_allocator.cpp
         tensor/tensor_exports.cu
+        nn/ops.cpp
+        nn/weight_file.cpp
+        nn/activation_arena.cpp
+        nn/models/moge2.cpp
+        nn/models/lpips.cpp
 )
 
 # Core module sources
@@ -50,6 +58,7 @@ set(CORE_SOURCES
         abi.cpp
         alloc_counter.cpp
         crash_handler.cpp
+        training_churn_metrics.cpp
         cuda_error.cpp
         cuda_error_typed.cpp
         device_fault.cpp
@@ -63,6 +72,7 @@ set(CORE_SOURCES
         host_metrics.cpp
         failure_report.cpp
         cuda/memory_arena_owner.cpp
+        cuda/vmm_device_buffer.cpp
         memory_pressure.cpp
         memory_domain.cpp
         operator_callbacks.cpp
@@ -73,6 +83,7 @@ set(CORE_SOURCES
         image_loader.cpp
         cuda_version.cpp
         image_io.cpp
+        image_codecs.cpp
         mapped_file.cpp
         optimization_properties.cpp
         parameters.cpp
@@ -89,6 +100,8 @@ set(CORE_SOURCES
         splat_data_mirror.cpp
         splat_data_transform.cpp
         splat_exportable_storage.cpp
+        sh_value_quant.cpp
+        shareable_allocation_limit.cpp
         tensor_debug.cpp
         training_snapshot.cpp
         mesh_data.cpp
@@ -98,6 +111,9 @@ set(CORE_SOURCES
 )
 
 add_library(lfs_core SHARED ${CORE_SOURCES} ${TENSOR_SOURCES})
+
+add_dependencies(lfs_core lfs_core_abi_stamp)
+target_include_directories(lfs_core BEFORE PRIVATE "${LFS_CORE_ABI_INCLUDE_DIR}")
 
 target_compile_definitions(lfs_core PRIVATE LFS_CORE_EXPORTS)
 
@@ -110,6 +126,7 @@ target_include_directories(lfs_core
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/src/io/include
         ${CMAKE_CURRENT_SOURCE_DIR}/tensor  # For internal/ headers
+        ${CMAKE_CURRENT_SOURCE_DIR}/nn
 )
 target_include_directories(lfs_core SYSTEM PRIVATE
     ${CMAKE_SOURCE_DIR}/external
@@ -131,13 +148,15 @@ target_link_libraries(lfs_core
     PRIVATE
         lfs_core_cuda
         lfs_tensor_kernels
+        lfs_nn_kernels
         taywee::args
-        lfs_oiio
+        JPEG::JPEG
+        PNG::PNG
+        TIFF::TIFF
+        WebP::webp
+        unofficial::tinyexr::tinyexr
         OpenMeshCore
 )
-
-set_property(SOURCE image_io.cpp APPEND PROPERTY COMPILE_DEFINITIONS FMT_HEADER_ONLY=1)
-
 # OpenMP for tensor multi-threaded operations
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)

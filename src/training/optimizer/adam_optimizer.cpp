@@ -19,8 +19,10 @@
 #include "lfs/training/sh_value_storage.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cuda_runtime.h>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
@@ -178,8 +180,81 @@ namespace lfs::training {
         cropbox_lr_scale_ = scale;
     }
 
+    void AdamOptimizer::set_per_splat_mean_step(const bool enabled,
+                                                const float median_extent,
+                                                const float r_min,
+                                                const float r_max) {
+        per_splat_mean_step_ = enabled;
+        mean_step_median_extent_ = median_extent;
+        mean_step_r_min_ = r_min;
+        mean_step_r_max_ = r_max;
+        if (!enabled) {
+            set_mean_step_far_mask({});
+        }
+    }
+
+    void AdamOptimizer::set_mean_step_far_mask(lfs::core::Tensor mask) {
+        if (!mask.is_valid() || mask.numel() == 0) {
+            mean_step_far_mask_ = nullptr;
+            mean_step_far_mask_n_ = 0;
+            mean_step_far_mask_storage_ = {};
+            return;
+        }
+        LFS_ASSERT_MSG(mask.dtype() == lfs::core::DataType::Bool && mask.ndim() == 1,
+                       "AdamOptimizer mean-step far mask must be a 1D bool tensor");
+        LFS_ASSERT_MSG(mask.numel() <= static_cast<size_t>(std::numeric_limits<int>::max()),
+                       "AdamOptimizer mean-step far mask exceeds the supported row count");
+        // Construct fresh handles: assignment to a view copies into its existing
+        // storage, even for mask = mask.cuda() or mask = mask.clone().
+        auto uploaded = mask.device() == lfs::core::Device::CUDA ? mask : mask.cuda();
+        auto storage = uploaded.is_contiguous() && uploaded.owns_memory()
+                           ? uploaded
+                           : uploaded.clone();
+        const auto* pointer = storage.ptr<bool>();
+        LFS_VALIDATE_CUDA_DEVICE_POINTER(pointer, "mean_step_far_mask");
+        // A raw pointer alone cannot keep a replaced strategy tensor alive.
+        mean_step_far_mask_storage_ = std::move(storage);
+        mean_step_far_mask_ = pointer;
+        mean_step_far_mask_n_ = static_cast<int>(mean_step_far_mask_storage_.numel());
+    }
+
+    void AdamOptimizer::validate_mean_step_far_mask() {
+        const auto& means = splat_data_.means();
+        const size_t n = means.is_valid() && means.ndim() > 0 ? means.shape()[0] : 0;
+        if (mean_step_far_mask_ != nullptr &&
+            (mean_step_far_mask_n_ < 0 || static_cast<size_t>(mean_step_far_mask_n_) != n)) {
+            LOG_WARN("AdamOptimizer: mean_step_far_mask row-count mismatch (mask={}, means={}); "
+                     "ignoring binding until the strategy republishes it",
+                     mean_step_far_mask_n_, n);
+            set_mean_step_far_mask({});
+        }
+    }
+
+    void AdamOptimizer::set_screen_share_cap(const float* max_share, const int n,
+                                             const float limit, const float penalty) {
+        screen_share_max_ = max_share;
+        screen_share_n_ = max_share != nullptr ? n : 0;
+        screen_share_limit_ = limit;
+        screen_share_penalty_ = penalty;
+        refresh_screen_share_buffer();
+    }
+
+    void AdamOptimizer::refresh_screen_share_buffer() {
+        if (!(screen_share_limit_ > 0.0f && screen_share_limit_ < 1.0f) ||
+            !splat_data_._max_screen_share.is_valid() ||
+            splat_data_._max_screen_share.numel() == 0) {
+            screen_share_max_ = nullptr;
+            screen_share_n_ = 0;
+            return;
+        }
+        screen_share_max_ = splat_data_._max_screen_share.ptr<float>();
+        screen_share_n_ = static_cast<int>(splat_data_._max_screen_share.numel());
+    }
+
     void AdamOptimizer::step(const int iteration) {
         LFS_TRACE("kernel.adam.step");
+        validate_mean_step_far_mask();
+        refresh_screen_share_buffer();
         if (fused_step_iteration_ == iteration) {
             last_step_zeroed_gradients_ = true;
             return;
@@ -189,6 +264,8 @@ namespace lfs::training {
         fast_lfs::optimizer::JointContiguousBatchEntry entries[5];
         int n_entries = 0;
         cudaStream_t batch_stream = nullptr;
+        const float* batch_mean_step_scale_raw = nullptr;
+        int batch_mean_step_scale_n = 0;
         const ParamType contiguous[] = {
             ParamType::Means, ParamType::Sh0, ParamType::Scaling,
             ParamType::Rotation, ParamType::Opacity};
@@ -244,6 +321,18 @@ namespace lfs::training {
             e.lr = param_lr;
             e.bias_correction1_rcp = static_cast<float>(bias_correction1_rcp);
             e.bias_correction2_sqrt_rcp = static_cast<float>(bias_correction2_sqrt_rcp);
+            if (type == ParamType::Means && per_splat_mean_step_) {
+                auto& scaling = splat_data_.scaling_raw();
+                if (scaling.is_valid() && scaling.numel() > 0) {
+                    lfs::core::waitForCUDAStream(batch_stream, scaling.stream());
+                    batch_mean_step_scale_raw = scaling.ptr<float>();
+                    batch_mean_step_scale_n = static_cast<int>(scaling.numel());
+                    e.apply_mean_step = 1;
+                }
+            }
+            if (type == ParamType::Scaling) {
+                e.apply_screen_share = 1;
+            }
             param_live.set_stream(batch_stream);
             state.exp_avg.set_stream(batch_stream);
             state.joint_bounds.set_stream(batch_stream);
@@ -254,6 +343,9 @@ namespace lfs::training {
             prepare_contiguous(type);
         }
         if (n_entries > 0) {
+            if (mean_step_far_mask_storage_.is_valid()) {
+                mean_step_far_mask_storage_.sync_to_stream(batch_stream);
+            }
             if (frozen_mask_.is_valid()) {
                 lfs::core::waitForCUDAStream(batch_stream, frozen_mask_.stream());
             }
@@ -267,7 +359,11 @@ namespace lfs::training {
                 static_cast<float>(config_.beta1),
                 static_cast<float>(config_.beta2),
                 static_cast<float>(config_.eps),
-                batch_stream);
+                batch_stream,
+                batch_mean_step_scale_raw, batch_mean_step_scale_n,
+                mean_step_median_extent_, mean_step_r_min_, mean_step_r_max_,
+                mean_step_far_mask_, mean_step_far_mask_n_,
+                screen_share_max_, screen_share_n_, screen_share_limit_, screen_share_penalty_);
         }
         step_param(ParamType::ShN, iteration);
     }
@@ -707,6 +803,29 @@ namespace lfs::training {
                 throw std::runtime_error("Optimizer state desync: " + name);
             }
             const size_t feature_dim = param_live.numel() / param_size;
+            if (mean_step_far_mask_storage_.is_valid()) {
+                mean_step_far_mask_storage_.sync_to_stream(execution_stream);
+            }
+            const float* mean_step_scale_raw = nullptr;
+            int mean_step_scale_n = 0;
+            if (type == ParamType::Means && per_splat_mean_step_) {
+                auto& scaling = splat_data_.scaling_raw();
+                if (scaling.is_valid() && scaling.numel() > 0) {
+                    lfs::core::waitForCUDAStream(execution_stream, scaling.stream());
+                    mean_step_scale_raw = scaling.ptr<float>();
+                    mean_step_scale_n = static_cast<int>(scaling.numel());
+                }
+            }
+            const float* share_max = nullptr;
+            int share_n = 0;
+            float share_limit = 0.0f;
+            float share_penalty = 0.0f;
+            if (type == ParamType::Scaling) {
+                share_max = screen_share_max_;
+                share_n = screen_share_n_;
+                share_limit = screen_share_limit_;
+                share_penalty = screen_share_penalty_;
+            }
             fast_lfs::optimizer::adam_step_joint_contiguous_raw(
                 param_live.ptr<float>(),
                 state.exp_avg.ptr<uint8_t>(),
@@ -727,7 +846,18 @@ namespace lfs::training {
                 static_cast<float>(config_.eps),
                 static_cast<float>(bias_correction1_rcp),
                 static_cast<float>(bias_correction2_sqrt_rcp),
-                execution_stream);
+                execution_stream,
+                mean_step_scale_raw,
+                mean_step_scale_n,
+                mean_step_median_extent_,
+                mean_step_r_min_,
+                mean_step_r_max_,
+                mean_step_far_mask_,
+                mean_step_far_mask_n_,
+                share_max,
+                share_n,
+                share_limit,
+                share_penalty);
             param_live.set_stream(execution_stream);
             state.exp_avg.set_stream(execution_stream);
             state.joint_bounds.set_stream(execution_stream);
@@ -743,6 +873,10 @@ namespace lfs::training {
     FastGSFusedAdamState AdamOptimizer::prepare_fastgs_fused_adam(
         const int iteration,
         const cudaStream_t execution_stream) {
+        validate_mean_step_far_mask();
+        if (mean_step_far_mask_storage_.is_valid()) {
+            mean_step_far_mask_storage_.sync_to_stream(execution_stream);
+        }
         if (crop_damping_mask_.is_valid()) {
             crop_damping_mask_.sync_to_stream(execution_stream);
         }
@@ -948,8 +1082,19 @@ namespace lfs::training {
             fused.shN.sh_value_n_cells = 0;
         }
         fused.scaling = prepare_param(ParamType::Scaling, 3, true);
+        refresh_screen_share_buffer();
+        fused.scaling.screen_share_max = screen_share_max_;
+        fused.scaling.screen_share_n = screen_share_n_;
+        fused.scaling.screen_share_limit = screen_share_limit_;
+        fused.scaling.screen_share_penalty = screen_share_penalty_;
         fused.rotation = prepare_param(ParamType::Rotation, 4, true);
         fused.opacity = prepare_param(ParamType::Opacity, 1, true);
+        fused.per_splat_mean_step = per_splat_mean_step_;
+        fused.mean_step_median_extent = mean_step_median_extent_;
+        fused.mean_step_r_min = mean_step_r_min_;
+        fused.mean_step_r_max = mean_step_r_max_;
+        fused.mean_step_far_mask = mean_step_far_mask_;
+        fused.mean_step_far_mask_n = mean_step_far_mask_n_;
 
         fused.enabled = fused.means.enabled || fused.sh0.enabled || fused.shN.enabled ||
                         fused.scaling.enabled || fused.rotation.enabled || fused.opacity.enabled;
@@ -1219,6 +1364,10 @@ namespace lfs::training {
             } else {
                 note_slow_path_grow("extend_state_for_new_params(joint)", name);
                 // Re-alloc with growth_factor headroom and restore capacity invariant.
+                // alloc_quantized_state zeros the new packed buffer — copy the live
+                // prefix so existing moments survive (otherwise a 1.5× grow would
+                // reset Adam state).
+                auto old_packed = std::move(state.exp_avg);
                 const size_t prim_cap = compute_new_capacity(
                     static_cast<size_t>(splat_data_.size()),
                     static_cast<size_t>(splat_data_.size()));
@@ -1234,6 +1383,17 @@ namespace lfs::training {
                 }
                 if (state.grad.is_valid())
                     state.grad.reserve(moment_cap);
+                if (old_packed.is_valid() && old_packed.numel() > 0 &&
+                    state.exp_avg.is_valid() && state.exp_avg.numel() > 0) {
+                    const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
+                    lfs::core::waitForCUDAStream(stream, old_packed.stream());
+                    lfs::core::waitForCUDAStream(stream, state.exp_avg.stream());
+                    const size_t copy_bytes = std::min(old_packed.bytes(), state.exp_avg.bytes());
+                    LFS_CUDA_CHECK(cudaMemcpyAsync(
+                        state.exp_avg.data_ptr(), old_packed.data_ptr(),
+                        copy_bytes, cudaMemcpyDeviceToDevice, stream));
+                    LFS_CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
             }
             const size_t prim_n = static_cast<size_t>(splat_data_.size());
             const size_t prim_cap =
@@ -1446,29 +1606,31 @@ namespace lfs::training {
             const size_t old_floats = lfs::core::sh_swizzled_float_count(old_N, layout_rest);
             const size_t new_floats = lfs::core::sh_swizzled_float_count(new_N, layout_rest);
             const size_t growth = new_floats - old_floats;
+            const bool q16_param = splat_data_.shN_value_quantized() &&
+                                   param.dtype() == lfs::core::DataType::Float16;
 
-            // Extend the swizzled param buffer by `growth` zero floats. The new range
-            // [old_floats, new_floats) covers all swizzled slots of primitives in
-            // [old_N, new_N). cuda.direct / q16-expand storage cannot reserve in place —
-            // reallocate with headroom when capacity is short (cross-block densify).
-            if (param.capacity() < new_floats) {
-                const size_t target = std::max(
-                    compute_new_capacity(new_floats, new_floats), new_floats);
-                auto fresh = lfs::core::Tensor::zeros_direct(
-                    lfs::core::TensorShape({old_floats}), target, param.device(),
-                    param.dtype());
-                if (old_floats > 0 && param.is_valid() && param.numel() > 0) {
-                    const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
-                    lfs::core::waitForCUDAStream(stream, param.stream());
-                    const size_t nbytes = old_floats * lfs::core::dtype_size(param.dtype());
-                    LFS_CUDA_CHECK(cudaMemcpyAsync(
-                        fresh.data_ptr(), param.data_ptr(), nbytes,
-                        cudaMemcpyDeviceToDevice, stream));
-                    LFS_CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (!q16_param) {
+                // Extend the swizzled fp32 param buffer by `growth` zero floats.
+                // q16 append is handled below (cell counts are not float4 slots).
+                if (param.capacity() < new_floats) {
+                    const size_t target = std::max(
+                        compute_new_capacity(new_floats, new_floats), new_floats);
+                    auto fresh = lfs::core::Tensor::zeros_direct(
+                        lfs::core::TensorShape({old_floats}), target, param.device(),
+                        param.dtype());
+                    if (old_floats > 0 && param.is_valid() && param.numel() > 0) {
+                        const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
+                        lfs::core::waitForCUDAStream(stream, param.stream());
+                        const size_t nbytes = old_floats * lfs::core::dtype_size(param.dtype());
+                        LFS_CUDA_CHECK(cudaMemcpyAsync(
+                            fresh.data_ptr(), param.data_ptr(), nbytes,
+                            cudaMemcpyDeviceToDevice, stream));
+                        LFS_CUDA_CHECK(cudaStreamSynchronize(stream));
+                    }
+                    param = std::move(fresh);
                 }
-                param = std::move(fresh);
+                param.append_zeros(growth);
             }
-            param.append_zeros(growth);
 
             const bool indices_are_i64 = indices.dtype() == lfs::core::DataType::Int64;
             lfs::core::Tensor indices_i32;
@@ -1501,11 +1663,22 @@ namespace lfs::training {
                 }
             };
 
-            // Param gather is float/q16 specific. Under q16 densify paths dequant first
-            // (ensure_shN_fp32_for_mutation); still only gather when float storage.
-            if (param.dtype() == lfs::core::DataType::Float32) {
+            // q16: gather-decode sources and encode only the appended 256-splat
+            // blocks. fp32: in-swizzle gather into the grown tail.
+            if (q16_param) {
+                lfs::core::Tensor canonical = lfs::core::Tensor::zeros(
+                    {n_new, static_cast<size_t>(layout_rest), size_t{3}},
+                    param.device());
+                lfs::training::sh_value::gather_shN_to_canonical(
+                    splat_data_, indices, canonical, old_N);
+                lfs::training::sh_value::append_canonical_to_shN(
+                    splat_data_, canonical, old_N);
+            } else if (param.dtype() == lfs::core::DataType::Float32) {
                 gather_new_swizzled_rows(param);
             }
+
+            // q16 grow may replace splat.shN(); re-fetch before using param.
+            auto& param_now = get_param(type);
 
             // Extend the Adam state.
             const auto name = param_name(type);
@@ -1528,7 +1701,7 @@ namespace lfs::training {
                             lfs::core::sh_swizzled_float_count(prim_cap, layout_rest);
                         // Preserve existing packed codes then grow.
                         auto old_packed = std::move(state.exp_avg);
-                        alloc_quantized_state(type, state, param, moment_cap, prim_cap);
+                        alloc_quantized_state(type, state, param_now, moment_cap, prim_cap);
                         if (old_packed.is_valid() && old_packed.numel() > 0 &&
                             state.exp_avg.is_valid()) {
                             const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
@@ -1543,7 +1716,7 @@ namespace lfs::training {
                     }
                     ensure_joint_bounds_capacity(state.joint_bounds, new_N,
                                                  std::max(new_N, state.capacity),
-                                                 param.device(), /*zero_all=*/false);
+                                                 param_now.device(), /*zero_all=*/false);
                     state.size = new_floats;
                     state.capacity = state.exp_avg.is_valid() ? state.exp_avg.capacity() : new_floats;
                     // Zero-encode new prim rows under (possibly non-zero) block bounds.
@@ -1728,6 +1901,7 @@ namespace lfs::training {
     }
 
     void AdamOptimizer::deserialize(std::istream& is) {
+        const auto deserialize_started = std::chrono::steady_clock::now();
         uint32_t magic = 0, version = 0;
         lfs::core::serialization_detail::read_exact(is, &magic, sizeof(magic), "Adam magic");
         lfs::core::serialization_detail::read_exact(is, &version, sizeof(version), "Adam version");
@@ -1894,8 +2068,6 @@ namespace lfs::training {
                         throw std::runtime_error("Invalid AdamOptimizer checkpoint: joint packed shape mismatch");
                     }
                 }
-                state.exp_avg = state.exp_avg.cuda();
-                state.joint_bounds = state.joint_bounds.cuda();
             }
 
             // Serialized capacity is advisory and may be attacker-controlled.
@@ -1906,10 +2078,44 @@ namespace lfs::training {
             loaded_states.emplace(std::move(name), std::move(state));
         }
 
+        const auto cpu_decode_finished = std::chrono::steady_clock::now();
+        // Tensor::to(CUDA, stream) rehomes onto that handle; do not destroy it.
+        cudaStream_t upload_stream = lfs::core::getCurrentCUDAStream();
+        for (auto& [state_name, state] : loaded_states) {
+            (void)state_name;
+            auto upload = [&](lfs::core::Tensor& tensor) {
+                if (!tensor.is_valid() ||
+                    tensor.device() == lfs::core::Device::CUDA) {
+                    return;
+                }
+                if (upload_stream != nullptr) {
+                    tensor = tensor.to(lfs::core::Device::CUDA, upload_stream);
+                    return;
+                }
+                tensor = tensor.to(lfs::core::Device::CUDA);
+                upload_stream = tensor.stream();
+            };
+            upload(state.exp_avg);
+            upload(state.joint_bounds);
+        }
+        if (upload_stream != nullptr) {
+            LFS_CUDA_CHECK(cudaStreamSynchronize(upload_stream));
+        }
+        const auto gpu_upload_finished = std::chrono::steady_clock::now();
+
         config_ = std::move(loaded_config);
         states_ = std::move(loaded_states);
 
         // Gradient buffers are transient and allocated lazily by get_grad().
+        const auto milliseconds = [](const auto begin, const auto end) {
+            return std::chrono::duration<double, std::milli>(end - begin).count();
+        };
+        LOG_DEBUG(
+            "Adam deserialize stages: states={} cpu_decode={:.3f} ms gpu_upload={:.3f} ms total={:.3f} ms",
+            num_states,
+            milliseconds(deserialize_started, cpu_decode_finished),
+            milliseconds(cpu_decode_finished, gpu_upload_finished),
+            milliseconds(deserialize_started, gpu_upload_finished));
         LOG_DEBUG("Deserialized AdamOptimizer: {} states", num_states);
     }
 

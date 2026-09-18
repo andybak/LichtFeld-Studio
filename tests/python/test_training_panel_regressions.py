@@ -37,6 +37,10 @@ def _install_lf_stub(monkeypatch):
     lf_stub.loss_buffer = lambda: []
     lf_stub.push_loss_to_element = lambda _element, _data: (0.0, 0.0)
     lf_stub.get_render_settings = lambda: None
+    lf_stub.detect_dataset_info = lambda _path: None
+    lf_stub.log = SimpleNamespace(error=lambda *_a, **_k: None, info=lambda *_a, **_k: None)
+    lf_stub.io = SimpleNamespace(save_point_cloud_ply=lambda *_a, **_k: None)
+    lf_stub.scene = SimpleNamespace(NodeType=SimpleNamespace(POINTCLOUD="POINTCLOUD"))
     monkeypatch.setitem(sys.modules, "lichtfeld", lf_stub)
     return lf_stub
 
@@ -51,6 +55,7 @@ def test_bundled_locales_define_training_panel_strategy_and_color_keys():
         assert "refinement.grow_until_iter" in data["training"]
         assert "tooltip.grow_until_iter" in data["training"]
         assert data["training"]["overwrite.btn_save_as_start"]
+        assert data["training"]["save_pc.message_project"]
         assert data["training_panel"]["color_red_prefix"] == "R:"
         assert data["training_panel"]["color_green_prefix"] == "G:"
         assert data["training_panel"]["color_blue_prefix"] == "B:"
@@ -893,6 +898,39 @@ def test_training_rml_exposes_mrnf_grow_until_iter():
     assert 'data-event-mousedown="pv_step(row.id, -1)"' in content
 
 
+def test_training_panel_keeps_controls_and_search_outside_scroll_region():
+    project_root = Path(__file__).parent.parent.parent
+    resources = project_root / "src" / "visualizer" / "gui" / "rmlui" / "resources"
+    rml = (resources / "training.rml").read_text()
+    rcss = (resources / "training.rcss").read_text()
+    panel_source = (project_root / "src" / "python" / "lfs_plugins" / "training_panel.py").read_text()
+
+    controls = rml.index('id="controls"')
+    search = rml.index('id="training-search-container"')
+    telemetry = rml.index('class="section-gap training-telemetry"')
+    scroll_start = rml.index('class="training-scroll-region"')
+    parameters = rml.index('class="training-panel-title"')
+    scroll_end = rml.index("<!-- /training-scroll-region -->")
+    color_picker = rml.index('id="color-picker-popup"')
+
+    assert controls < search < telemetry < scroll_start < parameters < scroll_end < color_picker
+    assert 'class="section-gap training-telemetry" data-if="show_training_telemetry"' in rml
+    assert 'id="training-search-icon" src="../icon/scene/search.png"' in rml
+    assert 'id="training-search-input" type="text"' in rml
+    assert '<img src="../icon/scene/x.png" />' in rml
+    assert ".training-panel-layout" in rcss
+    assert ".training-scroll-region" in rcss
+    assert ".training-telemetry" in rcss
+    assert "#training-search-input" in rcss
+    assert "background-color: transparent" in rcss
+    assert "border-width: 0" in rcss
+    assert "overflow-y: auto" in rcss
+    assert ".training-scroll-region scrollbarvertical" in rcss
+    assert "padding-bottom: 6dp" in rcss
+    assert "width: 4dp" in rcss
+    assert "height_mode = lf.ui.PanelHeightMode.FILL" in panel_source
+
+
 def test_set_bool_prop_hasattr_guard(training_panel_module, monkeypatch):
     """Issue #972: _set_bool_prop must not crash on missing attributes."""
     panel = training_panel_module.TrainingPanel()
@@ -978,6 +1016,35 @@ def test_save_steps_editable_in_active_trainer_states(training_panel_module):
         runtime.trainer_state.value = "finished"
         assert save_edit_mode() is False
         assert save_readonly_mode() is True
+    finally:
+        runtime.iteration._fallback = 0
+        runtime.training_state._fallback = "idle"
+
+
+def test_training_telemetry_is_reserved_from_start_until_clear(training_panel_module):
+    panel = training_panel_module.TrainingPanel()
+    model = _ModelStub()
+    params = _ParamsStub()
+    dataset = _DatasetStub()
+    runtime = training_panel_module.RuntimeState
+
+    panel._bind_visibility(model, lambda: params, lambda: dataset)
+    show_telemetry = model.bindings["show_training_telemetry"][0]
+
+    try:
+        runtime.trainer_state.value = "ready"
+        runtime.iteration.value = 0
+        assert show_telemetry() is False
+
+        runtime.trainer_state.value = "running"
+        assert show_telemetry() is True
+
+        runtime.trainer_state.value = "ready"
+        runtime.iteration.value = 1
+        assert show_telemetry() is True
+
+        runtime.iteration.value = 0
+        assert show_telemetry() is False
     finally:
         runtime.iteration._fallback = 0
         runtime.training_state._fallback = "idle"
@@ -1355,3 +1422,296 @@ def test_reset_without_dirty_or_training_runs_immediately(
     panel._on_action(None, None, ["reset"])
 
     assert resets == [True]
+
+
+def _stub_stored_session(training_panel_module, monkeypatch, **overrides):
+    state = {
+        "available": True,
+        "iteration": 0,
+        "max_iterations": 0,
+        "strategy": "mrnf",
+        "completed": False,
+        "hydrated": False,
+        "restoring": False,
+        "error": "",
+    }
+    state.update(overrides)
+    monkeypatch.setattr(
+        training_panel_module.lf,
+        "project_training_session_state",
+        lambda: dict(state),
+        raising=False,
+    )
+    return state
+
+
+def test_completed_stored_session_shows_complete_mode_and_buttons(
+    training_panel_module, monkeypatch
+):
+    _stub_stored_session(
+        training_panel_module,
+        monkeypatch,
+        iteration=30000,
+        max_iterations=30000,
+        completed=True,
+    )
+    panel = training_panel_module.TrainingPanel()
+    model = _ModelStub()
+    params = _ParamsStub()
+    dataset = _DatasetStub()
+    runtime = training_panel_module.RuntimeState
+
+    panel._bind_visibility(model, lambda: params, lambda: dataset)
+    panel._bind_status(model, lambda: params)
+    try:
+        runtime.has_trainer.value = False
+        runtime.trainer_state.value = "idle"
+        runtime.iteration.value = 30000
+        runtime.max_iterations.value = 30000
+
+        assert model.bindings["show_ctrl_completed"][0]() is True
+        assert model.bindings["show_ctrl_paused"][0]() is False
+        assert model.bindings["show_ctrl_ready"][0]() is False
+        assert "status.complete" in model.bindings["status_mode"][0]()
+        assert "30,000/30,000" in model.bindings["progress_text"][0]()
+        assert "session_at_iteration" not in model.bindings["status_mode"][0]()
+    finally:
+        runtime.has_trainer._fallback = False
+        runtime.training_state._fallback = "idle"
+        runtime.iteration._fallback = 0
+        runtime.total_iterations._fallback = 0
+
+
+def test_paused_stored_session_shows_paused_mode_and_resume(
+    training_panel_module, monkeypatch
+):
+    _stub_stored_session(
+        training_panel_module,
+        monkeypatch,
+        iteration=7000,
+        max_iterations=30000,
+        completed=False,
+    )
+    panel = training_panel_module.TrainingPanel()
+    model = _ModelStub()
+    params = _ParamsStub()
+    dataset = _DatasetStub()
+    runtime = training_panel_module.RuntimeState
+
+    panel._bind_visibility(model, lambda: params, lambda: dataset)
+    panel._bind_status(model, lambda: params)
+    try:
+        runtime.has_trainer.value = False
+        runtime.trainer_state.value = "idle"
+        runtime.iteration.value = 7000
+        runtime.max_iterations.value = 30000
+
+        assert model.bindings["show_ctrl_paused"][0]() is True
+        assert model.bindings["show_ctrl_completed"][0]() is False
+        assert model.bindings["show_ctrl_ready"][0]() is False
+        assert "status.paused" in model.bindings["status_mode"][0]()
+        assert "7,000/30,000" in model.bindings["progress_text"][0]()
+        assert "session_at_iteration" not in model.bindings["status_mode"][0]()
+    finally:
+        runtime.has_trainer._fallback = False
+        runtime.training_state._fallback = "idle"
+        runtime.iteration._fallback = 0
+        runtime.total_iterations._fallback = 0
+
+
+def test_stopped_stored_session_keeps_stopped_mode_and_edit_controls(
+    training_panel_module, monkeypatch
+):
+    _stub_stored_session(
+        training_panel_module,
+        monkeypatch,
+        iteration=7000,
+        max_iterations=30000,
+        completed=False,
+    )
+    panel = training_panel_module.TrainingPanel()
+    model = _ModelStub()
+    params = _ParamsStub()
+    dataset = _DatasetStub()
+    runtime = training_panel_module.RuntimeState
+
+    panel._bind_visibility(model, lambda: params, lambda: dataset)
+    panel._bind_status(model, lambda: params)
+    try:
+        runtime.has_trainer.value = False
+        runtime.trainer_state.value = "stopped"
+        runtime.iteration.value = 7000
+        runtime.max_iterations.value = 30000
+
+        assert model.bindings["show_ctrl_paused"][0]() is False
+        assert model.bindings["show_ctrl_stopped"][0]() is True
+        assert model.bindings["show_ctrl_completed"][0]() is False
+        assert model.bindings["show_ctrl_ready"][0]() is False
+        assert "status.stopped" in model.bindings["status_mode"][0]()
+        assert "7,000/30,000" in model.bindings["progress_text"][0]()
+        assert "session_at_iteration" not in model.bindings["status_mode"][0]()
+    finally:
+        runtime.has_trainer._fallback = False
+        runtime.training_state._fallback = "idle"
+        runtime.iteration._fallback = 0
+        runtime.total_iterations._fallback = 0
+
+
+def test_resume_on_stored_session_restores_before_resuming(
+    training_panel_module, monkeypatch
+):
+    _stub_stored_session(
+        training_panel_module,
+        monkeypatch,
+        iteration=7000,
+        max_iterations=30000,
+        completed=False,
+    )
+    calls = []
+    monkeypatch.setattr(
+        training_panel_module.lf,
+        "restore_training_session",
+        lambda then_start=False: calls.append(("restore", then_start)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        training_panel_module.lf,
+        "resume_training",
+        lambda: calls.append(("resume",)),
+        raising=False,
+    )
+    runtime = training_panel_module.RuntimeState
+    try:
+        runtime.has_trainer.value = False
+        runtime.trainer_state.value = "paused"
+        panel = training_panel_module.TrainingPanel()
+        panel._on_action(None, None, ["resume"])
+        assert calls[0] == ("restore", True)
+        assert ("resume",) in calls
+    finally:
+        runtime.has_trainer._fallback = False
+        runtime.training_state._fallback = "idle"
+
+
+def test_save_modified_pc_writes_to_bound_project(training_panel_module, monkeypatch):
+    project_saves = []
+    detect_calls = []
+    ply_calls = []
+    scene = SimpleNamespace(is_point_cloud_modified=True)
+
+    def save_titled():
+        project_saves.append(True)
+        return True
+
+    monkeypatch.setattr(training_panel_module, "_project_has_path", lambda: True)
+    monkeypatch.setattr(training_panel_module, "_save_titled_project", save_titled)
+    monkeypatch.setattr(training_panel_module.lf, "get_scene", lambda: scene)
+    monkeypatch.setattr(
+        training_panel_module.lf,
+        "detect_dataset_info",
+        lambda *args, **kwargs: detect_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        training_panel_module.lf,
+        "io",
+        SimpleNamespace(
+            save_point_cloud_ply=lambda *args, **kwargs: ply_calls.append((args, kwargs))
+        ),
+    )
+
+    training_panel_module.TrainingPanel()._save_modified_pc()
+
+    assert project_saves == [True]
+    assert detect_calls == []
+    assert ply_calls == []
+    assert scene.is_point_cloud_modified is False
+
+
+def test_save_modified_pc_bound_project_failed_save_skips_dataset(
+    training_panel_module, monkeypatch
+):
+    ply_calls = []
+    scene = SimpleNamespace(is_point_cloud_modified=True)
+
+    monkeypatch.setattr(training_panel_module, "_project_has_path", lambda: True)
+    monkeypatch.setattr(training_panel_module, "_save_titled_project", lambda: False)
+    monkeypatch.setattr(training_panel_module.lf, "get_scene", lambda: scene)
+    monkeypatch.setattr(
+        training_panel_module.lf,
+        "io",
+        SimpleNamespace(
+            save_point_cloud_ply=lambda *args, **kwargs: ply_calls.append((args, kwargs))
+        ),
+    )
+
+    training_panel_module.TrainingPanel()._save_modified_pc()
+
+    assert ply_calls == []
+    assert scene.is_point_cloud_modified is True
+
+
+def test_save_modified_pc_unbound_writes_dataset_ply(training_panel_module, monkeypatch):
+    ply_calls = []
+    pc = SimpleNamespace(size=12)
+    node = SimpleNamespace(
+        type=training_panel_module.lf.scene.NodeType.POINTCLOUD,
+        point_cloud=lambda: pc,
+    )
+    scene = SimpleNamespace(
+        is_point_cloud_modified=True,
+        get_nodes=lambda: [node],
+    )
+    dataset = SimpleNamespace(data_path="/data/scene_a", has_params=lambda: True)
+    info = SimpleNamespace(sparse_path="/data/scene_a/sparse/0")
+
+    monkeypatch.setattr(training_panel_module, "_project_has_path", lambda: False)
+    monkeypatch.setattr(training_panel_module.lf, "dataset_params", lambda: dataset)
+    monkeypatch.setattr(training_panel_module.lf, "detect_dataset_info", lambda _path: info)
+    monkeypatch.setattr(training_panel_module.lf, "get_scene", lambda: scene)
+    monkeypatch.setattr(
+        training_panel_module.lf,
+        "io",
+        SimpleNamespace(
+            save_point_cloud_ply=lambda cloud, path: ply_calls.append((cloud, path))
+        ),
+    )
+
+    training_panel_module.TrainingPanel()._save_modified_pc()
+
+    assert ply_calls == [(pc, "/data/scene_a/sparse/0/points3D.ply")]
+    assert scene.is_point_cloud_modified is False
+
+
+@pytest.mark.parametrize(
+    ("bound", "expected_message"),
+    [
+        (True, "training.save_pc.message_project"),
+        (False, "training.save_pc.message"),
+    ],
+)
+def test_show_save_pc_dialog_message_depends_on_project_binding(
+    training_panel_module, monkeypatch, bound, expected_message
+):
+    dialogs = []
+
+    monkeypatch.setattr(training_panel_module, "_project_has_path", lambda: bound)
+    monkeypatch.setattr(
+        training_panel_module.lf.ui,
+        "confirm_dialog",
+        lambda title, message, buttons, callback=None: dialogs.append(
+            (title, message, list(buttons), callback)
+        ),
+        raising=False,
+    )
+
+    training_panel_module.TrainingPanel()._show_save_pc_dialog()
+
+    assert len(dialogs) == 1
+    title, message, buttons, _callback = dialogs[0]
+    assert title == "training.save_pc.title"
+    assert message == expected_message
+    assert buttons == [
+        "training.save_pc.btn_save_start",
+        "training.save_pc.btn_start_without",
+        "training.conflict.btn_cancel",
+    ]

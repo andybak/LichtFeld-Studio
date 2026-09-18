@@ -11,15 +11,8 @@ import lichtfeld as lf
 from . import rml_widgets
 from .scrub_fields import ScrubFieldController, ScrubFieldSpec
 from .types import Panel
+from .panels import panel_class
 from .ui import RuntimeState, native_value as _native_store_value
-
-# Asset Manager integration (optional)
-try:
-    from .asset_manager_integration import register_catalog_asset_path
-
-    ASSET_MANAGER_AVAILABLE = True
-except ImportError:
-    ASSET_MANAGER_AVAILABLE = False
 
 __lfs_panel_classes__ = ["ExportPanel"]
 __lfs_panel_ids__ = ["lfs.export"]
@@ -34,11 +27,13 @@ class ExportFormat(IntEnum):
     NUREC_USDZ = 5
     RAD = 6
     COLMAP = 7
+    SSOG = 8
 
 
 FORMAT_INFO = (
     (ExportFormat.PLY, "export.format.ply_standard"),
     (ExportFormat.SOG, "export.format.sog_supersplat"),
+    (ExportFormat.SSOG, "export.format.ssog"),
     (ExportFormat.SPZ, "export.format.spz_niantic"),
     (ExportFormat.RAD, "export.format.rad_random_access"),
     (ExportFormat.USD, "export.format.usd_openusd"),
@@ -50,6 +45,7 @@ FORMAT_INFO = (
 EXPORT_PROGRESS_FORMAT_NAMES = {
     ExportFormat.PLY: "PLY",
     ExportFormat.SOG: "SOG",
+    ExportFormat.SSOG: "SSOG",
     ExportFormat.SPZ: "SPZ",
     ExportFormat.HTML_VIEWER: "HTML",
     ExportFormat.USD: "USD",
@@ -71,16 +67,8 @@ def _progress_format_name(fmt):
     return EXPORT_PROGRESS_FORMAT_NAMES.get(fmt, "file")
 
 
+@panel_class("export")
 class ExportPanel(Panel):
-    id = "lfs.export"
-    label = "Export"
-    space = lf.ui.PanelSpace.FLOATING
-    order = 10
-    options = {lf.ui.PanelOption.DEFAULT_CLOSED}
-    template = "rmlui/export_panel.rml"
-    height_mode = lf.ui.PanelHeightMode.CONTENT
-    size = (320, 0)
-    update_policy = "dirty"
 
     def __init__(self):
         self._format = ExportFormat.PLY
@@ -88,6 +76,12 @@ class ExportPanel(Panel):
         self._max_export_sh_degree = 3
         self._export_sh_degree = 3
         self._pinned_sh_degree = True
+        self._ssog_folder_name = ""
+        self._ssog_bundle = True
+        self._ssog_settings = {
+            "lod_levels": 4, "lod_ratio": 0.5, "chunk_count_k": 512,
+            "chunk_extent": 16.0, "chunk_min_k": 8, "kmeans_iterations": 10,
+        }
         self._spz_version = 4  # SPZ container: 4 (zstd) or 3 (legacy gzip)
         self._selection_seeded = False
         self._handle = None
@@ -110,8 +104,6 @@ class ExportPanel(Panel):
         self._rad_streamable = True
         self._include_provenance = True
         self._doc = None  # Document reference for DOM access
-        self._last_export_path = None  # Track last export path for Asset Manager
-        self._last_export_format = None  # Track last export format for Asset Manager
         self._reactive_unsubscribers = []
 
     # ── Data model ────────────────────────────────────────────
@@ -126,6 +118,14 @@ class ExportPanel(Panel):
         model.bind_func("show_no_models", lambda: not self._has_models)
         model.bind_func("show_model_selection", lambda: self._format != ExportFormat.COLMAP)
         model.bind_func("show_sh_degree", lambda: self._format != ExportFormat.COLMAP)
+        model.bind_func("show_ssog_settings", lambda: self._format == ExportFormat.SSOG)
+        model.bind_func("ssog_bundle", lambda: self._ssog_bundle)
+        model.bind_event("toggle_ssog_bundle", self._on_toggle_ssog_bundle)
+        model.bind_func("show_ssog_folder", lambda: not self._ssog_bundle)
+        model.bind("ssog_folder_name", self._get_ssog_folder_name, self._set_ssog_folder_name)
+        for field in self._ssog_settings:
+            model.bind(field, lambda f=field: str(self._ssog_settings[f]),
+                       lambda value, f=field: self._set_ssog_setting(f, value))
         model.bind_func("show_spz_version", lambda: self._format == ExportFormat.SPZ)
         model.bind_func("export_error_text", self._get_export_error_text)
         model.bind_func("can_export", self._can_export)
@@ -167,6 +167,40 @@ class ExportPanel(Panel):
         model.bind_record_list("models")
 
         self._handle = model.get_handle()
+
+    def _on_toggle_ssog_bundle(self, _handle, _ev, _args):
+        self._set_ssog_bundle(not self._ssog_bundle)
+
+    def _set_ssog_bundle(self, value):
+        self._ssog_bundle = bool(value)
+        self._dirty_model("ssog_bundle", "show_ssog_folder", "can_export", "export_error_text")
+
+    def _get_ssog_folder_name(self):
+        if self._ssog_folder_name:
+            return self._ssog_folder_name
+        names = self._get_selected_node_names()
+        return f"{names[0]}_ssog" if names else "scene_ssog"
+
+    def _set_ssog_folder_name(self, value):
+        self._ssog_folder_name = str(value).strip()
+        self._dirty_model("ssog_folder_name", "can_export", "export_error_text")
+
+    def _valid_ssog_folder_name(self):
+        name = self._get_ssog_folder_name()
+        return bool(name) and name not in {".", ".."} and not any(c in name for c in '/\\:')
+
+    def _set_ssog_setting(self, field, value):
+        bounds = {
+            "lod_levels": (int, 1, 8), "lod_ratio": (float, 0.1, 0.9),
+            "chunk_count_k": (int, 1, 2147483), "chunk_extent": (float, 0.01, 1e6),
+            "chunk_min_k": (int, 0, 2147483), "kmeans_iterations": (int, 1, 1000),
+        }
+        cast, low, high = bounds[field]
+        try:
+            self._ssog_settings[field] = cast(max(low, min(high, float(value))))
+        except (ValueError, TypeError, OverflowError):
+            return
+        self._dirty_model(field)
 
     def _set_sh_degree(self, v):
         try:
@@ -457,6 +491,8 @@ class ExportPanel(Panel):
 
     def _get_export_error_text(self):
         tr = lf.ui.tr
+        if self._format == ExportFormat.SSOG and not self._ssog_bundle and not self._valid_ssog_folder_name():
+            return tr("export_dialog.invalid_folder_name")
         if self._format != ExportFormat.COLMAP:
             return tr("export.select_at_least_one")
 
@@ -539,6 +575,8 @@ class ExportPanel(Panel):
         )
 
     def _rebuild_model_records(self, nodes):
+        if self._format == ExportFormat.SSOG:
+            self._dirty_model("ssog_folder_name")
         if self._handle:
             self._handle.update_record_list(
                 "models",
@@ -576,6 +614,10 @@ class ExportPanel(Panel):
         self._rebuild_format_records()
         # Dirty format-dependent settings visibility when format changes
         self._dirty_model(
+            "show_ssog_settings",
+            "ssog_bundle",
+            "show_ssog_folder",
+            "ssog_folder_name",
             "show_rad_settings",
             "show_model_selection",
             "show_sh_degree",
@@ -664,7 +706,8 @@ class ExportPanel(Panel):
     def _can_export(self):
         if self._format == ExportFormat.COLMAP:
             return self._can_export_colmap()
-        return bool(self._selected_nodes)
+        return bool(self._selected_nodes) and (
+            self._format != ExportFormat.SSOG or self._ssog_bundle or self._valid_ssog_folder_name())
 
     def _get_selected_node_names(self):
         selected = []
@@ -674,6 +717,13 @@ class ExportPanel(Panel):
         return selected
 
     def _get_save_path(self, default_name):
+        if self._format == ExportFormat.SSOG:
+            if self._ssog_bundle:
+                return lf.ui.save_ssog_file_dialog(default_name)
+            if not self._valid_ssog_folder_name():
+                return ""
+            parent = lf.ui.open_folder_dialog()
+            return str(Path(parent) / self._get_ssog_folder_name()) if parent else ""
         if self._format == ExportFormat.PLY:
             return lf.ui.save_ply_file_dialog(default_name)
         if self._format == ExportFormat.SOG:
@@ -741,6 +791,16 @@ class ExportPanel(Panel):
         path = self._get_save_path(default_name)
 
         if path:
+            if self._format == ExportFormat.SSOG and (Path(path) / "lod-meta.json").exists():
+                tr = lf.ui.tr
+                overwrite_label = tr("export.overwrite")
+                lf.ui.confirm_dialog(
+                    tr("export.format.ssog"),
+                    f"{tr('export_dialog.ssog_overwrite')}\n{path}",
+                    [overwrite_label, tr("common.cancel")],
+                    lambda reply: self._start_export(path, selected_nodes) if reply == overwrite_label else None,
+                )
+                return
             if self._format == ExportFormat.COLMAP:
                 if self._colmap_sparse_data_exists(path):
                     self._confirm_colmap_overwrite(path, selected_nodes)
@@ -750,11 +810,6 @@ class ExportPanel(Panel):
 
     def _start_export(self, path, selected_nodes):
         if path:
-
-            # Store export info for Asset Manager registration
-            self._last_export_path = path
-            self._last_export_format = self._format
-
             self._exporting = True
             self._last_progress = -1.0
             self._progress_value = "0"
@@ -783,6 +838,7 @@ class ExportPanel(Panel):
                     rad_streamable=self._rad_streamable,
                     spz_version=self._spz_version,
                     include_provenance=self._include_provenance,
+                    **self._ssog_settings,
                 )
             finally:
                 self._request_reactive_update()
@@ -813,12 +869,6 @@ class ExportPanel(Panel):
         if not state.get("active", False):
             self._exporting = False
             self._selection_seeded = False
-            # Register export with Asset Manager if successful
-            completed = state.get("outcome") == "completed" and not state.get("error")
-            if completed and self._last_export_path and self._last_export_format is not None:
-                self._register_export(self._last_export_path, self._last_export_format)
-            self._last_export_path = None
-            self._last_export_format = None
             self._last_progress = -1.0
             self._progress_value = "0"
             self._dirty_model(
@@ -857,47 +907,3 @@ class ExportPanel(Panel):
             return True
 
         return False
-
-    def _format_to_asset_type(self, fmt: ExportFormat) -> str:
-        """Map ExportFormat to asset type string for Asset Manager."""
-        mapping = {
-            ExportFormat.PLY: "ply",
-            ExportFormat.SOG: "sog",
-            ExportFormat.SPZ: "spz",
-            ExportFormat.RAD: "rad",
-            ExportFormat.USD: "usd",
-            ExportFormat.NUREC_USDZ: "usdz",
-            ExportFormat.HTML_VIEWER: "html",
-            ExportFormat.COLMAP: "dataset",
-        }
-        return mapping.get(fmt, "unknown")
-
-    def _register_export(self, path: str, fmt: ExportFormat):
-        """Register exported file with Asset Manager catalog.
-
-        Called after successful export to add/update the asset in the catalog
-        and refresh the Asset Manager UI if open.
-
-        Args:
-            path: Output file path
-            fmt: Export format used
-        """
-        if not ASSET_MANAGER_AVAILABLE:
-            return
-
-        try:
-            # Determine asset type from format
-            asset_type = self._format_to_asset_type(fmt)
-
-            role = "trained_output" if lf.trainer_current_iteration() > 0 else "export"
-            register_catalog_asset_path(
-                path,
-                asset_type=asset_type,
-                role=role,
-                select=True,
-            )
-
-        except Exception:
-            # Asset Manager integration is non-intrusive
-            # Log error but don't fail the export
-            pass

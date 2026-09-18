@@ -37,17 +37,21 @@ layout(push_constant) uniform Push {
     // Per-panel valid-region UV: left scale, left clamp, right scale, right clamp.
     vec4 left_uv_scale_clamp;  // xy = scale, zw = clamp max
     vec4 right_uv_scale_clamp;
+    // Per-panel mapping from full-content UVs into the clipped render target.
+    vec4 left_texcoord_scale_offset;  // xy = scale, zw = offset
+    vec4 right_texcoord_scale_offset;
 } pc;
 
 vec3 sample_panel(sampler2D tex, vec2 uv, float start, float end, float normalize, float flip_y,
-                  float spatial_filter, vec2 uv_scale, vec2 uv_clamp_max) {
+                  float spatial_filter, vec2 uv_scale, vec2 uv_clamp_max,
+                  vec2 texcoord_scale, vec2 texcoord_offset) {
     float u = uv.x;
     if (normalize > 0.5) {
         float span = max(end - start, 1e-6);
         u = (uv.x - start) / span;
     }
     float v = flip_y > 0.5 ? 1.0 - uv.y : uv.y;
-    vec2 st = min(vec2(u, v) * uv_scale, uv_clamp_max);
+    vec2 st = min((vec2(u, v) * texcoord_scale + texcoord_offset) * uv_scale, uv_clamp_max);
     vec3 center = texture(tex, st).rgb;
     if (spatial_filter < 0.5) {
         return center;
@@ -77,10 +81,13 @@ void main() {
         return;
     }
 
-    // UV inside the content rect (0..1).
+    // Pixel-center UV inside the content rect. Normalized texture coordinates
+    // place the first and last pixel centers at 0.5 / extent and
+    // (extent - 0.5) / extent; dividing by extent - 1 stretches clipped PLY
+    // panels differently after their cached widths are refreshed.
     vec2 content_uv = vec2(
-        pc.rect.z > 1.0 ? (px.x - pc.rect.x) / (pc.rect.z - 1.0) : 0.0,
-        pc.rect.w > 1.0 ? (px.y - pc.rect.y) / (pc.rect.w - 1.0) : 0.0);
+        (px.x - pc.rect.x) / max(pc.rect.z, 1.0),
+        (px.y - pc.rect.y) / max(pc.rect.w, 1.0));
 
     float split_x = pc.rect.x + clamp(pc.split.x, 0.0, 1.0) * pc.rect.z;
     float divider_pixel = pc.rect.x + floor(pc.split.x * pc.rect.z + 0.5);
@@ -89,10 +96,12 @@ void main() {
     vec3 color = use_left
         ? sample_panel(u_left, content_uv, pc.panel_norm.x, pc.panel_norm.y,
                        pc.panel_flags.x, pc.split.y, pc.panel_flags.z,
-                       pc.left_uv_scale_clamp.xy, pc.left_uv_scale_clamp.zw)
+                       pc.left_uv_scale_clamp.xy, pc.left_uv_scale_clamp.zw,
+                       pc.left_texcoord_scale_offset.xy, pc.left_texcoord_scale_offset.zw)
         : sample_panel(u_right, content_uv, pc.panel_norm.z, pc.panel_norm.w,
                        pc.panel_flags.y, pc.split.z, pc.panel_flags.w,
-                       pc.right_uv_scale_clamp.xy, pc.right_uv_scale_clamp.zw);
+                       pc.right_uv_scale_clamp.xy, pc.right_uv_scale_clamp.zw,
+                       pc.right_texcoord_scale_offset.xy, pc.right_texcoord_scale_offset.zw);
 
     // Divider/handle/grip overlay. Mirrors compositeSplitImages CPU geometry
     // pixel-for-pixel: vertical bar + rounded handle + horizontal grip lines.

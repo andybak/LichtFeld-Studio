@@ -4,28 +4,31 @@
 
 #pragma once
 
+#include "core/error.hpp"
+#include "core/sh_value_quant.hpp"
 #include "core/splat_data.hpp"
 #include "core/splat_exportable_storage.hpp"
 #include "core/tensor.hpp"
-#include "rendering/cuda_vulkan_interop.hpp"
 #include "window/vulkan_context.hpp"
 
 #include <expected>
 #include <memory>
 #include <string>
+#include <string_view>
 
 namespace lfs::vis {
 
     class VulkanExternalTensorStorage final {
     public:
-        // OWNED variant — this instance owns the Vulkan buffer + CUDA interop.
-        // Used by the legacy makeVulkanExternalTensor() path (one tensor per VkBuffer).
+        // OWNED variant — this instance owns the imported VkBuffer. CUDA storage
+        // lives in extra_owner (ExportableBlock). cuda_ptr is registered for
+        // diagnostics when non-null.
         VulkanExternalTensorStorage(VulkanContext& context,
                                     VulkanContext::ExternalBuffer buffer,
-                                    lfs::rendering::CudaVulkanBufferInterop interop,
                                     std::size_t bytes,
                                     std::string debug_label,
-                                    std::shared_ptr<void> extra_owner = {});
+                                    std::shared_ptr<void> extra_owner = {},
+                                    const void* cuda_ptr = nullptr);
 
         // SUB-VIEW variant — borrows the VkBuffer and lifetime from `parent` at a
         // fixed (offset, bytes) slice. Tensor::from_external_owner receives the
@@ -53,13 +56,14 @@ namespace lfs::vis {
         [[nodiscard]] VkBuffer vkBuffer() const;
         [[nodiscard]] VkDeviceSize vkBufferSize() const;
         [[nodiscard]] VkDeviceSize vkOffset() const;
+        [[nodiscard]] VkDeviceAddress vkDeviceAddress() const;
         [[nodiscard]] std::size_t bytes() const;
+        [[nodiscard]] bool bindNewExportableChunks(const lfs::core::ExportableBlock& block);
 
     private:
         // Owned-variant members (only meaningful when parent_ is nullptr).
         VulkanContext* context_ = nullptr;
         VulkanContext::ExternalBuffer buffer_{};
-        lfs::rendering::CudaVulkanBufferInterop interop_{};
         const void* registered_cuda_base_ = nullptr;
         // Sub-view members.
         std::shared_ptr<VulkanExternalTensorStorage> parent_;
@@ -80,9 +84,7 @@ namespace lfs::vis {
         lfs::core::TensorShape shape,
         lfs::core::DataType dtype,
         std::size_t capacity,
-        const char* debug_name,
-        cudaStream_t stream = nullptr,
-        bool zero_fill = true);
+        const char* debug_name);
 
     // Build a SplatTensorAllocator that hands out tensor views into a single
     // CUDA-exportable VMM block imported into Vulkan. Each tensor carries a
@@ -91,13 +93,24 @@ namespace lfs::vis {
     // returned allocator holds shared_ptrs to both the CUDA-side ExportableBlock
     // and the Vulkan-side parent storage; tensors keep them alive via the
     // standard shared_ptr<void> data_owner_ chain.
-    [[nodiscard]] std::expected<lfs::core::SplatTensorAllocator, std::string>
-    makeSplatExportableInteropAllocator(VulkanContext& context,
-                                        const lfs::core::SplatExportableStorage& storage);
+    [[nodiscard]] lfs::Result<lfs::core::SplatTensorAllocator>
+    makeSplatExportableInteropAllocator(
+        VulkanContext& context,
+        const lfs::core::SplatExportableStorage& storage,
+        std::shared_ptr<VulkanExternalTensorStorage>* parent_keep = nullptr);
+
+    // Float32 SplatData.shN is a q16 workspace: keep it in pooled CUDA so the viewer
+    // never imports a multi-gigabyte float rest buffer just to discard it after encode.
+    [[nodiscard]] inline bool keepFloatShNInPooledCuda(const std::string_view name,
+                                                       const lfs::core::DataType dtype) {
+        return name == "SplatData.shN" &&
+               dtype == lfs::core::DataType::Float32 &&
+               lfs::core::sh_value_quant::enabled();
+    }
 
     // One-tensor-per-VkBuffer allocator bound to the active window's Vulkan context, matching
     // what the splat renderer binds. Empty when interop is unavailable (headless). Shared by the
     // file loader and in-memory inserts (Python API).
-    [[nodiscard]] LFS_VIS_API lfs::core::SplatTensorAllocator makeViewerSplatTensorAllocator();
+    [[nodiscard]] LFS_VIS_API lfs::core::SplatTensorAllocator makeViewerSplatTensorAllocator(bool preserve_float_shN = false);
 
 } // namespace lfs::vis

@@ -62,7 +62,6 @@ def _install_lf_stub(monkeypatch):
         get_export_state=lambda: dict(state.export_state),
         set_panel_enabled=lambda panel_id, enabled: state.set_panel_enabled_calls.append((panel_id, enabled)),
         cancel_export=lambda: setattr(state, "cancel_calls", state.cancel_calls + 1),
-        set_save_asset_callback=lambda _callback: None,
         save_ply_file_dialog=lambda default_name: f"/tmp/{default_name}.ply",
         save_sog_file_dialog=lambda default_name: f"/tmp/{default_name}.sog",
         save_spz_file_dialog=lambda default_name: f"/tmp/{default_name}.spz",
@@ -70,6 +69,7 @@ def _install_lf_stub(monkeypatch):
         save_usdz_file_dialog=lambda default_name: f"/tmp/{default_name}.usdz",
         save_html_file_dialog=lambda default_name: f"/tmp/{default_name}.html",
         save_rad_file_dialog=lambda default_name: f"/tmp/{default_name}.rad",
+        open_folder_dialog=lambda: (state.folder_dialog_calls.append("") or state.folder_dialog_result),
         open_dataset_folder_dialog=lambda default_path="": (
             state.folder_dialog_calls.append(default_path) or state.folder_dialog_result
         ),
@@ -170,6 +170,7 @@ def test_export_panel_builds_format_and_model_records(export_panel_module):
     assert panel._handle.records["formats"] == [
         {"index": "0", "label": "export.format.ply_standard", "selected": False},
         {"index": "1", "label": "export.format.sog_supersplat", "selected": False},
+        {"index": "8", "label": "export.format.ssog", "selected": False},
         {"index": "2", "label": "export.format.spz_niantic", "selected": True},
         {"index": "6", "label": "export.format.rad_random_access", "selected": False},
         {"index": "4", "label": "export.format.usd_openusd", "selected": False},
@@ -183,7 +184,7 @@ def test_export_panel_builds_format_and_model_records(export_panel_module):
     ]
     assert panel._has_models is True
     assert panel.update_policy == "dirty"
-    assert "update_interval_ms" not in module.ExportPanel.__dict__
+    assert module.ExportPanel.update_interval_ms == 100
 
 
 def test_export_panel_seeds_selection_from_scene_nodes(export_panel_module):
@@ -268,27 +269,6 @@ def test_export_panel_closes_when_export_finishes(export_panel_module):
     assert panel._exporting is False
     assert panel._selection_seeded is False
     assert state.set_panel_enabled_calls == [("lfs.export", False)]
-
-
-def test_export_panel_does_not_register_failed_export(export_panel_module):
-    module, state = export_panel_module
-    panel = module.ExportPanel()
-    panel._exporting = True
-    panel._last_export_path = "/tmp/failed.ply"
-    panel._last_export_format = module.ExportFormat.PLY
-    registered = []
-    panel._register_export = lambda path, fmt: registered.append((path, fmt))
-    state.export_state = {
-        "active": False,
-        "stage": "Failed",
-        "error": "disk full",
-        "format": "PLY",
-    }
-
-    assert panel._update_export_progress() is True
-    assert registered == []
-    assert panel._last_export_path is None
-    assert panel._last_export_format is None
 
 
 def test_export_panel_store_subscriptions_mark_panel_dirty(export_panel_module, monkeypatch):
@@ -493,3 +473,82 @@ def test_export_panel_cancel_colmap_overwrite(export_panel_module, tmp_path):
 
     assert len(state.confirm_calls) == 1
     assert state.export_calls == []
+
+
+def test_ssog_directory_and_options(export_panel_module, tmp_path, monkeypatch):
+    module, state = export_panel_module
+    panel = module.ExportPanel()
+    panel._format = module.ExportFormat.SSOG
+    panel._on_toggle_ssog_bundle(None, None, None)
+    panel._selected_nodes = {"Tree"}
+    state.nodes = [_make_node(module.lf.scene.NodeType.SPLAT, "Tree", 128)]
+    state.folder_dialog_result = str(tmp_path)
+    calls = []
+    monkeypatch.setattr(module.lf, "export_scene", lambda *args, **kwargs: calls.append((args, kwargs)))
+    assert panel._get_ssog_folder_name() == "Tree_ssog"
+    panel._set_ssog_folder_name("my_scene")
+    settings = dict(lod_levels=3, lod_ratio=0.4, chunk_count_k=64,
+                    chunk_extent=12.5, chunk_min_k=2, kmeans_iterations=7)
+    for key, value in settings.items():
+        panel._set_ssog_setting(key, str(value))
+    panel._do_export()
+    assert calls[0][0] == (8, str(tmp_path / "my_scene"), ["Tree"], 3)
+    assert {key: calls[0][1][key] for key in settings} == settings
+    assert not state.confirm_calls
+    assert panel._cached_export_state["format"] == "SSOG"
+
+
+@pytest.mark.parametrize("reply,expected_exports", [("Overwrite", 1), ("Cancel", 0)])
+def test_ssog_overwrite_confirmation(export_panel_module, tmp_path, reply, expected_exports):
+    module, state = export_panel_module
+    panel = module.ExportPanel()
+    panel._format = module.ExportFormat.SSOG
+    panel._set_ssog_bundle(False)
+    panel._selected_nodes = {"Tree"}
+    state.nodes = [_make_node(module.lf.scene.NodeType.SPLAT, "Tree", 128)]
+    state.folder_dialog_result = str(tmp_path)
+    state.confirm_response = reply
+    output = tmp_path / "Tree_ssog"
+    output.mkdir()
+    (output / "lod-meta.json").write_text("{}")
+    panel._do_export()
+    assert len(state.confirm_calls) == 1
+    assert len(state.export_calls) == expected_exports
+
+
+
+@pytest.mark.parametrize("name", ["..", "a\\b"])
+def test_ssog_rejects_path_in_folder_name(export_panel_module, name):
+    module, _ = export_panel_module
+    panel = module.ExportPanel()
+    panel._format = module.ExportFormat.SSOG
+    panel._set_ssog_bundle(False)
+    panel._selected_nodes = {"Tree"}
+    panel._set_ssog_folder_name(name)
+    assert not panel._can_export()
+
+
+
+@pytest.mark.parametrize("chosen", ["/tmp/Tree.ssog", ""])
+def test_ssog_bundle_default_and_option_forwarding(export_panel_module, monkeypatch, chosen):
+    module, state = export_panel_module
+    panel = module.ExportPanel()
+    panel._format = module.ExportFormat.SSOG
+    panel._selected_nodes = {"Tree"}
+    state.nodes = [_make_node(module.lf.scene.NodeType.SPLAT, "Tree", 128)]
+    picked = []
+    monkeypatch.setattr(module.lf.ui, "save_ssog_file_dialog", lambda name: picked.append(name) or chosen, raising=False)
+    calls = []
+    monkeypatch.setattr(module.lf, "export_scene", lambda *args, **kwargs: calls.append((args, kwargs)))
+    assert panel._ssog_bundle is True
+    panel._set_ssog_folder_name("../unused")
+    assert panel._can_export()
+    panel._set_ssog_setting("lod_levels", "3")
+    panel._do_export()
+    assert picked == ["Tree"]
+    assert not state.folder_dialog_calls
+    if chosen:
+        assert calls[0][0] == (8, chosen, ["Tree"], 3)
+        assert calls[0][1]["lod_levels"] == 3
+    else:
+        assert not calls

@@ -4,11 +4,12 @@
 
 #pragma once
 
+#include "core/sh_value_codec.cuh"
 #include "fused_adam_types.h"
 #include "helper_math.h"
 #include "lfs/core/warp_reduce.cuh"
 #include "lfs/training/joint_adam_codec.cuh"
-#include "lfs/training/sh_value_codec.cuh"
+#include "lfs/training/screen_share.cuh"
 #include "rasterization_config.h"
 #include "utils.h"
 
@@ -77,7 +78,7 @@ namespace fast_lfs::rasterization::kernels {
 
         // ---- q16 decode-in-registers path (pad-dropped cell-linear) ----
         if (sh_value_bounds != nullptr && sh_value_n_cells > 0u) {
-            using DC = lfs::training::sh_value::DeviceCodec16;
+            using DC = lfs::core::sh_value::DeviceCodec16;
             const uint16_t* sh_u16 = reinterpret_cast<const uint16_t*>(sh_f4);
             const float2 mm = sh_value_bounds[primitive_idx / 256u];
             const uint n_cells = sh_value_n_cells;
@@ -91,11 +92,11 @@ namespace fast_lfs::rasterization::kernels {
                 if (i >= 8 && active_sh_bases <= 9)
                     break;
                 c[i] = make_float3(
-                    DC::decode(sh_u16[lfs::training::sh_value::shAtU16(primitive_idx, base + 0, n_cells)],
+                    DC::decode(sh_u16[lfs::core::sh_value::shAtU16(primitive_idx, base + 0, n_cells)],
                                mm.x, mm.y),
-                    DC::decode(sh_u16[lfs::training::sh_value::shAtU16(primitive_idx, base + 1, n_cells)],
+                    DC::decode(sh_u16[lfs::core::sh_value::shAtU16(primitive_idx, base + 1, n_cells)],
                                mm.x, mm.y),
-                    DC::decode(sh_u16[lfs::training::sh_value::shAtU16(primitive_idx, base + 2, n_cells)],
+                    DC::decode(sh_u16[lfs::core::sh_value::shAtU16(primitive_idx, base + 2, n_cells)],
                                mm.x, mm.y));
             }
             return;
@@ -235,18 +236,18 @@ namespace fast_lfs::rasterization::kernels {
         static_assert(COEFF >= 0 && COEFF < 15, "SH rest coeff 0..14");
 
         if (sh_value_bounds != nullptr && sh_value_n_cells > 0u) {
-            using DC = lfs::training::sh_value::DeviceCodec16;
+            using DC = lfs::core::sh_value::DeviceCodec16;
             const uint16_t* sh_u16 = reinterpret_cast<const uint16_t*>(sh_f4);
             const float2 mm = sh_value_bounds[primitive_idx / 256u];
             const uint base = static_cast<uint>(COEFF) * 3u;
             if (base + 2u >= sh_value_n_cells)
                 return make_float3(0.0f, 0.0f, 0.0f);
             return make_float3(
-                DC::decode(sh_u16[lfs::training::sh_value::shAtU16(primitive_idx, base + 0, sh_value_n_cells)],
+                DC::decode(sh_u16[lfs::core::sh_value::shAtU16(primitive_idx, base + 0, sh_value_n_cells)],
                            mm.x, mm.y),
-                DC::decode(sh_u16[lfs::training::sh_value::shAtU16(primitive_idx, base + 1, sh_value_n_cells)],
+                DC::decode(sh_u16[lfs::core::sh_value::shAtU16(primitive_idx, base + 1, sh_value_n_cells)],
                            mm.x, mm.y),
-                DC::decode(sh_u16[lfs::training::sh_value::shAtU16(primitive_idx, base + 2, sh_value_n_cells)],
+                DC::decode(sh_u16[lfs::core::sh_value::shAtU16(primitive_idx, base + 2, sh_value_n_cells)],
                            mm.x, mm.y));
         }
 
@@ -375,7 +376,17 @@ namespace fast_lfs::rasterization::kernels {
                 float m = mv.x;
                 float v = mv.y;
                 if (apply_step) {
-                    const float grad = (i < active) ? grads[i] : 0.0f;
+                    float grad = (i < active) ? grads[i] : 0.0f;
+                    if (i < active && param.screen_share_max != nullptr &&
+                        primitive_idx < static_cast<uint>(param.screen_share_n)) {
+                        grad += lfs::training::screen_share_hinge_extra_grad(
+                            param.screen_share_max[primitive_idx],
+                            param.screen_share_limit,
+                            param.screen_share_penalty,
+                            mv.y,
+                            param.bias_correction2_sqrt_rcp,
+                            eps);
+                    }
                     m = beta1 * mv.x + (1.0f - beta1) * grad;
                     v = beta2 * mv.y + (1.0f - beta2) * grad * grad;
                     if (i < active) {
@@ -696,17 +707,17 @@ namespace fast_lfs::rasterization::kernels {
         const uint slot,
         const uint n_value_cells,
         const float2 old_vmm) {
-        using VC = lfs::training::sh_value::DeviceCodec16;
+        using VC = lfs::core::sh_value::DeviceCodec16;
         if (value_q16) {
             float px = 0.0f, py = 0.0f, pz = 0.0f, pw = 0.0f;
             if (k * 4u + 0u < n_value_cells)
-                px = VC::decode(param_u16[lfs::training::sh_value::shAtU16(primitive_idx, k * 4u + 0u, n_value_cells)], old_vmm.x, old_vmm.y);
+                px = VC::decode(param_u16[lfs::core::sh_value::shAtU16(primitive_idx, k * 4u + 0u, n_value_cells)], old_vmm.x, old_vmm.y);
             if (k * 4u + 1u < n_value_cells)
-                py = VC::decode(param_u16[lfs::training::sh_value::shAtU16(primitive_idx, k * 4u + 1u, n_value_cells)], old_vmm.x, old_vmm.y);
+                py = VC::decode(param_u16[lfs::core::sh_value::shAtU16(primitive_idx, k * 4u + 1u, n_value_cells)], old_vmm.x, old_vmm.y);
             if (k * 4u + 2u < n_value_cells)
-                pz = VC::decode(param_u16[lfs::training::sh_value::shAtU16(primitive_idx, k * 4u + 2u, n_value_cells)], old_vmm.x, old_vmm.y);
+                pz = VC::decode(param_u16[lfs::core::sh_value::shAtU16(primitive_idx, k * 4u + 2u, n_value_cells)], old_vmm.x, old_vmm.y);
             if (k * 4u + 3u < n_value_cells)
-                pw = VC::decode(param_u16[lfs::training::sh_value::shAtU16(primitive_idx, k * 4u + 3u, n_value_cells)], old_vmm.x, old_vmm.y);
+                pw = VC::decode(param_u16[lfs::core::sh_value::shAtU16(primitive_idx, k * 4u + 3u, n_value_cells)], old_vmm.x, old_vmm.y);
             return make_float4(px, py, pz, pw);
         }
         if (value_f16) {
@@ -806,7 +817,7 @@ namespace fast_lfs::rasterization::kernels {
         const uint sh_layout_slots,
         GradSource grad_source) {
         using C = lfs::training::joint_adam::DeviceCodec<8>;
-        using VC = lfs::training::sh_value::DeviceCodec16;
+        using VC = lfs::core::sh_value::DeviceCodec16;
         constexpr float kInf = 1e30f;
         const FusedAdamParam& p = fused_adam.shN;
         const bool value_q16 = p.sh_value_bits == 16 && p.sh_value_bounds != nullptr &&
@@ -925,9 +936,15 @@ namespace fast_lfs::rasterization::kernels {
         const float u_max = -red.y;
         const float s_min = red.z;
         const float s_max = -red.w;
-        // value bounds (separate from moment bounds).
-        const float v_min = value_q16 ? lfs::core::warp_ops::block_reduce_min(local_v_min) : 0.0f;
-        const float v_max = value_q16 ? lfs::core::warp_ops::block_reduce_max(local_v_max) : 0.0f;
+        // value bounds: block-uniform fused min2 (own shared alloc, distinct from min4).
+        float v_min = 0.0f;
+        float v_max = 0.0f;
+        if (value_q16) {
+            const float2 r = lfs::core::warp_ops::block_reduce_min2(
+                make_float2(local_v_min, -local_v_max));
+            v_min = r.x;
+            v_max = -r.y;
+        }
 
         __shared__ float4 sm_bounds;
         __shared__ float2 sm_vbounds;
@@ -984,7 +1001,7 @@ namespace fast_lfs::rasterization::kernels {
                     if (value_q16) {
                         const uint cell_lin = k * 4u + static_cast<uint>(c);
                         if (cell_lin < n_value_cells) {
-                            param_u16[lfs::training::sh_value::shAtU16(
+                            param_u16[lfs::core::sh_value::shAtU16(
                                 primitive_idx, cell_lin, n_value_cells)] =
                                 VC::encode(pci, new_vmm.x, new_vmm.y);
                         }
@@ -1029,12 +1046,13 @@ namespace fast_lfs::rasterization::kernels {
         const float3& position,
         const float3& cam_position,
         const uint primitive_idx,
+        const uint grad_color_idx,
         const uint sh_layout_slots,
         float* __restrict__ sh0_grads_out,
         const float2* __restrict__ sh_value_bounds = nullptr,
         const uint sh_value_n_cells = 0u,
         const uint sh_value_bits = 0u) {
-        const float3 grad_color = grad_color_helper[primitive_idx];
+        const float3 grad_color = grad_color_helper[grad_color_idx];
         const float3 dL_dsh0 = 0.28209479177387814f * grad_color;
         sh0_grads_out[0] = dL_dsh0.x;
         sh0_grads_out[1] = dL_dsh0.y;

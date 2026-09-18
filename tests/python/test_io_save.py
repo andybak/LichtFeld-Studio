@@ -291,31 +291,6 @@ class TestSaveSPZ:
         assert b"export_id" not in data
 
 
-class TestAssetScannerSpzHeader:
-    """asset_scanner._parse_spz_header coverage for generated v3/v4 files."""
-
-    def test_parse_spz_header_v3_and_v4(self, lf, benchmark_ply, tmp_output):
-        from lfs_plugins.asset_scanner import AssetScanner
-
-        result = lf.io.load(str(benchmark_ply))
-        v3_path = tmp_output / "header_v3.spz"
-        v4_path = tmp_output / "header_v4.spz"
-        lf.io.save_spz(result.splat_data, str(v3_path), version=3)
-        lf.io.save_spz(result.splat_data, str(v4_path), version=4)
-
-        scanner = AssetScanner()
-        v3 = scanner._parse_spz_header(str(v3_path))
-        v4 = scanner._parse_spz_header(str(v4_path))
-
-        assert v3 is not None
-        assert v3["version"] == 3
-        assert v3["vertex_count"] == result.splat_data.num_points
-
-        assert v4 is not None
-        assert v4["version"] == 4
-        assert v4["vertex_count"] == result.splat_data.num_points
-
-
 class TestSaveSOG:
     """Tests for SOG (SuperSplat) save functionality."""
 
@@ -404,3 +379,55 @@ class TestSaveProgress:
 
         lf.io.save_ply(result.splat_data, str(output_path), progress=on_progress)
         assert output_path.exists()
+
+
+class TestSaveSSOG:
+    """Nightly CUDA roundtrip using a small synthetic splat, without a GUI."""
+
+    @pytest.mark.gpu
+    @pytest.mark.slow
+    def test_ssog_roundtrip(self, lf, numpy, gpu_available, tmp_output):
+        if not gpu_available:
+            pytest.skip("GPU not available")
+        n = 256
+        fields = ["x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity",
+                  "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"]
+        points = numpy.zeros(n, dtype=[(name, "<f4") for name in fields])
+        rng = numpy.random.default_rng(42)
+        for name in ("x", "y", "z"):
+            points[name] = rng.uniform(-1, 1, n)
+        for name in ("f_dc_0", "f_dc_1", "f_dc_2"):
+            points[name] = rng.uniform(-0.5, 0.5, n)
+        for name in ("scale_0", "scale_1", "scale_2"):
+            points[name] = -3.0
+        points["rot_0"] = 1.0
+        points["opacity"] = 2.0
+        source = tmp_output / "synthetic.ply"
+        header = "ply\nformat binary_little_endian 1.0\nelement vertex 256\n"
+        header += "".join(f"property float {name}\n" for name in fields) + "end_header\n"
+        source.write_bytes(header.encode() + points.tobytes())
+        splat = lf.io.load(str(source)).splat_data
+        expected = numpy.stack([points[name] for name in ("x", "y", "z")], axis=1)
+        for name in ("ssog_directory", "scene.ssog"):
+            output = tmp_output / name
+            progress = []
+
+            def on_progress(value, stage):
+                progress.append((value, stage))
+                return True
+
+            lf.io.save_ssog(splat, output, lod_levels=2, chunk_count_k=1,
+                            chunk_min_k=0, kmeans_iterations=2, progress=on_progress)
+            assert progress
+            assert lf.io.is_ssog_path(output)
+            loaded = lf.io.load(output).splat_data
+            assert loaded.num_points == n
+            actual = loaded.get_means().cpu().numpy()
+            # The chunk writer reorders points; compare nearest original positions.
+            distances = numpy.linalg.norm(actual[:, None, :] - expected[None, :, :], axis=2)
+            assert float(distances.min(axis=1).max()) < 0.01
+            assert numpy.isfinite(loaded.get_scaling().cpu().numpy()).all()
+
+        with pytest.raises(RuntimeError, match="[Cc]ancel"):
+            lf.io.save_ssog(splat, tmp_output / "cancelled.ssog", progress=lambda _value, _stage: False)
+        assert not (tmp_output / "cancelled.ssog").exists()

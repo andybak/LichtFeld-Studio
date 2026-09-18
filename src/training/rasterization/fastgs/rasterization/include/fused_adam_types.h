@@ -34,6 +34,10 @@ namespace fast_lfs::rasterization {
         float step_size = 0.0f;
         float bias_correction2_sqrt_rcp = 1.0f;
         bool enabled = false;
+        const float* screen_share_max = nullptr;
+        int screen_share_n = 0;
+        float screen_share_limit = 0.0f;
+        float screen_share_penalty = 0.0f;
     };
 
     struct FusedAdamSettings {
@@ -54,6 +58,12 @@ namespace fast_lfs::rasterization {
         int sparsity_n = 0;
         float sparsity_rho = 0.0f;
         float sparsity_grad_loss = 0.0f;
+        bool per_splat_mean_step = false;
+        float mean_step_median_extent = 0.0f;
+        float mean_step_r_min = 1.0f;
+        float mean_step_r_max = 300.0f;
+        const bool* mean_step_far_mask = nullptr;
+        int mean_step_far_mask_n = 0;
 
         FusedAdamParam means;
         FusedAdamParam scaling;

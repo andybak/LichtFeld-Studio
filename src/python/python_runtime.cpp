@@ -73,6 +73,8 @@ namespace lfs::python {
         // Sequencer timeline callbacks
         HasKeyframesCallback g_has_keyframes_cb = nullptr;
         SaveCameraPathCallback g_save_camera_path_cb = nullptr;
+        GetCameraPathDataCallback g_get_camera_path_data_cb = nullptr;
+        SetCameraPathDataCallback g_set_camera_path_data_cb = nullptr;
         LoadCameraPathCallback g_load_camera_path_cb = nullptr;
         ClearKeyframesCallback g_clear_keyframes_cb = nullptr;
         SetPlaybackSpeedCallback g_set_playback_speed_cb = nullptr;
@@ -97,9 +99,6 @@ namespace lfs::python {
         GetMultiTransformModeCallback g_get_multi_transform_mode_cb = nullptr;
         SetMultiTransformModeCallback g_set_multi_transform_mode_cb = nullptr;
 
-        // Asset Manager save callback
-        SaveAssetCallback g_save_asset_cb = nullptr;
-
         // Thumbnail callbacks
         RequestThumbnailCallback g_request_thumbnail_cb = nullptr;
         ProcessThumbnailsCallback g_process_thumbnails_cb = nullptr;
@@ -110,6 +109,7 @@ namespace lfs::python {
         HasViewportDrawHandlersCallback g_has_viewport_draw_handlers_cb = nullptr;
         InvokeViewportOverlayCallback g_invoke_viewport_overlay_cb = nullptr;
         SyncViewportOverlayDocumentCallback g_sync_viewport_overlay_document_cb = nullptr;
+        ViewportOverlayDocumentUnloadCallback g_viewport_overlay_document_unload_cb = nullptr;
 
         // Selection sub-mode (shared between C++ toolbar and Python operator)
         std::atomic<int> g_selection_submode{0};
@@ -554,6 +554,19 @@ namespace lfs::python {
         return g_save_camera_path_cb ? g_save_camera_path_cb(path) : false;
     }
 
+    void set_camera_path_data_callbacks(GetCameraPathDataCallback get_cb, SetCameraPathDataCallback set_cb) {
+        g_get_camera_path_data_cb = get_cb;
+        g_set_camera_path_data_cb = set_cb;
+    }
+
+    std::string get_camera_path_data() {
+        return g_get_camera_path_data_cb ? g_get_camera_path_data_cb() : "null";
+    }
+
+    bool set_camera_path_data(const std::string& value) {
+        return g_set_camera_path_data_cb ? g_set_camera_path_data_cb(value) : false;
+    }
+
     bool load_camera_path(const std::string& path) {
         return g_load_camera_path_cb ? g_load_camera_path_cb(path) : false;
     }
@@ -644,15 +657,6 @@ namespace lfs::python {
     void set_multi_transform_mode(int mode) {
         if (g_set_multi_transform_mode_cb)
             g_set_multi_transform_mode_cb(mode);
-    }
-
-    void set_save_asset_callback(SaveAssetCallback save_cb) {
-        g_save_asset_cb = save_cb;
-    }
-
-    void invoke_save_asset(const std::string& node_name) {
-        if (g_save_asset_cb)
-            g_save_asset_cb(node_name.c_str());
     }
 
     void set_scene_manager(vis::SceneManager* sm) { g_scene_manager.store(sm); }
@@ -834,6 +838,22 @@ namespace lfs::python {
     void unregister_rml_document(const char* name) {
         if (g_rml_doc_unregister_cb)
             g_rml_doc_unregister_cb(name);
+    }
+
+    namespace {
+        RmlDocPendingCallback rml_doc_pending_callback = nullptr;
+    }
+
+    void set_rml_doc_pending_callback(RmlDocPendingCallback callback) {
+        rml_doc_pending_callback = callback;
+    }
+
+    bool has_pending_rml_document_updates(void* doc) {
+        return doc && rml_doc_pending_callback && rml_doc_pending_callback(doc, false);
+    }
+
+    bool consume_pending_rml_document_updates(void* doc) {
+        return doc && rml_doc_pending_callback && rml_doc_pending_callback(doc, true);
     }
 
     void set_ensure_initialized_callback(EnsureInitializedCallback cb) {
@@ -1255,7 +1275,8 @@ namespace lfs::python {
                        bool rad_flip_y,
                        bool rad_streamable,
                        int spz_version,
-                       bool include_provenance) {
+                       bool include_provenance,
+                       int lod_levels, float lod_ratio, int chunk_count_k, float chunk_extent, int chunk_min_k, int kmeans_iterations) {
         if (!g_export_callback)
             return;
 
@@ -1269,7 +1290,7 @@ namespace lfs::python {
                           rad_flip_y,
                           rad_streamable,
                           spz_version,
-                          include_provenance);
+                          include_provenance, lod_levels, lod_ratio, chunk_count_k, chunk_extent, chunk_min_k, kmeans_iterations);
     }
 
     void cancel_active_operator() {
@@ -1546,6 +1567,11 @@ namespace lfs::python {
         g_sync_viewport_overlay_document_cb = sync_cb;
     }
 
+    void set_viewport_overlay_document_unload_callback(
+        ViewportOverlayDocumentUnloadCallback unload_cb) {
+        g_viewport_overlay_document_unload_cb = unload_cb;
+    }
+
     bool has_viewport_draw_handlers() {
         return g_has_viewport_draw_handlers_cb && g_has_viewport_draw_handlers_cb();
     }
@@ -1553,6 +1579,11 @@ namespace lfs::python {
     bool sync_viewport_overlay_document(void* document) {
         return document && g_sync_viewport_overlay_document_cb &&
                g_sync_viewport_overlay_document_cb(document);
+    }
+
+    void notify_viewport_overlay_document_unloaded() {
+        if (g_viewport_overlay_document_unload_cb)
+            g_viewport_overlay_document_unload_cb();
     }
 
     void invoke_viewport_overlay(const float* view_matrix, const float* proj_matrix,

@@ -7,17 +7,21 @@
 #include "components/ppisp_controller_pool.hpp"
 #include "components/sparsity_optimizer.hpp"
 #include "core/logger.hpp"
+#include "core/parameters.hpp"
 #include "core/path_utils.hpp"
+#include "core/splat_data.hpp"
 #include "optimizer/adam_optimizer.hpp"
 #include "strategies/istrategy.hpp"
 #include "strategies/strategy_factory.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -292,8 +296,13 @@ namespace lfs::training {
             };
         } catch (const std::exception& error) {
             // LFS-CENSUS-OK(empty-catch): normalize the exception into a typed checkpoint error.
+            const bool layout_changed =
+                std::string_view(error.what()).find("layout changed") !=
+                std::string_view::npos;
             return checkpoint_stream_error(
-                lfs::ErrorCode::Internal,
+                layout_changed
+                    ? lfs::ErrorCode::FailedPrecondition
+                    : lfs::ErrorCode::Internal,
                 std::string("Serialize checkpoint failed: ") +
                     error.what(),
                 LFS_SOURCE_SITE_CURRENT());
@@ -342,8 +351,13 @@ namespace lfs::training {
         PPISPControllerPool* ppisp_controller_pool,
         ADMMSparsityOptimizer* sparsity_optimizer,
         lfs::core::SplatTensorAllocator tensor_allocator,
-        const std::string_view source_name) {
+        const std::string_view source_name,
+        lfs::core::SplatData* preloaded_model) {
         try {
+            const auto load_started = std::chrono::steady_clock::now();
+            const auto milliseconds = [](const auto begin, const auto end) {
+                return std::chrono::duration<double, std::milli>(end - begin).count();
+            };
             CheckpointHeader header{};
             file.read(reinterpret_cast<char*>(&header), sizeof(header));
             if (!file)
@@ -443,6 +457,8 @@ namespace lfs::training {
                         cli_bg_color;
                 loaded_params.cli_bg_color_set =
                     cli_bg_color_set;
+                lfs::core::param::apply_explicit_training_overrides(
+                    loaded_params, loaded_params.overrides);
             }
             if (loaded_params.optimization.max_cap < 0)
                 return std::unexpected("Invalid checkpoint parameters: max_cap must be nonnegative");
@@ -470,25 +486,44 @@ namespace lfs::training {
                     ? std::max<std::size_t>(static_cast<std::size_t>(loaded_params.optimization.max_cap),
                                             static_cast<std::size_t>(header.num_gaussians))
                     : 0;
+            const auto splat_started = std::chrono::steady_clock::now();
             lfs::core::SplatData loaded_model;
-            loaded_model.deserialize(
-                file,
-                make_checkpoint_tensor_allocator(std::move(tensor_allocator), target_capacity));
+            bool reused_preloaded_model = false;
+            if (preloaded_model) {
+                if (static_cast<uint64_t>(preloaded_model->size()) != header.num_gaussians)
+                    throw std::runtime_error("Invalid checkpoint: preloaded model count does not match header");
+                if (preloaded_model->get_max_sh_degree() != header.sh_degree)
+                    throw std::runtime_error("Invalid checkpoint: preloaded model SH degree does not match header");
+                lfs::core::SplatData::skip_serialized(file);
+                loaded_model = std::move(*preloaded_model);
+                reused_preloaded_model = true;
+            } else {
+                loaded_model.deserialize(
+                    file,
+                    make_checkpoint_tensor_allocator(std::move(tensor_allocator), target_capacity));
+            }
             if (static_cast<uint64_t>(loaded_model.size()) != header.num_gaussians)
                 throw std::runtime_error("Invalid checkpoint: model count does not match header");
             if (loaded_model.get_max_sh_degree() != header.sh_degree)
                 throw std::runtime_error("Invalid checkpoint: model SH degree does not match header");
+            const auto splat_finished = std::chrono::steady_clock::now();
 
             auto loaded_strategy_result = StrategyFactory::instance().create(saved_type, loaded_model);
             if (!loaded_strategy_result)
                 throw std::runtime_error("Cannot construct checkpoint strategy: " + loaded_strategy_result.error());
             auto loaded_strategy = std::move(*loaded_strategy_result);
+            // Dataset-derived state belongs to the candidate too: MRNF builds
+            // its camera hull and far-field mask during initialization. Adopting
+            // a candidate without cameras would disable those protections.
+            loaded_strategy->set_training_dataset(strategy.get_training_dataset());
             auto* checkpoint_adopter = dynamic_cast<ICheckpointStateAdopter*>(&strategy);
             if (checkpoint_adopter && checkpoint_adopter->has_checkpoint_runtime_state())
                 loaded_strategy->initialize(loaded_params.optimization);
             else
                 loaded_strategy->set_optimization_params(loaded_params.optimization);
+            const auto strategy_initialized_at = std::chrono::steady_clock::now();
             loaded_strategy->deserialize(file);
+            const auto strategy_deserialized_at = std::chrono::steady_clock::now();
             if (!checkpoint_adopter || !checkpoint_adopter->can_adopt_checkpoint_state(*loaded_strategy)) {
                 throw std::runtime_error(
                     "Strategy does not support transactional checkpoint state adoption");
@@ -584,6 +619,15 @@ namespace lfs::training {
                 loaded_strategy->reserve_optimizer_capacity(max_cap);
             }
 
+            if (bilateral_grid && loaded_bilateral_grid &&
+                bilateral_grid->parameterization() != loaded_bilateral_grid->parameterization()) {
+                throw std::runtime_error(
+                    std::string("BilateralGrid parameterization mismatch: checkpoint is ") +
+                    bilateral_grid_parameterization_name(loaded_bilateral_grid->parameterization()) +
+                    ", current is " +
+                    bilateral_grid_parameterization_name(bilateral_grid->parameterization()));
+            }
+
             static_assert(std::is_nothrow_swappable_v<lfs::core::param::TrainingParameters>);
             static_assert(std::is_nothrow_move_assignable_v<lfs::core::SplatData>);
 
@@ -616,6 +660,16 @@ namespace lfs::training {
 
             LOG_INFO("Checkpoint loaded: {} ({} Gaussians, iter {})",
                      source_name, header.num_gaussians, header.iteration);
+            LOG_DEBUG(
+                "Checkpoint load stages: source={} gaussians={} model_reuse={} splat={:.3f} ms strategy_init={:.3f} ms strategy_deserialize={:.3f} ms commit={:.3f} ms total={:.3f} ms",
+                source_name,
+                header.num_gaussians,
+                reused_preloaded_model ? "yes" : "no",
+                milliseconds(splat_started, splat_finished),
+                milliseconds(splat_finished, strategy_initialized_at),
+                milliseconds(strategy_initialized_at, strategy_deserialized_at),
+                milliseconds(strategy_deserialized_at, std::chrono::steady_clock::now()),
+                milliseconds(load_started, std::chrono::steady_clock::now()));
             return header.iteration;
 
         } catch (const std::exception& e) {

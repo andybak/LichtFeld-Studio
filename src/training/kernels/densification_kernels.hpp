@@ -7,6 +7,10 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+namespace lfs::training {
+    struct PositiveMedianScratch;
+}
+
 namespace lfs::training::kernels {
 
     /**
@@ -134,6 +138,29 @@ namespace lfs::training::kernels {
      */
     void launch_normalize_by_positive_median(
         float* data,
+        size_t n,
+        cudaStream_t stream = nullptr,
+        lfs::training::PositiveMedianScratch* scratch = nullptr);
+
+    /// Subtract min(log(share/limit), log(1.5)) from the longest log-scale axis
+    /// when share > limit. The other two axes are left unchanged.
+    void launch_clip_log_scale_by_screen_share(
+        float* log_scales, // [N, 3]
+        const float* max_share,
+        const bool* frozen_mask,
+        size_t frozen_n,
+        float limit,
+        size_t n,
+        cudaStream_t stream = nullptr);
+
+    /// out[i] = sqrt(error) * (share/limit) when share > limit and error > 0, else 0.
+    void launch_oversize_split_scores(
+        const float* error_score, // [N]
+        const float* max_share,   // [N]
+        const bool* frozen_mask,
+        size_t frozen_n,
+        float* out_scores, // [N]
+        float limit,
         size_t n,
         cudaStream_t stream = nullptr);
 

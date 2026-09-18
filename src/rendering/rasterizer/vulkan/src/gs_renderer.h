@@ -2,11 +2,63 @@
 
 #include "gs_pipeline.h"
 
+#include "../shader/src/slang/overlay_flags.inc"
 #include "indirect_layout.h"
 #include "perf_timer.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <optional>
+#include <vector>
+
+// Descriptor layouts for q16/f16 projection skip binding 2 (shN is a 64-bit
+// buffer device address in push constants, not a storage-buffer descriptor).
+[[nodiscard]] inline std::vector<int> vksplatSkipBinding(const int binding_count, const int skip) {
+    std::vector<int> layouts;
+    layouts.reserve(static_cast<std::size_t>(binding_count > 0 ? binding_count - 1 : 0));
+    for (int i = 0; i < binding_count; ++i) {
+        if (i != skip) {
+            layouts.push_back(i);
+        }
+    }
+    return layouts;
+}
+
+[[nodiscard]] inline std::vector<int> vksplatSkipBindings(const int binding_count,
+                                                          std::initializer_list<int> skips) {
+    std::vector<int> layouts;
+    layouts.reserve(static_cast<std::size_t>(binding_count > 0 ? binding_count : 0));
+    for (int i = 0; i < binding_count; ++i) {
+        bool skip = false;
+        for (const int s : skips) {
+            if (i == s) {
+                skip = true;
+                break;
+            }
+        }
+        if (!skip) {
+            layouts.push_back(i);
+        }
+    }
+    return layouts;
+}
+
+[[nodiscard]] inline std::vector<int> vksplatWithout(const std::initializer_list<int> bindings,
+                                                     const int skip) {
+    std::vector<int> layouts;
+    layouts.reserve(bindings.size());
+    for (const int binding : bindings) {
+        if (binding != skip) {
+            layouts.push_back(binding);
+        }
+    }
+    return layouts;
+}
+
+// lod_enabled bit 6: projection writes overlay_flags. Clear when the bound
+// buffer is the one-word dummy (raster overlays idle).
+constexpr uint32_t kLodEnabledWriteOverlayFlags = LFS_VK_OVERLAY_WRITE_BIT;
 
 PACK_STRUCT(struct VulkanGSRendererUniforms {
     uint32_t image_height;
@@ -42,15 +94,20 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     // Honored by the per-pixel rasterizer (alphablend_shader) regardless of backend.
     float expected_far;
     // Explicit padding: dist_coeffs is a float4 on the shader side and must
-    // sit on a 16-byte boundary; both layouts pad here by hand so C++ and
-    // Slang can never silently disagree.
+    // sit on a 16-byte boundary. shN_address occupies the former pad1/pad2
+    // (8-byte aligned at offset 104) to preserve the camera field offsets.
     uint32_t depth_wave;
-    uint32_t uniforms_pad1;
-    uint32_t uniforms_pad2;
+    uint64_t shN_address;
     float dist_coeffs[4];
     float world_view_transform[16];
+    float color_exposure;
+    uint32_t color_tonemapping;
+    uint32_t splat_render_profile;
+    uint32_t color_padding;
 });
-static_assert(sizeof(VulkanGSRendererUniforms) == 192);
+static_assert(sizeof(VulkanGSRendererUniforms) == 208);
+static_assert(offsetof(VulkanGSRendererUniforms, shN_address) % 8 == 0);
+static_assert(offsetof(VulkanGSRendererUniforms, dist_coeffs) % 16 == 0);
 
 PACK_STRUCT(struct VulkanGSLodCompactUniforms {
     uint32_t chunk_count;
@@ -88,7 +145,7 @@ PACK_STRUCT(struct VulkanGSLodSelectUniforms {
     // Frame clock + fade window for newly streamed pages (0 disables fading).
     uint32_t current_frame;
     uint32_t fade_frames;
-    uint32_t pad4;
+    uint32_t budget_pass;
 });
 static_assert(sizeof(VulkanGSLodSelectUniforms) == 144);
 
@@ -155,6 +212,7 @@ public:
         bool count_overflow = false;
     };
     struct LodSelectionStats {
+        float threshold_scale = 1.0f;
         size_t candidate_count = 0;
         size_t rendered_capacity = 0;
         size_t overflow_count = 0;
@@ -207,7 +265,8 @@ public:
                                   const _VulkanBuffer& lod_logical_indices = _VulkanBuffer(),
                                   const _VulkanBuffer& lod_levels = _VulkanBuffer(),
                                   const _VulkanBuffer& lod_weights = _VulkanBuffer(),
-                                  const _VulkanBuffer& lod_counts = _VulkanBuffer());
+                                  const _VulkanBuffer& lod_counts = _VulkanBuffer(),
+                                  bool write_overlay_flags = true);
     // HiGS viewer chain. The cull prepass + survivor projection replace the
     // N-wide projection / visible-flag / compact passes: per-splat outputs are
     // written at wave-appended compact slots and the depth-sort input is
@@ -233,7 +292,8 @@ public:
                                            const _VulkanBuffer& lod_logical_indices = _VulkanBuffer(),
                                            const _VulkanBuffer& lod_levels = _VulkanBuffer(),
                                            const _VulkanBuffer& lod_weights = _VulkanBuffer(),
-                                           const _VulkanBuffer& lod_counts = _VulkanBuffer());
+                                           const _VulkanBuffer& lod_counts = _VulkanBuffer(),
+                                           bool write_overlay_flags = true);
     // prepare_visible_chain fan-out + indirect depth sort + sorted-id snapshot.
     void executeSortPrimitivesByDepthVisible(const VulkanGSRendererUniforms& uniforms,
                                              VulkanGSPipelineBuffers& buffers,
@@ -331,6 +391,12 @@ public:
                                    VulkanGSPipelineBuffers& buffers);
 
 protected:
+    // Projection ORs individual bytes into zeroed words. Raster-only overlay
+    // refreshes retain these flags and must not clear them.
+    _VulkanBuffer& prepareOverlayFlags(VulkanGSPipelineBuffers& buffers,
+                                       size_t num_splats,
+                                       bool write_overlay_flags);
+
     // Export W_rec can exceed the interactive wave budget. Callers disable
     // timestamps after W_MAX so fixed-size query rings remain bounded while all
     // scan work is still recorded and executed.
@@ -361,24 +427,27 @@ protected:
     void executePrepareTileSort(const VulkanGSRendererUniforms& uniforms,
                                 VulkanGSPipelineBuffers& buffers);
 
-    _ComputePipeline pipeline_projection_forward = _ComputePipeline(24);
-    _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(24);
+    // Binding 8 is unused (legacy write-only radii buffer deleted). Shader
+    // binding numbers stay stable so tagged lists keep placeholder slot 8.
+    _ComputePipeline pipeline_projection_forward = _ComputePipeline(vksplatSkipBinding(24, 8));
+    _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(vksplatSkipBinding(24, 8));
     // Canonical quantized LOD pool variants: same binding sets plus the
     // per-page dequant frames appended last.
-    _ComputePipeline pipeline_projection_forward_quant = _ComputePipeline(25);
-    _ComputePipeline pipeline_projection_forward_quant_3dgut = _ComputePipeline(25);
-    // IEEE f16 SH rest (standalone PLY/SOG): same 24 bindings as fp32 split path.
-    _ComputePipeline pipeline_projection_forward_shn_f16 = _ComputePipeline(24);
-    _ComputePipeline pipeline_projection_forward_shn_f16_3dgut = _ComputePipeline(24);
-    // Pad-dropped q16 SH rest (exportable training): 24 + bounds binding last.
-    _ComputePipeline pipeline_projection_forward_shn_q16 = _ComputePipeline(25);
-    _ComputePipeline pipeline_projection_forward_shn_q16_3dgut = _ComputePipeline(25);
+    _ComputePipeline pipeline_projection_forward_quant = _ComputePipeline(vksplatSkipBindings(25, {8}));
+    _ComputePipeline pipeline_projection_forward_quant_3dgut = _ComputePipeline(vksplatSkipBindings(25, {8}));
+    // IEEE f16 SH rest (standalone PLY/SOG): fp32's 24 bindings minus shN (BDA)
+    // and radii (8).
+    _ComputePipeline pipeline_projection_forward_shn_f16 = _ComputePipeline(vksplatSkipBindings(24, {2, 8}));
+    _ComputePipeline pipeline_projection_forward_shn_f16_3dgut = _ComputePipeline(vksplatSkipBindings(24, {2, 8}));
+    // Pad-dropped q16 SH rest: 25 bindings minus shN (BDA) and radii (8).
+    _ComputePipeline pipeline_projection_forward_shn_q16 = _ComputePipeline(vksplatSkipBindings(25, {2, 8}));
+    _ComputePipeline pipeline_projection_forward_shn_q16_3dgut = _ComputePipeline(vksplatSkipBindings(25, {2, 8}));
     _ComputePipeline pipeline_selection_mask = _ComputePipeline(11);
     _ComputePipeline pipeline_selection_polygon_rasterize = _ComputePipeline(2);
     _ComputePipeline pipeline_generate_keys_wave = _ComputePipeline(8);
     _ComputePipeline pipeline_apply_depth_ordering = _ComputePipeline(4);
-    _ComputePipeline pipeline_visible_flags = _ComputePipeline(2);
-    _ComputePipeline pipeline_prepare_visible_sort = _ComputePipeline(3);
+    _ComputePipeline pipeline_visible_flags = _ComputePipeline(3);
+    _ComputePipeline pipeline_prepare_visible_sort = _ComputePipeline(4);
     _ComputePipeline pipeline_prepare_tile_sort = _ComputePipeline(2);
     _ComputePipeline pipeline_compact_visible_primitives = _ComputePipeline(5);
     _ComputePipeline pipeline_lod_map_indices = _ComputePipeline(3);
@@ -387,16 +456,18 @@ protected:
     // HiGS viewer chain
     _ComputePipeline pipeline_cull_splats = _ComputePipeline(10);
     _ComputePipeline pipeline_cull_prepare = _ComputePipeline(2);
-    // Bindings 6 (tiles_touched) and 8 (radii) are legacy-chain outputs and
+    // Bindings 6 (tiles_touched) and 8 (legacy radii, now unused) are
     // absent from the survivor variant.
     _ComputePipeline pipeline_projection_forward_survivors = _ComputePipeline(std::vector<int>{
         0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28});
     _ComputePipeline pipeline_projection_forward_quant_survivors = _ComputePipeline(std::vector<int>{
         0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29});
-    _ComputePipeline pipeline_projection_forward_shn_f16_survivors = _ComputePipeline(std::vector<int>{
-        0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28});
-    _ComputePipeline pipeline_projection_forward_shn_q16_survivors = _ComputePipeline(std::vector<int>{
-        0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29});
+    _ComputePipeline pipeline_projection_forward_shn_f16_survivors = _ComputePipeline(vksplatWithout(
+        {0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28},
+        2));
+    _ComputePipeline pipeline_projection_forward_shn_q16_survivors = _ComputePipeline(vksplatWithout(
+        {0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29},
+        2));
     _ComputePipeline pipeline_prepare_visible_chain = _ComputePipeline(4);
     _ComputePipeline pipeline_copy_visible_indices = _ComputePipeline(3);
     struct _CumsumIndirectComputePipeline {

@@ -42,8 +42,9 @@ namespace lfs::io::project {
         normalized_lock_anchor(
             const std::filesystem::path& path) noexcept {
             std::error_code error;
-            auto absolute =
-                std::filesystem::absolute(path, error);
+            auto absolute = std::filesystem::absolute(path, error);
+            if (!error)
+                absolute = std::filesystem::weakly_canonical(absolute, error);
             return (error ? path : absolute)
                 .lexically_normal();
         }
@@ -134,6 +135,60 @@ namespace lfs::io::project {
 
 namespace lfs::io::project::detail {
 
+    lfs::Result<ProjectPathIdentity> ProjectPathIdentity::capture(const std::filesystem::path& path) {
+        std::error_code error;
+        const auto absolute = std::filesystem::absolute(path, error);
+        auto canonical = error ? absolute : std::filesystem::weakly_canonical(absolute, error);
+        if (error)
+            return project_error(lfs::ErrorCode::FailedPrecondition,
+                                 "The project path could not be checked.", error.message(), path);
+        ProjectPathIdentity identity{absolute, std::move(canonical), std::nullopt};
+        const bool exists = std::filesystem::exists(path, error);
+        if (error)
+            return project_error(lfs::ErrorCode::FailedPrecondition,
+                                 "The project identity could not be checked.", error.message(), path);
+        if (exists) {
+            auto file = NativeFile::open_read(path);
+            if (!file)
+                return std::move(file).error();
+            auto size = (*file)->size();
+            if (!size)
+                return std::move(size).error();
+            identity.superblock.emplace(static_cast<std::size_t>(std::min<std::uint64_t>(*size, 256)));
+            if (auto read = (*file)->read_exact(0, *identity.superblock); !read)
+                return std::move(read).error();
+        }
+        return identity;
+    }
+
+    lfs::Result<void> ProjectPathIdentity::validate() const {
+        auto current = capture(path);
+        if (!current)
+            return lfs::Result<void>::failure(std::move(current).error());
+        if (current->canonical_path != canonical_path || current->superblock != superblock)
+            return lfs::Result<void>::failure(project_error(
+                lfs::ErrorCode::FailedPrecondition,
+                "The project identity or path changed before writing. Refresh Projects and try again.",
+                "the destination no longer has the planned path and superblock", path));
+        return {};
+    }
+
+    namespace {
+        thread_local const ProjectPathIdentity* active_identity = nullptr;
+    }
+
+    const ProjectPathIdentity* active_operation_identity() noexcept {
+        return active_identity;
+    }
+
+    const ProjectPathIdentity* set_active_operation_identity(const ProjectPathIdentity* identity) noexcept {
+        return std::exchange(active_identity, identity);
+    }
+
+    lfs::Result<void> validate_project_operation_identity() {
+        return active_identity ? active_identity->validate() : lfs::Result<void>{};
+    }
+
     namespace {
 
         lfs::ErrorCode native_error_code(const int error, const bool writing) noexcept {
@@ -174,14 +229,79 @@ namespace lfs::io::project::detail {
         }
 
 #ifdef _WIN32
-        lfs::Result<DWORD> wait_for_overlapped(HANDLE handle, OVERLAPPED& operation,
+        struct OverlappedOperation {
+            explicit OverlappedOperation(const std::uint64_t offset) {
+                overlapped.Offset = static_cast<DWORD>(offset & 0xffffffffu);
+                overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
+                overlapped.hEvent =
+                    CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                if (overlapped.hEvent == nullptr) {
+                    event_error = GetLastError();
+                }
+            }
+
+            OverlappedOperation(const OverlappedOperation&) = delete;
+            OverlappedOperation& operator=(const OverlappedOperation&) = delete;
+
+            ~OverlappedOperation() {
+                if (pending) {
+                    // An in-flight request must never outlive its OVERLAPPED and buffer.
+                    CancelIoEx(file_handle, &overlapped);
+                    DWORD transferred = 0;
+                    GetOverlappedResult(file_handle, &overlapped, &transferred,
+                                        TRUE);
+                }
+                if (overlapped.hEvent != nullptr) {
+                    CloseHandle(overlapped.hEvent);
+                }
+            }
+
+            [[nodiscard]] bool valid() const noexcept {
+                return overlapped.hEvent != nullptr;
+            }
+
+            void mark_pending(const HANDLE handle) noexcept {
+                file_handle = handle;
+                pending = true;
+            }
+
+            void mark_complete() noexcept { pending = false; }
+
+            [[nodiscard]] DWORD creation_error() const noexcept {
+                return event_error;
+            }
+
+            OVERLAPPED overlapped{};
+
+        private:
+            HANDLE file_handle = INVALID_HANDLE_VALUE;
+            DWORD event_error = ERROR_SUCCESS;
+            bool pending = false;
+        };
+
+        lfs::Error overlapped_operation_start_error(
+            const OverlappedOperation& operation,
+            const std::filesystem::path& path,
+            const std::uint64_t offset,
+            const std::string_view action) {
+            return project_error(
+                lfs::ErrorCode::ResourceExhausted,
+                "The project file operation could not be started.",
+                std::format("{} could not create a completion event with Windows error {}",
+                            action, operation.creation_error()),
+                path, offset, {},
+                static_cast<std::int64_t>(operation.creation_error()), "Win32");
+        }
+
+        lfs::Result<DWORD> wait_for_overlapped(HANDLE handle,
+                                               OverlappedOperation& operation,
                                                const BOOL immediate_result,
                                                const std::filesystem::path& path,
                                                const std::string_view action,
                                                const bool writing) {
             if (immediate_result) {
                 DWORD transferred = 0;
-                if (!GetOverlappedResult(handle, &operation, &transferred, TRUE)) {
+                if (!GetOverlappedResult(handle, &operation.overlapped, &transferred, TRUE)) {
                     const DWORD error = GetLastError();
                     return project_error(native_error_code(static_cast<int>(error), writing),
                                          writing ? "The project could not be written."
@@ -201,8 +321,16 @@ namespace lfs::io::project::detail {
                                      path, std::nullopt, {}, static_cast<std::int64_t>(error),
                                      "Win32");
             }
+            operation.mark_pending(handle);
+            // The event belongs to this operation, so this wait cannot be
+            // satisfied by another request on the same file handle.
             DWORD transferred = 0;
-            if (!GetOverlappedResult(handle, &operation, &transferred, TRUE)) {
+            const BOOL completed =
+                GetOverlappedResult(handle, &operation.overlapped, &transferred, TRUE);
+            if (completed || HasOverlappedIoCompleted(&operation.overlapped)) {
+                operation.mark_complete();
+            }
+            if (!completed) {
                 const DWORD completion_error = GetLastError();
                 return project_error(
                     native_error_code(static_cast<int>(completion_error), writing),
@@ -212,13 +340,6 @@ namespace lfs::io::project::detail {
                     path, std::nullopt, {}, static_cast<std::int64_t>(completion_error), "Win32");
             }
             return transferred;
-        }
-
-        OVERLAPPED operation_at(const std::uint64_t offset) noexcept {
-            OVERLAPPED operation{};
-            operation.Offset = static_cast<DWORD>(offset & 0xffffffffu);
-            operation.OffsetHigh = static_cast<DWORD>(offset >> 32);
-            return operation;
         }
 #endif
 
@@ -435,10 +556,15 @@ namespace lfs::io::project::detail {
 #ifdef _WIN32
             const DWORD request = static_cast<DWORD>(
                 std::min<std::size_t>(remaining, std::numeric_limits<DWORD>::max()));
-            OVERLAPPED operation = operation_at(offset + completed);
+            OverlappedOperation operation(offset + completed);
+            if (!operation.valid()) {
+                return status_failure(overlapped_operation_start_error(
+                    operation, path_, offset + completed, "ReadFile"));
+            }
             const BOOL immediate = ReadFile(handle_, destination.data() + completed, request, nullptr,
-                                            &operation);
-            auto result = wait_for_overlapped(handle_, operation, immediate, path_, "ReadFile", false);
+                                            &operation.overlapped);
+            auto result = wait_for_overlapped(handle_, operation, immediate, path_, "ReadFile",
+                                              false);
             if (!result) {
                 return status_failure(std::move(result).error());
             }
@@ -485,10 +611,16 @@ namespace lfs::io::project::detail {
 #ifdef _WIN32
             const DWORD request = static_cast<DWORD>(
                 std::min<std::size_t>(remaining, std::numeric_limits<DWORD>::max()));
-            OVERLAPPED operation = operation_at(offset + completed);
+            OverlappedOperation operation(offset + completed);
+            if (!operation.valid()) {
+                return status_failure(overlapped_operation_start_error(
+                    operation, path_, offset + completed, "WriteFile"));
+            }
             const BOOL immediate =
-                WriteFile(handle_, source.data() + completed, request, nullptr, &operation);
-            auto result = wait_for_overlapped(handle_, operation, immediate, path_, "WriteFile", true);
+                WriteFile(handle_, source.data() + completed, request, nullptr,
+                          &operation.overlapped);
+            auto result = wait_for_overlapped(handle_, operation, immediate, path_, "WriteFile",
+                                              true);
             if (!result) {
                 return status_failure(std::move(result).error());
             }
@@ -538,9 +670,13 @@ namespace lfs::io::project::detail {
                 lfs::ErrorCode::BoundsViolation, "The project head could not be written.",
                 "single-write request exceeds DWORD", path_, offset, "head_write"));
         }
-        OVERLAPPED operation = operation_at(offset);
+        OverlappedOperation operation(offset);
+        if (!operation.valid()) {
+            return status_failure(overlapped_operation_start_error(
+                operation, path_, offset, "WriteFile(head)"));
+        }
         const BOOL immediate = WriteFile(handle_, source.data(), static_cast<DWORD>(source.size()),
-                                         nullptr, &operation);
+                                         nullptr, &operation.overlapped);
         auto result = wait_for_overlapped(handle_, operation, immediate, path_, "WriteFile(head)",
                                           true);
         if (!result) {
@@ -710,7 +846,13 @@ namespace lfs::io::project::detail {
 #endif
 
     lfs::Result<WriterLock> WriterLock::acquire(const std::filesystem::path& project_path) {
-        auto lock_path = project_path;
+        std::error_code error;
+        auto lock_path = std::filesystem::absolute(project_path, error);
+        if (!error)
+            lock_path = std::filesystem::weakly_canonical(lock_path, error);
+        if (error)
+            return project_error(lfs::ErrorCode::FailedPrecondition,
+                                 "The project path could not be locked.", error.message(), project_path);
         lock_path += ".lock";
         if (auto parent = ensure_parent_directory(lock_path); !parent) {
             return std::move(parent).error();
@@ -845,10 +987,14 @@ namespace lfs::io::project::detail {
             std::format(".{}.{}.{}.{}.tmp", tag, ticks, process_id,
                         counter.fetch_add(1, std::memory_order_relaxed));
         if (destination.has_extension()) {
-            return destination.parent_path() /
-                   (destination.stem().string() + suffix + destination.extension().string());
+            auto temp_name = destination.stem();
+            temp_name += suffix;
+            temp_name += destination.extension();
+            return destination.parent_path() / temp_name;
         }
-        return std::filesystem::path(destination.string() + suffix);
+        auto temporary = destination;
+        temporary += suffix;
+        return temporary;
     }
 
     lfs::Result<void> ensure_parent_directory(const std::filesystem::path& path) {

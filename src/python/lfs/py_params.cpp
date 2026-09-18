@@ -789,6 +789,10 @@ namespace lfs::python {
             .value("SEGMENT_AND_IGNORE", MaskMode::SegmentAndIgnore)
             .value("ALPHA_CONSISTENT", MaskMode::AlphaConsistent);
 
+        nb::enum_<DensifyErrorMap>(m, "DensifyErrorMap")
+            .value("SSIM", DensifyErrorMap::Ssim)
+            .value("SSIM_CS", DensifyErrorMap::SsimCs);
+
         nb::enum_<NormalLossSpace>(m, "NormalLossSpace")
             .value("AUTO", NormalLossSpace::Auto)
             .value("CAMERA_OPENCV", NormalLossSpace::CameraOpenCV)
@@ -903,6 +907,62 @@ namespace lfs::python {
                 [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.enable_eval = v; }); },
                 "Enable evaluation during training")
             .def_prop_rw(
+                "background_improvements",
+                [](PyOptimizationParams& self) { return self.params().background_improvements; },
+                [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.background_improvements = v; }); },
+                "Improve distant background reconstruction (MRNF): far-field seeding and splits, decay relief, growth cap, per-splat position steps, visibility-ratio growth ranking, paced capacity fill")
+            .def_prop_rw(
+                "far_scene_min_fraction",
+                [](PyOptimizationParams& self) { return self.params().far_scene_min_fraction; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.far_scene_min_fraction = v; }); },
+                "Minimum deep-far splat fraction that activates far-field features (0 = always on)")
+            .def_prop_rw(
+                "growth_ratio_rank",
+                [](PyOptimizationParams& self) { return self.params().growth_ratio_rank; },
+                [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.growth_ratio_rank = v; }); },
+                "Rank MRNF growth by visibility-normalized error (err/vis^p) instead of raw window error")
+            .def_prop_rw(
+                "growth_ratio_pow",
+                [](PyOptimizationParams& self) { return self.params().growth_ratio_pow; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.growth_ratio_pow = v; }); },
+                "Visibility exponent p for the err/vis^p growth rank")
+            .def_prop_rw(
+                "fill_pacing_iter",
+                [](PyOptimizationParams& self) { return self.params().fill_pacing_iter; },
+                [](PyOptimizationParams&, size_t v) { modify_params([v](auto& p) { p.fill_pacing_iter = v; }); },
+                "Pace MRNF cap fill until this iteration (0 = fill as fast as possible)")
+            .def_prop_rw(
+                "far_seed_dose",
+                [](PyOptimizationParams& self) { return self.params().far_seed_dose; },
+                [](PyOptimizationParams&, size_t v) { modify_params([v](auto& p) { p.far_seed_dose = v; }); },
+                "Far-field seeds injected per refine window (0 = starvation-scaled default)")
+            .def_prop_rw(
+                "densify_error_map",
+                [](PyOptimizationParams& self) { return self.params().densify_error_map; },
+                [](PyOptimizationParams&, DensifyErrorMap v) {
+                    modify_params([v](auto& p) { p.densify_error_map = v; });
+                },
+                "Densification error map: full SSIM or contrast-structure only")
+            .def_prop_rw(
+                "max_screen_share",
+                [](PyOptimizationParams& self) { return self.params().max_screen_share; },
+                [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.max_screen_share = v; }); },
+                "Shrink Gaussians that cover more than this share of the view; 0 or 1 disables")
+            .def_prop_rw(
+                "screen_share_penalty",
+                [](PyOptimizationParams& self) { return self.params().screen_share_penalty; },
+                [](PyOptimizationParams&, float v) {
+                    modify_params([v](auto& p) { p.screen_share_penalty = v; });
+                },
+                "Soft hinge weight on log-scale for Gaussians over the screen-share cap")
+            .def_prop_rw(
+                "oversize_split_fraction",
+                [](PyOptimizationParams& self) { return self.params().oversize_split_fraction; },
+                [](PyOptimizationParams&, float v) {
+                    modify_params([v](auto& p) { p.oversize_split_fraction = v; });
+                },
+                "Fraction of MRNF growth budget used to split Gaussians over the screen-share cap; 0 disables")
+            .def_prop_rw(
                 "steps_scaler",
                 [](PyOptimizationParams& self) { return self.params().steps_scaler; },
                 [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.steps_scaler = v; }); },
@@ -936,6 +996,18 @@ namespace lfs::python {
                 [](PyOptimizationParams& self) { return self.params().gut; },
                 [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.gut = v; }); },
                 "Enable Gaussian Unscented Transform")
+            .def_prop_rw(
+                "use_exposure_correction",
+                [](PyOptimizationParams& self) { return self.params().use_exposure_correction; },
+                [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.use_exposure_correction = v; }); },
+                "Enable combined per-photo exposure correction")
+            .def_prop_rw(
+                "exposure_correction_grid_start_iter",
+                [](PyOptimizationParams& self) { return self.params().exposure_correction_grid_start_iter; },
+                [](PyOptimizationParams&, int v) {
+                    modify_params([v](auto& p) { p.exposure_correction_grid_start_iter = v; });
+                },
+                "Iteration at which the local residual grid starts training")
             .def_prop_rw(
                 "use_bilateral_grid",
                 [](PyOptimizationParams& self) { return self.params().use_bilateral_grid; },
@@ -1058,6 +1130,11 @@ namespace lfs::python {
                 [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.use_normal_loss = v; }); },
                 "Load normal maps and use normal-map supervision during training")
             .def_prop_rw(
+                "normal_auto_generate",
+                [](PyOptimizationParams& self) { return self.params().normal_auto_generate; },
+                [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.normal_auto_generate = v; }); },
+                "Generate missing or size-mismatched maps with MoGe-2 from the full-resolution images/ folder so they work at every training resolution")
+            .def_prop_rw(
                 "normal_loss_weight",
                 [](PyOptimizationParams& self) { return self.params().normal_loss_weight; },
                 [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.normal_loss_weight = std::max(0.0f, v); }); },
@@ -1072,6 +1149,20 @@ namespace lfs::python {
                 [](PyOptimizationParams& self) { return self.params().normal_flatten_weight; },
                 [](PyOptimizationParams&, float v) { modify_params([v](auto& p) { p.normal_flatten_weight = std::max(0.0f, v); }); },
                 "Min-axis scale flattening weight while normal supervision is active")
+            .def_prop_rw(
+                "normal_start_fraction",
+                [](PyOptimizationParams& self) { return self.params().normal_start_fraction; },
+                [](PyOptimizationParams&, float v) {
+                    modify_params([v](auto& p) { p.normal_start_fraction = std::clamp(v, 0.0f, 1.0f); });
+                },
+                "Fraction of total iterations at which normal supervision starts")
+            .def_prop_rw(
+                "normal_end_fraction",
+                [](PyOptimizationParams& self) { return self.params().normal_end_fraction; },
+                [](PyOptimizationParams&, float v) {
+                    modify_params([v](auto& p) { p.normal_end_fraction = std::clamp(v, 0.0f, 1.0f); });
+                },
+                "Fraction of total iterations at which normal supervision stops; 1.0 keeps it on until the end")
             .def_prop_rw(
                 "normal_loss_space",
                 [](PyOptimizationParams& self) { return std::string(normal_loss_space_name(self.params().normal_loss_space)); },

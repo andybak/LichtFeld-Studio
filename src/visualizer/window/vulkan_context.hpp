@@ -6,6 +6,7 @@
 
 #include "core/error.hpp"
 #include "core/export.hpp"
+#include "core/exportable_storage.hpp"
 #include "gpu_object_census.hpp"
 #include "renderer_terminal_state.hpp"
 #include "rendering/vulkan_result.hpp"
@@ -17,6 +18,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <expected>
 #include <format>
 #include <mutex>
@@ -44,6 +46,8 @@ struct SDL_Window;
 namespace lfs::vis {
 
     class VulkanContext {
+        friend struct VulkanContextTestAccess;
+
     public:
         enum class ResizeIntent {
             Interactive,
@@ -51,7 +55,7 @@ namespace lfs::vis {
         };
 
         VulkanContext() = default;
-        ~VulkanContext();
+        LFS_VIS_API ~VulkanContext();
 
         VulkanContext(const VulkanContext&) = delete;
         VulkanContext& operator=(const VulkanContext&) = delete;
@@ -60,6 +64,8 @@ namespace lfs::vis {
         void shutdown();
         void notifyFramebufferResized(int width, int height, ResizeIntent intent = ResizeIntent::Exact);
         [[nodiscard]] bool hasPendingSwapchainResize() const {
+            if (rendererTerminalState() != RendererTerminalState::Running)
+                return false;
             // A forced rebuild is pending work too, otherwise render-on-demand can idle for
             // half a second holding an out-of-date swapchain. Zero framebuffers are excluded:
             // beginFrame skips those without rebuilding, so they would never clear the flag.
@@ -71,6 +77,8 @@ namespace lfs::vis {
 
         [[nodiscard]] bool presentBootstrapFrame(float r, float g, float b, float a);
         [[nodiscard]] const std::string& lastError() const { return last_error_; }
+        // Preserve terminal errors crossing a renderer's legacy string-result boundary.
+        void noteFailure(const std::exception& exception);
 
         // Typed terminal-renderer state polled by the frame state machine. Acquire
         // loads of the two 7B cause latches; DeviceLost dominates a bare quarantine.
@@ -121,12 +129,20 @@ namespace lfs::vis {
         struct ExternalBuffer {
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceMemory memory = VK_NULL_HANDLE;
+            std::vector<VkDeviceMemory> memories;
+            std::size_t bound_chunks = 0;
+            // Offsets already sparse-bound into this VkBuffer. grow() inserts
+            // per-region tails in the middle of ExportableBlock::chunks, so a
+            // prefix count is not a bound set.
+            std::vector<std::size_t> bound_chunk_offsets;
+            VkDeviceAddress device_address = 0;
             VkDeviceSize size = 0;
             VkDeviceSize allocation_size = 0;
             std::string diagnostic_scope;
             std::string diagnostic_label;
             ExternalNativeHandle native_handle = kInvalidExternalNativeHandle;
             bool census_counted = false;
+            bool sparse = false;
         };
 
         struct ExternalSemaphore {
@@ -194,6 +210,9 @@ namespace lfs::vis {
             std::size_t additional_block_bytes = 0,
             std::size_t additional_allocation_bytes = 0) const;
         [[nodiscard]] VkPipelineCache pipelineCache() const { return pipeline_cache_; }
+        // Persist the live cache without destroying it. Calls are serialized
+        // with shutdown and other cache serialization calls.
+        void flushPipelineCache();
         [[nodiscard]] VkFormat swapchainFormat() const { return swapchain_format_; }
         [[nodiscard]] VkFormat depthStencilFormat() const { return depth_stencil_format_; }
         [[nodiscard]] VkImageAspectFlags depthStencilAspectMask() const;
@@ -254,17 +273,18 @@ namespace lfs::vis {
             return debug_utils_enabled_ && debug_name_writer_.enabled();
         }
 
-        [[nodiscard]] bool beginFrame(const VkClearValue& clear_value, Frame& frame);
+        [[nodiscard]] LFS_VIS_API bool beginFrame(const VkClearValue& clear_value, Frame& frame);
         // Dynamic rendering must be closed while external-image layout barriers
         // are recorded. These helpers bracket that interop window.
         [[nodiscard]] bool finishActiveRendering(VkCommandBuffer command_buffer);
         [[nodiscard]] bool restartActiveRendering(VkCommandBuffer command_buffer,
                                                   const Frame& frame);
-        [[nodiscard]] bool endFrame();
+        [[nodiscard]] LFS_VIS_API bool endFrame();
         [[nodiscard]] bool hasActiveFrame() const noexcept { return frame_active_; }
         [[nodiscard]] LFS_VIS_API std::expected<WindowCapture, std::string> captureAndEndActiveFrameRgba();
+        [[nodiscard]] bool waitForNextFrameSlot();
         [[nodiscard]] bool waitForCurrentFrameSlot();
-        [[nodiscard]] bool waitForSubmittedFrames();
+        [[nodiscard]] LFS_VIS_API bool waitForSubmittedFrames();
         // Serial of the most recent graphics frame submission attempt (pre-incremented
         // before vkQueueSubmit; advances even if the submit fails).
         [[nodiscard]] std::uint64_t lastFrameSubmitSerial() const;
@@ -310,13 +330,7 @@ namespace lfs::vis {
                                                std::string_view diagnostic_label = {});
         void destroyExternalImage(ExternalImage& image);
         [[nodiscard]] ExternalNativeHandle releaseExternalImageNativeHandle(ExternalImage& image) const;
-        [[nodiscard]] bool createExternalBuffer(VkDeviceSize size,
-                                                VkBufferUsageFlags usage,
-                                                ExternalBuffer& out,
-                                                std::string_view diagnostic_scope = "vulkan.external.buffer",
-                                                std::string_view diagnostic_label = {});
         void destroyExternalBuffer(ExternalBuffer& buffer);
-        [[nodiscard]] ExternalNativeHandle releaseExternalBufferNativeHandle(ExternalBuffer& buffer) const;
         // Import a foreign-allocated external memory handle (e.g. from CUDA's
         // cuMemExportToShareableHandle) into Vulkan. The exporter retains ownership
         // of the handle; this method dup()'s on Linux and the imported VkDeviceMemory
@@ -331,6 +345,15 @@ namespace lfs::vis {
                                                 ExternalBuffer& out,
                                                 std::string_view diagnostic_scope = "vulkan.external.imported_buffer",
                                                 std::string_view diagnostic_label = {});
+        [[nodiscard]] bool importExportableBlock(const lfs::core::ExportableBlock& block,
+                                                 VkBufferUsageFlags usage,
+                                                 ExternalBuffer& out,
+                                                 std::string_view diagnostic_scope = "vulkan.external.imported_block",
+                                                 std::string_view diagnostic_label = {});
+        [[nodiscard]] bool bindNewChunks(ExternalBuffer& imported,
+                                         const lfs::core::ExportableBlock& block);
+        [[nodiscard]] bool sparseBindingEnabled() const { return sparse_binding_enabled_; }
+        [[nodiscard]] bool bufferDeviceAddressEnabled() const { return buffer_device_address_enabled_; }
         [[nodiscard]] bool createExternalTimelineSemaphore(
             std::uint64_t initial_value,
             ExternalSemaphore& out,
@@ -352,7 +375,8 @@ namespace lfs::vis {
     private:
         bool fail(std::string message,
                   std::source_location location = std::source_location::current());
-        bool setVkFailure(std::string message);
+        bool setVkFailure(std::string message, VkResult result,
+                          std::source_location location = std::source_location::current());
 
         // Phase 7B: shared WaitContext for the six UI-frame bounded waits.
         [[nodiscard]] lfs::rendering::WaitContext makeWaitContext(std::string_view fingerprint);
@@ -360,9 +384,9 @@ namespace lfs::vis {
         // clear last_error_ and return false; Quarantined/DeviceLost/other fail().
         // When set_framebuffer_resized_on_hard_error is true (image-fence site), only
         // hard Error results set framebuffer_resized_ (never Quarantined/soft).
-        [[nodiscard]] bool mapWaitOutcome(lfs::Result<lfs::rendering::WaitOutcome> result,
-                                          std::string_view op,
-                                          bool set_framebuffer_resized_on_hard_error = false);
+        [[nodiscard]] LFS_VIS_API bool mapWaitOutcome(lfs::Result<lfs::rendering::WaitOutcome> result,
+                                                      std::string_view op,
+                                                      bool set_framebuffer_resized_on_hard_error = false);
         // Validation timeline waits (sites 5–6): every non-Ready path fails with detail.
         [[nodiscard]] bool mapValidationWaitOutcome(lfs::Result<lfs::rendering::WaitOutcome> result,
                                                     std::string_view detail_on_fail);
@@ -421,6 +445,7 @@ namespace lfs::vis {
         void destroyDebugMessenger();
         void destroyAllocator();
         void saveAndDestroyPipelineCache();
+        void savePipelineCacheLocked();
         void destroySwapchain();
         [[nodiscard]] bool waitForFrameFences();
 
@@ -456,6 +481,7 @@ namespace lfs::vis {
         VkDevice device_ = VK_NULL_HANDLE;
         VmaAllocator allocator_ = VK_NULL_HANDLE;
         VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+        std::mutex pipeline_cache_mutex_;
         VkQueue graphics_queue_ = VK_NULL_HANDLE;
         VkQueue present_queue_ = VK_NULL_HANDLE;
         uint32_t graphics_queue_family_ = 0;
@@ -545,6 +571,7 @@ namespace lfs::vis {
         std::atomic<bool> gpu_wait_quarantined_{false};
         // Phase 8 P3: second cause latch — set only at the three DeviceLost sites so
         // rendererTerminalState() distinguishes a lost device from a bare stall.
+        std::atomic<bool> terminal_failure_reported_{false};
         std::atomic<bool> gpu_device_lost_{false};
         // Phase 7B AMB-B3: set at shutdown() entry so mid-teardown waits yield Shutdown.
         std::atomic<bool> context_shutdown_started_{false};
@@ -557,6 +584,9 @@ namespace lfs::vis {
         bool external_memory_interop_enabled_ = false;
         bool external_semaphore_interop_enabled_ = false;
         bool external_memory_dedicated_allocation_enabled_ = false;
+        bool sparse_binding_enabled_ = false;
+        bool buffer_device_address_enabled_ = false;
+        std::mutex graphics_queue_mutex_;
         bool swapchain_maintenance1_enabled_ = false;
         bool swapchain_present_scaling_enabled_ = false;
         bool has_push_descriptor_ = false;

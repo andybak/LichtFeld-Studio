@@ -2,7 +2,27 @@
 
 /* ── Window ────────────────────────────────────────────── */
 
+#asset-floating-title {
+    color: @{text};
+}
+
 #asset-popup {
+    @{panel.body_decor};
+    color: @{text};
+    border-color: @{border};
+}
+
+/* ── Quick Look ──────────────────────────────────────────── */
+
+.asset-quick-look {
+    background-color: @{modal.backdrop};
+}
+
+.asset-quick-look-card {
+    background-color: @{surface};
+}
+
+.asset-size-menu {
     background-color: @{surface};
     color: @{text};
     border-color: @{border};
@@ -10,8 +30,25 @@
 
 /* ── Toolbar ─────────────────────────────────────────────── */
 
+.asset-button {
+    background-color: @{surface_bright};
+    border-color: @{border};
+    color: @{text};
+}
+
+.asset-button:hover {
+    background-color: @{lighten(surface_bright,0.06)};
+    border-color: @{primary};
+    color: @{text};
+}
+
+.asset-button:active {
+    background-color: @{alpha(primary,0.24)};
+    border-color: @{primary};
+}
+
 #asset-popup-toolbar {
-    background-color: @{blend(surface,background,0.5)};
+    background-color: @{alpha(surface,0.72)};
     border-bottom-color: @{border};
 }
 
@@ -35,12 +72,52 @@
     border-color: @{border};
 }
 
-.asset-search-icon {
-    color: @{text_dim};
-}
-
 .asset-search-box input[type="text"] {
     color: @{text};
+}
+
+.asset-icon-grid > span,
+.asset-icon-list > span {
+    background-color: @{text};
+}
+
+.asset-refresh-button img,
+.asset-folder-menu img,
+.asset-card-menu img {
+    image-color: @{alpha(text,0.90)};
+}
+
+.inspector-more img,
+.inspector-disclosure,
+.asset-list-header-gallery-icon {
+    image-color: @{alpha(text,0.90)};
+}
+
+.asset-refresh-button:hover img,
+.asset-folder-menu:hover img,
+.asset-card-menu:hover img,
+.inspector-more:hover img {
+    image-color: @{text};
+}
+
+.asset-add-folder-glyph {
+    color: @{text};
+}
+
+.asset-import-button {
+    background-color: @{blend(surface,primary,button.tint_normal)};
+    border-color: @{blend(surface,primary,button.tint_normal)};
+    color: @{text};
+}
+
+.asset-import-button:hover {
+    background-color: @{blend(surface,primary,button.tint_hover)};
+    border-color: @{blend(surface,primary,button.tint_hover)};
+}
+
+.asset-import-button:active {
+    background-color: @{blend(surface,primary,button.tint_active)};
+    border-color: @{blend(surface,primary,button.tint_active)};
 }
 
 .asset-sort-button {
@@ -61,58 +138,35 @@
     border-color: @{primary};
 }
 
-.asset-button-label {
-    color: @{text};
-}
-
-.asset-header-action {
-    color: @{text};
-    background-color: @{surface_bright};
-    border-color: @{border};
-}
-
-.asset-header-action:hover {
-    background-color: @{lighten(surface_bright,0.12)};
-    border-color: @{primary};
-}
-
-/* ── Summary Bar ─────────────────────────────────────────── */
-
-#asset-popup-summary {
-    background-color: @{surface};
-    border-bottom-color: @{border};
-    color: @{text_dim};
-}
-
-#asset-viewport-edge {
-    background-color: @{right_panel.border};
-}
-
 /* ── Sidebar ─────────────────────────────────────────────── */
 
 #asset-sidebar {
-    background-color: @{blend(surface,background,0.35)};
-    border-right-color: @{border};
+    background-color: @{alpha(background,0.32)};
+    border-bottom-color: @{border};
 }
 
-#sidebar-resize-handle {
-    background-color: @{alpha(primary,0.12)};
-    border-top-color: @{alpha(primary,0.26)};
-    border-bottom-color: @{alpha(background,0.55)};
-}
-
-#sidebar-resize-handle:hover {
-    background-color: @{alpha(primary,0.30)};
+.asset-sidebar-global {
+    border-bottom-color: @{border};
 }
 
 .asset-sidebar-title {
     color: @{text_dim};
 }
 
+.asset-sidebar-title .section-arrow {
+    color: @{alpha(text_dim,0.72)};
+}
+
+.asset-sidebar-title:hover .section-arrow,
+.asset-sidebar-title .section-arrow.is-expanded {
+    color: @{text};
+}
+
 .asset-filter-row:hover {
     background-color: @{lighten(surface_bright,0.06)};
 }
 
+.asset-filter-row.is-drag-over,
 .asset-filter-row.is-active {
     background-color: @{alpha(primary,0.20)};
 }
@@ -129,22 +183,53 @@
     color: @{text_dim};
 }
 
+.asset-folder-menu {
+    background-color: transparent;
+    border-color: transparent;
+}
+
+.asset-folder-menu:hover {
+    background-color: @{alpha(surface_bright,0.94)};
+}
+
+.asset-resize-handle:hover,
+.asset-resize-handle:active,
+.asset-resize-handle:focus {
+    background-color: @{alpha(primary,0.45)};
+}
+
 /* ── Gallery ─────────────────────────────────────────────── */
 
 #asset-gallery {
-    background-color: @{surface};
+    background-color: @{alpha(surface,0.58)};
 }
 
 .asset-gallery-header {
     border-bottom-color: @{border};
 }
 
-.asset-gallery-title {
-    color: @{text};
-}
-
 .asset-gallery-subtitle {
     color: @{text_dim};
+}
+
+.asset-gallery-notice {
+    color: @{warning};
+}
+
+.asset-gallery-scan-status {
+    color: @{text_dim};
+}
+
+.asset-gallery-scroll::-webkit-scrollbar-track {
+    background: @{blend(surface,background,0.35)};
+}
+
+.asset-gallery-scroll::-webkit-scrollbar-thumb {
+    background: @{border};
+}
+
+.asset-gallery-scroll::-webkit-scrollbar-thumb:hover {
+    background: @{lighten(border,0.12)};
 }
 
 /* ── Asset Cards ─────────────────────────────────────────── */
@@ -154,21 +239,32 @@
     border-color: @{border};
 }
 
-.asset-card:hover {
+.asset-card:hover,
+.asset-list-row:hover {
     border-color: @{primary};
 }
 
-.asset-card.is-selected {
+.asset-card.is-selected,
+.asset-list-row.is-selected {
     border-color: @{primary};
+    background-color: @{alpha(primary,0.12)};
+}
+
+.asset-card.is-missing,
+.asset-list-row.is-missing {
+    border-color: @{error};
 }
 
 .asset-card-thumb {
     border-bottom-color: @{border};
 }
 
-.asset-pill-mp4 {
-    background-color: @{alpha(warning,0.25)};
-    color: @{warning};
+.asset-thumbnail-placeholder {
+    background-color: @{darken(primary,0.40)};
+}
+
+.asset-thumb-project {
+    background-color: @{alpha(info,0.14)};
 }
 
 .asset-card-title {
@@ -179,58 +275,57 @@
     color: @{text_dim};
 }
 
-.asset-card-button {
-    color: @{text};
-    background-color: @{lighten(surface_bright,0.06)};
+.asset-card-menu {
+    background-color: @{alpha(surface_bright,0.88)};
+    border-color: transparent;
+}
+
+.asset-card-menu:hover {
+    background-color: @{surface_bright};
+}
+
+.asset-list-header {
+    background-color: @{blend(surface_bright,background,0.18)};
     border-color: @{border};
+    color: @{text_dim};
 }
 
-.asset-card-button:hover {
-    background-color: @{lighten(surface_bright,0.12)};
-    border-color: @{primary};
+.asset-list-header .asset-list-sort {
+    background-color: transparent;
+    color: @{text_dim};
+    border-radius: 0;
 }
 
-/* ── Info Panel ──────────────────────────────────────────── */
+.asset-list-header .asset-list-sort:hover {
+    background-color: @{surface_bright};
+    color: @{text};
+}
 
-#asset-info-panel {
-    background-color: @{blend(surface,background,0.35)};
+.asset-list-row {
+    background-color: @{surface_bright};
+    border-color: @{border};
+    color: @{text};
+}
+
+.asset-list-column-handle:hover {
+    border-right-color: @{primary};
+    background-color: @{alpha(primary,0.18)};
+}
+
+.asset-list-primary {
+    color: @{text};
+}
+
+/* ── Inspector ───────────────────────────────────────────── */
+
+.asset-inspector {
+    background-color: @{surface};
     border-left-color: @{border};
-}
-
-#bottom-panel-resize-handle {
-    background-color: @{alpha(primary,0.12)};
-    border-top-color: @{alpha(primary,0.26)};
-    border-bottom-color: @{alpha(background,0.55)};
-}
-
-#bottom-panel-resize-handle:hover {
-    background-color: @{alpha(primary,0.30)};
-}
-
-.asset-info-tabs {
-    border-bottom-color: @{border};
-}
-
-.asset-info-tab {
-    color: @{text_dim};
-    border-bottom-color: transparent;
-}
-
-.asset-info-tab:hover {
     color: @{text};
 }
 
-.asset-info-tab.is-active {
-    color: @{primary};
-    border-bottom-color: @{primary};
-}
-
-.asset-info-name {
-    color: @{text};
-}
-
-.asset-info-section-title {
-    color: @{text_dim};
+.asset-inspector-content {
+    background-color: @{surface};
 }
 
 .parameter-row {
@@ -245,9 +340,29 @@
     color: @{text};
 }
 
-/* ── Footer / Batch Actions ─────────────────────────────── */
-
-#asset-popup-footer {
-    background-color: @{blend(surface,background,0.5)};
-    border-top-color: @{border};
+.asset-info-header {
+    border-bottom-color: @{border};
 }
+
+.asset-info-empty-text {
+    color: @{text_dim};
+}
+
+.gallery-progress { background-color: @{statusbar.progress_bg}; }
+.gallery-progress-fill { background-color: @{primary}; }
+
+.gallery-remote { border-color: @{text_dim}; }
+
+.asset-list-sort { color: @{text_dim}; }
+.asset-list-sort:hover, .asset-list-sort:focus { background-color: @{surface_bright}; color: @{text}; }
+
+.contents-tag { color: @{text_dim}; background-color: @{surface_bright}; }
+.contents-row--pending { color: @{text_dim}; }
+.contents-remove img { image-color: @{text}; }
+
+.gallery-activity > img { image-color: @{text_dim}; opacity: 0.35; }
+.gallery-activity > progress, .gallery-activity > progress fill { image-color: @{primary}; }
+
+.gallery-activity > progress, .gallery-activity > progress fill { background-color: transparent; border-width: 0; }
+
+.gallery-activity > progress, .gallery-activity > progress fill { decorator: none; }
