@@ -688,7 +688,9 @@ function Initialize-PinnedToolDirectory {
     $isComplete = Test-Path -LiteralPath $executablePath
     if ($isComplete) {
         foreach ($relativePath in $ValidationRelativePaths) {
-            if (-not (Test-Path -LiteralPath (Join-Path $DestinationDirectory $relativePath))) {
+            # Validation entries may use wildcards (for example share\cmake-*), so they
+            # must not be probed with -LiteralPath.
+            if (-not (Test-Path -Path (Join-Path $DestinationDirectory $relativePath))) {
                 $isComplete = $false
                 break
             }
