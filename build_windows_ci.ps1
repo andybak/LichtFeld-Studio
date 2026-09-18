@@ -678,23 +678,54 @@ function Initialize-PinnedToolDirectory {
         [string]$SourceDirectory,
         [string]$DestinationDirectory,
         [string]$ExecutableRelativePath,
+        [string[]]$ValidationRelativePaths = @(),
         [switch]$Refresh
     )
 
     $executablePath = Join-Path $DestinationDirectory $ExecutableRelativePath
     $created = $false
 
-    if ($Refresh -or -not (Test-Path -LiteralPath $executablePath)) {
+    $isComplete = Test-Path -LiteralPath $executablePath
+    if ($isComplete) {
+        foreach ($relativePath in $ValidationRelativePaths) {
+            if (-not (Test-Path -LiteralPath (Join-Path $DestinationDirectory $relativePath))) {
+                $isComplete = $false
+                break
+            }
+        }
+    }
+
+    if ($Refresh -or -not $isComplete) {
         if (-not (Test-Path -LiteralPath $SourceDirectory)) {
             throw "Cannot pin build tool: source directory not found: $SourceDirectory"
         }
 
-        if (Test-Path -LiteralPath $DestinationDirectory) {
-            Remove-Item -LiteralPath $DestinationDirectory -Recurse -Force
+        # Copy into a staging directory first so an interrupted copy can never look like a
+        # complete pin. The destination is only replaced once the copy succeeded.
+        $stagingDirectory = "$DestinationDirectory.staging-$([guid]::NewGuid().ToString('N'))"
+        try {
+            if (Test-CommandExists -Name 'robocopy') {
+                & robocopy $SourceDirectory $stagingDirectory /E /MT:16 /NFL /NDL /NJH /NJS /NP /R:2 /W:1 | Out-Null
+                if ($LASTEXITCODE -gt 7) {
+                    throw "robocopy failed with exit code $LASTEXITCODE while pinning $SourceDirectory"
+                }
+            } else {
+                Copy-Item -LiteralPath $SourceDirectory -Destination $stagingDirectory -Recurse -Force
+            }
+
+            if (Test-Path -LiteralPath $DestinationDirectory) {
+                Remove-Item -LiteralPath $DestinationDirectory -Recurse -Force
+            }
+
+            Move-Item -LiteralPath $stagingDirectory -Destination $DestinationDirectory
+        } catch {
+            if (Test-Path -LiteralPath $stagingDirectory) {
+                Remove-Item -LiteralPath $stagingDirectory -Recurse -Force -ErrorAction SilentlyContinue
+            }
+
+            throw
         }
 
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $DestinationDirectory) | Out-Null
-        Copy-Item -LiteralPath $SourceDirectory -Destination $DestinationDirectory -Recurse -Force
         $created = $true
     }
 
@@ -1014,6 +1045,7 @@ $pinnedPowerShell = Initialize-PinnedToolDirectory `
     -SourceDirectory $powerShellSourceDirectory `
     -DestinationDirectory (Join-Path $PinnedToolsRoot 'pwsh') `
     -ExecutableRelativePath 'pwsh.exe' `
+    -ValidationRelativePaths @('Modules') `
     -Refresh:$RefreshPinnedTools
 $pinnedPowerShellVersion = Get-PowerShellVersionFrom -PowerShellPath $pinnedPowerShell.Path
 
@@ -1030,6 +1062,7 @@ $pinnedCMake = Initialize-PinnedToolDirectory `
     -SourceDirectory $cmakeInstallRoot `
     -DestinationDirectory (Join-Path $PinnedToolsRoot 'cmake') `
     -ExecutableRelativePath 'bin\cmake.exe' `
+    -ValidationRelativePaths @('share\cmake-*') `
     -Refresh:$RefreshPinnedTools
 $pinnedCMakeVersion = Get-CMakeVersionFrom -CMakePath $pinnedCMake.Path
 
