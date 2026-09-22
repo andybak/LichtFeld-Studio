@@ -50,6 +50,8 @@
 #include "visualizer/core/services.hpp"
 #include "visualizer/gui/gui_manager.hpp"
 #include "visualizer/gui/panel_registry.hpp"
+#include "visualizer/gui/sequencer_ui_state.hpp"
+#include "visualizer/input/sdl_coordinate_utils.hpp"
 #include "visualizer/ipc/view_context.hpp"
 #include "visualizer/operation/undo_history.hpp"
 #include "visualizer/operator/operator_context.hpp"
@@ -154,6 +156,19 @@ namespace lfs::python {
             return mod + "." + name;
         }
 
+        bool set_video_reconstruction_selection(const io::video::VideoReconstructionSelection& selection) {
+            return invoke_on_viewer(
+                [selection = selection]() mutable {
+                    auto* const viewer = get_visualizer();
+                    auto* const gui = get_gui_manager();
+                    if (!viewer || !viewer->acceptsPostedWork() || !gui)
+                        return false;
+                    gui->getSequencerUIState().reconstruction = std::move(selection);
+                    return true;
+                },
+                false);
+        }
+
         constexpr size_t INPUT_TEXT_BUFFER_SIZE = 1024;
         constexpr float GRID_AUTO_COLUMN_WIDTH = 100.0f;
         constexpr float ALERT_BG_ALPHA = 0.15f;
@@ -170,6 +185,7 @@ namespace lfs::python {
 
         // Dynamic texture tracking
         std::atomic<bool> g_texture_service_alive{true};
+        std::atomic<uint64_t> g_next_dynamic_texture_id{1};
         std::mutex g_dynamic_textures_mutex;
 
         class PyDynamicTexture;
@@ -214,28 +230,34 @@ namespace lfs::python {
 
             void update(const PyTensor& py_tensor) {
                 lfs::python::require_ui_texture_creation_thread();
-                auto t = py_tensor.tensor();
+                const auto t = py_tensor.tensor();
                 if (t.ndim() != 3)
                     throw std::invalid_argument("DynamicTexture requires 3D tensor [H, W, C]");
                 if (t.size(2) != 3 && t.size(2) != 4)
                     throw std::invalid_argument("DynamicTexture channels must be 3 (RGB) or 4 (RGBA)");
 
-                if (t.device() == core::Device::CPU)
-                    t = t.cuda();
                 const auto orig_dtype = t.dtype();
-                if (orig_dtype != core::DataType::Float32)
-                    t = t.to(core::DataType::Float32);
-                if (orig_dtype == core::DataType::UInt8)
-                    t = t / 255.0f;
+                const auto device_tensor = t.device() == core::Device::CPU ? t.gpu() : t;
+                const auto float_tensor = orig_dtype == core::DataType::Float32
+                                              ? device_tensor
+                                              : device_tensor.to(core::DataType::Float32);
+                const auto normalized = orig_dtype == core::DataType::UInt8
+                                            ? float_tensor / 255.0f
+                                            : float_tensor;
 
                 const int w = t.size(1);
                 const int h = t.size(0);
+                // This API is HWC. Resolve short images before the renderer's
+                // CHW-first inference mistakes their height for a channel axis.
+                const auto upload_tensor = (h == 1 || h == 3 || h == 4)
+                                               ? normalized.permute({2, 0, 1}).contiguous()
+                                               : normalized;
 
                 if (!texture_) {
                     texture_ = std::make_unique<lfs::vis::gui::VulkanUiTexture>();
                 }
 
-                if (!texture_->upload(t, w, h) || !texture_->valid())
+                if (!texture_->upload(upload_tensor, w, h) || !texture_->valid())
                     throw std::runtime_error("Failed to update UI texture");
                 width_ = w;
                 height_ = h;
@@ -261,7 +283,9 @@ namespace lfs::python {
             }
 
             uint64_t texture_id() const {
-                return texture_ ? static_cast<uint64_t>(texture_->textureId()) : 0;
+                // RmlUI resolves this token through the live texture registry.
+                // CUDA interop textures do not have an overlay descriptor set.
+                return valid() ? registry_id_ : 0;
             }
 
             std::string rml_src_url(const int width, const int height) const {
@@ -283,6 +307,8 @@ namespace lfs::python {
             }
 
         private:
+            const uint64_t registry_id_ =
+                g_next_dynamic_texture_id.fetch_add(1, std::memory_order_relaxed);
             std::unique_ptr<lfs::vis::gui::VulkanUiTexture> texture_;
             std::string plugin_name_;
             int width_ = 0;
@@ -2354,7 +2380,7 @@ namespace lfs::python {
     std::tuple<float, float> PyUILayout::get_mouse_pos() const {
         float x = 0.0f;
         float y = 0.0f;
-        SDL_GetMouseState(&x, &y);
+        lfs::vis::input::mouseStateInPixels(SDL_GetMouseFocus(), &x, &y);
         return {x, y};
     }
     std::tuple<float, float> PyUILayout::get_window_pos() const {
@@ -2731,7 +2757,7 @@ namespace lfs::python {
         m.def("get_mouse_screen_pos", []() -> nb::tuple {
             float x = 0.0f;
             float y = 0.0f;
-            SDL_GetMouseState(&x, &y);
+            lfs::vis::input::mouseStateInPixels(SDL_GetMouseFocus(), &x, &y);
             return nb::make_tuple(x, y);
         });
 
@@ -3695,6 +3721,45 @@ namespace lfs::python {
             "Clear all localization overrides");
 
         m.def(
+            "_loc_register_catalog",
+            [](const std::string& owner_id,
+               const std::string& language_code,
+               const nb::dict& translations) {
+                lfs::event::LocalizationManager::TranslationMap entries;
+                entries.reserve(translations.size());
+                for (const auto& item : translations) {
+                    if (!nb::isinstance<nb::str>(item.first) ||
+                        !nb::isinstance<nb::str>(item.second))
+                        throw nb::type_error("translations must be a dict[str, str]");
+                    entries.emplace(nb::cast<std::string>(item.first),
+                                    nb::cast<std::string>(item.second));
+                }
+
+                std::string error;
+                const auto token =
+                    lfs::event::LocalizationManager::getInstance().registerPluginCatalog(
+                        owner_id, language_code, entries, &error);
+                if (token == 0)
+                    throw nb::value_error(error.c_str());
+
+                lfs::vis::publish_language_generation();
+                return token;
+            },
+            nb::arg("owner_id"), nb::arg("language_code"), nb::arg("translations"),
+            "Register one validated, owner-scoped plugin localization catalog");
+
+        m.def(
+            "_loc_unregister_catalog",
+            [](const std::uint64_t token) {
+                const bool removed =
+                    lfs::event::LocalizationManager::getInstance().unregisterPluginCatalog(token);
+                if (removed)
+                    lfs::vis::publish_language_generation();
+                return removed;
+            },
+            nb::arg("token"), "Unregister one plugin localization catalog by ownership token");
+
+        m.def(
             "register_popup_draw_callback",
             [](nb::object callback) {
                 warnLegacyPopupDrawCallbackOnce();
@@ -4229,11 +4294,12 @@ namespace lfs::python {
                 switch (rm->getGTComparisonMode()) {
                 case vis::GTComparisonMode::Normal: return "normal";
                 case vis::GTComparisonMode::Depth: return "depth";
+                case vis::GTComparisonMode::Loss: return "loss";
                 case vis::GTComparisonMode::RGB:
                 default: return "rgb";
                 }
             },
-            "Get ground-truth comparison mode: rgb, normal, or depth.");
+            "Get ground-truth comparison mode: rgb, normal, depth, or loss.");
 
         m.def(
             "set_gt_comparison_mode",
@@ -4248,8 +4314,10 @@ namespace lfs::python {
                     settings.gt_comparison_mode = vis::GTComparisonMode::Normal;
                 } else if (mode == "depth") {
                     settings.gt_comparison_mode = vis::GTComparisonMode::Depth;
+                } else if (mode == "loss") {
+                    settings.gt_comparison_mode = vis::GTComparisonMode::Loss;
                 } else {
-                    throw nb::value_error("GT comparison mode must be 'rgb', 'normal', or 'depth'");
+                    throw nb::value_error("GT comparison mode must be 'rgb', 'normal', 'depth', or 'loss'");
                 }
                 rm->updateSettings(settings, vis::DirtyFlag::ALL);
             },
@@ -4270,6 +4338,9 @@ namespace lfs::python {
                     settings.gt_comparison_mode = vis::GTComparisonMode::Depth;
                     break;
                 case vis::GTComparisonMode::Depth:
+                    settings.gt_comparison_mode = vis::GTComparisonMode::Loss;
+                    break;
+                case vis::GTComparisonMode::Loss:
                 default:
                     settings.gt_comparison_mode = vis::GTComparisonMode::RGB;
                     break;
@@ -4278,11 +4349,12 @@ namespace lfs::python {
                 switch (settings.gt_comparison_mode) {
                 case vis::GTComparisonMode::Normal: return "normal";
                 case vis::GTComparisonMode::Depth: return "depth";
+                case vis::GTComparisonMode::Loss: return "loss";
                 case vis::GTComparisonMode::RGB:
                 default: return "rgb";
                 }
             },
-            "Cycle ground-truth comparison mode: rgb -> normal -> depth -> rgb.");
+            "Cycle ground-truth comparison mode: rgb -> normal -> depth -> loss -> rgb.");
 
         m.def(
             "reveal_in_file_manager",
@@ -4894,23 +4966,79 @@ namespace lfs::python {
               "Set sequencer playback speed");
 
         m.def(
+            "get_video_reconstruction_selection",
+            [] {
+                using Selection = io::video::VideoReconstructionSelection;
+                const auto selection = invoke_on_viewer(
+                    []() -> std::optional<Selection> {
+                        auto* const viewer = get_visualizer();
+                        auto* const gui = get_gui_manager();
+                        if (!viewer || !viewer->acceptsPostedWork() || !gui)
+                            return std::nullopt;
+                        return gui->getSequencerUIState().reconstruction;
+                    },
+                    std::optional<Selection>{});
+                if (!selection)
+                    throw std::runtime_error("Viewer is unavailable");
+                nb::dict result;
+                result["backend_id"] = selection->backend_id;
+                result["preset_id"] = selection->preset_id;
+                result["fallback"] = std::string(io::video::videoReconstructionFallbackId(selection->fallback));
+                return result;
+            },
+            "Return the saved video reconstruction selection used by both export entry points.");
+
+        m.def(
+            "set_video_reconstruction_selection",
+            [](const std::string& backend_id, const std::string& preset_id, const std::string& fallback) {
+                const auto policy = io::video::videoReconstructionFallbackFromId(fallback);
+                if (!policy)
+                    throw nb::value_error("Video reconstruction fallback must be 'abort' or 'native'");
+                const io::video::VideoReconstructionSelection selection{
+                    .backend_id = backend_id,
+                    .preset_id = preset_id,
+                    .fallback = *policy};
+                if (const auto valid = io::video::validateVideoReconstructionSelection(selection); !valid)
+                    throw nb::value_error(valid.error().message.c_str());
+                if (!set_video_reconstruction_selection(selection))
+                    throw std::runtime_error("Viewer is unavailable");
+            },
+            nb::arg("backend_id"), nb::arg("preset_id"), nb::arg("fallback") = "abort",
+            "Set the persisted video reconstruction selection. Validates metadata only, without loading a backend.");
+
+        m.def(
+            "reset_video_reconstruction_selection",
+            [] {
+                if (!set_video_reconstruction_selection({}))
+                    throw std::runtime_error("Viewer is unavailable");
+            },
+            "Reset the saved video reconstruction selection to native/native with abort policy.");
+
+        m.def(
             "export_video",
             [](int width, int height, int framerate, int crf, const std::string& path,
                bool include_provenance) {
-                lfs::core::events::cmd::SequencerExportVideo{
-                    .width = width,
-                    .height = height,
-                    .framerate = framerate,
-                    .crf = crf,
-                    .path = path,
-                    .include_provenance = include_provenance}
-                    .emit();
+                const bool dispatched = invoke_on_viewer(
+                    [width, height, framerate, crf, path, include_provenance] {
+                        auto* const viewer = get_visualizer();
+                        auto* const gui = get_gui_manager();
+                        if (!viewer || !viewer->acceptsPostedWork() || !gui)
+                            return false;
+                        gui->getSequencerUIState()
+                            .videoExportRequest(width, height, framerate, crf, path, include_provenance)
+                            .emit();
+                        return true;
+                    },
+                    false);
+                if (!dispatched)
+                    throw std::runtime_error("Viewer is unavailable");
             },
             nb::arg("width"), nb::arg("height"), nb::arg("framerate"), nb::arg("crf"),
             nb::arg("path") = std::string{},
             nb::arg("include_provenance") = true,
             "Export video with specified settings. Without a path a save dialog opens, "
             "which a script cannot answer; pass one to export directly. "
+            "Uses the saved video reconstruction selection, as does the Sequencer button. "
             "include_provenance (default true) writes a full provenance stamp into the video comment; when false, a minimal build stamp is still embedded.");
 
         m.def(
@@ -5290,7 +5418,8 @@ namespace lfs::python {
             "set_scene_reconstruction",
             [](const std::string& backend_id, const std::string& preset_id) {
                 const auto backend = vis::sceneUpscalerBackendFromId(backend_id);
-                if (!backend || !vis::sceneUpscalerPreset(*backend, preset_id))
+                if (!backend || !vis::sceneUpscalerBackendAvailable(*backend) ||
+                    !vis::sceneUpscalerPreset(*backend, preset_id))
                     return false;
                 nb::gil_scoped_release release;
                 auto settings = vis::get_render_settings();
@@ -5298,7 +5427,10 @@ namespace lfs::python {
                     return false;
                 settings->scene_upscaler = backend_id;
                 settings->scene_upscaler_preset = preset_id;
-                vis::update_render_settings(*settings);
+                vis::update_render_settings(
+                    *settings,
+                    {.scene_upscaler_explicit = true,
+                     .scene_upscaler_preset_explicit = true});
                 return true;
             },
             nb::arg("backend_id"), nb::arg("preset_id"),
@@ -5311,6 +5443,30 @@ namespace lfs::python {
                 vis::clearSceneUpscalerPreference();
             },
             "Clear all saved scene reconstruction backend and preset preferences");
+
+        m.def("get_tensor_backend_preferences", [] {
+            const auto state = vis::UserPreferences::instance().tensorBackend();
+            nb::dict result;
+            result["backend"] = state.backend == core::GpuBackend::Vulkan ? "vulkan" : "cuda";
+            result["vulkan_device"] = state.options.vulkan_device;
+            result["vulkan_validation"] = state.options.vulkan_validation;
+            result["force_fp32_half"] = state.options.force_fp32_half;
+            result["force_no_atomic_float"] = state.options.force_no_atomic_float;
+            result["viewer_vulkan_inputs"] = state.options.viewer_vulkan_inputs;
+            return result; }, "Get saved tensor backend preferences; changes apply after restart");
+
+        m.def("set_tensor_backend_preferences", [](const std::string& backend, const std::string& device, int validation, bool fp32_half, bool no_atomic_float, bool viewer_inputs) {
+                  if (backend != "cuda" && backend != "vulkan")
+                      throw nb::value_error("Backend must be cuda or vulkan");
+                  if (validation < 0 || validation > 2)
+                      throw nb::value_error("Validation must be 0, 1, or 2");
+                  const vis::TensorPreferenceState state{
+                      .backend = backend == "vulkan" ? core::GpuBackend::Vulkan : core::GpuBackend::CUDA,
+                      .options = {.vulkan_device = device, .vulkan_validation = validation,
+                                  .force_fp32_half = fp32_half, .force_no_atomic_float = no_atomic_float,
+                                  .viewer_vulkan_inputs = viewer_inputs},
+                  };
+                  vis::UserPreferences::instance().setTensorBackend(state); }, nb::arg("backend") = "cuda", nb::arg("vulkan_device") = "", nb::arg("vulkan_validation") = 0, nb::arg("force_fp32_half") = false, nb::arg("force_no_atomic_float") = false, nb::arg("viewer_vulkan_inputs") = false, "Save tensor backend preferences for the next application start");
 
         m.def(
             "get_mcp_preferences",
@@ -5928,6 +6084,115 @@ namespace lfs::python {
                 return d;
             },
             "Get split view info");
+
+        m.def(
+            "get_focused_split_panel", []() -> const char* {
+                // Read unprotected, main-thread-owned focused_panel_ on the viewer thread.
+                const bool right = invoke_on_viewer(
+                    [] {
+                        auto* const rm = get_rendering_manager();
+                        return rm && rm->getFocusedSplitPanel() == vis::SplitViewPanelId::Right;
+                    },
+                    false);
+                return right ? "right" : "left";
+            },
+            "Get the focused split-view panel ('left' or 'right').\n"
+            "Outside independent-dual split this reports the panel the depth\n"
+            "toolbar would address; it is 'left' with no rendering manager.");
+
+        m.def(
+            "get_depth_window_sync", []() -> bool {
+                auto* rm = get_rendering_manager();
+                return rm ? rm->getDepthWindowSync() : false;
+            },
+            "Is the per-panel depth-window sync flag on? While on, a depth-window\n"
+            "edit in either split panel writes both panels.");
+
+        m.def(
+            "get_depth_window_collapse_source", []() -> const char* {
+                // The getter holds settings_mutex_, so no viewer-thread marshal is needed.
+                auto* rm = get_rendering_manager();
+                return rm && rm->getDepthWindowCollapseSource() == vis::SplitViewPanelId::Right
+                           ? "right"
+                           : "left";
+            },
+            "Which panel the last LINEAGE EVENT took its surviving window from\n"
+            "('left' or 'right') -- not only a collapse. Leaving independent-dual\n"
+            "copies the PRE-transition focused panel's depth window into the\n"
+            "single remaining one, and the split service resets the observable\n"
+            "focus to Left in the same transition, so a poller cannot recover\n"
+            "that panel from get_focused_split_panel(). A sync-ON copy and a\n"
+            "project or sync-undo restore overwrite this field too, so it names\n"
+            "the source of whichever write stamped LAST; use\n"
+            "get_depth_window_collapse_record() to learn which kind that was.\n"
+            "Only meaningful once such a write has happened; it reports 'left'\n"
+            "before the first one and with no rendering manager.");
+
+        m.def(
+            "get_depth_window_collapse_record", []() -> nb::tuple {
+                // Read source, generation and kind together under the manager's settings lock.
+                auto* rm = get_rendering_manager();
+                if (!rm) {
+                    return nb::make_tuple("left", static_cast<uint64_t>(0), "leave_collapse");
+                }
+                const auto record = rm->getDepthWindowCollapseRecord();
+                const char* kind = "leave_collapse";
+                switch (record.kind) {
+                case vis::RenderingManager::DepthWindowLineageKind::SyncCopy:
+                    kind = "sync_copy";
+                    break;
+                case vis::RenderingManager::DepthWindowLineageKind::ProjectRestore:
+                    kind = "project_restore";
+                    break;
+                case vis::RenderingManager::DepthWindowLineageKind::RetainedPairDiscard:
+                    kind = "retained_pair_discard";
+                    break;
+                case vis::RenderingManager::DepthWindowLineageKind::LeaveCollapse:
+                    break;
+                }
+                return nb::make_tuple(
+                    record.source == vis::SplitViewPanelId::Right ? "right" : "left",
+                    record.generation,
+                    kind);
+            },
+            "The last depth-window reference-lineage stamp, as\n"
+            "('left'|'right', generation, kind).\n"
+            "kind is 'leave_collapse', 'sync_copy', 'project_restore' or\n"
+            "'retained_pair_discard'. These invalidate slot-derived references;\n"
+            "sync undo/redo also reports 'project_restore'. A retained-pair discard\n"
+            "requires fresh baselines from live windows, not from source. The\n"
+            "generation counts them, so a poller whose delta exceeds the\n"
+            "transitions it observed slept through boundaries and cannot replay\n"
+            "anything it cached; the kind says how to recover from the ones it\n"
+            "missed. 'leave_collapse' and 'sync_copy' leave ONE window, so every\n"
+            "cached reference recovers from it; 'project_restore' means\n"
+            "'fresh-baseline required' and can leave the two panel windows\n"
+            "DIFFERING, so a per-panel consumer must re-read each panel with\n"
+            "selection.get_depth_filter_window(panel=...) rather than reuse the\n"
+            "projection. source is the panel the surviving window came from and\n"
+            "is meaningful for 'leave_collapse' (the PRE-transition focus, which\n"
+            "get_focused_split_panel() can no longer report) and for 'sync_copy'\n"
+            "(the panel copied FROM); a 'project_restore' takes its windows from\n"
+            "the restored state, not from a panel. The generation is 0 before\n"
+            "the first such write and with no rendering manager.");
+
+        m.def(
+            "set_depth_window_sync", [](bool sync) -> bool {
+                auto* rm = get_rendering_manager();
+                if (!rm)
+                    return false;
+                rm->setDepthWindowSync(sync);
+                // Refused drag/parked-GT requests return the actual flag.
+                return rm->getDepthWindowSync();
+            },
+            nb::arg("sync"), "Set the per-panel depth-window sync flag. Turning it on with\n"
+                             "differing panels copies the focused panel's window to the other as\n"
+                             "one undo step. Both ON and OFF changes are silently ignored while a\n"
+                             "depth-window drag owns a panel, including subthreshold presses, or\n"
+                             "while an independent pair is parked in GT. GT without a parked pair\n"
+                             "is unaffected. In a retained Disabled interval an actual flag change\n"
+                             "discards the pair before applying; a same-value request preserves it.\n"
+                             "Returns the flag's actual state after the call, not the requested one.");
 
         m.def(
             "get_current_camera_id", []() -> int {

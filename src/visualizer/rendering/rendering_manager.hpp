@@ -9,6 +9,7 @@
 #include "core/event_bridge/scoped_handler.hpp"
 #include "core/export.hpp"
 #include "core/tensor.hpp"
+#include "depth_window_state.hpp"
 #include "dirty_flags.hpp"
 #include "framerate_controller.hpp"
 #include "internal/viewport.hpp"
@@ -19,8 +20,10 @@
 #include "passes/vulkan_split_view_pass.hpp"
 #include "render_animation_state.hpp"
 #include "rendering/rendering.hpp"
+#include "rendering/scene_temporal_resolve.hpp"
 #include "rendering/scene_upscaler_registry.hpp"
 #include "rendering/screen_overlay_renderer.hpp"
+#include "rendering/temporal_frame_tracker.hpp"
 #include "rendering_types.hpp"
 #include "spark_lod_controller.hpp"
 #include "split_view_service.hpp"
@@ -50,6 +53,8 @@
 #include <vector>
 #include <vulkan/vulkan.h>
 
+class PythonIntegrationTest_ParkedGtPanelWindowRequestsAreAtomicallyRefused_Test;
+
 namespace lfs::core {
     class Camera;
     class Scene;
@@ -71,6 +76,10 @@ namespace lfs::core::events::cmd {
     struct ToggleIndependentSplitView;
 } // namespace lfs::core::events::cmd
 
+namespace lfs::vis::op {
+    struct DepthWindowModeSnapshot;
+}
+
 namespace lfs::vis {
     class VulkanContext;
     class VksplatViewportRenderer;
@@ -80,6 +89,11 @@ namespace lfs::vis {
     class SceneManager;
     struct SceneRenderState;
     class TrainerManager;
+
+    enum class SceneUpscalerPresetUpdate : std::uint8_t {
+        UseRequested,
+        RestoreRememberedForBackend,
+    };
 
     class LFS_VIS_API RenderingManager {
     public:
@@ -245,6 +259,10 @@ namespace lfs::vis {
         void markDirty();
         void markDirty(DirtyMask flags);
         void markCameraPoseChanged();
+        // Marks a discontinuous camera jump. Unlike interactive camera motion,
+        // the next successfully published temporal frame must not reproject
+        // history across this boundary.
+        void markCameraCut();
 
         [[nodiscard]] bool pollDirtyState();
 
@@ -264,7 +282,10 @@ namespace lfs::vis {
 
         // Settings management
         void updateSettings(const RenderSettings& settings);
-        void updateSettings(const RenderSettings& settings, DirtyMask dirty_flags);
+        void updateSettings(
+            const RenderSettings& settings,
+            DirtyMask dirty_flags,
+            SceneUpscalerPresetUpdate preset_update = SceneUpscalerPresetUpdate::UseRequested);
         RenderSettings getSettings() const;
         // The presentation pass reports its actual runtime choice after pipeline
         // preparation. Rendering uses this feedback on the next frame so a failed
@@ -286,6 +307,19 @@ namespace lfs::vis {
         [[nodiscard]] bool isSplitViewActive() const;
         [[nodiscard]] bool isGTComparisonActive() const;
         [[nodiscard]] bool isPLYComparisonActive() const;
+        // Internal drag-preview signal for the shader-approximate live reveal; never touches
+        // RenderSettings.
+        [[nodiscard]] bool depthWindowDragPreview() const;
+        // Own from invoke through destruction, including replacement overlap.
+        // Claiming an owned slot retains its backup; otherwise record live state.
+        // Mint the drag token and return whether the other slot was pinned too.
+        // Lifecycle: docs/docs/development/depth-window-state.md.
+        bool beginDepthWindowDrag(SplitViewPanelId panel, uint64_t& out_drag_token);
+        void endDepthWindowDrag(SplitViewPanelId panel, uint64_t drag_token);
+        // Preview spans the latch, excluding subthreshold presses. Counts allow
+        // the same replacement overlap as ownership.
+        void beginDepthWindowPreview(SplitViewPanelId panel);
+        void endDepthWindowPreview(SplitViewPanelId panel);
         [[nodiscard]] bool isIndependentSplitViewActive() const;
         [[nodiscard]] GTComparisonMode getGTComparisonMode() const;
         [[nodiscard]] SplitViewMode getSplitViewMode() const;
@@ -300,6 +334,89 @@ namespace lfs::vis {
         [[nodiscard]] SplitViewPanelId getFocusedSplitPanel() const { return split_view_service_.focusedPanel(); }
         [[nodiscard]] int getGridPlaneForPanel(SplitViewPanelId panel) const;
         void setGridPlaneForPanel(SplitViewPanelId panel, int plane);
+        [[nodiscard]] DepthWindowState getDepthWindowForPanel(SplitViewPanelId panel) const;
+        struct DepthWindowOverlaySnapshot {
+            bool independent_dual_active = false;
+            std::array<DepthWindowState, 2> panel_windows{};
+        };
+        [[nodiscard]] DepthWindowOverlaySnapshot getDepthWindowOverlaySnapshot() const;
+        // Refuses the entire explicit-panel write while a pair is parked in GT.
+        bool setDepthWindowForPanel(SplitViewPanelId panel, const DepthWindowState& state);
+        // Preview writes require both the current epoch and slot ownership.
+        // Non-drag writes revoke ownership so stale drags cannot overwrite them.
+        bool applyDepthWindowForPanelIfEpoch(SplitViewPanelId panel,
+                                             const DepthWindowState& state,
+                                             uint64_t expected_epoch,
+                                             uint64_t drag_token);
+        // Restore each still-owned slot independently under one lock. States
+        // are the pre-drag values; other_state exists only for a fan-out drag.
+        // Returns true only if the epoch matches and the addressed slot is still owned.
+        // A superseded addressed slot does not prevent restoring the other owned slot.
+        bool restorePinnedDepthWindowSlots(SplitViewPanelId panel,
+                                           const DepthWindowState& own_state,
+                                           const std::optional<DepthWindowState>& other_state,
+                                           uint64_t expected_epoch,
+                                           uint64_t drag_token);
+        // Atomically check epoch/ownership, write and capture the undo snapshot.
+        // On refusal the caller must skip undo and draw-commit publication.
+        bool commitDepthWindowForPanelIfEpoch(SplitViewPanelId panel,
+                                              const DepthWindowState& state,
+                                              uint64_t expected_epoch,
+                                              uint64_t drag_token,
+                                              op::DepthWindowModeSnapshot& out_snapshot);
+        // Hold across release commit, undo and publication, or a mode change.
+        // Acquire before settings/history locks; see the member's lock order.
+        [[nodiscard]] std::unique_lock<std::mutex> acquireDepthWindowTransitionLock() {
+            return std::unique_lock<std::mutex>(depth_window_transition_mutex_);
+        }
+        void setDepthWindowSync(bool sync);
+        [[nodiscard]] bool getDepthWindowSync() const;
+        // Describes how consumers recover references after slot replacement.
+        enum class DepthWindowLineageKind {
+            // Leaving independent-dual folded the pre-transition focused
+            // panel's window into the single remaining one.
+            LeaveCollapse,
+            // Enabling sync copied the focused panel's window over the other.
+            SyncCopy,
+            // Project load seeds both slots from the projection; sync undo/redo may
+            // restore unequal slots. Both require fresh cached references.
+            ProjectRestore,
+            // A retained GT pair was discarded; cached panel references expire.
+            RetainedPairDiscard,
+        };
+        // Source and kind of the latest replacement, plus its generation.
+        struct DepthWindowCollapseRecord {
+            SplitViewPanelId source = SplitViewPanelId::Left;
+            uint64_t generation = 0;
+            DepthWindowLineageKind kind = DepthWindowLineageKind::LeaveCollapse;
+        };
+        // Source of the latest lineage event, not necessarily a leave collapse.
+        // Use the complete record when the event kind also matters.
+        [[nodiscard]] SplitViewPanelId getDepthWindowCollapseSource() const;
+        // Read coherent source/generation/kind; generation detects missed boundaries.
+        // Collapse, sync copy, project restore and retained-pair discard stamp with
+        // their writes. Sync undo/redo stamps separately. Nondestructive boundaries
+        // and ordinary edits without a retained pair do not stamp.
+        [[nodiscard]] DepthWindowCollapseRecord getDepthWindowCollapseRecord() const;
+        // One locked read of the whole depth-window state, so an absolute undo
+        // snapshot can never mix slots, sync and epoch from different instants.
+        [[nodiscard]] op::DepthWindowModeSnapshot depthWindowSnapshot() const;
+        // Substitute recorded backups for slots owned by this token, so a
+        // replacement inherits the original baseline rather than a preview.
+        // Unowned slots keep their live values; token 0 substitutes nothing.
+        [[nodiscard]] op::DepthWindowModeSnapshot
+        depthWindowBaselineSnapshotForDrag(uint64_t drag_token) const;
+        void restoreDepthWindowStateFromProject();
+        // Check epoch and restore atomically. Drag entries preserve sync and
+        // project the panel focused at execution; sync entries also restore sync.
+        bool restoreDepthWindowSnapshotIfEpoch(const op::DepthWindowModeSnapshot& snapshot,
+                                               uint64_t expected_epoch,
+                                               bool restore_sync);
+        // Sync undo/redo uses ProjectRestore lineage so each panel reference
+        // rebases from its own restored slot. Drag undo does not stamp.
+        void stampDepthWindowSyncRestoreLineage();
+        [[nodiscard]] uint64_t depthWindowProjectionGeneration() const;
+        [[nodiscard]] uint64_t depthWindowModeEpoch() const;
         [[nodiscard]] Viewport& resolvePanelViewport(Viewport& primary_viewport,
                                                      SplitViewPanelId panel = SplitViewPanelId::Left);
         [[nodiscard]] const Viewport& resolvePanelViewport(const Viewport& primary_viewport,
@@ -370,6 +487,12 @@ namespace lfs::vis {
         };
         ContentBounds getContentBounds(const glm::ivec2& viewport_size) const;
 
+        struct GTSelectionContext {
+            GTRenderCamera camera;
+            glm::ivec2 size{0, 0};
+        };
+        [[nodiscard]] std::optional<GTSelectionContext> gtComparisonSelectionContext() const;
+
         // Current camera tracking for GT comparison
         void setCurrentCameraId(int cam_id) {
             const bool changed = camera_interaction_service_.currentCameraId() != cam_id;
@@ -396,6 +519,9 @@ namespace lfs::vis {
         float getAverageFPS() const { return framerate_controller_.getAverageFPS(); }
         float getPresentedAverageFPS() const {
             return presented_framerate_controller_.getAverageFPS();
+        }
+        [[nodiscard]] std::uint32_t temporalConvergenceRemaining() const {
+            return temporal_convergence_.remaining();
         }
         // Measurement only — does not affect scene render pacing/limiting.
         void notePresentedFrame() { presented_framerate_controller_.beginFrame(); }
@@ -525,6 +651,12 @@ namespace lfs::vis {
         // Vulkan mesh frame — populated by `renderVulkanFrame` when there are meshes in
         // the scene, consumed by gui_manager to feed `vulkan_viewport_pass.mesh_items`.
         struct VulkanMeshFrame {
+            struct TemporalFrame {
+                TemporalFrameInput input;
+                SceneTemporalResolveSettings resolve_settings;
+                SceneTemporalQuality quality = SceneTemporalQuality::Balanced;
+            };
+
             glm::mat4 view_projection{1.0f};
             glm::vec3 camera_position{0.0f};
             std::vector<lfs::vis::VulkanMeshDrawItem> items;
@@ -532,6 +664,7 @@ namespace lfs::vis {
             lfs::vis::VulkanEnvironmentParams environment;
             lfs::vis::VulkanDepthBlitParams depth_blit;
             lfs::vis::VulkanSplitViewParams split_view;
+            std::optional<TemporalFrame> temporal;
         };
         void setVulkanMeshFrame(VulkanMeshFrame frame) {
             std::lock_guard lock(vulkan_mesh_frame_mutex_);
@@ -737,9 +870,8 @@ namespace lfs::vis {
         void queueCameraMetricsRefreshIfStale(SceneManager* scene_manager);
         void invalidateCameraMetricsRequests(bool clear_latest = false);
         void requestRenderFollowUp();
+        void requestTemporalFollowUp();
         void notifyAsyncLodResultsReady();
-        void requestResizeTrainingPause(TrainerManager* trainer_manager);
-        void releaseResizeTrainingPause();
         void cameraMetricsWorkerLoop(std::stop_token stop_token);
         [[nodiscard]] GTComparisonImageLookup getOrQueueGTComparisonImage(
             GTComparisonImageJobRequest request);
@@ -774,6 +906,38 @@ namespace lfs::vis {
         void handlePointCloudModeChanged(const lfs::core::events::ui::PointCloudModeChanged& event);
         [[nodiscard]] static int clampGridPlane(int plane);
         void syncGridPlanesLocked(int plane);
+        [[nodiscard]] op::DepthWindowModeSnapshot depthWindowSnapshotLocked() const;
+        void applyDepthWindowProjectionLocked(const DepthWindowState& state);
+        void restoreDepthWindowStateLocked(const std::array<DepthWindowState, 2>& panels,
+                                           bool sync,
+                                           const DepthWindowState& projection);
+        // Return whether both slots were written, identifying backups to release.
+        // restore_mode suppresses sync fan-out.
+        bool applyDepthWindowForPanelLocked(SplitViewPanelId panel,
+                                            const DepthWindowState& clamped,
+                                            bool restore_mode = false);
+        void releaseDepthWindowBackupsLocked(SplitViewPanelId panel, bool fan_out);
+        // Discard stale backups only where ownership and drag count are both zero.
+        // Restored values then survive later transitions; active backups stay intact.
+        void releaseIdleDepthWindowBackupsLocked();
+        // The sole lineage writer updates source/generation/kind with settings_mutex_
+        // held. Consumers revalidate generation around separate slot/record reads.
+        // Sync undo/redo restores slots, unlocks, then stamps under a second lock;
+        // revalidation does not close that unstamped interval.
+        void discardRetainedDepthWindowPairLocked(SplitViewPanelId source);
+        void stampDepthWindowLineageLocked(SplitViewPanelId source,
+                                           DepthWindowLineageKind kind);
+        // Only updateSettings can combine mode and global depth writes. On an
+        // independent-to-GT boundary, retain that explicit incoming projection
+        // instead of replacing it with the pre-transition focused window.
+        void applyDepthWindowModeTransitionLocked(SplitViewMode previous_mode,
+                                                  SplitViewMode new_mode,
+                                                  SplitViewPanelId pre_transition_focus,
+                                                  bool boundary_carries_global_depth_write = false);
+        [[nodiscard]] bool depthWindowDragActiveLocked() const;
+        // Ownership lasts from invoke to destruction, including subthreshold presses.
+        // The sync gate uses this lifetime so before_ capture cannot straddle a sync change.
+        [[nodiscard]] bool depthWindowDragOwnedLocked() const;
 
         // Core components
         std::unique_ptr<lfs::rendering::RenderingEngine> engine_;
@@ -788,6 +952,13 @@ namespace lfs::vis {
         std::string last_logged_vksplat_render_error_;
         StaleFrameGuard vksplat_stale_frame_guard_;
         std::uint64_t viewport_projection_generation_ = 1;
+        std::uint64_t temporal_scene_revision_ = 1;
+        TemporalConvergenceController temporal_convergence_;
+        std::atomic<std::uint64_t> temporal_camera_cut_generation_{0};
+        std::uint64_t consumed_temporal_camera_cut_generation_ = 0;
+        bool scene_reconstruction_request_logged_ = false;
+        std::string last_scene_reconstruction_backend_;
+        std::string last_scene_reconstruction_preset_;
         std::unique_ptr<VksplatViewportRenderer> vksplat_viewport_renderer_;
         std::unique_ptr<PointCloudVulkanRenderer> point_cloud_vulkan_renderer_;
         std::unique_ptr<SparkLodController> lod_controller_;
@@ -840,6 +1011,13 @@ namespace lfs::vis {
         glm::ivec2 vulkan_viewport_coordinate_size_{0, 0};
         bool vulkan_viewport_image_flip_y_ = false;
         glm::ivec2 vulkan_gt_comparison_content_size_{0, 0};
+        // GT compare-panel camera for the frame currently presented, for the selection lane.
+        // Written and cleared at exactly the same sites as vulkan_gt_comparison_content_size_.
+        struct GTPresentedView {
+            GTRenderCamera camera;
+            glm::ivec2 size{0, 0};
+        };
+        std::optional<GTPresentedView> vulkan_gt_comparison_selection_view_;
         struct GTComparisonImageCacheEntry {
             int camera_uid = -1;
             GTComparisonMode mode = GTComparisonMode::RGB;
@@ -879,11 +1057,14 @@ namespace lfs::vis {
         std::optional<lfs::rendering::CameraIntrinsics> gt_async_ticket_intrinsics_;
         bool gt_async_ticket_flip_y_ = false;
         lfs::rendering::FrameMetadata gt_async_ticket_metadata_{};
+        // The GT camera and size that produced a given async depth/normal image. Carried with
+        // the ticket and promoted with the held display, so the selection lane can only ever see
+        // the camera of the image the panel is ACTUALLY showing (#1574 hold-then-swap).
+        std::optional<GTPresentedView> gt_async_ticket_view_;
         std::shared_ptr<lfs::core::Tensor> gt_async_held_display_;
         bool gt_async_held_flip_y_ = false;
         lfs::rendering::FrameMetadata gt_async_held_metadata_{};
-        TrainerManager* resize_training_pause_trainer_ = nullptr;
-        bool resize_training_pause_active_ = false;
+        std::optional<GTPresentedView> gt_async_held_view_;
 
         // Granular dirty tracking
         std::atomic<uint32_t> dirty_mask_{DirtyFlag::ALL};
@@ -899,9 +1080,41 @@ namespace lfs::vis {
 
         // Settings
         RenderSettings settings_;
+        std::array<int, 2> depth_window_drag_counts_{};
+        std::array<int, 2> depth_window_preview_counts_{};
+        std::array<std::optional<DepthWindowState>, 2> depth_window_drag_backups_{};
+        // One drag token owns each slot's preview and backup. Replacement takes
+        // over ownership; non-drag writes, mode transitions and project restore
+        // revoke it. Teardown may affect only slots still owned by its token.
+        std::array<std::optional<uint64_t>, 2> depth_window_pin_owners_{};
+        // Monotonic, never-reused token source; 0 is reserved for no owner.
+        uint64_t depth_window_last_drag_token_ = 0;
         SceneUpscalerSelection scene_upscaler_runtime_selection_{};
         std::array<int, 2> panel_grid_planes_{{1, 1}};
+        std::array<DepthWindowState, 2> panel_depth_windows_{};
+        // Pair parked by direct independent-to-GT entry while GT suspends filtering.
+        // Retain through GT and unedited Disabled intervals; independent entry
+        // consumes it. GT global writes may replace live slots but not this pair.
+        // Disabled geometry/committed-drag/sync edits, other comparisons and scene/
+        // project reset discard it under settings_mutex_.
+        std::optional<std::array<DepthWindowState, 2>> depth_window_dormant_panels_;
+        bool depth_window_sync_ = false;
+        // Lineage fields share settings_mutex_ for reads and stamps, including
+        // sync undo/redo's separate stamp acquisition.
+        SplitViewPanelId depth_window_collapse_source_ = SplitViewPanelId::Left;
+        // Stamp with source/kind under the same lock; 0 means no invalidation yet.
+        uint64_t depth_window_collapse_generation_ = 0;
+        DepthWindowLineageKind depth_window_collapse_kind_ =
+            DepthWindowLineageKind::LeaveCollapse;
+        uint64_t depth_window_projection_generation_ = 0;
+        uint64_t depth_window_mode_epoch_ = 0;
         mutable std::mutex settings_mutex_;
+        // Serializes release commit/undo/publication with mode transitions.
+        // Acquire transition before settings; never while holding settings/history locks.
+        // Release settings before pushing history. updateSettings releases settings,
+        // acquires transition, then rechecks the mode. Equal-mode writes bypass this
+        // nonrecursive lock for latch-release reentrancy.
+        mutable std::mutex depth_window_transition_mutex_;
         mutable std::mutex camera_metrics_mutex_;
         mutable std::mutex vulkan_mesh_frame_mutex_;
         VulkanMeshFrame vulkan_mesh_frame_;
@@ -927,6 +1140,8 @@ namespace lfs::vis {
         lfs::event::ScopedHandler event_handlers_;
 
         friend class RenderingManagerEventsTest_SceneClearedResetsFrustumLoaderSyncCache_Test;
+        friend class DepthWindowPanelsTest_ParkedGtPanelWriteRefusesWithoutMutation_Test;
+        friend class ::PythonIntegrationTest_ParkedGtPanelWindowRequestsAreAtomicallyRefused_Test;
         friend class SceneManager;
     };
 

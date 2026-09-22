@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "depth_window_state.hpp"
 #include "dirty_flags.hpp"
 #include "internal/viewport.hpp"
 #include "rendering_types.hpp"
@@ -77,6 +78,7 @@ namespace lfs::vis {
         glm::ivec2 viewport_pos;
         DirtyMask frame_dirty = 0;
         bool training_active = false;
+        bool depth_window_drag_preview = false;
 
         CursorPreviewState cursor_preview;
         GizmoState gizmo;
@@ -85,6 +87,8 @@ namespace lfs::vis {
         int hovered_gaussian_id = -1;
         float selection_flash_intensity = 0;
         std::vector<FrameViewPanel> view_panels;
+        glm::vec2 scene_jitter_pixels{0.0f};
+        std::array<DepthWindowState, 2> panel_depth_windows{};
 
         [[nodiscard]] const FrameViewPanel* findViewPanel(const SplitViewPanelId panel_id) const {
             for (const auto& panel : view_panels) {
@@ -97,11 +101,23 @@ namespace lfs::vis {
 
         [[nodiscard]] lfs::rendering::FrameView makeFrameView(const Viewport& source,
                                                               const glm::ivec2 size) const {
+            std::optional<lfs::rendering::CameraIntrinsics> containment_intrinsics;
+            if (!settings.orthographic) {
+                const auto [fx, fy] =
+                    lfs::rendering::computePixelFocalLengths(size, settings.focal_length_mm);
+                containment_intrinsics = lfs::rendering::CameraIntrinsics{
+                    .focal_x = fx,
+                    .focal_y = fy,
+                    .center_x = 0.5f * static_cast<float>(size.x),
+                    .center_y = 0.5f * static_cast<float>(size.y),
+                };
+            }
             return {.rotation = source.getRotationMatrix(),
                     .translation = source.getTranslation(),
                     .size = size,
                     .focal_length_mm = settings.focal_length_mm,
                     .intrinsics_override = std::nullopt,
+                    .containment_intrinsics = containment_intrinsics,
                     .near_plane = lfs::rendering::DEFAULT_NEAR_PLANE,
                     .far_plane = settings.depth_clip_enabled ? settings.depth_clip_far
                                                              : lfs::rendering::DEFAULT_FAR_PLANE,
@@ -200,18 +216,30 @@ namespace lfs::vis {
     inline void applyGTComparisonRenderCamera(
         lfs::rendering::FrameView& frame_view,
         bool& equirectangular,
+        const GTRenderCamera& render_camera) {
+        frame_view.rotation = render_camera.rotation;
+        frame_view.translation = render_camera.translation;
+        frame_view.intrinsics_override = render_camera.intrinsics;
+        // The GT camera is unjittered by construction (temporal is ineligible for GT split), and
+        // this replaces the draw override wholesale — so the containment value must be replaced
+        // in the same operation or it keeps the pre-GT interactive camera. For an equirectangular
+        // GT camera render_camera.intrinsics is empty by construction
+        // (split_view_service.cpp:78-103), which correctly clears BOTH fields: equirect ignores
+        // cx/cy, and the host does not write overlay slot 12 for an equirect request.
+        frame_view.containment_intrinsics = render_camera.intrinsics;
+        frame_view.orthographic = false;
+        frame_view.ortho_scale = lfs::rendering::DEFAULT_ORTHO_SCALE;
+        equirectangular = render_camera.equirectangular;
+    }
+
+    inline void applyGTComparisonRenderCamera(
+        lfs::rendering::FrameView& frame_view,
+        bool& equirectangular,
         const std::optional<GTComparisonContext>& gt_context) {
         if (!gt_context || !gt_context->render_camera.has_value()) {
             return;
         }
-
-        const auto& render_camera = *gt_context->render_camera;
-        frame_view.rotation = render_camera.rotation;
-        frame_view.translation = render_camera.translation;
-        frame_view.intrinsics_override = render_camera.intrinsics;
-        frame_view.orthographic = false;
-        frame_view.ortho_scale = lfs::rendering::DEFAULT_ORTHO_SCALE;
-        equirectangular = render_camera.equirectangular;
+        applyGTComparisonRenderCamera(frame_view, equirectangular, *gt_context->render_camera);
     }
 
 } // namespace lfs::vis

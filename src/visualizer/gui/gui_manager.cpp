@@ -59,6 +59,7 @@
 #include "core/events.hpp"
 #include "core/parameters.hpp"
 #include "core/scene.hpp"
+#include "operator/ops/depth_window_ops.hpp"
 #include "python/gil.hpp"
 #include "python/package_manager.hpp"
 #include "python/python_runtime.hpp"
@@ -2419,43 +2420,6 @@ namespace lfs::vis::gui {
             return alpha;
         }
 
-        [[nodiscard]] glm::vec4 cameraFrustumColor(const lfs::core::Camera& camera,
-                                                   const size_t camera_index,
-                                                   const RenderSettings& settings,
-                                                   const std::span<const glm::vec3> per_camera_colors,
-                                                   const float alpha,
-                                                   const bool focused,
-                                                   const bool disabled,
-                                                   const bool emphasized) {
-            const bool has_override = camera_index < per_camera_colors.size();
-            const bool is_validation = camera.image_name().find("test") != std::string::npos;
-            glm::vec3 color = is_validation ? settings.eval_camera_color : settings.train_camera_color;
-            if (has_override) {
-                const glm::vec3 override_color = per_camera_colors[camera_index];
-                if (std::isfinite(override_color.x) &&
-                    std::isfinite(override_color.y) &&
-                    std::isfinite(override_color.z)) {
-                    color = override_color;
-                }
-            }
-
-            float final_alpha = alpha;
-            if (emphasized) {
-                color = glm::vec3(1.0f, 0.55f, 0.0f);
-                final_alpha = std::min(1.0f, final_alpha + 0.4f);
-            }
-            if (focused) {
-                color = is_validation ? glm::vec3(0.9f, 0.75f, 0.0f)
-                                      : glm::vec3(1.0f, 0.55f, 0.0f);
-                final_alpha = std::min(1.0f, final_alpha + 0.3f);
-            }
-            if (disabled) {
-                color = glm::mix(color, glm::vec3(0.5f), 0.5f);
-                final_alpha *= 0.5f;
-            }
-            return glm::vec4(color, std::clamp(final_alpha, 0.0f, 1.0f));
-        }
-
         [[nodiscard]] std::optional<glm::mat4> cameraFrustumModelMatrix(
             const lfs::core::Camera& camera,
             const glm::mat4& visualizer_camera_to_world,
@@ -3226,32 +3190,170 @@ namespace lfs::vis::gui {
             }
         }
 
+        // The depth-window rectangle. Extracted so the GT compare panel can own it without
+        // duplicating the crop/ellipsoid/frustum/axis/pivot overlays that the shared panel
+        // collector drives. The math is byte-identical to its previous inline form (F7).
+        void appendScreenWindowOverlay(VulkanViewportPassParams& params,
+                                       const VulkanGuidePanelTarget& panel,
+                                       const RenderSettings& settings,
+                                       const float scale_x,
+                                       const float scale_y,
+                                       const float offset_x,
+                                       const float offset_y) {
+            if (!settings.depth_filter_enabled) {
+                return;
+            }
+            // KEEP IN SYNC: the screen-window formula lives in four places —
+            // this overlay (rect only, no depth test),
+            // vertex_shader.slang compute_splat_active_state,
+            // filterSelectionByScreenWindowKernel (selection_ops.cu), and the
+            // CPU reference in tests/test_selection_screen_window.cpp.
+            // Contract: the window RECTANGLE is framebuffer-centred in all four
+            // copies; the splat projection uses the displayed camera's real
+            // unjittered intrinsics; jitter moves the draw sample, not the
+            // containment boundary.
+            const float W = static_cast<float>(std::max(panel.render_size.x, 1));
+            const float H = static_cast<float>(std::max(panel.render_size.y, 1));
+
+            const float half_w = 0.5f * scale_x * W;
+            const float half_h = 0.5f * scale_y * H;
+            const float cx = 0.5f * W + offset_x * (0.5f * W - half_w);
+            const float cy = 0.5f * H + offset_y * (0.5f * H - half_h);
+            const glm::vec2 min_screen =
+                renderToPanelScreen(panel, glm::vec2(cx - half_w, cy - half_h));
+            const glm::vec2 max_screen =
+                renderToPanelScreen(panel, glm::vec2(cx + half_w, cy + half_h));
+            const glm::vec2 tl{min_screen.x, min_screen.y};
+            const glm::vec2 tr{max_screen.x, min_screen.y};
+            const glm::vec2 br{max_screen.x, max_screen.y};
+            const glm::vec2 bl{min_screen.x, max_screen.y};
+            const auto append_rect = [&](const glm::vec4& color, const float thickness) {
+                appendShapeOverlayLine(params.ui_shape_overlay_triangles, params, tl, tr, color, thickness);
+                appendShapeOverlayLine(params.ui_shape_overlay_triangles, params, tr, br, color, thickness);
+                appendShapeOverlayLine(params.ui_shape_overlay_triangles, params, br, bl, color, thickness);
+                appendShapeOverlayLine(params.ui_shape_overlay_triangles, params, bl, tl, color, thickness);
+            };
+            append_rect(glm::vec4(0.0f, 0.0f, 0.0f, 0.85f), 9.0f);
+            append_rect(glm::vec4(1.0f, 1.0f, 1.0f, 0.90f), 6.0f);
+            append_rect(glm::vec4(1.0f, 1.0f, 1.0f, 1.0f), 4.5f);
+        }
+
         void appendCropAndFilterOverlays(VulkanViewportPassParams& params,
                                          const VulkanGuidePanelTarget& panel,
                                          const RenderSettings& settings,
                                          const SceneRenderState* scene_state,
                                          const SceneManager* scene_manager,
-                                         const GizmoState& gizmo) {
-            if (settings.depth_filter_enabled) {
-                const glm::mat4 filter_to_world = settings.depth_filter_transform.toMat4();
-                appendProjectedBox(params, panel, settings,
-                                   settings.depth_filter_min,
-                                   settings.depth_filter_max,
-                                   filter_to_world,
-                                   glm::vec4(0.0f, 0.0f, 0.0f, 0.85f),
-                                   9.0f);
-                appendProjectedBox(params, panel, settings,
-                                   settings.depth_filter_min,
-                                   settings.depth_filter_max,
-                                   filter_to_world,
-                                   glm::vec4(1.0f, 1.0f, 1.0f, 0.90f),
-                                   6.0f);
-                appendProjectedBox(params, panel, settings,
-                                   settings.depth_filter_min,
-                                   settings.depth_filter_max,
-                                   filter_to_world,
-                                   glm::vec4(1.0f, 1.0f, 1.0f, 1.0f),
-                                   4.5f);
+                                         const GizmoState& gizmo,
+                                         const float depth_window_scale_x,
+                                         const float depth_window_scale_y,
+                                         const float depth_window_offset_x,
+                                         const float depth_window_offset_y,
+                                         const bool suppress_screen_window = false) {
+            if (!suppress_screen_window) {
+                appendScreenWindowOverlay(params, panel, settings,
+                                          depth_window_scale_x, depth_window_scale_y,
+                                          depth_window_offset_x, depth_window_offset_y);
+                if (settings.depth_filter_enabled) {
+                    const op::DepthWindowPanelMapping window_panel{
+                        .panel = panel.panel,
+                        .x = panel.pos.x,
+                        .y = panel.pos.y,
+                        .width = panel.size.x,
+                        .height = panel.size.y,
+                        .render_width = panel.render_size.x,
+                        .render_height = panel.render_size.y,
+                    };
+                    const auto screen_rect = op::depthWindowScreenRect(
+                        window_panel,
+                        depth_window_scale_x,
+                        depth_window_scale_y,
+                        depth_window_offset_x,
+                        depth_window_offset_y);
+                    const auto& overlay_state = op::depthWindowOverlayState();
+                    if (overlay_state.visible) {
+                        const auto geometry = op::depthWindowHandleGeometry(screen_rect);
+                        const auto append_square = [&](const glm::vec2 center,
+                                                       const float radius,
+                                                       const glm::vec4 color) {
+                            const glm::vec2 extent(radius);
+                            appendShapeOverlayQuad(
+                                params.ui_shape_overlay_triangles,
+                                params.viewport_pos,
+                                params.viewport_size,
+                                center + glm::vec2(-extent.x, -extent.y),
+                                center + glm::vec2(extent.x, -extent.y),
+                                center + glm::vec2(extent.x, extent.y),
+                                center + glm::vec2(-extent.x, extent.y),
+                                center,
+                                center,
+                                color,
+                                {3.0f, 0.0f, 0.0f, 1.0f});
+                        };
+                        const auto append_move_glyph = [&](const glm::vec2 center,
+                                                           const float s,
+                                                           const glm::vec4 color) {
+                            const float bar_w = 0.12f * s;
+                            const float bar_end = 0.62f * s;
+                            const float head_w = 0.30f * s;
+                            const auto poly = [&](std::initializer_list<glm::vec2> pts) {
+                                std::array<glm::vec2, 4> buf;
+                                std::copy(pts.begin(), pts.end(), buf.begin());
+                                appendShapeOverlayPolygon(
+                                    params.ui_shape_overlay_triangles, params,
+                                    std::span<const glm::vec2>(buf.data(), pts.size()),
+                                    center, center, color, {3.0f, 0.0f, 0.0f, 1.0f});
+                            };
+                            const glm::vec2 c = center;
+                            poly({c + glm::vec2(-bar_end, -bar_w), c + glm::vec2(bar_end, -bar_w),
+                                  c + glm::vec2(bar_end, bar_w), c + glm::vec2(-bar_end, bar_w)});
+                            poly({c + glm::vec2(-bar_w, -bar_end), c + glm::vec2(bar_w, -bar_end),
+                                  c + glm::vec2(bar_w, bar_end), c + glm::vec2(-bar_w, bar_end)});
+                            poly({c + glm::vec2(-s, 0.0f), c + glm::vec2(-bar_end, -head_w),
+                                  c + glm::vec2(-bar_end, head_w)});
+                            poly({c + glm::vec2(s, 0.0f), c + glm::vec2(bar_end, head_w),
+                                  c + glm::vec2(bar_end, -head_w)});
+                            poly({c + glm::vec2(0.0f, -s), c + glm::vec2(head_w, -bar_end),
+                                  c + glm::vec2(-head_w, -bar_end)});
+                            poly({c + glm::vec2(0.0f, s), c + glm::vec2(-head_w, bar_end),
+                                  c + glm::vec2(head_w, bar_end)});
+                        };
+                        const auto& accent_src = lfs::vis::theme().palette.primary;
+                        const glm::vec4 accent(accent_src.x, accent_src.y,
+                                               accent_src.z, 0.95f);
+                        const auto draw_handle = [&](const glm::vec2 center,
+                                                     const bool circle) {
+                            constexpr float radius = op::DEPTH_WINDOW_HANDLE_DRAW_RADIUS_DP;
+                            const auto append_pass = [&](const float pass_radius,
+                                                         const glm::vec4 color) {
+                                if (circle) {
+                                    appendShapeOverlayCircle(
+                                        params.ui_shape_overlay_triangles,
+                                        params, center, pass_radius, color);
+                                } else {
+                                    append_square(center, pass_radius, color);
+                                }
+                            };
+                            append_pass(radius + 3.0f, glm::vec4(0.0f, 0.0f, 0.0f, 0.85f));
+                            append_pass(radius, accent);
+                        };
+
+                        if (!overlay_state.hide_handles) {
+                            for (size_t index = 0; index < geometry.corners.size(); ++index) {
+                                draw_handle(geometry.corners[index], false);
+                            }
+                            for (size_t index = 0; index < geometry.edge_midpoints.size(); ++index) {
+                                draw_handle(geometry.edge_midpoints[index], false);
+                            }
+                        }
+                        if (!overlay_state.hide_handles) {
+                            constexpr float glyph =
+                                op::DEPTH_WINDOW_HANDLE_DRAW_RADIUS_DP * 3.2f;
+                            append_move_glyph(geometry.center, glyph + 2.0f,
+                                              glm::vec4(0.0f, 0.0f, 0.0f, 0.85f));
+                            append_move_glyph(geometry.center, glyph, accent);
+                        }
+                    }
+                }
             }
 
             const auto selected_cropbox_is_visible = [&]() {
@@ -3380,6 +3482,7 @@ namespace lfs::vis::gui {
                                             const ViewportLayout& viewport_layout,
                                             const RenderSettings& settings,
                                             RenderingManager& rendering_manager,
+                                            const RenderingManager::DepthWindowOverlaySnapshot& depth_window_snapshot,
                                             SceneManager* scene_manager,
                                             const SceneRenderState* scene_state,
                                             const GizmoState& gizmo) {
@@ -3408,7 +3511,25 @@ namespace lfs::vis::gui {
                     continue;
                 }
 
-                appendCropAndFilterOverlays(params, panel, settings, scene_state, scene_manager, gizmo);
+                // The depth window (rect + handles) draws on no panel while GT
+                // comparison mode is active — see depthWindowOverlaySuppressed.
+                const lfs::vis::DepthWindowState panel_depth_window =
+                    depth_window_snapshot.independent_dual_active
+                        ? depth_window_snapshot.panel_windows[splitViewPanelIndex(panel.panel)]
+                        : lfs::vis::DepthWindowState{
+                              .near_plane = -settings.depth_filter_max.z,
+                              .far_plane = -settings.depth_filter_min.z,
+                              .scale_x = settings.depth_filter_scale_x,
+                              .scale_y = settings.depth_filter_scale_y,
+                              .offset_x = settings.depth_filter_offset_x,
+                              .offset_y = settings.depth_filter_offset_y,
+                          };
+                appendCropAndFilterOverlays(params, panel, settings, scene_state, scene_manager, gizmo,
+                                            panel_depth_window.scale_x,
+                                            panel_depth_window.scale_y,
+                                            panel_depth_window.offset_x,
+                                            panel_depth_window.offset_y,
+                                            op::depthWindowOverlaySuppressed(rendering_manager.isGTComparisonActive()));
                 if (settings.show_coord_axes) {
                     for (size_t axis = 0; axis < axes.size(); ++axis) {
                         if (settings.axes_visibility[axis]) {
@@ -3436,7 +3557,6 @@ namespace lfs::vis::gui {
                     appendPivotShaderOverlay(params, panel, settings, panel.viewport->camera.getPivot(), opacity);
                 }
             }
-
             if (scene_manager) {
                 appendCameraFrustumOverlays(params,
                                             panels,
@@ -3748,6 +3868,10 @@ namespace lfs::vis::gui {
         // Create components
         menu_bar_ = std::make_unique<MenuBar>();
         rml_modal_overlay_ = std::make_unique<RmlModalOverlay>(&rmlui_manager_);
+        rml_progress_overlay_ = std::make_unique<RmlProgressOverlay>(
+            &rmlui_manager_,
+            [this] { async_tasks_.dismissImport(); },
+            [this] { async_tasks_.cancelVideoExport(); });
         rml_toast_overlay_ = std::make_unique<RmlToastOverlay>(&rmlui_manager_);
         global_context_menu_ = std::make_unique<GlobalContextMenu>(&rmlui_manager_);
         lfs::python::set_global_context_menu(global_context_menu_.get());
@@ -4583,7 +4707,7 @@ namespace lfs::vis::gui {
             viewer_->getRenderingManager()->setViewportResizeActive(true);
             int ww = 0;
             int wh = 0;
-            SDL_GetWindowSize(viewer_->getWindow(), &ww, &wh);
+            SDL_GetWindowSizeInPixels(viewer_->getWindow(), &ww, &wh);
             ScreenState ss;
             ss.work_pos = {0.0f, 0.0f};
             ss.work_size = {static_cast<float>(ww), static_cast<float>(wh)};
@@ -4596,7 +4720,7 @@ namespace lfs::vis::gui {
             viewer_->getRenderingManager()->setViewportResizeActive(true);
             int ww = 0;
             int wh = 0;
-            SDL_GetWindowSize(viewer_->getWindow(), &ww, &wh);
+            SDL_GetWindowSizeInPixels(viewer_->getWindow(), &ww, &wh);
             ScreenState ss;
             ss.work_pos = {0.0f, 0.0f};
             ss.work_size = {static_cast<float>(ww), static_cast<float>(wh)};
@@ -4891,16 +5015,6 @@ namespace lfs::vis::gui {
         return result;
     }
 
-    GuiManager::DevResourceScanResult GuiManager::scanDevResourceFiles(const bool detect_changes) {
-        auto result = scanDevResourceFilesSnapshot(dev_resource_watch_.rml_dir,
-                                                   dev_resource_watch_.locale_dir,
-                                                   dev_resource_watch_.file_times,
-                                                   detect_changes);
-        if (!result.scan_failed)
-            dev_resource_watch_.file_times = result.file_times;
-        return result;
-    }
-
     void GuiManager::launchDevResourceScan() {
         if (dev_resource_watch_.scan_future.valid())
             return;
@@ -4991,6 +5105,8 @@ namespace lfs::vis::gui {
 
         if (rml_modal_overlay_)
             rml_modal_overlay_->reloadResources();
+        if (rml_progress_overlay_)
+            rml_progress_overlay_->reloadResources();
         if (rml_toast_overlay_)
             rml_toast_overlay_->reloadResources();
         if (global_context_menu_)
@@ -5013,6 +5129,8 @@ namespace lfs::vis::gui {
         if (global_context_menu_ && global_context_menu_->isOpen())
             return true;
         if (rml_modal_overlay_ && rml_modal_overlay_->isOpen())
+            return true;
+        if (rml_progress_overlay_ && rml_progress_overlay_->isVisible())
             return true;
 
         return false;
@@ -5095,6 +5213,7 @@ namespace lfs::vis::gui {
         lfs::python::set_global_context_menu(nullptr);
 
         rml_modal_overlay_.reset();
+        rml_progress_overlay_.reset();
         rml_toast_overlay_.reset();
         global_context_menu_.reset();
         panels::ShutdownPythonConsoleRml();
@@ -5261,6 +5380,7 @@ namespace lfs::vis::gui {
 
         if (auto* const rendering_manager = viewer_ ? viewer_->getRenderingManager() : nullptr) {
             const auto settings = rendering_manager->getSettings();
+            const auto depth_window_snapshot = rendering_manager->getDepthWindowOverlaySnapshot();
             params.scene_upscaler = sceneUpscalerBackendFromId(settings.scene_upscaler)
                                         .value_or(SceneUpscalerBackend::Native);
             params.background_color = settings.background_color;
@@ -5326,6 +5446,7 @@ namespace lfs::vis::gui {
                                                viewport_layout_,
                                                settings,
                                                *rendering_manager,
+                                               depth_window_snapshot,
                                                scene_manager,
                                                overlay_scene_state ? &*overlay_scene_state : nullptr,
                                                gizmo_state);
@@ -5346,6 +5467,7 @@ namespace lfs::vis::gui {
             // Pull GPU mesh / environment frame populated by renderVulkanFrame.
             // vulkan_viewport_pass rasterizes these on the GPU.
             auto mesh_frame = rendering_manager->getVulkanMeshFrame();
+            auto temporal_frame = std::move(mesh_frame.temporal);
             params.mesh_view_projection = mesh_frame.view_projection;
             params.mesh_camera_position = mesh_frame.camera_position;
             params.mesh_items = std::move(mesh_frame.items);
@@ -5357,102 +5479,328 @@ namespace lfs::vis::gui {
             // run after params.split_view is populated (split stitching is gated on
             // params.split_view.enabled).
             rendering_manager->bindViewportInteropParams(params, frame_slot, export_locked);
+
+            const glm::ivec2 output_extent = temporal_frame
+                                                 ? temporal_frame->input.output_extent
+                                                 : glm::ivec2(0);
+            const bool temporal_inputs_match =
+                temporal_frame.has_value() && !params.split_view.enabled &&
+                params.external_scene_image_view != VK_NULL_HANDLE &&
+                params.depth_blit.external_image_view != VK_NULL_HANDLE &&
+                params.scene_image_size.x > 0 && params.scene_image_size.y > 0 &&
+                params.depth_blit.external_image_size == params.scene_image_size &&
+                output_extent.x > 0 && output_extent.y > 0 &&
+                temporal_frame->input.view.size == params.scene_image_size;
+            if (temporal_inputs_match) {
+                const bool jitter_enabled = !temporal_frame->input.view.orthographic;
+                const glm::ivec2 allocation_extent =
+                    params.scene_image_alloc_size.x >= params.scene_image_size.x &&
+                            params.scene_image_alloc_size.y >= params.scene_image_size.y
+                        ? params.scene_image_alloc_size
+                        : params.scene_image_size;
+                const glm::ivec2 depth_allocation_extent =
+                    params.depth_blit.external_image_allocation_size.x >=
+                                params.depth_blit.external_image_size.x &&
+                            params.depth_blit.external_image_allocation_size.y >=
+                                params.depth_blit.external_image_size.y
+                        ? params.depth_blit.external_image_allocation_size
+                        : params.depth_blit.external_image_size;
+                const SceneDepthContract depth = makeSceneDepthContract(
+                    true,
+                    SceneDepthStorage::VulkanImage,
+                    params.depth_blit.depth_is_ndc ? SceneDepthEncoding::VulkanNdc
+                                                   : SceneDepthEncoding::LinearView,
+                    params.scene_image_size,
+                    params.depth_blit.near_plane,
+                    params.depth_blit.far_plane,
+                    temporal_frame->input.view.orthographic,
+                    params.depth_blit.flip_y);
+                params.temporal = VulkanSceneTemporalPipelineRequest{
+                    .temporal = {
+                        .view = TemporalViewId::Main,
+                        .requirements = {
+                            .depth = true,
+                            .motion = true,
+                            .jitter = jitter_enabled,
+                            .history_color = true,
+                            .history_depth = true,
+                        },
+                        .frame = temporal_frame->input,
+                        .render_extent = params.scene_image_size,
+                        .output_extent = output_extent,
+                    },
+                    .motion = {
+                        .enabled = true,
+                        .depth_view = params.depth_blit.external_image_view,
+                        .current_depth_layout = params.depth_blit.external_image_layout,
+                        .depth_generation = params.depth_blit.external_image_generation,
+                        .depth = depth,
+                        .render_extent = params.scene_image_size,
+                        .flip_y = params.scene_image_flip_y,
+                    },
+                    .resolve = {
+                        .enabled = true,
+                        .view = TemporalViewId::Main,
+                        .current_color_view = params.external_scene_image_view,
+                        .current_color_layout = params.external_scene_image_layout,
+                        .render_extent = params.scene_image_size,
+                        .output_extent = output_extent,
+                        .current_allocation_extent = allocation_extent,
+                        .history_weight = temporal_frame->resolve_settings.history_weight,
+                        .motion_rejection_pixels = temporal_frame->resolve_settings.motion_rejection_pixels,
+                        .motion_confidence_pixels = temporal_frame->resolve_settings.motion_confidence_pixels,
+                        .current_sharpness = temporal_frame->resolve_settings.current_sharpness,
+                        .current_depth = {
+                            .enabled = true,
+                            .view = TemporalViewId::Main,
+                            .current_depth_view = params.depth_blit.external_image_view,
+                            .current_depth_layout = params.depth_blit.external_image_layout,
+                            .depth = depth,
+                            .allocation_extent = depth_allocation_extent,
+                        },
+                        .depth_relative_threshold = temporal_frame->resolve_settings.depth_relative_threshold,
+                        .depth_absolute_threshold = temporal_frame->resolve_settings.depth_absolute_threshold,
+                    },
+                    .frame_slot = frame_slot,
+                };
+                if (params.scene_upscaler == SceneUpscalerBackend::NvidiaDlss &&
+                    params.external_scene_image != VK_NULL_HANDLE &&
+                    params.depth_blit.external_image != VK_NULL_HANDLE) {
+                    VulkanSceneDlssPipelineRequest dlss_request{
+                        .temporal = *params.temporal,
+                        .color_image = params.external_scene_image,
+                        .color_format = VK_FORMAT_R8G8B8A8_UNORM,
+                        .depth_image = params.depth_blit.external_image,
+                        .depth_format = params.depth_blit.external_image_format,
+                        .quality = temporal_frame->quality,
+                    };
+                    if (validVulkanSceneDlssPipelineRequest(dlss_request))
+                        params.dlss = dlss_request;
+                }
+            }
+
+            if (params.split_view.enabled) {
+                const auto make_split_temporal_request =
+                    [frame_slot](const VulkanSplitViewPanel& panel,
+                                 const TemporalViewId view)
+                    -> std::optional<VulkanSceneTemporalPipelineRequest> {
+                    if (!panel.temporal_input ||
+                        panel.external_image_view == VK_NULL_HANDLE ||
+                        panel.depth_image_view == VK_NULL_HANDLE ||
+                        panel.image_size.x <= 0 || panel.image_size.y <= 0 ||
+                        panel.depth_image_size != panel.image_size ||
+                        panel.temporal_input->view.size != panel.image_size) {
+                        return std::nullopt;
+                    }
+                    const glm::ivec2 output_extent = panel.temporal_input->output_extent;
+                    if (output_extent.x <= 0 || output_extent.y <= 0) {
+                        return std::nullopt;
+                    }
+                    const glm::ivec2 allocation_extent =
+                        panel.allocation_size.x >= panel.image_size.x &&
+                                panel.allocation_size.y >= panel.image_size.y
+                            ? panel.allocation_size
+                            : panel.image_size;
+                    const glm::ivec2 depth_allocation_extent =
+                        panel.depth_allocation_size.x >= panel.depth_image_size.x &&
+                                panel.depth_allocation_size.y >= panel.depth_image_size.y
+                            ? panel.depth_allocation_size
+                            : panel.depth_image_size;
+                    const bool jitter_enabled = !panel.temporal_input->view.orthographic;
+                    const SceneDepthContract depth = makeSceneDepthContract(
+                        true,
+                        SceneDepthStorage::VulkanImage,
+                        SceneDepthEncoding::LinearView,
+                        panel.image_size,
+                        panel.temporal_input->view.near_plane,
+                        panel.temporal_input->view.far_plane,
+                        panel.temporal_input->view.orthographic,
+                        panel.flip_y);
+                    return VulkanSceneTemporalPipelineRequest{
+                        .temporal = {
+                            .view = view,
+                            .requirements = {
+                                .depth = true,
+                                .motion = true,
+                                .jitter = jitter_enabled,
+                                .history_color = true,
+                                .history_depth = true,
+                            },
+                            .frame = *panel.temporal_input,
+                            .render_extent = panel.image_size,
+                            .output_extent = output_extent,
+                        },
+                        .motion = {
+                            .enabled = true,
+                            .depth_view = panel.depth_image_view,
+                            .current_depth_layout = panel.depth_image_layout,
+                            .depth_generation = panel.depth_image_generation,
+                            .depth = depth,
+                            .render_extent = panel.image_size,
+                            .flip_y = panel.flip_y,
+                        },
+                        .resolve = {
+                            .enabled = true,
+                            .view = view,
+                            .current_color_view = panel.external_image_view,
+                            .current_color_layout = panel.external_image_layout,
+                            .render_extent = panel.image_size,
+                            .output_extent = output_extent,
+                            .current_allocation_extent = allocation_extent,
+                            .history_weight = panel.temporal_settings.history_weight,
+                            .motion_rejection_pixels = panel.temporal_settings.motion_rejection_pixels,
+                            .motion_confidence_pixels = panel.temporal_settings.motion_confidence_pixels,
+                            .current_sharpness = panel.temporal_settings.current_sharpness,
+                            .current_depth = {
+                                .enabled = true,
+                                .view = view,
+                                .current_depth_view = panel.depth_image_view,
+                                .current_depth_layout = panel.depth_image_layout,
+                                .depth = depth,
+                                .allocation_extent = depth_allocation_extent,
+                            },
+                            .depth_relative_threshold = panel.temporal_settings.depth_relative_threshold,
+                            .depth_absolute_threshold = panel.temporal_settings.depth_absolute_threshold,
+                        },
+                        .frame_slot = frame_slot,
+                    };
+                };
+                params.split_temporal[0] = make_split_temporal_request(
+                    params.split_view.left, TemporalViewId::SplitLeft);
+                params.split_temporal[1] = make_split_temporal_request(
+                    params.split_view.right, TemporalViewId::SplitRight);
+                if (params.scene_upscaler == SceneUpscalerBackend::NvidiaDlss) {
+                    const auto make_split_dlss_request =
+                        [](const VulkanSplitViewPanel& panel,
+                           const std::optional<VulkanSceneTemporalPipelineRequest>& temporal)
+                        -> std::optional<VulkanSceneDlssPipelineRequest> {
+                        if (!temporal ||
+                            panel.external_image == VK_NULL_HANDLE ||
+                            panel.depth_image == VK_NULL_HANDLE) {
+                            return std::nullopt;
+                        }
+                        VulkanSceneDlssPipelineRequest request{
+                            .temporal = *temporal,
+                            .color_image = panel.external_image,
+                            .color_format = VK_FORMAT_R8G8B8A8_UNORM,
+                            .depth_image = panel.depth_image,
+                            .depth_format = panel.depth_image_format,
+                            .quality = panel.temporal_quality,
+                        };
+                        if (!validVulkanSceneDlssPipelineRequest(request))
+                            return std::nullopt;
+                        return request;
+                    };
+                    params.split_dlss[0] = make_split_dlss_request(
+                        params.split_view.left, params.split_temporal[0]);
+                    params.split_dlss[1] = make_split_dlss_request(
+                        params.split_view.right, params.split_temporal[1]);
+                }
+            }
         }
 
         // Use the same window-relative snapshot as cursor selection and hit tests.
         // Wayland global coordinates are synthesized, not a late pointer sample.
         if (viewer_ && !ui_hidden_ && !guiFocusState().want_capture_mouse) {
             if (auto* const sel = viewer_->getSelectionTool(); sel && sel->isEnabled()) {
-                const auto& input = viewer_->getWindowManager()->frameInput();
-                const glm::vec2 mp{input.mouse_x, input.mouse_y};
-                if (isPositionInViewport(mp.x, mp.y)) {
-                    auto* const rm = viewer_->getRenderingManager();
-                    const auto mode = rm ? rm->getSelectionPreviewMode()
-                                         : lfs::vis::SelectionPreviewMode::Centers;
-                    const bool hardware_selection_ring =
-                        isHardwareSelectionRingActive();
-                    const auto& palette = lfs::vis::theme().palette;
-                    const auto& base = (SDL_GetModState() & SDL_KMOD_CTRL) ? palette.error : palette.primary;
-                    const glm::vec4 color{base.x * 0.85f, base.y * 0.85f, base.z * 0.85f, 0.85f};
-                    auto line = [&](const glm::vec2 a, const glm::vec2 b, const float thickness = 2.0f) {
-                        appendShapeOverlayLine(params.ui_shape_overlay_triangles, params, a, b, color, thickness);
-                    };
-                    auto rect = [&](const glm::vec2 mn, const glm::vec2 mx, const float thickness = 2.0f) {
-                        line({mn.x, mn.y}, {mx.x, mn.y}, thickness);
-                        line({mx.x, mn.y}, {mx.x, mx.y}, thickness);
-                        line({mx.x, mx.y}, {mn.x, mx.y}, thickness);
-                        line({mn.x, mx.y}, {mn.x, mn.y}, thickness);
-                    };
-                    auto polyline = [&](const auto& pts, const bool closed, const float thickness = 2.0f) {
-                        for (std::size_t i = 1; i < pts.size(); ++i) {
-                            line(pts[i - 1], pts[i], thickness);
-                        }
-                        if (closed && pts.size() > 1) {
-                            line(pts.back(), pts.front(), thickness);
-                        }
-                    };
+                const SDL_Keymod suppress_mods = SDL_GetModState();
+                const bool depth_window_chord = (suppress_mods & SDL_KMOD_SHIFT) && (suppress_mods & SDL_KMOD_ALT);
+                // Under GT comparison the depth-window chord has no meaning, so the
+                // selection ring is never suppressed there.
+                auto* const chord_rm = viewer_->getRenderingManager();
+                const bool chord_gt_active = chord_rm && chord_rm->isGTComparisonActive();
+                if (!(depth_window_chord && sel->isDepthFilterEnabled() && !chord_gt_active)) {
+                    const auto& input = viewer_->getWindowManager()->frameInput();
+                    const glm::vec2 mp{input.mouse_x, input.mouse_y};
+                    if (isPositionInViewport(mp.x, mp.y)) {
+                        auto* const rm = viewer_->getRenderingManager();
+                        const auto mode = rm ? rm->getSelectionPreviewMode()
+                                             : lfs::vis::SelectionPreviewMode::Centers;
+                        const bool hardware_selection_ring =
+                            isHardwareSelectionRingActive();
+                        const auto& palette = lfs::vis::theme().palette;
+                        const auto& base = (SDL_GetModState() & SDL_KMOD_CTRL) ? palette.error : palette.primary;
+                        const glm::vec4 color{base.x * 0.85f, base.y * 0.85f, base.z * 0.85f, 0.85f};
+                        auto line = [&](const glm::vec2 a, const glm::vec2 b, const float thickness = 2.0f) {
+                            appendShapeOverlayLine(params.ui_shape_overlay_triangles, params, a, b, color, thickness);
+                        };
+                        auto rect = [&](const glm::vec2 mn, const glm::vec2 mx, const float thickness = 2.0f) {
+                            line({mn.x, mn.y}, {mx.x, mn.y}, thickness);
+                            line({mx.x, mn.y}, {mx.x, mx.y}, thickness);
+                            line({mx.x, mx.y}, {mn.x, mx.y}, thickness);
+                            line({mn.x, mx.y}, {mn.x, mn.y}, thickness);
+                        };
+                        auto polyline = [&](const auto& pts, const bool closed, const float thickness = 2.0f) {
+                            for (std::size_t i = 1; i < pts.size(); ++i) {
+                                line(pts[i - 1], pts[i], thickness);
+                            }
+                            if (closed && pts.size() > 1) {
+                                line(pts.back(), pts.front(), thickness);
+                            }
+                        };
 
-                    switch (mode) {
-                    case lfs::vis::SelectionPreviewMode::Centers:
-                        if (!hardware_selection_ring) {
+                        switch (mode) {
+                        case lfs::vis::SelectionPreviewMode::Centers:
+                            if (!hardware_selection_ring) {
+                                appendShapeOverlayCircleOutline(params.ui_shape_overlay_triangles, params,
+                                                                mp, sel->getBrushRadius(), color, 2.0f);
+                                appendShapeOverlayCircle(params.ui_shape_overlay_triangles, params,
+                                                         mp, 3.0f, color);
+                            }
+                            break;
+                        case lfs::vis::SelectionPreviewMode::Rings:
                             appendShapeOverlayCircleOutline(params.ui_shape_overlay_triangles, params,
-                                                            mp, sel->getBrushRadius(), color, 2.0f);
-                            appendShapeOverlayCircle(params.ui_shape_overlay_triangles, params,
-                                                     mp, 3.0f, color);
+                                                            mp, 10.0f, color, 2.0f);
+                            line({mp.x - 14.0f, mp.y}, {mp.x - 5.0f, mp.y}, 1.5f);
+                            line({mp.x + 5.0f, mp.y}, {mp.x + 14.0f, mp.y}, 1.5f);
+                            line({mp.x, mp.y - 14.0f}, {mp.x, mp.y - 5.0f}, 1.5f);
+                            line({mp.x, mp.y + 5.0f}, {mp.x, mp.y + 14.0f}, 1.5f);
+                            break;
+                        case lfs::vis::SelectionPreviewMode::Rectangle:
+                            rect({mp.x - 12.0f, mp.y - 9.0f}, {mp.x + 12.0f, mp.y + 9.0f});
+                            break;
+                        case lfs::vis::SelectionPreviewMode::Box:
+                            rect({mp.x - 11.0f, mp.y - 11.0f}, {mp.x + 11.0f, mp.y + 11.0f});
+                            line({mp.x - 11.0f, mp.y - 11.0f}, {mp.x - 5.0f, mp.y - 17.0f}, 1.5f);
+                            line({mp.x + 11.0f, mp.y - 11.0f}, {mp.x + 17.0f, mp.y - 17.0f}, 1.5f);
+                            line({mp.x + 11.0f, mp.y + 11.0f}, {mp.x + 17.0f, mp.y + 5.0f}, 1.5f);
+                            line({mp.x - 5.0f, mp.y - 17.0f}, {mp.x + 17.0f, mp.y - 17.0f}, 1.5f);
+                            line({mp.x + 17.0f, mp.y - 17.0f}, {mp.x + 17.0f, mp.y + 5.0f}, 1.5f);
+                            break;
+                        case lfs::vis::SelectionPreviewMode::Sphere:
+                            appendShapeOverlayCircleOutline(params.ui_shape_overlay_triangles, params,
+                                                            mp, 12.0f, color, 2.0f);
+                            appendShapeOverlayCircleOutline(params.ui_shape_overlay_triangles, params,
+                                                            mp, 7.0f, color, 1.5f);
+                            line({mp.x - 12.0f, mp.y}, {mp.x + 12.0f, mp.y}, 1.5f);
+                            break;
+                        case lfs::vis::SelectionPreviewMode::Polygon: {
+                            const std::array<glm::vec2, 3> pts{{
+                                {mp.x, mp.y - 13.0f},
+                                {mp.x + 12.0f, mp.y + 8.0f},
+                                {mp.x - 12.0f, mp.y + 8.0f},
+                            }};
+                            polyline(pts, true);
+                            break;
                         }
-                        break;
-                    case lfs::vis::SelectionPreviewMode::Rings:
-                        appendShapeOverlayCircleOutline(params.ui_shape_overlay_triangles, params,
-                                                        mp, 10.0f, color, 2.0f);
-                        line({mp.x - 14.0f, mp.y}, {mp.x - 5.0f, mp.y}, 1.5f);
-                        line({mp.x + 5.0f, mp.y}, {mp.x + 14.0f, mp.y}, 1.5f);
-                        line({mp.x, mp.y - 14.0f}, {mp.x, mp.y - 5.0f}, 1.5f);
-                        line({mp.x, mp.y + 5.0f}, {mp.x, mp.y + 14.0f}, 1.5f);
-                        break;
-                    case lfs::vis::SelectionPreviewMode::Rectangle:
-                        rect({mp.x - 12.0f, mp.y - 9.0f}, {mp.x + 12.0f, mp.y + 9.0f});
-                        break;
-                    case lfs::vis::SelectionPreviewMode::Box:
-                        rect({mp.x - 11.0f, mp.y - 11.0f}, {mp.x + 11.0f, mp.y + 11.0f});
-                        line({mp.x - 11.0f, mp.y - 11.0f}, {mp.x - 5.0f, mp.y - 17.0f}, 1.5f);
-                        line({mp.x + 11.0f, mp.y - 11.0f}, {mp.x + 17.0f, mp.y - 17.0f}, 1.5f);
-                        line({mp.x + 11.0f, mp.y + 11.0f}, {mp.x + 17.0f, mp.y + 5.0f}, 1.5f);
-                        line({mp.x - 5.0f, mp.y - 17.0f}, {mp.x + 17.0f, mp.y - 17.0f}, 1.5f);
-                        line({mp.x + 17.0f, mp.y - 17.0f}, {mp.x + 17.0f, mp.y + 5.0f}, 1.5f);
-                        break;
-                    case lfs::vis::SelectionPreviewMode::Sphere:
-                        appendShapeOverlayCircleOutline(params.ui_shape_overlay_triangles, params,
-                                                        mp, 12.0f, color, 2.0f);
-                        appendShapeOverlayCircleOutline(params.ui_shape_overlay_triangles, params,
-                                                        mp, 7.0f, color, 1.5f);
-                        line({mp.x - 12.0f, mp.y}, {mp.x + 12.0f, mp.y}, 1.5f);
-                        break;
-                    case lfs::vis::SelectionPreviewMode::Polygon: {
-                        const std::array<glm::vec2, 3> pts{{
-                            {mp.x, mp.y - 13.0f},
-                            {mp.x + 12.0f, mp.y + 8.0f},
-                            {mp.x - 12.0f, mp.y + 8.0f},
-                        }};
-                        polyline(pts, true);
-                        break;
-                    }
-                    case lfs::vis::SelectionPreviewMode::Lasso: {
-                        const std::array<glm::vec2, 6> pts{{
-                            {mp.x - 13.0f, mp.y - 2.0f},
-                            {mp.x - 8.0f, mp.y - 11.0f},
-                            {mp.x + 5.0f, mp.y - 12.0f},
-                            {mp.x + 13.0f, mp.y - 3.0f},
-                            {mp.x + 9.0f, mp.y + 9.0f},
-                            {mp.x - 7.0f, mp.y + 11.0f},
-                        }};
-                        polyline(pts, true);
-                        break;
-                    }
-                    case lfs::vis::SelectionPreviewMode::Color:
-                        appendShapeOverlayCircleOutline(params.ui_shape_overlay_triangles, params,
-                                                        mp, 8.0f, color, 2.0f);
-                        line({mp.x - 10.0f, mp.y + 10.0f}, {mp.x + 10.0f, mp.y - 10.0f});
-                        break;
+                        case lfs::vis::SelectionPreviewMode::Lasso: {
+                            const std::array<glm::vec2, 6> pts{{
+                                {mp.x - 13.0f, mp.y - 2.0f},
+                                {mp.x - 8.0f, mp.y - 11.0f},
+                                {mp.x + 5.0f, mp.y - 12.0f},
+                                {mp.x + 13.0f, mp.y - 3.0f},
+                                {mp.x + 9.0f, mp.y + 9.0f},
+                                {mp.x - 7.0f, mp.y + 11.0f},
+                            }};
+                            polyline(pts, true);
+                            break;
+                        }
+                        case lfs::vis::SelectionPreviewMode::Color:
+                            appendShapeOverlayCircleOutline(params.ui_shape_overlay_triangles, params,
+                                                            mp, 8.0f, color, 2.0f);
+                            line({mp.x - 10.0f, mp.y + 10.0f}, {mp.x + 10.0f, mp.y - 10.0f});
+                            break;
+                        }
                     }
                 }
             }
@@ -5868,6 +6216,8 @@ namespace lfs::vis::gui {
                 global_context_menu_->preload();
             if (rml_modal_overlay_)
                 rml_modal_overlay_->preload();
+            if (rml_progress_overlay_)
+                rml_progress_overlay_->preload();
             warmupNativeFileDialogBackend();
             {
                 LOG_TIMER_THRESHOLD("gui_render.panel_setup.preferences_preload", 2.0);
@@ -5943,6 +6293,7 @@ namespace lfs::vis::gui {
 
         bool modal_overlay_open = false;
         bool modal_overlay_pending = false;
+        bool progress_overlay_visible = false;
         bool context_menu_open = false;
         bool startup_overlay_blocking = startup_overlay_.blocksUnderlayInput();
         bool block_underlay_input = startup_overlay_blocking;
@@ -5951,8 +6302,10 @@ namespace lfs::vis::gui {
             rmlui_manager_.beginFrameCursorTracking();
             modal_overlay_open = rml_modal_overlay_->isOpen();
             modal_overlay_pending = rml_modal_overlay_->hasPendingRequest();
+            progress_overlay_visible = rml_progress_overlay_ && rml_progress_overlay_->isVisible();
             context_menu_open = global_context_menu_ && global_context_menu_->isOpen();
-            block_underlay_input = block_underlay_input || modal_overlay_open || modal_overlay_pending || context_menu_open;
+            block_underlay_input = block_underlay_input || modal_overlay_open || modal_overlay_pending ||
+                                   progress_overlay_visible || context_menu_open;
             if (block_underlay_input) {
                 auto& focus = guiFocusState();
                 focus.want_capture_mouse = true;
@@ -6116,7 +6469,8 @@ namespace lfs::vis::gui {
             LOG_TIMER_THRESHOLD("gui_render.panel_setup.frame_input", 0.25);
             frame_input = buildPanelInputFromSDL(sdl_input);
             startup_overlay_input = frame_input;
-            if (modal_overlay_open || modal_overlay_pending || context_menu_open)
+            if (modal_overlay_open || modal_overlay_pending || progress_overlay_visible ||
+                context_menu_open)
                 startup_overlay_input = maskInputForBlockedUi(std::move(startup_overlay_input));
             if (startup_overlay_blocking)
                 frame_input = maskInputForBlockedUi(std::move(frame_input));
@@ -6629,10 +6983,10 @@ namespace lfs::vis::gui {
                         glm::vec2{left_dock_layout.panel_width, left_dock_h});
         const bool pointer_over_left_dock_edge =
             left_dock_layout.panel_width > 0.0f &&
-            panel_input.mouse_x >= left_dock_layout.edge_min_x &&
-            panel_input.mouse_x < left_dock_layout.edge_max_x &&
-            panel_input.mouse_y >= screen.work_pos.y &&
-            panel_input.mouse_y < screen.work_pos.y + left_dock_h;
+            PanelLayoutManager::leftDockResizeRect(screen.work_pos.x, screen.work_pos.y,
+                                                   left_dock_h, current_ui_scale_,
+                                                   left_dock_layout.panel_width)
+                .contains(panel_input.mouse_x, panel_input.mouse_y);
         const bool pointer_targets_left_dock =
             pointer_over_left_dock || pointer_over_left_dock_edge;
         if (pointer_targets_left_dock &&
@@ -6971,27 +7325,63 @@ namespace lfs::vis::gui {
             });
         };
         resolve_project_asset_drag();
-        PanelInputState viewport_overlay_input = panel_input;
-        if (has_floating_panels &&
-            reg.isPositionOverFloatingPanel(panel_input.mouse_x, panel_input.mouse_y)) {
-            viewport_overlay_input = maskInputForBlockedUi(std::move(viewport_overlay_input));
-        }
-        if (pointer_targets_left_dock)
-            viewport_overlay_input = maskInputForBlockedUi(std::move(viewport_overlay_input));
+        // Other underlay consumers use masked copies. The overlay must retain
+        // the canonical stream so an already delivered DOWN can receive its UP.
+        const PanelInputState viewport_overlay_input = buildPanelInputFromSDL(sdl_input);
         {
             LOG_TIMER_THRESHOLD("gui_render.rml_viewport_overlay.processInput", 0.25);
-            if (!block_underlay_input)
-                rml_viewport_overlay_.processInput(viewport_overlay_input);
+            rml_viewport_overlay_.processInput(viewport_overlay_input, {
+                                                                           .startup = startup_overlay_blocking,
+                                                                           .progress = progress_overlay_visible,
+                                                                           .modal = modal_overlay_open,
+                                                                           .pending_modal = modal_overlay_pending,
+                                                                           .context_menu = context_menu_open,
+                                                                           .menu_pointer = menu_blocks_underlay_pointer,
+                                                                           .floating_panel = has_floating_panels &&
+                                                                                             reg.isPositionOverFloatingPanel(sdl_input.mouse_x, sdl_input.mouse_y),
+                                                                           .left_dock = pointer_targets_left_dock,
+                                                                       });
         }
-        if (rml_viewport_overlay_.wantsInput() && viewport_overlay_input.mouse_clicked[0]) {
+        // Apply overlayPressMayFocusPanel (rml_viewport_overlay.hpp) after processInput,
+        // so text blur and its commit handler run before focus moves.
+        // Match overlay entry i to this frame's i-th left DOWN, using that event's
+        // coordinates and GUI ownership together. The overlay spans the dock, and the
+        // latest cursor position or wantsInput alone cannot identify where a press landed.
+        // Process every left DOWN in SDL order. Refused presses (controls, GUI-owned
+        // or outside the viewport) leave focus unchanged; the last eligible press wins.
+        // With no eligible press, keep the existing focus.
+        // Explicit blockers or invalid bounds produce no classifications. External
+        // capture still classifies earlier viewport presses before blocking motion,
+        // allowing their text edits to commit before the corresponding focus changes.
+        const auto& overlay_left_presses = rml_viewport_overlay_.leftPressClassifications();
+        std::size_t overlay_press_index = 0;
+        for (const auto& overlay_event : viewport_overlay_input.mouse_button_events) {
+            if (!overlay_event.down || overlay_event.button != 0)
+                continue;
+            if (overlay_press_index >= overlay_left_presses.size())
+                break;
+            const auto& overlay_press_class = overlay_left_presses[overlay_press_index++];
+            const auto* const overlay_press = &overlay_event;
+            const glm::vec2 overlay_press_point{overlay_press->x, overlay_press->y};
+            if (!overlayPressMayFocusPanel({
+                    .left_pressed = true,
+                    .overlay_wants_input = rml_viewport_overlay_.wantsInput(),
+                    .pressed_interactive_control = overlay_press_class.on_interactive_control,
+                    .press_blurred_text_input = overlay_press_class.blurred_text_input,
+                    .press_inside_viewport = pointInsideViewport(overlay_press_point,
+                                                                 viewport_layout_.pos,
+                                                                 viewport_layout_.size),
+                    .press_gui_owned = overlay_press->gui_owned,
+                })) {
+                continue;
+            }
             if (auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr;
                 rendering && rendering->isIndependentSplitViewActive()) {
                 if (const auto target_panel = rendering->resolveViewerPanel(
                         viewer_->getViewport(),
                         viewport_layout_.pos,
                         viewport_layout_.size,
-                        glm::vec2(viewport_overlay_input.mouse_x,
-                                  viewport_overlay_input.mouse_y))) {
+                        overlay_press_point)) {
                     if (auto* const input_controller = viewer_->getInputController()) {
                         input_controller->setFocusedSplitPanel(target_panel->panel);
                     } else {
@@ -7130,6 +7520,11 @@ namespace lfs::vis::gui {
             python::draw_python_modals(scene);
         }
 
+        if (rml_progress_overlay_) {
+            LOG_TIMER_THRESHOLD("gui_render.rml_progress_processInput", 0.25);
+            rml_progress_overlay_->processInput(
+                raw_panel_input, rml_modal_overlay_->isOpen() || rml_modal_overlay_->hasPendingRequest());
+        }
         if (rml_modal_overlay_->isOpen()) {
             LOG_TIMER_THRESHOLD("gui_render.rml_modal_processInput", 0.25);
             rml_modal_overlay_->processInput(raw_panel_input);
@@ -7277,6 +7672,20 @@ namespace lfs::vis::gui {
                                            static_cast<float>(panel_input.screen_w),
                                            static_cast<float>(panel_input.screen_h));
             }
+            if (rml_progress_overlay_ &&
+                !rml_modal_overlay_->isOpen() &&
+                !rml_modal_overlay_->hasPendingRequest() &&
+                rml_progress_overlay_->hasPendingRenderWork()) {
+                LOG_TIMER_THRESHOLD("gui_render.menu_context_modal_render.progress_overlay", 0.25);
+                rml_progress_overlay_->render(panel_input.screen_w,
+                                              panel_input.screen_h,
+                                              panel_input.screen_x,
+                                              panel_input.screen_y,
+                                              viewport_layout_.pos.x,
+                                              viewport_layout_.pos.y,
+                                              viewport_layout_.size.x,
+                                              viewport_layout_.size.y);
+            }
             if (rml_modal_overlay_->hasPendingRenderWork()) {
                 LOG_TIMER_THRESHOLD("gui_render.menu_context_modal_render.modal_overlay", 0.25);
                 rml_modal_overlay_->render(panel_input.screen_w,
@@ -7377,11 +7786,63 @@ namespace lfs::vis::gui {
                 if (viewport_pass_ready) {
                     LOG_TIMER_THRESHOLD("gui_render.viewport_pass_prepare_record", 0.25);
                     vulkan_viewport_pass_->prepare(*vulkan_context, viewport_params);
+                    const bool temporal_pre_render =
+                        vulkan_viewport_pass_->hasPreRenderWork(viewport_params);
+                    const bool requires_pre_render_scope = rendering || temporal_pre_render;
+                    bool render_scope_ready = true;
+                    bool render_scope_closed = false;
+                    if (requires_pre_render_scope) {
+                        render_scope_closed =
+                            vulkan_context->finishActiveRendering(frame.command_buffer);
+                        render_scope_ready = render_scope_closed;
+                        if (!render_scope_closed) {
+                            LOG_ERROR("Unable to close dynamic rendering before viewport pre-render work: {}",
+                                      vulkan_context->lastError());
+                        }
+                    }
+                    if (render_scope_ready && rendering) {
+                        // #1575: interop barriers and temporal compute must be recorded
+                        // outside dynamic rendering. Native/Spatial remain fragment-only;
+                        // Temporal waits at its first compute and fragment consumers.
+                        rendering->viewportInterop().recordFrameBarriers(frame.command_buffer,
+                                                                         *vulkan_context);
+                        const auto completion = rendering->viewportInterop().frameCompletion();
+                        if (completion.semaphore != VK_NULL_HANDLE && completion.value != 0) {
+                            LOG_TIMER_THRESHOLD("gui_render.vksplat_completion_wait_submit", 0.25);
+                            const VkPipelineStageFlags wait_stage =
+                                temporal_pre_render
+                                    ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                                    : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+                            if (!vulkan_context->addFrameTimelineWait(completion.semaphore,
+                                                                      completion.value,
+                                                                      wait_stage)) {
+                                LOG_ERROR("Unable to wait on VkSplat frame completion timeline: {}",
+                                          vulkan_context->lastError());
+                                render_scope_ready = false;
+                            }
+                        }
+                    }
+                    if (render_scope_ready && temporal_pre_render) {
+                        static_cast<void>(vulkan_viewport_pass_->recordPreRenderWork(
+                            frame.command_buffer, viewport_params));
+                    }
+                    if (render_scope_closed) {
+                        const bool restarted =
+                            vulkan_context->restartActiveRendering(frame.command_buffer, frame);
+                        render_scope_ready = render_scope_ready && restarted;
+                        if (!restarted) {
+                            LOG_ERROR("Unable to restart dynamic rendering after viewport pre-render work: {}",
+                                      vulkan_context->lastError());
+                        }
+                    }
                     if (auto* const rendering_manager = viewer_ ? viewer_->getRenderingManager() : nullptr) {
                         rendering_manager->reportSceneUpscalerRuntimeSelection(
                             vulkan_viewport_pass_->sceneUpscalerSelection());
                     }
-                    recordVulkanViewport(frame.command_buffer, frame.extent, viewport_params);
+                    if (render_scope_ready) {
+                        recordVulkanViewport(frame.command_buffer, frame.extent, viewport_params);
+                    }
                 }
                 {
                     LOG_TIMER("gui_render.rmlui_record");
@@ -7939,6 +8400,22 @@ namespace lfs::vis::gui {
                y < last_ui_layout_work_pos_.y + last_ui_layout_work_size_.y;
     }
 
+    GuiHitTestResult GuiManager::hitTestMouseButton(const double x, const double y) const {
+        const auto hit = hitTestPointer(x, y);
+        if (hit.blocks_pointer || hit.blocks_mouse_button)
+            return hit;
+
+        // The resize hover latch may lag a press in the same SDL batch as motion.
+        // Hit-test the shared strip geometry so its viewport-overlapping half is
+        // GUI-owned even before the next renderLeftDock().
+        if (panel_layout_.isPositionOverLeftDockResizeEdge(
+                static_cast<float>(x), static_cast<float>(y),
+                last_ui_layout_work_pos_.x, last_ui_layout_work_pos_.y,
+                last_ui_layout_work_size_.y))
+            return {.blocks_mouse_button = true};
+        return hit;
+    }
+
     GuiHitTestResult GuiManager::hitTestPointer(const double x, const double y) const {
         if (isCapturingInput() || isModalWindowOpen() || startup_overlay_.blocksUnderlayInput() ||
             (global_context_menu_ && global_context_menu_->isOpen())) {
@@ -8194,7 +8671,8 @@ namespace lfs::vis::gui {
     }
 
     bool GuiManager::isModalWindowOpen() const {
-        return rml_modal_overlay_->isOpen();
+        return rml_modal_overlay_->isOpen() ||
+               (rml_progress_overlay_ && rml_progress_overlay_->blocksUnderlayInput());
     }
 
     bool GuiManager::passiveMouseMoveNeedsRender(const float mouse_x, const float mouse_y) const {
@@ -8345,7 +8823,7 @@ namespace lfs::vis::gui {
         int window_w = 0;
         int window_h = 0;
         if (viewer_ && viewer_->getWindow()) {
-            SDL_GetWindowSize(viewer_->getWindow(), &window_w, &window_h);
+            SDL_GetWindowSizeInPixels(viewer_->getWindow(), &window_w, &window_h);
         }
         const float work_w = static_cast<float>(window_w);
         const float work_h = static_cast<float>(window_h);

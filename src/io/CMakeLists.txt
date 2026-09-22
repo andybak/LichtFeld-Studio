@@ -111,6 +111,8 @@ set_target_properties(spz_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Video encoding library (FFmpeg + CUDA for GPU-accelerated encoding)
 find_package(PkgConfig REQUIRED)
+# vcpkg swaps FFmpeg's codec between master (x264) and dev (openh264); do not reuse FindPkgConfig's cached library list.
+unset(__pkg_config_checked_FFMPEG CACHE)
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
         libavcodec
         libavformat
@@ -123,8 +125,11 @@ add_library(lfs_video STATIC
         include/io/video/video_encoder_interface.hpp
         include/io/video/video_export_options.hpp
         include/io/video/video_extensions.hpp
+        include/io/video/video_output_extent.hpp
+        include/io/video/video_reconstruction.hpp
         video/video_encoder.hpp
         video/video_encoder.cpp
+        video/video_reconstruction.cpp
         video/color_convert.cuh
         video/color_convert.cu
         video/cuda_frame_handoff.hpp
@@ -157,6 +162,7 @@ target_link_libraries(lfs_video
         PRIVATE
         PkgConfig::FFMPEG
         spdlog::spdlog
+        nlohmann_json::nlohmann_json
         CUDA::cudart
         CUDA::cuda_driver
 )

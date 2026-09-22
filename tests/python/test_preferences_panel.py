@@ -74,6 +74,14 @@ def preferences_panel_module(monkeypatch):
         },
     )
 
+    tensor_defaults = dict(backend="cuda", vulkan_device="", vulkan_validation=0,
+                           force_fp32_half=False, force_no_atomic_float=False,
+                           viewer_vulkan_inputs=False)
+    state.tensor_preferences = dict(tensor_defaults)
+
+    def set_tensor_backend_preferences(**values):
+        state.tensor_preferences = {**tensor_defaults, **values}
+
     def set_project_location(path):
         state.project_location = str(path)
         return ""
@@ -147,6 +155,8 @@ def preferences_panel_module(monkeypatch):
             (panel_id, bool(enabled))
         ),
         take_preferences_section_request=take_preferences_section_request,
+        get_tensor_backend_preferences=lambda: dict(state.tensor_preferences),
+        set_tensor_backend_preferences=set_tensor_backend_preferences,
         tr=lambda key: key,
         get_scene_reconstruction_options=lambda: [
             {
@@ -303,6 +313,8 @@ def preferences_panel_module(monkeypatch):
             TOGGLE_SCENE_SELECTION_TRAINING=SimpleNamespace(
                 name="TOGGLE_SCENE_SELECTION_TRAINING", value=84
             ),
+            DEPTH_ADJUST_SIZE=SimpleNamespace(name="DEPTH_ADJUST_SIZE", value=85),
+            DEPTH_WINDOW_DRAG=SimpleNamespace(name="DEPTH_WINDOW_DRAG", value=86),
         ),
         get_available_profiles=lambda: ["Default"],
         get_current_profile=lambda: "Default",
@@ -1025,3 +1037,15 @@ def test_preferences_keymap_rows_are_created_when_expanded(preferences_panel_mod
 
     assert panel._keymap._rows_built is True
     assert records["binding_rows"]
+
+
+def test_tensor_setting_preserves_other_pending_preferences(preferences_panel_module):
+    module, state = preferences_panel_module
+    panel = module.PreferencesPanel()
+    panel._set_tensor_preference("backend", "vulkan")
+    panel._set_tensor_preference("vulkan_validation", "2")
+    panel._set_tensor_preference("force_fp32_half", True)
+    assert state.tensor_preferences["backend"] == "vulkan"
+    assert state.tensor_preferences["vulkan_validation"] == 2
+    assert state.tensor_preferences["force_fp32_half"] is True
+    assert state.tensor_preferences["viewer_vulkan_inputs"] is False

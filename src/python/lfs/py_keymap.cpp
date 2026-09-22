@@ -186,11 +186,13 @@ namespace lfs::python {
             .value("SELECT_ALL_SCENE_NODES", Action::SELECT_ALL_SCENE_NODES)
             .value("TOGGLE_SCENE_SELECTION_VISIBILITY", Action::TOGGLE_SCENE_SELECTION_VISIBILITY)
             .value("TOGGLE_SCENE_SELECTION_TRAINING", Action::TOGGLE_SCENE_SELECTION_TRAINING)
+            .value("DEPTH_ADJUST_SIZE", Action::DEPTH_ADJUST_SIZE)
             .value("GROUP_SELECTED_SCENE_NODES", Action::GROUP_SELECTED_SCENE_NODES)
+            .value("UNGROUP_SELECTED_SCENE_NODE", Action::UNGROUP_SELECTED_SCENE_NODE)
             .value("ASSET_GALLERY_PRIMARY", Action::ASSET_GALLERY_PRIMARY)
             .value("ASSET_GALLERY_COPY_LINK", Action::ASSET_GALLERY_COPY_LINK)
             .value("ASSET_REFRESH", Action::ASSET_REFRESH)
-            .value("UNGROUP_SELECTED_SCENE_NODE", Action::UNGROUP_SELECTED_SCENE_NODE);
+            .value("DEPTH_WINDOW_DRAG", Action::DEPTH_WINDOW_DRAG);
 
         // Expose ToolMode enum
         nb::enum_<ToolMode>(keymap, "ToolMode")

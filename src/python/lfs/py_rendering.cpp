@@ -26,6 +26,7 @@
 #include "visualizer/ipc/view_context.hpp"
 #include "visualizer/post_work_utils.hpp"
 #include "visualizer/rendering/rendering_manager.hpp"
+#include "visualizer/rendering/scene_upscaler_registry.hpp"
 #include "visualizer/rendering/viewport_appearance_correction.hpp"
 #include "visualizer/visualizer.hpp"
 
@@ -162,7 +163,7 @@ namespace lfs::python {
             scene_state.transform_indices = std::make_shared<core::Tensor>(
                 core::Tensor::zeros(
                     {static_cast<std::size_t>(splat.size())},
-                    core::Device::CUDA,
+                    core::Device::GPU,
                     core::DataType::Int32));
             scene_state.node_visibility_mask = {true};
             scene_state.selected_node_mask = {true};
@@ -214,7 +215,7 @@ namespace lfs::python {
             auto transform_indices = std::make_shared<core::Tensor>(
                 core::Tensor::zeros(
                     {static_cast<std::size_t>(point_cloud.size())},
-                    core::Device::CUDA,
+                    core::Device::GPU,
                     core::DataType::Int32));
 
             rendering::PointCloudRenderRequest request{};
@@ -673,6 +674,25 @@ namespace lfs::python {
             group.properties.push_back(std::move(meta));
         };
 
+        auto add_int = [&](int Proxy::*member, const std::string& id, const std::string& name,
+                           const std::string& desc, int default_val, int min_val, int max_val) {
+            PropertyMeta meta;
+            meta.id = id;
+            meta.name = name;
+            meta.description = desc;
+            meta.type = PropType::Int;
+            meta.default_value = static_cast<int64_t>(default_val);
+            meta.min_value = static_cast<double>(min_val);
+            meta.max_value = static_cast<double>(max_val);
+            meta.getter = [member](const PropertyObjectRef& ref) -> std::any {
+                return static_cast<const Proxy*>(ref.ptr)->*member;
+            };
+            meta.setter = [member](PropertyObjectRef& ref, const std::any& val) {
+                static_cast<Proxy*>(ref.ptr)->*member = std::any_cast<int>(val);
+            };
+            group.properties.push_back(std::move(meta));
+        };
+
         auto add_int_enum = [&](int Proxy::*member, const std::string& id, const std::string& name,
                                 const std::string& desc, std::vector<EnumItem> items, int default_idx) {
             PropertyMeta meta;
@@ -781,8 +801,24 @@ namespace lfs::python {
                  "Desaturate unselected PLYs when one is selected", false);
         add_bool(&Proxy::desaturate_cropping, "desaturate_cropping", "Desaturate Cropping",
                  "Dim outside crop area instead of hiding", false);
-        add_bool(&Proxy::hide_outside_depth_box, "hide_outside_depth_box", "Hide Outside Depth Box",
-                 "Hide Gaussians outside the selection depth box", false);
+        {
+            PropertyMeta meta;
+            meta.id = "hide_outside_depth_box";
+            meta.name = "Hide Outside Depth Box";
+            meta.description =
+                "Deprecated compatibility alias for depth_filter_viz_mode == 2; use depth_filter_viz_mode";
+            meta.type = PropType::Bool;
+            meta.default_value = false;
+            meta.getter = [](const PropertyObjectRef& ref) -> std::any {
+                return static_cast<const Proxy*>(ref.ptr)->depth_filter_viz_mode == 2;
+            };
+            meta.setter = [](PropertyObjectRef& ref, const std::any& val) {
+                static_cast<Proxy*>(ref.ptr)->depth_filter_viz_mode = std::any_cast<bool>(val) ? 2 : 0;
+            };
+            group.properties.push_back(std::move(meta));
+        }
+        add_int(&Proxy::depth_filter_viz_mode, "depth_filter_viz_mode", "Depth Filter Visualization",
+                "Selection depth-filter visualization mode (0 = off, 1 = dim, 2 = hide)", 1, 0, 2);
 
         // View Settings
         add_float(&Proxy::focal_length_mm, "focal_length_mm", "Focal Length", "Focal length in mm", 35.0, 10.0, 200.0);
@@ -816,7 +852,7 @@ namespace lfs::python {
                      {{"Color", "palette", 0}, {"Gray", "gray", 1}}, 0);
         add_int_enum(&Proxy::gt_comparison_mode, "gt_comparison_mode", "GT Compare",
                      "Ground-truth comparison payload",
-                     {{"RGB", "rgb", 0}, {"Normal", "normal", 1}, {"Depth", "depth", 2}}, 0);
+                     {{"RGB", "rgb", 0}, {"Normal", "normal", 1}, {"Depth", "depth", 2}, {"Loss", "loss", 3}}, 0);
         add_int_enum(&Proxy::camera_metrics_mode, "camera_metrics_mode", "Camera Metrics",
                      "Compute metrics when jumping to a source camera",
                      {{"Off", "OFF", 0}, {"PSNR", "PSNR", 1}, {"PSNR + SSIM", "PSNR_SSIM", 2}}, 0);
@@ -934,6 +970,27 @@ namespace lfs::python {
           prop_(&settings_, "render_settings") {}
 
     void PyRenderSettings::set(const std::string& name, nb::object value) {
+        if (name == "scene_upscaler") {
+            const auto backend_id = nb::cast<std::string>(value);
+            const auto backend = vis::sceneUpscalerBackendFromId(backend_id);
+            if (!backend) {
+                throw nb::value_error(
+                    "Field 'scene_upscaler' must name a registered scene reconstruction backend");
+            }
+            if (!vis::sceneUpscalerBackendAvailable(*backend)) {
+                throw nb::value_error(
+                    "Field 'scene_upscaler' names a scene reconstruction backend "
+                    "that is not available in this process");
+            }
+        }
+        // Re-read live settings immediately before applying the requested property
+        // and its dependent normalization. A retained snapshot may be stale after
+        // a focus change or another write; dispatching it with DirtyFlag::ALL would
+        // overwrite unrelated settings.
+        const auto fresh = vis::get_render_settings();
+        if (fresh) {
+            settings_ = *fresh;
+        }
         prop_.setattr(name, value);
         if (name == "raster_backend") {
             const auto backend = static_cast<rendering::GaussianRasterBackend>(settings_.raster_backend);
@@ -942,7 +999,15 @@ namespace lfs::python {
             settings_.gut = rendering::isGutBackend(
                 static_cast<rendering::GaussianRasterBackend>(settings_.raster_backend));
         }
-        vis::update_render_settings(settings_);
+        if (!fresh) {
+            // Without live settings, keep local validation/mutation but do not dispatch
+            // a potentially stale proxy.
+            return;
+        }
+        vis::update_render_settings(
+            settings_,
+            {.scene_upscaler_explicit = name == "scene_upscaler",
+             .scene_upscaler_preset_explicit = name == "scene_upscaler_preset"});
         // update_render_settings may normalize dependent properties (for
         // example the preset when switching scene reconstruction backends).
         // Keep this Python proxy in lockstep with that applied state so the
@@ -1454,8 +1519,8 @@ namespace {
                     eye_vec,
                     glm::vec3{tx, ty, tz},
                     glm::vec3{ux, uy, uz}))
-                .cuda(),
-            tensor_from_vec3(eye_vec).cuda()};
+                .gpu(),
+            tensor_from_vec3(eye_vec).gpu()};
     }
 
 } // namespace
@@ -1560,8 +1625,8 @@ namespace lfs::python {
         std::memcpy(T.data_ptr(), view_info->translation.data(), 3 * sizeof(float));
 
         return PyViewInfo{
-            .rotation = PyTensor(R.cuda(), true),
-            .translation = PyTensor(T.cuda(), true),
+            .rotation = PyTensor(R.gpu(), true),
+            .translation = PyTensor(T.gpu(), true),
             .width = view_info->width,
             .height = view_info->height,
             .fov_x = vertical_fov_to_horizontal_fov(view_info->fov, view_info->width, view_info->height),

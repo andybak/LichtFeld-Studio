@@ -240,6 +240,7 @@ namespace lfs::vis::project {
         }
         [[nodiscard]] bool isScratchBoundSession() const;
         [[nodiscard]] bool isBlankProject() const;
+        [[nodiscard]] bool isHydrating() const;
         [[nodiscard]] bool isBlankUntitledSession() const;
         [[nodiscard]] lfs::Result<ProjectInfo> info();
         [[nodiscard]] ProjectDisplayInfo displayInfo();
@@ -318,6 +319,7 @@ namespace lfs::vis::project {
             bool hydrated = false;
             bool restoring = false;
             std::string error;
+            std::string raster_backend;
         };
 
         [[nodiscard]] TrainingSessionState
@@ -836,6 +838,7 @@ namespace lfs::vis::project {
         std::string training_session_error_;
         int stored_max_iterations_ = 0;
         std::string stored_strategy_;
+        std::string stored_raster_backend_;
         bool stored_completed_ = false;
         mutable std::mutex thread_mutex_;
         std::vector<std::jthread> hydration_threads_;

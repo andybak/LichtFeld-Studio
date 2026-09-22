@@ -359,7 +359,8 @@ namespace lfs::app {
         std::expected<std::string, std::string> capture_live_viewport_to_base64(
             vis::Visualizer* viewer,
             int width = 0,
-            int height = 0) {
+            int height = 0,
+            bool presented = false) {
             auto* const viewer_impl = dynamic_cast<vis::VisualizerImpl*>(viewer);
             if (!viewer_impl)
                 return std::unexpected("Live viewport capture requires a GUI visualizer");
@@ -368,13 +369,16 @@ namespace lfs::app {
             if (!rendering_manager)
                 return std::unexpected("Viewport capture is not initialized");
 
-            if (auto image = rendering_manager->captureViewportImage(); image && image->is_valid())
-                return mcp::encode_render_tensor_to_base64(*image, width, height);
+            if (!presented) {
+                if (auto image = rendering_manager->captureViewportImage(); image && image->is_valid())
+                    return mcp::encode_render_tensor_to_base64(*image, width, height);
+            }
 
             // Mesh-only and environment-only scenes are drawn by GPU passes that composite
             // straight into the window, so no render path publishes an offscreen image to
             // read back. The viewport is on screen regardless, so crop it out of the
-            // composited window instead of reporting nothing to capture.
+            // composited window; presented=true asks for that crop deliberately so the
+            // capture shows Spatial/Temporal reconstruction as the user sees it.
             return capture_viewport_from_window(viewer_impl, *rendering_manager, width, height);
         }
 
@@ -614,6 +618,50 @@ namespace lfs::app {
             return glm::vec3(value[0].get<float>(), value[1].get<float>(), value[2].get<float>());
         }
 
+        struct ViewArguments {
+            glm::vec3 eye{};
+            glm::vec3 target{};
+            glm::vec3 up{0.0f, 1.0f, 0.0f};
+            std::optional<float> fov_degrees;
+        };
+
+        struct ViewArgumentsError {
+            std::string message;
+        };
+
+        std::expected<ViewArguments, ViewArgumentsError> parse_view_arguments(const json& args) {
+            auto eye = optional_vec3_arg(args, "eye");
+            if (!eye)
+                return std::unexpected(ViewArgumentsError{eye.error()});
+            auto target = optional_vec3_arg(args, "target");
+            if (!target)
+                return std::unexpected(ViewArgumentsError{target.error()});
+            auto up = optional_vec3_arg(args, "up");
+            if (!up)
+                return std::unexpected(ViewArgumentsError{up.error()});
+            if (!eye->has_value() || !target->has_value())
+                return std::unexpected(ViewArgumentsError{"Fields 'eye' and 'target' must be provided"});
+
+            ViewArguments result{
+                .eye = **eye,
+                .target = **target,
+                .up = up->value_or(glm::vec3(0.0f, 1.0f, 0.0f)),
+            };
+            if (args.contains("fov_degrees"))
+                result.fov_degrees = args["fov_degrees"].get<float>();
+            return result;
+        }
+
+        void apply_view_arguments(const ViewArguments& view) {
+            vis::apply_set_view(vis::SetViewParams{
+                .eye = {view.eye.x, view.eye.y, view.eye.z},
+                .target = {view.target.x, view.target.y, view.target.z},
+                .up = {view.up.x, view.up.y, view.up.z},
+            });
+            if (view.fov_degrees)
+                vis::apply_set_fov(*view.fov_degrees);
+        }
+
         void show_python_console() {
             core::events::cmd::ShowWindow{.window_name = "python_console", .show = true}.emit();
         }
@@ -832,7 +880,8 @@ namespace lfs::app {
                                  {"use_ellipsoid", settings.use_ellipsoid},
                                  {"desaturate_unselected", settings.desaturate_unselected},
                                  {"desaturate_cropping", settings.desaturate_cropping},
-                                 {"hide_outside_depth_box", settings.hide_outside_depth_box},
+                                 {"hide_outside_depth_box", settings.depth_filter_viz_mode == 2},
+                                 {"depth_filter_viz_mode", settings.depth_filter_viz_mode},
                                  {"crop_filter_for_selection", settings.crop_filter_for_selection},
                                  {"apply_appearance_correction", settings.apply_appearance_correction},
                                  {"ppisp_mode", settings.ppisp_mode},
@@ -908,6 +957,22 @@ namespace lfs::app {
             };
         }
 
+        json scene_reconstruction_status_json(vis::RenderingManager& rendering_manager) {
+            const auto selection = rendering_manager.sceneUpscalerRuntimeSelection();
+            const auto settings = vis::get_render_settings();
+            return json{
+                {"success", true},
+                {"requested", std::string(vis::sceneUpscalerBackendId(selection.requested))},
+                {"effective", std::string(vis::sceneUpscalerBackendId(selection.effective))},
+                {"fallback", std::string(vis::sceneUpscalerFallbackId(selection.fallback))},
+                {"fell_back", selection.fellBack()},
+                {"preset", settings ? settings->scene_upscaler_preset : std::string{}},
+                {"convergence_remaining", rendering_manager.temporalConvergenceRemaining()},
+                {"scene_fps", rendering_manager.getAverageFPS()},
+                {"presented_fps", rendering_manager.getPresentedAverageFPS()},
+            };
+        }
+
         std::expected<void, std::string> apply_render_settings_patch(const json& args, vis::RenderSettingsProxy& settings) {
             bool touched = false;
 
@@ -957,24 +1022,31 @@ namespace lfs::app {
             };
             const auto set_scene_reconstruction = [&args, &touched](vis::RenderSettingsProxy& settings)
                 -> std::expected<void, std::string> {
+                const bool backend_explicit = args.contains("scene_upscaler");
+                const bool preset_explicit = args.contains("scene_upscaler_preset");
+                if (!backend_explicit && !preset_explicit)
+                    return {};
+
                 const std::string backend_id = args.value("scene_upscaler", settings.scene_upscaler);
                 const auto backend = vis::sceneUpscalerBackendFromId(backend_id);
                 if (!backend) {
                     return std::unexpected("Field 'scene_upscaler' must name a registered scene reconstruction backend");
                 }
-                std::string preset_id = args.value("scene_upscaler_preset", settings.scene_upscaler_preset);
-                if (!args.contains("scene_upscaler_preset") &&
-                    !vis::sceneUpscalerPreset(*backend, preset_id)) {
-                    preset_id = std::string(vis::defaultSceneUpscalerPreset(*backend).id);
+                if (!vis::sceneUpscalerBackendAvailable(*backend)) {
+                    return std::unexpected(
+                        "Field 'scene_upscaler' names a scene reconstruction backend "
+                        "that is not available in this process");
                 }
-                if (!vis::sceneUpscalerPreset(*backend, preset_id)) {
-                    return std::unexpected("Field 'scene_upscaler_preset' is not valid for the selected scene reconstruction backend");
-                }
-                if (args.contains("scene_upscaler"))
+                if (backend_explicit)
                     settings.scene_upscaler = backend_id;
-                if (args.contains("scene_upscaler_preset"))
+                if (preset_explicit) {
+                    const std::string preset_id = args["scene_upscaler_preset"].get<std::string>();
+                    if (!vis::sceneUpscalerPreset(*backend, preset_id)) {
+                        return std::unexpected("Field 'scene_upscaler_preset' is not valid for the selected scene reconstruction backend");
+                    }
                     settings.scene_upscaler_preset = preset_id;
-                touched = touched || args.contains("scene_upscaler") || args.contains("scene_upscaler_preset");
+                }
+                touched = true;
                 return {};
             };
 
@@ -1018,7 +1090,11 @@ namespace lfs::app {
             set_bool("use_ellipsoid", settings.use_ellipsoid);
             set_bool("desaturate_unselected", settings.desaturate_unselected);
             set_bool("desaturate_cropping", settings.desaturate_cropping);
-            set_bool("hide_outside_depth_box", settings.hide_outside_depth_box);
+            if (args.contains("hide_outside_depth_box") && !args.contains("depth_filter_viz_mode")) {
+                settings.depth_filter_viz_mode = args["hide_outside_depth_box"].get<bool>() ? 2 : 0;
+                touched = true;
+            }
+            set_int("depth_filter_viz_mode", settings.depth_filter_viz_mode);
             set_bool("crop_filter_for_selection", settings.crop_filter_for_selection);
             set_bool("apply_appearance_correction", settings.apply_appearance_correction);
             set_int("ppisp_mode", settings.ppisp_mode);
@@ -2451,14 +2527,16 @@ namespace lfs::app {
                     return result;
                 },
             .render_capture =
-                [viewer](std::optional<int> camera_index, int width, int height) {
+                [viewer](std::optional<int> camera_index, int width, int height, bool presented) {
                     // Runs as render work, not plain posted work: the window-crop fallback
                     // inside capture_live_viewport_to_base64 needs an active GUI frame.
-                    return capture_after_gui_render(viewer, [viewer, camera_index, width, height]() {
-                        if (camera_index)
-                            return render_scene_to_base64(viewer->getScene(), *camera_index, width, height);
-                        return capture_live_viewport_to_base64(viewer, width, height);
-                    });
+                    return capture_after_gui_render(
+                        viewer, [viewer, camera_index, width, height, presented]() {
+                            if (camera_index)
+                                return render_scene_to_base64(
+                                    viewer->getScene(), *camera_index, width, height);
+                            return capture_live_viewport_to_base64(viewer, width, height, presented);
+                        });
                 },
             .gaussian_count =
                 [viewer]() -> std::expected<int64_t, std::string> {
@@ -2618,31 +2696,12 @@ namespace lfs::app {
                         {"fov_degrees", json{{"type", "number"}, {"description", "Optional vertical field of view in degrees"}}}},
                     .required = {"eye", "target"}}},
             [viewer_impl](const json& args) -> json {
-                auto eye = optional_vec3_arg(args, "eye");
-                if (!eye)
-                    return json{{"error", eye.error()}};
-                auto target = optional_vec3_arg(args, "target");
-                if (!target)
-                    return json{{"error", target.error()}};
-                auto up = optional_vec3_arg(args, "up");
-                if (!up)
-                    return json{{"error", up.error()}};
-                if (!eye->has_value() || !target->has_value())
-                    return json{{"error", "Fields 'eye' and 'target' must be provided"}};
+                auto view = parse_view_arguments(args);
+                if (!view)
+                    return json{{"error", view.error().message}};
 
-                const glm::vec3 up_value = up->value_or(glm::vec3(0.0f, 1.0f, 0.0f));
-                const std::optional<float> fov = args.contains("fov_degrees")
-                                                     ? std::optional<float>(args["fov_degrees"].get<float>())
-                                                     : std::nullopt;
-
-                return post_and_wait(viewer_impl, [eye = **eye, target = **target, up_value, fov]() -> json {
-                    vis::apply_set_view(vis::SetViewParams{
-                        .eye = {eye.x, eye.y, eye.z},
-                        .target = {target.x, target.y, target.z},
-                        .up = {up_value.x, up_value.y, up_value.z},
-                    });
-                    if (fov)
-                        vis::apply_set_fov(*fov);
+                return post_and_wait(viewer_impl, [view = *view]() -> json {
+                    apply_view_arguments(view);
 
                     const auto info = vis::get_current_view_info();
                     if (!info)
@@ -2905,6 +2964,89 @@ namespace lfs::app {
 
         registry.register_tool(
             McpTool{
+                .name = "render.reconstruction.catalog",
+                .description = "List registered viewport scene-reconstruction backends and their backend-specific presets",
+                .input_schema = {.type = "object", .properties = json::object(), .required = {}}},
+            [](const json&) -> json {
+                json backends = json::array();
+                for (const auto& descriptor : vis::sceneUpscalerDescriptors()) {
+                    json presets = json::array();
+                    for (const auto& preset : descriptor.presets) {
+                        presets.push_back(json{
+                            {"id", std::string(preset.id)},
+                            {"input_scale", preset.input_scale},
+                        });
+                    }
+                    backends.push_back(json{
+                        {"id", std::string(descriptor.id)},
+                        {"presets", std::move(presets)},
+                    });
+                }
+                return json{{"success", true}, {"backends", std::move(backends)}};
+            });
+
+        registry.register_tool(
+            McpTool{
+                .name = "render.reconstruction.status",
+                .description = "Read requested/effective viewport reconstruction, fallback, convergence, and live frame-rate state",
+                .input_schema = {.type = "object", .properties = json::object(), .required = {}}},
+            [viewer_impl](const json&) -> json {
+                return post_and_wait(viewer_impl, [viewer_impl]() -> json {
+                    auto* const rendering_manager = viewer_impl->getRenderingManager();
+                    if (!rendering_manager)
+                        return json{{"error", "Rendering manager is not available"}};
+                    return scene_reconstruction_status_json(*rendering_manager);
+                });
+            });
+
+        registry.register_tool(
+            McpTool{
+                .name = "render.reconstruction.sample_frame",
+                .description = "Set the interactive camera and wait for the ensuing production viewport frame without capture or readback",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json{
+                        {"eye", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Camera eye position [x,y,z]"}}},
+                        {"target", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Camera target/pivot position [x,y,z]"}}},
+                        {"up", json{{"type", "array"}, {"items", json{{"type", "number"}}}, {"description", "Optional up vector [x,y,z], defaults to [0,1,0]"}}},
+                        {"fov_degrees", json{{"type", "number"}, {"description", "Optional vertical field of view in degrees"}}}},
+                    .required = {"eye", "target"}},
+                .metadata = mcp::McpToolMetadata{
+                    .category = "render",
+                    .kind = "mutation",
+                    .runtime = "gui",
+                    .thread_affinity = "gui_thread",
+                    .user_visible = false,
+                }},
+            [viewer_impl](const json& args) -> json {
+                auto view = parse_view_arguments(args);
+                if (!view)
+                    return json{{"error", view.error().message}};
+
+                const auto started_at = std::chrono::steady_clock::now();
+                auto applied = post_and_wait(viewer_impl, [view = *view]() -> json {
+                    apply_view_arguments(view);
+                    return json{{"success", true}};
+                });
+                if (applied.contains("error"))
+                    return applied;
+
+                return post_render_and_wait(viewer_impl, [viewer_impl, started_at]() -> json {
+                    auto* const rendering_manager = viewer_impl->getRenderingManager();
+                    if (!rendering_manager)
+                        return json{{"error", "Rendering manager is not available"}};
+
+                    auto result = scene_reconstruction_status_json(*rendering_manager);
+                    result["frame_latency_ms"] = std::chrono::duration<double, std::milli>(
+                                                     std::chrono::steady_clock::now() - started_at)
+                                                     .count();
+                    result["timing_scope"] = "camera_mutation_to_post_render_without_readback";
+                    return result;
+                });
+            });
+
+        registry.register_tool(
+            McpTool{
                 .name = "render.settings.get",
                 .description = "Read the current viewport render settings",
                 .input_schema = {.type = "object", .properties = json::object(), .required = {}}},
@@ -2956,6 +3098,8 @@ namespace lfs::app {
                         {"use_crop_box", json{{"type", "boolean"}}},
                         {"show_ellipsoid", json{{"type", "boolean"}}},
                         {"use_ellipsoid", json{{"type", "boolean"}}},
+                        {"hide_outside_depth_box", json{{"type", "boolean"}}},
+                        {"depth_filter_viz_mode", json{{"type", "integer"}, {"minimum", 0}, {"maximum", 2}}},
                         {"ppisp_exposure", json{{"type", "number"}}},
                         {"ppisp", json{{"type", "object"}}}},
                     .required = {}}},
@@ -2968,7 +3112,10 @@ namespace lfs::app {
                     if (auto result = apply_render_settings_patch(args, *settings); !result)
                         return json{{"error", result.error()}};
 
-                    vis::update_render_settings(*settings);
+                    vis::update_render_settings(
+                        *settings,
+                        {.scene_upscaler_explicit = args.contains("scene_upscaler"),
+                         .scene_upscaler_preset_explicit = args.contains("scene_upscaler_preset")});
 
                     auto* const scene_manager = viewer_impl->getSceneManager();
                     auto* const rendering_manager = viewer_impl->getRenderingManager();
@@ -3751,7 +3898,7 @@ namespace lfs::app {
                         {"y0", json{{"type", "number"}, {"description", "Top edge Y coordinate"}}},
                         {"x1", json{{"type", "number"}, {"description", "Right edge X coordinate"}}},
                         {"y1", json{{"type", "number"}, {"description", "Bottom edge Y coordinate"}}},
-                        {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
+                        {"camera_index", json{{"type", "integer"}, {"description", "-1 = the current viewer (default; matches render.capture omitted-index behavior); >= 0 = dataset camera index; out-of-range fails with an error"}}},
                         {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"x0", "y0", "x1", "y1"}}},
             [viewer_impl](const json& args) -> json {
@@ -3760,7 +3907,7 @@ namespace lfs::app {
                 const float x1 = args["x1"].get<float>();
                 const float y1 = args["y1"].get<float>();
                 const std::string mode = args.value("mode", "replace");
-                const int camera_index = args.value("camera_index", 0);
+                const int camera_index = selection_camera_index_from_args(args);
 
                 return post_and_wait(viewer_impl, [viewer_impl, x0, y0, x1, y1, mode, camera_index]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
@@ -3779,7 +3926,7 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"points", json{{"type", "array"}, {"items", json{{"type", "array"}, {"items", json{{"type", "number"}}}}}, {"description", "Polygon vertices [[x0,y0], [x1,y1], ...]"}}},
-                        {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
+                        {"camera_index", json{{"type", "integer"}, {"description", "-1 = the current viewer (default; matches render.capture omitted-index behavior); >= 0 = dataset camera index; out-of-range fails with an error"}}},
                         {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"points"}}},
             [viewer_impl](const json& args) -> json {
@@ -3795,7 +3942,7 @@ namespace lfs::app {
                 }
 
                 const std::string mode = args.value("mode", "replace");
-                const int camera_index = args.value("camera_index", 0);
+                const int camera_index = selection_camera_index_from_args(args);
 
                 return post_and_wait(viewer_impl, [viewer_impl, vertex_data = std::move(vertex_data), mode, camera_index]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
@@ -3814,7 +3961,7 @@ namespace lfs::app {
                     .type = "object",
                     .properties = json{
                         {"points", json{{"type", "array"}, {"items", json{{"type", "array"}, {"items", json{{"type", "number"}}}}}, {"description", "Lasso points [[x0,y0], [x1,y1], ...]"}}},
-                        {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
+                        {"camera_index", json{{"type", "integer"}, {"description", "-1 = the current viewer (default; matches render.capture omitted-index behavior); >= 0 = dataset camera index; out-of-range fails with an error"}}},
                         {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"points"}}},
             [viewer_impl](const json& args) -> json {
@@ -3830,7 +3977,7 @@ namespace lfs::app {
                 }
 
                 const std::string mode = args.value("mode", "replace");
-                const int camera_index = args.value("camera_index", 0);
+                const int camera_index = selection_camera_index_from_args(args);
 
                 return post_and_wait(viewer_impl, [viewer_impl, vertex_data = std::move(vertex_data), mode, camera_index]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
@@ -3850,14 +3997,14 @@ namespace lfs::app {
                     .properties = json{
                         {"x", json{{"type", "number"}, {"description", "X coordinate"}}},
                         {"y", json{{"type", "number"}, {"description", "Y coordinate"}}},
-                        {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
+                        {"camera_index", json{{"type", "integer"}, {"description", "-1 = the current viewer (default; matches render.capture omitted-index behavior); >= 0 = dataset camera index; out-of-range fails with an error"}}},
                         {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"x", "y"}}},
             [viewer_impl](const json& args) -> json {
                 const float x = args["x"].get<float>();
                 const float y = args["y"].get<float>();
                 const std::string mode = args.value("mode", "replace");
-                const int camera_index = args.value("camera_index", 0);
+                const int camera_index = selection_camera_index_from_args(args);
 
                 return post_and_wait(viewer_impl, [viewer_impl, x, y, mode, camera_index]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
@@ -3878,7 +4025,7 @@ namespace lfs::app {
                         {"x", json{{"type", "number"}, {"description", "X coordinate"}}},
                         {"y", json{{"type", "number"}, {"description", "Y coordinate"}}},
                         {"radius", json{{"type", "number"}, {"description", "Selection radius in pixels (default: 20)"}}},
-                        {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
+                        {"camera_index", json{{"type", "integer"}, {"description", "-1 = the current viewer (default; matches render.capture omitted-index behavior); >= 0 = dataset camera index; out-of-range fails with an error"}}},
                         {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"x", "y"}}},
             [viewer_impl](const json& args) -> json {
@@ -3886,7 +4033,7 @@ namespace lfs::app {
                 const float y = args["y"].get<float>();
                 const float radius = args.value("radius", 20.0f);
                 const std::string mode = args.value("mode", "replace");
-                const int camera_index = args.value("camera_index", 0);
+                const int camera_index = selection_camera_index_from_args(args);
 
                 return post_and_wait(viewer_impl, [viewer_impl, x, y, radius, mode, camera_index]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
@@ -3907,7 +4054,7 @@ namespace lfs::app {
                         {"x", json{{"type", "number"}, {"description", "X coordinate"}}},
                         {"y", json{{"type", "number"}, {"description", "Y coordinate"}}},
                         {"radius", json{{"type", "number"}, {"description", "Selection radius in pixels (default: 20)"}}},
-                        {"camera_index", json{{"type", "integer"}, {"description", "Camera index (default: 0)"}}},
+                        {"camera_index", json{{"type", "integer"}, {"description", "-1 = the current viewer (default; matches render.capture omitted-index behavior); >= 0 = dataset camera index; out-of-range fails with an error"}}},
                         {"mode", json{{"type", "string"}, {"enum", json::array({"replace", "add", "remove", "intersect"})}, {"description", "Selection mode (default: replace)"}}}},
                     .required = {"x", "y"}}},
             [viewer_impl](const json& args) -> json {
@@ -3915,7 +4062,7 @@ namespace lfs::app {
                 const float y = args["y"].get<float>();
                 const float radius = args.value("radius", 20.0f);
                 const std::string mode = args.value("mode", "replace");
-                const int camera_index = args.value("camera_index", 0);
+                const int camera_index = selection_camera_index_from_args(args);
 
                 return post_and_wait(viewer_impl, [viewer_impl, x, y, radius, mode, camera_index]() -> json {
                     auto* const scene_manager = viewer_impl->getSceneManager();
@@ -4980,7 +5127,7 @@ namespace lfs::app {
                                 node->model->max_sh_coeffs_rest() == 0) {
                                 field_payloads[field_name] = tensor_payload_json(
                                     core::Tensor::zeros({static_cast<size_t>(resolved_indices.size()), 0, 3},
-                                                        core::Device::CUDA));
+                                                        core::Device::GPU));
                                 continue;
                             }
                             const auto rest_coefficients =

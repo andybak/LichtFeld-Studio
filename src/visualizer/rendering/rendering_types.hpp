@@ -45,7 +45,61 @@ namespace lfs::vis {
         RGB = 0,
         Normal = 1,
         Depth = 2,
+        Loss = 3,
     };
+
+    [[nodiscard]] inline bool gtComparisonUsesRGBReference(
+        const GTComparisonMode mode) noexcept {
+        return mode == GTComparisonMode::RGB ||
+               mode == GTComparisonMode::Loss;
+    }
+
+    [[nodiscard]] inline bool gtComparisonShowsLoss(
+        const GTComparisonMode mode) noexcept {
+        return mode == GTComparisonMode::Loss;
+    }
+
+    [[nodiscard]] inline glm::vec3 gtLossHeatmapColor(
+        const glm::vec3& ground_truth,
+        const glm::vec3& rendered) noexcept {
+        const glm::vec3 difference =
+            glm::abs(ground_truth - rendered);
+        const float mean_absolute_error =
+            (difference.r + difference.g + difference.b) /
+            3.0f;
+        const float intensity =
+            std::isfinite(mean_absolute_error)
+                ? std::clamp(
+                      1.0f - std::exp(
+                                 -8.0f *
+                                 std::max(
+                                     mean_absolute_error,
+                                     0.0f)),
+                      0.0f, 1.0f)
+                : 1.0f;
+
+        constexpr glm::vec3 black{0.0f, 0.0f, 0.0f};
+        constexpr glm::vec3 purple{0.22f, 0.02f, 0.47f};
+        constexpr glm::vec3 red{0.72f, 0.12f, 0.29f};
+        constexpr glm::vec3 yellow{0.99f, 0.65f, 0.04f};
+        constexpr glm::vec3 white{1.0f, 1.0f, 0.75f};
+        if (intensity < 0.25f) {
+            return glm::mix(black, purple, intensity * 4.0f);
+        }
+        if (intensity < 0.5f) {
+            return glm::mix(
+                purple, red,
+                (intensity - 0.25f) * 4.0f);
+        }
+        if (intensity < 0.75f) {
+            return glm::mix(
+                red, yellow,
+                (intensity - 0.5f) * 4.0f);
+        }
+        return glm::mix(
+            yellow, white,
+            (intensity - 0.75f) * 4.0f);
+    }
 
     enum class SplitViewPanelId : uint8_t {
         Left = 0,
@@ -294,7 +348,6 @@ namespace lfs::vis {
         bool use_ellipsoid = false;
         bool desaturate_unselected = false;     // Desaturate unselected PLYs when one is selected
         bool desaturate_cropping = false;       // Desaturate outside crop box/ellipsoid instead of hiding
-        bool hide_outside_depth_box = false;    // Hide gaussians outside the selection depth box
         bool crop_filter_for_selection = false; // Use crop box/ellipsoid as selection filter
 
         // Appearance correction (PPISP)
@@ -385,6 +438,11 @@ namespace lfs::vis {
         glm::vec3 depth_filter_min = glm::vec3(-50.0f, -10000.0f, 0.0f);
         glm::vec3 depth_filter_max = glm::vec3(50.0f, 10000.0f, 100.0f);
         lfs::geometry::EuclideanTransform depth_filter_transform;
+        float depth_filter_scale_x = 0.35f;
+        float depth_filter_scale_y = 0.35f;
+        float depth_filter_offset_x = 0.0f;
+        float depth_filter_offset_y = 0.0f;
+        int depth_filter_viz_mode = 1;
 
         // ---- LOD (Spark-style) ----
         bool lod_enabled = false;                       // Master toggle
@@ -434,6 +492,7 @@ namespace lfs::vis {
         case GTComparisonMode::RGB:
         case GTComparisonMode::Normal:
         case GTComparisonMode::Depth:
+        case GTComparisonMode::Loss:
             break;
         default:
             settings.gt_comparison_mode = GTComparisonMode::RGB;

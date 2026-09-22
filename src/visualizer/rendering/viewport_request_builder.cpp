@@ -5,6 +5,7 @@
 #include "viewport_request_builder.hpp"
 #include "rendering/model_renderability.hpp"
 #include "scene/scene_manager.hpp"
+#include "temporal_frame_tracker.hpp"
 #include <type_traits>
 #include <vector>
 
@@ -242,16 +243,53 @@ namespace lfs::vis {
                 filters.ellipsoid_region = filters.ellipsoid_regions.front();
             }
         }
-        void applyGaussianViewVolume(lfs::rendering::GaussianFilterState& filters, const FrameContext& ctx) {
-            if (!ctx.settings.depth_filter_enabled) {
+        void applyGaussianViewVolume(lfs::rendering::GaussianFilterState& filters,
+                                     const FrameContext& ctx,
+                                     const std::optional<SplitViewPanelId> render_panel) {
+            // While GT comparison mode is active the depth filter's render effect
+            // (dim/hide/containment, and the drag-preview lane with it) is fully
+            // suspended. Settings are never mutated — dropping the filters from the
+            // request restores everything the moment GT ends.
+            if (!ctx.settings.depth_filter_enabled ||
+                splitViewUsesGTComparison(ctx.settings.split_view_mode)) {
                 return;
             }
 
+            const bool use_panel_slots =
+                splitViewUsesIndependentPanels(ctx.settings.split_view_mode) && render_panel;
+            float depth_near = -ctx.settings.depth_filter_max.z;
+            float depth_far = -ctx.settings.depth_filter_min.z;
+            float scale_x = ctx.settings.depth_filter_scale_x;
+            float scale_y = ctx.settings.depth_filter_scale_y;
+            float offset_x = ctx.settings.depth_filter_offset_x;
+            float offset_y = ctx.settings.depth_filter_offset_y;
+            if (use_panel_slots) {
+                const DepthWindowState& window =
+                    ctx.panel_depth_windows[splitViewPanelIndex(*render_panel)];
+                depth_near = window.near_plane;
+                depth_far = window.far_plane;
+                scale_x = window.scale_x;
+                scale_y = window.scale_y;
+                offset_x = window.offset_x;
+                offset_y = window.offset_y;
+            }
+
             filters.view_volume = lfs::rendering::BoundingBox{
-                .min = ctx.settings.depth_filter_min,
-                .max = ctx.settings.depth_filter_max,
+                .min = {ctx.settings.depth_filter_min.x,
+                        ctx.settings.depth_filter_min.y,
+                        -depth_far},
+                .max = {ctx.settings.depth_filter_max.x,
+                        ctx.settings.depth_filter_max.y,
+                        -depth_near},
                 .transform = ctx.settings.depth_filter_transform.inv().toMat4()};
-            filters.cull_outside_view_volume = ctx.settings.hide_outside_depth_box;
+            filters.screen_window = lfs::rendering::SelectionScreenWindow{
+                .scale_x = scale_x,
+                .scale_y = scale_y,
+                .offset_x = offset_x,
+                .offset_y = offset_y,
+                .drag_preview = ctx.depth_window_drag_preview};
+            filters.cull_outside_view_volume = ctx.settings.depth_filter_viz_mode == 2;
+            filters.dim_outside_view_volume = ctx.settings.depth_filter_viz_mode == 1;
         }
 
         void populateSelectionColors(
@@ -296,7 +334,8 @@ namespace lfs::vis {
                                                                      const glm::ivec2 subregion_origin,
                                                                      const glm::ivec2 subregion_full_size) {
         const Viewport& viewport = source_viewport ? *source_viewport : ctx.viewport;
-        const auto frame_view = ctx.makeFrameView(viewport, render_size);
+        const auto frame_view = applySceneViewJitter(
+            ctx.makeFrameView(viewport, render_size), ctx.scene_jitter_pixels);
         const bool selection_overlay_enabled = !ctx.training_active;
         const bool overlay_visible =
             selection_overlay_enabled && panelMatches(ctx.cursor_preview.panel, render_panel);
@@ -366,7 +405,7 @@ namespace lfs::vis {
 
         applyGaussianCropBox(request.filters, ctx);
         applyGaussianEllipsoid(request.filters, ctx);
-        applyGaussianViewVolume(request.filters, ctx);
+        applyGaussianViewVolume(request.filters, ctx, render_panel);
         request.frame_view.subregion_origin = subregion_origin;
         request.frame_view.subregion_full_size = subregion_full_size;
         return request;

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "app/application.hpp"
+#include "app/gpu_preflight.hpp"
 #include "app/headless_recovery_document.hpp"
 #include "app/headless_run_coordinator.hpp"
 #include "control/command_api.hpp"
@@ -23,6 +24,7 @@
 #include "core/scene.hpp"
 #include "core/session_breadcrumb.hpp"
 #include "core/tensor.hpp"
+#include "core/tensor_backend.hpp"
 #include "core/user_paths.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "io/cache_image_loader.hpp"
@@ -38,6 +40,7 @@
 
 #include "app/mcp_gui_tools.hpp"
 #include "gui/gpu_memory_query.hpp"
+#include "io/exporter.hpp"
 #include "io/loader.hpp"
 #include "io/video/video_encoder.hpp"
 #include "mcp/mcp_http_server.hpp"
@@ -76,6 +79,75 @@
 namespace lfs::app {
 
     namespace {
+
+        const char* final_export_extension(const core::param::OutputFormat format) {
+            using core::param::OutputFormat;
+            switch (format) {
+            case OutputFormat::PLY: return ".ply";
+            case OutputFormat::SOG: return ".sog";
+            case OutputFormat::SPZ: return ".spz";
+            case OutputFormat::HTML: return ".html";
+            case OutputFormat::USD: return ".usd";
+            case OutputFormat::USDA: return ".usda";
+            case OutputFormat::USDC: return ".usdc";
+            case OutputFormat::RAD: return ".rad";
+            }
+            return ".ply";
+        }
+
+        io::Result<void> save_final_splat(const core::SplatData& splat,
+                                          const std::filesystem::path& output,
+                                          const core::param::OutputFormat format,
+                                          const core::ProvenanceStamp& provenance) {
+            using core::param::OutputFormat;
+            switch (format) {
+            case OutputFormat::PLY:
+                return io::save_ply(splat, {.output_path = output, .binary = true, .provenance = provenance});
+            case OutputFormat::SOG:
+                return io::save_sog(splat, {.output_path = output, .kmeans_iterations = 10, .provenance = provenance});
+            case OutputFormat::SPZ:
+                return io::save_spz(splat, {.output_path = output, .version = 4, .provenance = provenance});
+            case OutputFormat::HTML:
+                return io::export_html(splat, {.output_path = output, .kmeans_iterations = 10, .provenance = provenance});
+            case OutputFormat::USD:
+            case OutputFormat::USDA:
+            case OutputFormat::USDC:
+                return io::save_usd(splat, {.output_path = output, .provenance = provenance});
+            case OutputFormat::RAD:
+                return io::save_rad(splat, {.output_path = output, .provenance = provenance});
+            }
+            return io::save_ply(splat, {.output_path = output, .binary = true, .provenance = provenance});
+        }
+
+        void export_final_splats(const training::Trainer& trainer,
+                                 const core::param::TrainingParameters& params) {
+            if (params.export_formats.empty()) {
+                return;
+            }
+            const auto& model = trainer.get_strategy().get_model();
+            const std::filesystem::path out_dir = params.dataset.output_path;
+            const std::string stem = params.dataset.output_name.empty()
+                                         ? std::format("splat_{}", trainer.get_current_iteration())
+                                         : params.dataset.output_name;
+
+            core::ProvenanceStamp stamp = params.include_provenance
+                                              ? core::make_provenance_stamp()
+                                              : core::make_minimal_provenance_stamp();
+            if (params.include_provenance) {
+                stamp.iteration = trainer.get_current_iteration();
+                stamp.strategy = params.optimization.strategy;
+            }
+
+            for (const auto format : params.export_formats) {
+                const std::filesystem::path path = out_dir / (stem + final_export_extension(format));
+                if (const auto result = save_final_splat(model, path, format, stamp); !result) {
+                    LOG_ERROR("Failed to export final splat to {}: {}",
+                              core::path_to_utf8(path), result.error().message);
+                } else {
+                    LOG_INFO("Exported final splat: {}", core::path_to_utf8(path));
+                }
+            }
+        }
 
         struct HeadlessPluginSignalGuard {
             HeadlessPluginSignalGuard() {
@@ -681,7 +753,11 @@ namespace lfs::app {
                                 effective_params
                                     .python_scripts);
                         }
-                        trainer->setParams(effective_params);
+                        if (auto updated = trainer->setParams(effective_params); !updated) {
+                            LOG_ERROR("Failed to apply training parameters: {}",
+                                      lfs::format_for_developer(updated.error()));
+                            return 1;
+                        }
                         training::grant_headless_project_saves(
                             *trainer, effective_params,
                             headless_dataset_project_destination(effective_params),
@@ -947,12 +1023,8 @@ namespace lfs::app {
                     training::grant_headless_project_saves(
                         *trainer, *ckpt_params_result);
 
-                    const auto ckpt_result = trainer->load_checkpoint(*params->resume_checkpoint);
-                    if (!ckpt_result) {
-                        LOG_ERROR("Failed to restore checkpoint state: {}", ckpt_result.error());
-                        return 1;
-                    }
-                    LOG_INFO("Resumed from iteration {}", *ckpt_result);
+                    // initialize() already loads resume_checkpoint and propagates errors.
+                    LOG_INFO("Resumed from iteration {}", trainer->get_current_iteration());
                     if (ckpt_params_result->optimization.enable_eval)
                         trainer->set_lpips_weights_path(prepare_lpips_weights(!params->no_download));
 
@@ -1084,7 +1156,7 @@ namespace lfs::app {
                 auto* const bg_ptr = background.ptr<float>();
                 bg_ptr[0] = bg_ptr[1] = bg_ptr[2] = 0.0f;
             }
-            background = background.to(core::Device::CUDA);
+            background = background.to(core::Device::GPU);
 
             lfs::io::video::VideoEncoder encoder;
             lfs::io::video::VideoExportOptions options;
@@ -1145,8 +1217,8 @@ namespace lfs::app {
                 if (image.dtype() != core::DataType::Float32) {
                     image = image.to(core::DataType::Float32);
                 }
-                if (image.device() != core::Device::CUDA) {
-                    image = image.cuda();
+                if (image.device() != core::Device::GPU) {
+                    image = image.gpu();
                 }
                 auto image_hwc = image.permute({1, 2, 0}).contiguous();
 
@@ -1204,7 +1276,40 @@ namespace lfs::app {
     // kernels. Without this gate the first launch inside warmup_kernels dies with no
     // user-facing message (#1540). show_dialog is false for CLI-only modes: a modal in a
     // non-interactive process blocks it forever.
-    bool preflightGpu(const bool show_dialog) {
+    bool preflightGpu(const bool show_dialog, const bool viewer_only) {
+        const bool cuda_usable =
+            lfs::core::gpu_backend_available(lfs::core::GpuBackend::CUDA);
+        const bool vulkan_usable =
+            lfs::core::gpu_backend_available(lfs::core::GpuBackend::Vulkan);
+        switch (decide_gpu_preflight(viewer_only, cuda_usable, vulkan_usable)) {
+        case GpuPreflightDecision::UseVulkanViewer: {
+            const lfs::Status backend = lfs::core::set_default_gpu_backend(
+                lfs::core::GpuBackend::Vulkan);
+            if (!backend.has_value()) {
+                reportFatalStartupError(
+                    "LichtFeld Studio - No usable GPU",
+                    std::format("No usable NVIDIA GPU found, and the Vulkan tensor backend "
+                                "could not be selected ({}).",
+                                lfs::format_for_developer(backend.error())),
+                    show_dialog);
+                return false;
+            }
+            LOG_WARN("No usable NVIDIA GPU: training is unavailable, the viewer runs on the "
+                     "Vulkan tensor backend");
+            return true;
+        }
+        case GpuPreflightDecision::Fatal:
+            reportFatalStartupError(
+                "LichtFeld Studio - No usable GPU",
+                std::format("No usable NVIDIA GPU found. LichtFeld Studio requires an "
+                            "NVIDIA GPU with compute capability {}.{} or newer.{}",
+                            LFS_MIN_SM / 10, LFS_MIN_SM % 10, kMinGpuHint),
+                show_dialog);
+            return false;
+        case GpuPreflightDecision::UseCuda:
+            break;
+        }
+
         const auto info = lfs::core::check_cuda_version();
         if (info.query_failed) {
             LOG_WARN("Failed to query CUDA driver version");
@@ -1354,7 +1459,9 @@ namespace lfs::app {
             // module memory (the cuda.modules row). Without it the modules land in the
             // unattributed NVML residual. The pre-flight gate in run_mode covers
             // hardware compatibility before this warmup starts.
-            warmupCudaAsync();
+            if (lfs::core::gpu_backend_available(lfs::core::GpuBackend::CUDA)) {
+                warmupCudaAsync();
+            }
 
             lfs::event::CommandCenterBridge::instance().set(&lfs::training::CommandCenter::instance());
 

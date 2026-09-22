@@ -53,11 +53,11 @@ namespace {
         std::optional<std::string> previous_;
     };
 
-    auto current_process_id() {
+    int current_process_id() noexcept {
 #ifdef _WIN32
         return _getpid();
 #else
-        return getpid();
+        return static_cast<int>(getpid());
 #endif
     }
 

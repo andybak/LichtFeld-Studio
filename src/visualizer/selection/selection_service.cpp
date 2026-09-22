@@ -8,8 +8,10 @@
 #include "core/logger.hpp"
 #include "core/services.hpp"
 #include "core/splat_data.hpp"
-#include "core/tensor/internal/cuda_event_pool.hpp"
-#include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/tensor/backend/cuda/runtime/cuda_event_pool.hpp"
+#include "core/tensor/backend/cuda/runtime/cuda_stream_context.hpp"
+#include "core/tensor/backend/gpu_backend_ops.hpp"
+#include "core/tensor_backend.hpp"
 #include "gui/gui_manager.hpp"
 #include "internal/viewport.hpp"
 #include "operation/undo_entry.hpp"
@@ -32,6 +34,7 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <exception>
+#include <expected>
 #include <functional>
 #include <glm/geometric.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -52,6 +55,46 @@ namespace lfs::vis {
         constexpr float RING_PICK_PADDING_PX = 4.0f;
         constexpr float MIN_VOLUME_SELECTION_RADIUS = 1.0e-3f;
 
+        [[nodiscard]] SelectionService::ViewportInfo viewportInfoFromLayout(
+            const SelectionProjectionContext::ViewerLayout& layout) {
+            return SelectionService::ViewportInfo{
+                .x = layout.x,
+                .y = layout.y,
+                .width = layout.width,
+                .height = layout.height,
+                .render_width = layout.render_width,
+                .render_height = layout.render_height,
+            };
+        }
+
+        [[nodiscard]] SelectionProjectionContext::ViewerLayout viewerLayoutFromInfo(
+            const SelectionService::ViewportInfo& info) {
+            return SelectionProjectionContext::ViewerLayout{
+                .x = info.x,
+                .y = info.y,
+                .width = info.width,
+                .height = info.height,
+                .render_width = info.render_width,
+                .render_height = info.render_height,
+            };
+        }
+
+        // KEEP IN SYNC: formula-identical to the ViewportInfo overload below and
+        // to op::screenToRender in depth_window_geometry.hpp. A change to any one
+        // of the three must be mirrored in the other two.
+        [[nodiscard]] glm::vec2 screenToRender(const glm::vec2& screen,
+                                               const SelectionProjectionContext::ViewerLayout& info) {
+            const float scale_x = static_cast<float>(info.render_width) / info.width;
+            const float scale_y = static_cast<float>(info.render_height) / info.height;
+            return {
+                (screen.x - info.x) * scale_x,
+                (screen.y - info.y) * scale_y,
+            };
+        }
+
+        // KEEP IN SYNC: formula-identical to the ViewerLayout overload above and
+        // to op::screenToRender in depth_window_geometry.hpp. A change to any one
+        // of the three must be mirrored in the other two.
         [[nodiscard]] glm::vec2 screenToRender(const glm::vec2& screen, const SelectionService::ViewportInfo& info) {
             const float scale_x = static_cast<float>(info.render_width) / info.width;
             const float scale_y = static_cast<float>(info.render_height) / info.height;
@@ -70,6 +113,41 @@ namespace lfs::vis {
                 render_points.emplace_back(render.x, render.y);
             }
             return render_points;
+        }
+
+        // CPU inverse/forward of filterSelectionByScreenWindowKernel's equirect
+        // branch. Not a fifth KEEP-IN-SYNC copy: used by the GT path and by the
+        // CPU fallback of projectGaussianScreenPositions.
+        constexpr float kEquirectPi = 3.14159265358979323846f;
+
+        [[nodiscard]] glm::vec3 equirectVisualizerDirectionFromRenderPixel(
+            const glm::vec2& render_point, const int width, const int height) {
+            const float lon =
+                (render_point.x / static_cast<float>(width) - 0.5f) * (2.0f * kEquirectPi);
+            const float lat =
+                (render_point.y / static_cast<float>(height) - 0.5f) * kEquirectPi;
+            const glm::vec3 vk_dir{
+                std::cos(lat) * std::sin(lon),
+                std::sin(lat),
+                std::cos(lat) * std::cos(lon),
+            };
+            return {vk_dir.x, -vk_dir.y, -vk_dir.z};
+        }
+
+        [[nodiscard]] std::optional<glm::vec2> equirectRenderPixelFromVisualizerView(
+            const glm::vec3& vis_view, const int width, const int height) {
+            const glm::vec3 vk{vis_view.x, -vis_view.y, -vis_view.z};
+            const float len = glm::length(vk);
+            if (len <= 1.0e-6f || !std::isfinite(len)) {
+                return std::nullopt;
+            }
+            const glm::vec3 dir = vk / len;
+            const float px =
+                (std::atan2(dir.x, dir.z) / (2.0f * kEquirectPi) + 0.5f) * static_cast<float>(width);
+            const float py =
+                (std::asin(std::clamp(dir.y, -1.0f, 1.0f)) / kEquirectPi + 0.5f) *
+                static_cast<float>(height);
+            return glm::vec2(px, py);
         }
 
         void hashCombine(std::size_t& seed, const std::size_t value) {
@@ -117,11 +195,42 @@ namespace lfs::vis {
             hashCombine(seed, std::hash<int>{}(static_cast<int>(tensor->device())));
         }
 
+        [[nodiscard]] std::size_t projectionContextSignature(const SelectionProjectionContext& context) {
+            std::size_t seed = 0;
+            hashMat3(seed, context.viewport.rotation);
+            hashVec3(seed, context.viewport.translation);
+            hashCombine(seed, std::hash<int>{}(context.viewport.size.x));
+            hashCombine(seed, std::hash<int>{}(context.viewport.size.y));
+            hashFloat(seed, context.viewport.focal_length_mm);
+            hashCombine(seed, std::hash<bool>{}(context.viewport.orthographic));
+            hashFloat(seed, context.viewport.ortho_scale);
+            hashCombine(seed, std::hash<bool>{}(context.equirectangular));
+            hashFloat(seed, context.far_plane);
+            if (context.viewer_layout) {
+                const auto& layout = *context.viewer_layout;
+                hashFloat(seed, layout.x);
+                hashFloat(seed, layout.y);
+                hashFloat(seed, layout.width);
+                hashFloat(seed, layout.height);
+                hashCombine(seed, std::hash<int>{}(layout.render_width));
+                hashCombine(seed, std::hash<int>{}(layout.render_height));
+            }
+            hashCombine(seed, std::hash<bool>{}(context.containment_intrinsics.has_value()));
+            if (context.containment_intrinsics) {
+                hashFloat(seed, context.containment_intrinsics->focal_x);
+                hashFloat(seed, context.containment_intrinsics->focal_y);
+                hashFloat(seed, context.containment_intrinsics->center_x);
+                hashFloat(seed, context.containment_intrinsics->center_y);
+            }
+            return seed;
+        }
+
         [[nodiscard]] std::size_t makeScreenPositionCacheSignature(
             const SceneRenderState& scene_state,
             const rendering::ViewportData& viewport,
             const bool equirectangular,
-            const std::uint64_t projection_generation) {
+            const std::uint64_t projection_generation,
+            const std::optional<rendering::CameraIntrinsics>& containment) {
             std::size_t seed = 0;
             hashCombine(seed, std::hash<std::uint64_t>{}(projection_generation));
             hashCombine(seed, reinterpret_cast<std::size_t>(scene_state.combined_model));
@@ -149,28 +258,60 @@ namespace lfs::vis {
             hashCombine(seed, std::hash<bool>{}(viewport.orthographic));
             hashFloat(seed, viewport.ortho_scale);
             hashCombine(seed, std::hash<bool>{}(equirectangular));
+            hashCombine(seed, std::hash<bool>{}(containment.has_value()));
+            if (containment) {
+                hashFloat(seed, containment->focal_x);
+                hashFloat(seed, containment->focal_y);
+                hashFloat(seed, containment->center_x);
+                hashFloat(seed, containment->center_y);
+            }
             return seed;
+        }
+
+        [[nodiscard]] std::optional<core::GpuBackend> gpuBackendOf(const core::Tensor& tensor) {
+            if (!tensor.is_valid() || tensor.device() != core::Device::GPU) {
+                return std::nullopt;
+            }
+            return core::gpu_backend_of(tensor);
+        }
+
+        [[nodiscard]] core::GpuBackend resolveGpuBackend(const core::Tensor* const affinity) {
+            if (affinity) {
+                if (const auto backend = gpuBackendOf(*affinity)) {
+                    return *backend;
+                }
+            }
+            return core::default_gpu_backend();
+        }
+
+        [[nodiscard]] bool bufferMatchesBackend(const core::Tensor& buffer, const core::GpuBackend backend) {
+            const auto got = gpuBackendOf(buffer);
+            return got.has_value() && *got == backend;
         }
 
         [[nodiscard]] core::Tensor& uploadFloat2PointsToBuffer(
             const std::vector<glm::vec2>& points,
             std::vector<float>& host_buffer,
-            core::Tensor& device_buffer) {
+            core::Tensor& device_buffer,
+            const core::Tensor* const affinity = nullptr) {
             host_buffer.resize(points.size() * 2);
             for (size_t i = 0; i < points.size(); ++i) {
                 host_buffer[i * 2] = points[i].x;
                 host_buffer[i * 2 + 1] = points[i].y;
             }
 
+            const auto backend = resolveGpuBackend(affinity);
             const bool needs_realloc = !device_buffer.is_valid() ||
-                                       device_buffer.device() != core::Device::CUDA ||
+                                       device_buffer.device() != core::Device::GPU ||
                                        device_buffer.dtype() != core::DataType::Float32 ||
                                        device_buffer.shape().rank() != 2 ||
                                        device_buffer.size(0) != points.size() ||
-                                       device_buffer.size(1) != 2;
+                                       device_buffer.size(1) != 2 ||
+                                       !bufferMatchesBackend(device_buffer, backend);
             if (needs_realloc) {
+                core::GpuBackendScope scope(backend);
                 device_buffer = core::Tensor::empty({points.size(), size_t{2}},
-                                                    core::Device::CUDA,
+                                                    core::Device::GPU,
                                                     core::DataType::Float32);
             }
 
@@ -214,19 +355,22 @@ namespace lfs::vis {
 
         [[nodiscard]] core::Tensor ensureCudaBoolMask(const core::Tensor& mask) {
             auto result = (mask.dtype() == core::DataType::Bool) ? mask : mask.to(core::DataType::Bool);
-            if (result.device() != core::Device::CUDA) {
-                result = result.cuda();
+            if (result.device() != core::Device::GPU) {
+                result = result.gpu();
             }
             return result;
         }
 
         [[nodiscard]] core::Tensor& ensureCudaByteScratchBuffer(core::Tensor& buffer, const size_t size) {
+            const auto backend = core::default_gpu_backend();
             const bool needs_realloc = !buffer.is_valid() ||
-                                       buffer.device() != core::Device::CUDA ||
+                                       buffer.device() != core::Device::GPU ||
                                        buffer.dtype() != core::DataType::UInt8 ||
-                                       buffer.numel() != size;
+                                       buffer.numel() != size ||
+                                       !bufferMatchesBackend(buffer, backend);
             if (needs_realloc) {
-                buffer = core::Tensor::empty({size}, core::Device::CUDA, core::DataType::UInt8);
+                core::GpuBackendScope scope(backend);
+                buffer = core::Tensor::empty({size}, core::Device::GPU, core::DataType::UInt8);
             }
             return buffer;
         }
@@ -295,8 +439,13 @@ namespace lfs::vis {
             if (!source.is_valid() || !output.is_valid() || source.numel() != output.numel()) {
                 return false;
             }
-            if (source.device() == core::Device::CUDA &&
-                output.device() == core::Device::CUDA &&
+            const auto src_backend = lfs::core::gpu_backend_of(source);
+            const auto dst_backend = lfs::core::gpu_backend_of(output);
+            const bool same_backend = src_backend == dst_backend;
+            if (source.device() == core::Device::GPU &&
+                output.device() == core::Device::GPU &&
+                same_backend &&
+                src_backend != lfs::core::GpuBackend::Vulkan &&
                 source.dtype() == output.dtype() &&
                 source.is_contiguous() &&
                 output.is_contiguous()) {
@@ -325,7 +474,13 @@ namespace lfs::vis {
                 lfs::core::bridgeStreams(source_stream, output_stream);
                 return true;
             }
-            output.copy_from(source);
+            if (same_backend ||
+                source.device() == core::Device::CPU ||
+                output.device() == core::Device::CPU) {
+                output.copy_from(source);
+                return true;
+            }
+            output.copy_from(source.cpu());
             return true;
         }
 
@@ -333,7 +488,7 @@ namespace lfs::vis {
             lfs::core::Scene& scene,
             const size_t visible_count,
             const std::vector<bool>& node_mask) {
-            auto scope = core::Tensor::ones({visible_count}, core::Device::CUDA, core::DataType::Bool);
+            auto scope = core::Tensor::ones({visible_count}, core::Device::GPU, core::DataType::Bool);
             if (!nodeMaskRestrictsSelection(node_mask)) {
                 return scope;
             }
@@ -376,8 +531,8 @@ namespace lfs::vis {
                             return {};
                         }
                         auto active_group = existing_mask->eq(group_id);
-                        if (active_group.device() != core::Device::CUDA) {
-                            active_group = active_group.cuda();
+                        if (active_group.device() != core::Device::GPU) {
+                            active_group = active_group.gpu();
                         }
                         return selection.where(scope, active_group);
                     }
@@ -399,11 +554,11 @@ namespace lfs::vis {
             core::Tensor expanded;
             if (preserves_active_group) {
                 expanded = existing_mask->eq(group_id);
-                if (expanded.device() != core::Device::CUDA) {
-                    expanded = expanded.cuda();
+                if (expanded.device() != core::Device::GPU) {
+                    expanded = expanded.gpu();
                 }
             } else {
-                expanded = core::Tensor::zeros({full_count}, core::Device::CUDA, core::DataType::Bool);
+                expanded = core::Tensor::zeros({full_count}, core::Device::GPU, core::DataType::Bool);
             }
 
             const core::Tensor* visible_selection = &selection;
@@ -433,14 +588,14 @@ namespace lfs::vis {
 
             const size_t selection_count = selection.numel();
             if (!existing_mask || !existing_mask->is_valid()) {
-                return core::Tensor::zeros({selection_count}, core::Device::CUDA, core::DataType::Bool);
+                return core::Tensor::zeros({selection_count}, core::Device::GPU, core::DataType::Bool);
             }
 
             auto& scene = scene_manager->getScene();
             const size_t full_count = scene.getSelectionGaussianCount();
             auto active_group = existing_mask->eq(group_id);
-            if (active_group.device() != core::Device::CUDA) {
-                active_group = active_group.cuda();
+            if (active_group.device() != core::Device::GPU) {
+                active_group = active_group.gpu();
             }
 
             if (selection_count == full_count) {
@@ -458,6 +613,55 @@ namespace lfs::vis {
 
             const auto active_visible = active_group.index_select(0, *visible_indices).contiguous();
             return selection.logical_and(active_visible);
+        }
+
+        // Base intrinsics for a dataset camera, scaled to a target render size.
+        // O3 ruling: prefer the undistort destination set when it is precomputed, exactly as
+        // buildGTRenderCamera does (split_view_service.cpp:78-103), otherwise the raw camera
+        // values; then scale all four fields from the base size to the target. get_intrinsics()
+        // is NOT usable here: it scales to image_/camera_ size (camera.cpp:351-354), while the
+        // selection viewport is sized max(image_*, camera_*) (viewportDataFromCamera, this file),
+        // so the two disagree whenever a dataset is loaded resized.
+        [[nodiscard]] std::optional<rendering::CameraIntrinsics> containmentIntrinsicsFromCamera(
+            const core::Camera& camera, glm::ivec2 target_size) {
+            if (camera.camera_model_type() == core::CameraModelType::EQUIRECTANGULAR) {
+                return std::nullopt;
+            }
+            if (target_size.x <= 0 || target_size.y <= 0) {
+                return std::nullopt;
+            }
+
+            float base_fx = camera.focal_x();
+            float base_fy = camera.focal_y();
+            float base_cx = camera.center_x();
+            float base_cy = camera.center_y();
+            int base_width = camera.camera_width();
+            int base_height = camera.camera_height();
+            if (camera.is_undistort_precomputed()) {
+                const auto& undistort = camera.undistort_params();
+                base_fx = undistort.dst_fx;
+                base_fy = undistort.dst_fy;
+                base_cx = undistort.dst_cx;
+                base_cy = undistort.dst_cy;
+                base_width = undistort.dst_width;
+                base_height = undistort.dst_height;
+            }
+            const float x_scale =
+                static_cast<float>(target_size.x) / static_cast<float>(std::max(base_width, 1));
+            const float y_scale =
+                static_cast<float>(target_size.y) / static_cast<float>(std::max(base_height, 1));
+            const rendering::CameraIntrinsics intrinsics{
+                .focal_x = base_fx * x_scale,
+                .focal_y = base_fy * y_scale,
+                .center_x = base_cx * x_scale,
+                .center_y = base_cy * y_scale,
+            };
+            if (!std::isfinite(intrinsics.focal_x) || !std::isfinite(intrinsics.focal_y) ||
+                !std::isfinite(intrinsics.center_x) || !std::isfinite(intrinsics.center_y) ||
+                intrinsics.focal_x <= 0.0f || intrinsics.focal_y <= 0.0f) {
+                return std::nullopt;
+            }
+            return intrinsics;
         }
 
         [[nodiscard]] rendering::ViewportData viewportDataFromCamera(const core::Camera& camera) {
@@ -492,7 +696,9 @@ namespace lfs::vis {
             };
         }
 
-        [[nodiscard]] core::Tensor uploadModelTransformsToCuda(const std::vector<glm::mat4>& model_transforms) {
+        [[nodiscard]] core::Tensor uploadModelTransformsToGpu(
+            const std::vector<glm::mat4>& model_transforms,
+            const core::GpuBackend backend) {
             std::vector<float> transform_data(model_transforms.size() * 16);
             for (size_t i = 0; i < model_transforms.size(); ++i) {
                 const auto& transform = model_transforms[i];
@@ -502,11 +708,18 @@ namespace lfs::vis {
                     }
                 }
             }
+            core::GpuBackendScope scope(backend);
             return core::Tensor::from_vector(
                        transform_data,
                        {model_transforms.size(), size_t{4}, size_t{4}},
                        core::Device::CPU)
-                .cuda();
+                .gpu();
+        }
+
+        // Single source for the effective orthographic scale: the per-panel override when a
+        // panel has one, otherwise the global setting.
+        [[nodiscard]] float effectiveOrthoScale(const Viewport& viewport, const RenderSettings& settings) {
+            return viewport.ortho_scale_override.value_or(settings.ortho_scale);
         }
 
         [[nodiscard]] rendering::ViewportData viewportDataFromViewer(
@@ -519,19 +732,21 @@ namespace lfs::vis {
                 .size = glm::ivec2(info.render_width, info.render_height),
                 .focal_length_mm = settings.focal_length_mm,
                 .orthographic = settings.orthographic,
-                .ortho_scale = settings.ortho_scale,
+                .ortho_scale = effectiveOrthoScale(viewport, settings),
             };
         }
 
         [[nodiscard]] rendering::FrameView frameViewFromViewport(const rendering::ViewportData& viewport,
                                                                  const glm::vec3& background_color,
-                                                                 const float far_plane = rendering::DEFAULT_FAR_PLANE) {
+                                                                 const float far_plane = rendering::DEFAULT_FAR_PLANE,
+                                                                 std::optional<rendering::CameraIntrinsics> intrinsics = std::nullopt) {
             return rendering::FrameView{
                 .rotation = viewport.rotation,
                 .translation = viewport.translation,
                 .size = viewport.size,
                 .focal_length_mm = viewport.focal_length_mm,
-                .intrinsics_override = std::nullopt,
+                .intrinsics_override = intrinsics,
+                .containment_intrinsics = intrinsics,
                 .far_plane = far_plane,
                 .orthographic = viewport.orthographic,
                 .ortho_scale = viewport.ortho_scale,
@@ -643,9 +858,10 @@ namespace lfs::vis {
             const core::SplatData& model,
             const rendering::ViewportData& viewport,
             const bool equirectangular,
-            const rendering::GaussianSceneState& scene) {
-            if (equirectangular || viewport.size.x <= 0 || viewport.size.y <= 0 ||
-                (viewport.orthographic && viewport.ortho_scale <= 0.0f)) {
+            const rendering::GaussianSceneState& scene,
+            const std::optional<rendering::CameraIntrinsics>& containment) {
+            if (viewport.size.x <= 0 || viewport.size.y <= 0 ||
+                (!equirectangular && viewport.orthographic && viewport.ortho_scale <= 0.0f)) {
                 return nullptr;
             }
 
@@ -665,39 +881,48 @@ namespace lfs::vis {
                 if (means.dtype() != core::DataType::Float32) {
                     means = means.to(core::DataType::Float32);
                 }
-                if (means.device() == core::Device::CUDA) {
+                if (means.device() == core::Device::GPU) {
                     try {
                         if (!means.is_valid() || means.numel() == 0 ||
                             means.storage_ptr() == nullptr) {
                             return nullptr;
                         }
+                        const auto backend = resolveGpuBackend(&means);
+                        core::GpuBackendScope scope(backend);
 
-                        core::Tensor model_transforms_cuda;
+                        core::Tensor model_transforms_gpu;
                         const core::Tensor* model_transforms_ptr = nullptr;
                         if (scene.model_transforms && !scene.model_transforms->empty()) {
-                            model_transforms_cuda = uploadModelTransformsToCuda(*scene.model_transforms);
-                            model_transforms_ptr = &model_transforms_cuda;
+                            model_transforms_gpu = uploadModelTransformsToGpu(*scene.model_transforms, backend);
+                            model_transforms_ptr = &model_transforms_gpu;
                         }
 
-                        core::Tensor transform_indices_cuda;
+                        core::Tensor transform_indices_gpu;
                         const core::Tensor* transform_indices_ptr = nullptr;
                         if (scene.transform_indices && scene.transform_indices->is_valid() &&
                             scene.transform_indices->numel() >= count) {
-                            transform_indices_cuda = *scene.transform_indices;
-                            if (transform_indices_cuda.dtype() != core::DataType::Int32) {
-                                transform_indices_cuda = transform_indices_cuda.to(core::DataType::Int32);
+                            transform_indices_gpu = *scene.transform_indices;
+                            if (transform_indices_gpu.dtype() != core::DataType::Int32) {
+                                transform_indices_gpu = transform_indices_gpu.to(core::DataType::Int32);
                             }
-                            if (transform_indices_cuda.device() != core::Device::CUDA) {
-                                transform_indices_cuda = transform_indices_cuda.cuda();
+                            if (transform_indices_gpu.device() != core::Device::GPU ||
+                                !bufferMatchesBackend(transform_indices_gpu, backend)) {
+                                transform_indices_gpu = transform_indices_gpu.cpu().to(core::Device::GPU);
                             }
-                            if (!transform_indices_cuda.is_contiguous()) {
-                                transform_indices_cuda = transform_indices_cuda.contiguous();
+                            if (!transform_indices_gpu.is_contiguous()) {
+                                transform_indices_gpu = transform_indices_gpu.contiguous();
                             }
-                            transform_indices_ptr = &transform_indices_cuda;
+                            transform_indices_ptr = &transform_indices_gpu;
                         }
 
-                        const auto [fx, fy] =
+                        const auto [derived_focal_x, derived_focal_y] =
                             rendering::computePixelFocalLengths(viewport.size, viewport.focal_length_mm);
+                        const float fx = containment ? containment->focal_x : derived_focal_x;
+                        const float fy = containment ? containment->focal_y : derived_focal_y;
+                        const float center_x = containment ? containment->center_x
+                                                           : 0.5f * static_cast<float>(viewport.size.x);
+                        const float center_y = containment ? containment->center_y
+                                                           : 0.5f * static_cast<float>(viewport.size.y);
                         const std::array<float, 9> view_rotation_rows{
                             viewport.rotation[0].x,
                             viewport.rotation[0].y,
@@ -714,6 +939,11 @@ namespace lfs::vis {
                             viewport.translation.y,
                             viewport.translation.z,
                         };
+                        const auto camera_model = equirectangular
+                                                      ? rendering::ScreenWindowCameraModel::Equirectangular
+                                                  : viewport.orthographic
+                                                      ? rendering::ScreenWindowCameraModel::Orthographic
+                                                      : rendering::ScreenWindowCameraModel::Pinhole;
 
                         return std::make_shared<core::Tensor>(
                             rendering::project_screen_positions_tensor(
@@ -724,13 +954,15 @@ namespace lfs::vis {
                                 translation,
                                 fx,
                                 fy,
-                                viewport.orthographic,
+                                center_x,
+                                center_y,
+                                camera_model,
                                 viewport.ortho_scale,
                                 model_transforms_ptr,
                                 transform_indices_ptr,
                                 scene.node_visibility_mask));
                     } catch (const std::exception& e) {
-                        LOG_DEBUG("SelectionService: CUDA screen-position projection unavailable, falling back to CPU: {}",
+                        LOG_DEBUG("SelectionService: GPU screen-position projection unavailable, falling back to CPU: {}",
                                   e.what());
                     }
                 }
@@ -778,6 +1010,19 @@ namespace lfs::vis {
                             transforms[static_cast<size_t>(clamped_index)] * glm::vec4(world_point, 1.0f));
                     }
 
+                    if (equirectangular) {
+                        const glm::vec3 view =
+                            glm::transpose(viewport.rotation) * (world_point - viewport.translation);
+                        const auto projected = equirectRenderPixelFromVisualizerView(
+                            view, viewport.size.x, viewport.size.y);
+                        if (!projected || !std::isfinite(projected->x) || !std::isfinite(projected->y)) {
+                            continue;
+                        }
+                        positions[i * 2] = projected->x;
+                        positions[i * 2 + 1] = projected->y;
+                        continue;
+                    }
+
                     const auto projected = rendering::projectWorldPoint(
                         viewport.rotation,
                         viewport.translation,
@@ -785,7 +1030,8 @@ namespace lfs::vis {
                         world_point,
                         viewport.focal_length_mm,
                         viewport.orthographic,
-                        viewport.ortho_scale);
+                        viewport.ortho_scale,
+                        containment);
                     if (!projected || !std::isfinite(projected->x) || !std::isfinite(projected->y)) {
                         continue;
                     }
@@ -798,7 +1044,7 @@ namespace lfs::vis {
                         positions,
                         {count, size_t{2}},
                         core::Device::CPU)
-                        .cuda()
+                        .gpu()
                         .contiguous());
             } catch (const std::exception& e) {
                 LOG_WARN("SelectionService: failed to project Gaussian screen positions: {}", e.what());
@@ -815,14 +1061,14 @@ namespace lfs::vis {
                 return std::nullopt;
             }
 
-            if (screen_positions.device() == core::Device::CUDA &&
+            if (screen_positions.device() == core::Device::GPU &&
                 screen_positions.dtype() == core::DataType::Float32) {
                 try {
                     const int picked = rendering::pick_projected_gaussian_tensor(
                         screen_positions, cursor_pos.x, cursor_pos.y, radius_px);
                     return picked >= 0 ? std::optional<int>{picked} : std::nullopt;
                 } catch (const std::exception& e) {
-                    LOG_DEBUG("SelectionService: CUDA projected pick unavailable, falling back to CPU scan: {}",
+                    LOG_DEBUG("SelectionService: GPU projected pick unavailable, falling back to CPU scan: {}",
                               e.what());
                 }
             }
@@ -871,13 +1117,25 @@ namespace lfs::vis {
           rendering_manager_(rendering_manager) {
         assert(scene_manager_);
         assert(rendering_manager_);
+        const bool cuda_usable = lfs::core::gpu_backend_available(lfs::core::GpuBackend::CUDA);
+        const auto allocate_host_counts = [](int*& host_counts) {
+            host_counts = new int[selection::kSelectionGroupCount + 1]{};
+        };
         for (auto& pending : pending_selection_counts_) {
+            if (!cuda_usable) {
+                allocate_host_counts(pending.host_counts);
+                continue;
+            }
             if (cudaHostAlloc(reinterpret_cast<void**>(&pending.host_counts),
                               (selection::kSelectionGroupCount + 1) * sizeof(int),
                               cudaHostAllocPortable) != cudaSuccess ||
                 cudaEventCreateWithFlags(&pending.ready_event, cudaEventDisableTiming) != cudaSuccess) {
                 throw std::runtime_error("SelectionService: failed to allocate async count staging");
             }
+        }
+        if (!cuda_usable) {
+            allocate_host_counts(pending_passive_ring_count_.host_counts);
+            return;
         }
         if (cudaHostAlloc(reinterpret_cast<void**>(&pending_passive_ring_count_.host_counts),
                           (selection::kSelectionGroupCount + 1) * sizeof(int),
@@ -888,7 +1146,37 @@ namespace lfs::vis {
     }
 
     SelectionService::~SelectionService() {
+        const bool cuda_usable = lfs::core::gpu_backend_available(lfs::core::GpuBackend::CUDA);
+        const auto release_host_counts = [cuda_usable](int*& host_counts, const char* const what) {
+            if (!host_counts) {
+                return;
+            }
+            if (cuda_usable) {
+                LFS_CUDA_LOG_TEARDOWN(cudaFreeHost(host_counts), nullptr, what);
+            } else {
+                delete[] host_counts;
+            }
+            host_counts = nullptr;
+        };
+        const auto drain_vulkan = [](PendingSelectionCounts& pending) {
+            if (pending.vulkan_ticket.id == 0 || pending.host_counts == nullptr) {
+                return;
+            }
+            try {
+                lfs::core::internal::backend_ops(lfs::core::GpuBackend::Vulkan)
+                    .wait_for(lfs::core::internal::SyncToken{
+                        .backend = lfs::core::GpuBackend::Vulkan,
+                        .value = pending.vulkan_ticket.timeline_value,
+                    });
+                rendering::poll_selection_group_count_readback(
+                    pending.vulkan_ticket, pending.host_counts);
+            } catch (const std::exception& error) {
+                LOG_WARN("SelectionService: Vulkan selection count drain failed: {}", error.what());
+            }
+            pending.vulkan_ticket = {};
+        };
         for (auto& pending : pending_selection_counts_) {
+            drain_vulkan(pending);
             if (pending.ready_event) {
                 if (pending.pending) {
                     LFS_CUDA_LOG_TEARDOWN(cudaEventSynchronize(pending.ready_event), nullptr,
@@ -897,11 +1185,9 @@ namespace lfs::vis {
                 LFS_CUDA_LOG_TEARDOWN(cudaEventDestroy(pending.ready_event), nullptr,
                                       "selection count teardown: destroy ready event");
             }
-            if (pending.host_counts) {
-                LFS_CUDA_LOG_TEARDOWN(cudaFreeHost(pending.host_counts), nullptr,
-                                      "selection count teardown: free pinned counts");
-            }
+            release_host_counts(pending.host_counts, "selection count teardown: free pinned counts");
         }
+        drain_vulkan(pending_passive_ring_count_);
         if (pending_passive_ring_count_.ready_event) {
             if (pending_passive_ring_count_.pending) {
                 LFS_CUDA_LOG_TEARDOWN(cudaEventSynchronize(pending_passive_ring_count_.ready_event), nullptr,
@@ -910,10 +1196,8 @@ namespace lfs::vis {
             LFS_CUDA_LOG_TEARDOWN(cudaEventDestroy(pending_passive_ring_count_.ready_event), nullptr,
                                   "passive ring teardown: destroy ready event");
         }
-        if (pending_passive_ring_count_.host_counts) {
-            LFS_CUDA_LOG_TEARDOWN(cudaFreeHost(pending_passive_ring_count_.host_counts), nullptr,
-                                  "passive ring teardown: free pinned counts");
-        }
+        release_host_counts(pending_passive_ring_count_.host_counts,
+                            "passive ring teardown: free pinned counts");
     }
 
     void SelectionService::completePendingSelectionCount(
@@ -922,18 +1206,35 @@ namespace lfs::vis {
             return;
         }
 
-        const cudaError_t status = wait ? cudaEventSynchronize(pending.ready_event)
-                                        : cudaEventQuery(pending.ready_event);
-        if (status == cudaErrorNotReady) {
-            return;
-        }
-        if (status != cudaSuccess) {
-            LOG_WARN("SelectionService: async selection count failed: {}",
-                     cudaGetErrorString(status));
-            pending.pending = false;
-            pending.mask.reset();
-            pending.undo_entry.reset();
-            return;
+        if (pending.vulkan_ticket.id != 0) {
+            if (wait) {
+                lfs::core::internal::backend_ops(lfs::core::GpuBackend::Vulkan)
+                    .wait_for(lfs::core::internal::SyncToken{
+                        .backend = lfs::core::GpuBackend::Vulkan,
+                        .value = pending.vulkan_ticket.timeline_value,
+                    });
+            }
+            if (!rendering::poll_selection_group_count_readback(
+                    pending.vulkan_ticket, pending.host_counts)) {
+                return;
+            }
+            pending.vulkan_ticket = {};
+        } else if (pending.ready_event == nullptr) {
+            // CUDA-less callers that still enqueue a blocking download.
+        } else {
+            const cudaError_t status = wait ? cudaEventSynchronize(pending.ready_event)
+                                            : cudaEventQuery(pending.ready_event);
+            if (status == cudaErrorNotReady) {
+                return;
+            }
+            if (status != cudaSuccess) {
+                LOG_WARN("SelectionService: async selection count failed: {}",
+                         cudaGetErrorString(status));
+                pending.pending = false;
+                pending.mask.reset();
+                pending.undo_entry.reset();
+                return;
+            }
         }
 
         auto completed_mask = std::move(pending.mask);
@@ -975,7 +1276,7 @@ namespace lfs::vis {
         const std::shared_ptr<core::Tensor>& mask,
         std::unique_ptr<op::SceneSnapshot>& undo_entry,
         const core::Scene::SelectionStateMetadata& after_metadata) const {
-        if (!mask || !mask->is_valid() || mask->device() != core::Device::CUDA) {
+        if (!mask || !mask->is_valid() || mask->device() != core::Device::GPU) {
             return false;
         }
 
@@ -997,8 +1298,13 @@ namespace lfs::vis {
         }
 
         rendering::count_selection_groups_async(*mask, slot->scratch);
-        rendering::enqueue_selection_group_count_read(
-            slot->scratch, slot->host_counts, slot->ready_event);
+        if (core::gpu_backend_of(slot->scratch) == core::GpuBackend::Vulkan) {
+            rendering::enqueue_selection_group_count_read(
+                slot->scratch, slot->host_counts, nullptr, &slot->vulkan_ticket);
+        } else {
+            rendering::enqueue_selection_group_count_read(
+                slot->scratch, slot->host_counts, slot->ready_event);
+        }
         slot->mask = mask;
         slot->undo_entry = std::move(undo_entry);
         slot->after_metadata = after_metadata;
@@ -1036,25 +1342,31 @@ namespace lfs::vis {
         if (!scene_manager_ || !rendering_manager_) {
             return {false, 0, "Missing managers"};
         }
+        const auto projection_snapshot = resolveCommandProjectionSnapshot(camera_index);
+        if (!projection_snapshot) {
+            return {false, 0, projection_snapshot.error().message};
+        }
+        const SelectionProjectionContext& projection_context = *projection_snapshot;
         const auto filters = defaultFilterState();
-        const auto settings = rendering_manager_->getSettings();
         const std::vector<glm::vec4> primitives{{x, y, radius * radius, 0.0f}};
-        if (const auto frame_view = resolveCommandFrameView(camera_index)) {
+        if (const auto frame_view = frameViewFromProjectionContext(projection_context)) {
             if (auto selection = tryBuildVksplatSelectionMask(
-                    scene_manager_, rendering_manager_, *frame_view, settings.equirectangular,
+                    scene_manager_, rendering_manager_, *frame_view, projection_context.equirectangular,
                     RenderingManager::VksplatSelectionMaskShape::Brush, primitives)) {
-                return commitSelection(*selection, mode, effectiveNodeMask(true), filters, "selection.brush");
+                return commitSelection(*selection, mode, effectiveNodeMask(true), filters, projection_context,
+                                       "selection.brush");
             }
         }
 
-        const auto screen_positions = resolveCommandScreenPositions(camera_index);
+        const auto screen_positions = screenPositionsForCommandPass(camera_index, projection_context);
         if (!screen_positions || !screen_positions->is_valid()) {
             return {false, 0, "No screen positions"};
         }
 
-        auto& selection = resetBoolScratchBuffer(command_selection_buffer_, screen_positions->size(0));
+        auto& selection = resetBoolScratchBuffer(command_selection_buffer_, screen_positions->size(0),
+                                                 screen_positions.get());
         rendering::brush_select_tensor(*screen_positions, x, y, radius, selection);
-        return commitSelection(selection, mode, effectiveNodeMask(true), filters, "selection.brush");
+        return commitSelection(selection, mode, effectiveNodeMask(true), filters, projection_context, "selection.brush");
     }
 
     SelectionResult SelectionService::selectRect(float x0, float y0, float x1, float y1, SelectionMode mode,
@@ -1063,30 +1375,35 @@ namespace lfs::vis {
         if (!scene_manager_ || !rendering_manager_) {
             return {false, 0, "Missing managers"};
         }
+        const auto projection_snapshot = resolveCommandProjectionSnapshot(camera_index);
+        if (!projection_snapshot) {
+            return {false, 0, projection_snapshot.error().message};
+        }
+        const SelectionProjectionContext& projection_context = *projection_snapshot;
         const auto filters = defaultFilterState();
-        const auto settings = rendering_manager_->getSettings();
         const std::vector<glm::vec4> primitives{{
             std::min(x0, x1),
             std::min(y0, y1),
             std::max(x0, x1),
             std::max(y0, y1),
         }};
-        if (const auto frame_view = resolveCommandFrameView(camera_index)) {
+        if (const auto frame_view = frameViewFromProjectionContext(projection_context)) {
             LOG_TIMER_THRESHOLD("SelectionService::selectRect.vksplat_query", 1.0);
             if (auto selection = tryBuildVksplatSelectionMask(
-                    scene_manager_, rendering_manager_, *frame_view, settings.equirectangular,
+                    scene_manager_, rendering_manager_, *frame_view, projection_context.equirectangular,
                     RenderingManager::VksplatSelectionMaskShape::Rectangle, primitives)) {
-                return commitSelection(*selection, mode, effectiveNodeMask(true), filters, "selection.rect");
+                return commitSelection(*selection, mode, effectiveNodeMask(true), filters, projection_context, "selection.rect");
             }
         }
 
         LOG_TIMER_THRESHOLD("SelectionService::selectRect.resolve_screen_positions", 1.0);
-        const auto screen_positions = resolveCommandScreenPositions(camera_index);
+        const auto screen_positions = screenPositionsForCommandPass(camera_index, projection_context);
         if (!screen_positions || !screen_positions->is_valid()) {
             return {false, 0, "No screen positions"};
         }
 
-        auto& selection = resetBoolScratchBuffer(command_selection_buffer_, screen_positions->size(0));
+        auto& selection = resetBoolScratchBuffer(command_selection_buffer_, screen_positions->size(0),
+                                                 screen_positions.get());
         {
             LOG_TIMER_THRESHOLD("SelectionService::selectRect.rect_select_kernel", 1.0);
             rendering::rect_select_tensor(*screen_positions,
@@ -1096,33 +1413,7 @@ namespace lfs::vis {
                                           std::max(y0, y1),
                                           selection);
         }
-        return commitSelection(selection, mode, effectiveNodeMask(true), filters, "selection.rect");
-    }
-
-    std::optional<rendering::FrameView> SelectionService::resolveCommandFrameView(int camera_index) const {
-        if (!scene_manager_ || !rendering_manager_) {
-            return std::nullopt;
-        }
-        const auto settings = rendering_manager_->getSettings();
-        if (camera_index >= 0) {
-            const auto cameras = scene_manager_->getScene().getAllCameras();
-            if (camera_index < static_cast<int>(cameras.size()) && cameras[camera_index]) {
-                return frameViewFromViewport(
-                    viewportDataFromCamera(*cameras[camera_index]),
-                    settings.background_color);
-            }
-            return std::nullopt;
-        }
-        const auto context = resolveViewerViewportContext();
-        if (!context || !context->valid()) {
-            return std::nullopt;
-        }
-        Viewport projection_viewport = *context->viewport;
-        projection_viewport.windowSize = {context->info.render_width, context->info.render_height};
-        return frameViewFromViewport(
-            viewportDataFromViewer(projection_viewport, context->info, settings),
-            settings.background_color,
-            settings.depth_clip_enabled ? settings.depth_clip_far : lfs::rendering::DEFAULT_FAR_PLANE);
+        return commitSelection(selection, mode, effectiveNodeMask(true), filters, projection_context, "selection.rect");
     }
 
     SelectionResult SelectionService::selectPolygon(const std::vector<glm::vec2>& vertices,
@@ -1134,26 +1425,32 @@ namespace lfs::vis {
         if (vertices.size() < 3) {
             return {false, 0, "Polygon requires at least 3 vertices"};
         }
+        const auto projection_snapshot = resolveCommandProjectionSnapshot(camera_index);
+        if (!projection_snapshot) {
+            return {false, 0, projection_snapshot.error().message};
+        }
+        const SelectionProjectionContext& projection_context = *projection_snapshot;
 
         const auto filters = defaultFilterState();
-        const auto settings = rendering_manager_->getSettings();
 
-        if (const auto frame_view = resolveCommandFrameView(camera_index)) {
+        if (const auto frame_view = frameViewFromProjectionContext(projection_context)) {
             if (auto selection = tryBuildVksplatPolygonSelectionMask(
-                    scene_manager_, rendering_manager_, *frame_view, settings.equirectangular, vertices)) {
-                return commitSelection(*selection, mode, effectiveNodeMask(true), filters, "selection.polygon");
+                    scene_manager_, rendering_manager_, *frame_view, projection_context.equirectangular, vertices)) {
+                return commitSelection(*selection, mode, effectiveNodeMask(true), filters, projection_context, "selection.polygon");
             }
         }
 
-        const auto screen_positions = resolveCommandScreenPositions(camera_index);
+        const auto screen_positions = screenPositionsForCommandPass(camera_index, projection_context);
         if (!screen_positions || !screen_positions->is_valid()) {
             return {false, 0, "No screen positions"};
         }
 
-        auto& selection = resetBoolScratchBuffer(command_selection_buffer_, screen_positions->size(0));
-        auto& polygon = uploadFloat2PointsToBuffer(vertices, polygon_vertex_host_buffer_, polygon_vertex_device_buffer_);
+        auto& selection = resetBoolScratchBuffer(command_selection_buffer_, screen_positions->size(0),
+                                                 screen_positions.get());
+        auto& polygon = uploadFloat2PointsToBuffer(
+            vertices, polygon_vertex_host_buffer_, polygon_vertex_device_buffer_, screen_positions.get());
         rendering::polygon_select_tensor(*screen_positions, polygon, selection);
-        return commitSelection(selection, mode, effectiveNodeMask(true), filters, "selection.polygon");
+        return commitSelection(selection, mode, effectiveNodeMask(true), filters, projection_context, "selection.polygon");
     }
 
     SelectionResult SelectionService::selectLasso(const std::vector<glm::vec2>& vertices,
@@ -1175,49 +1472,56 @@ namespace lfs::vis {
             return {false, 0, "Missing managers"};
         }
 
+        const auto projection_snapshot = resolveCommandProjectionSnapshot(
+            camera_index, glm::vec2{x, y}, testing_hovered_gaussian_id_.has_value());
+        if (!projection_snapshot) {
+            return {false, 0, projection_snapshot.error().message.empty() ? std::string{"No hovered gaussian"} : projection_snapshot.error().message};
+        }
+        const SelectionProjectionContext& projection_context = *projection_snapshot;
+
         const auto filters = defaultFilterState();
         const size_t total = activeSelectionGaussianCount(scene_manager_);
         if (total == 0) {
             return {false, 0, "No gaussians"};
         }
 
-        const auto settings = rendering_manager_->getSettings();
-        std::optional<rendering::FrameView> frame_view;
+        if (testing_hovered_gaussian_id_.has_value()) {
+            const int hovered_id = *testing_hovered_gaussian_id_;
+            if (hovered_id >= 0 && static_cast<size_t>(hovered_id) < total) {
+                auto& selection = resetBoolScratchBuffer(command_selection_buffer_, total);
+                rendering::set_selection_element(selection, hovered_id, true);
+                return commitSelection(selection, mode, effectiveNodeMask(true), filters, projection_context,
+                                       "selection.ring");
+            }
+            return {false, 0, "No hovered gaussian"};
+        }
+
         glm::vec2 query_point{x, y};
         float query_padding = RING_PICK_PADDING_PX;
-        if (camera_index >= 0) {
-            frame_view = resolveCommandFrameView(camera_index);
-        } else if (const auto context = resolveViewerViewportContext(glm::vec2{x, y});
-                   context && context->valid()) {
-            Viewport projection_viewport = *context->viewport;
-            projection_viewport.windowSize = {context->info.render_width, context->info.render_height};
-            frame_view = frameViewFromViewport(
-                viewportDataFromViewer(projection_viewport, context->info, settings),
-                settings.background_color,
-                settings.depth_clip_enabled ? settings.depth_clip_far : lfs::rendering::DEFAULT_FAR_PLANE);
-            query_point = screenToRender(glm::vec2{x, y}, context->info);
-            query_padding = RING_PICK_PADDING_PX *
-                            (static_cast<float>(context->info.render_width) / context->info.width);
+        if (projection_context.viewer_layout) {
+            query_point = screenToRender(glm::vec2{x, y}, *projection_context.viewer_layout);
+            query_padding = RING_PICK_PADDING_PX * (static_cast<float>(projection_context.viewer_layout->render_width) /
+                                                    projection_context.viewer_layout->width);
         }
         const std::vector<glm::vec4> primitives{{query_point.x, query_point.y, query_padding, 0.0f}};
-        if (frame_view) {
+        if (const auto frame_view = frameViewFromProjectionContext(projection_context)) {
             std::uint32_t picked_ring_id = std::numeric_limits<std::uint32_t>::max();
             if (auto selection = tryBuildVksplatSelectionMask(
-                    scene_manager_, rendering_manager_, *frame_view, settings.equirectangular,
+                    scene_manager_, rendering_manager_, *frame_view, projection_context.equirectangular,
                     RenderingManager::VksplatSelectionMaskShape::Ring, primitives, &picked_ring_id);
                 selection) {
                 if (picked_ring_id != std::numeric_limits<std::uint32_t>::max()) {
-                    return commitSelection(*selection, mode, effectiveNodeMask(true), filters, "selection.ring");
+                    return commitSelection(*selection, mode, effectiveNodeMask(true), filters, projection_context, "selection.ring");
                 }
                 return {false, 0, "No hovered gaussian"};
             }
         }
 
-        const auto hovered_id = resolveCommandHoveredGaussianId(x, y, camera_index, filters);
+        const auto hovered_id = resolveCommandHoveredGaussianId(x, y, camera_index, filters, projection_context);
         if (hovered_id && *hovered_id >= 0 && static_cast<size_t>(*hovered_id) < total) {
             auto& selection = resetBoolScratchBuffer(command_selection_buffer_, total);
-            rendering::set_selection_element(selection.ptr<bool>(), *hovered_id, true);
-            return commitSelection(selection, mode, effectiveNodeMask(true), filters, "selection.ring");
+            rendering::set_selection_element(selection, *hovered_id, true);
+            return commitSelection(selection, mode, effectiveNodeMask(true), filters, projection_context, "selection.ring");
         }
 
         return {false, 0, "No hovered gaussian"};
@@ -1230,7 +1534,17 @@ namespace lfs::vis {
             return {false, 0, "Missing managers"};
         }
 
-        const auto hovered_id = resolveCommandHoveredGaussianId(x, y, camera_index, filters);
+        const auto projection_snapshot = resolveCommandProjectionSnapshot(
+            camera_index, glm::vec2{x, y}, testing_hovered_gaussian_id_.has_value());
+        if (!projection_snapshot) {
+            if (camera_index < 0 && projection_snapshot.error().message.empty()) {
+                return {false, 0, {}};
+            }
+            return {false, 0, projection_snapshot.error().message};
+        }
+        const SelectionProjectionContext& projection_context = *projection_snapshot;
+
+        const auto hovered_id = resolveCommandHoveredGaussianId(x, y, camera_index, filters, projection_context);
         if (!hovered_id) {
             return {false, 0, "No hovered gaussian"};
         }
@@ -1268,6 +1582,7 @@ namespace lfs::vis {
                                mode,
                                effectiveNodeMask(filters.restrict_to_selected_nodes),
                                filters,
+                               projection_context,
                                "selection.by_color");
     }
 
@@ -1295,15 +1610,29 @@ namespace lfs::vis {
         const auto crop_max =
             core::Tensor::from_vector({gizmo.cropbox_max.x, gizmo.cropbox_max.y, gizmo.cropbox_max.z}, {3});
 
-        auto selection = core::Tensor::ones({total}, core::Device::CUDA, core::DataType::Bool);
+        auto selection = core::Tensor::ones({total}, core::Device::GPU, core::DataType::Bool);
         applyCropFilter(selection, &crop_t, &crop_min, &crop_max, nullptr, nullptr, false);
 
+        const auto viewer_context = resolveViewerViewportContext();
+        const auto projection_context_opt = viewer_context
+                                                ? projectionContextFromViewerContext(*viewer_context)
+                                                : std::nullopt;
         auto filters = defaultFilterState();
         filters.crop_filter = false;
+        // A projection is only consumed by the depth filter (applyFilters).
+        // Demanding one unconditionally failed this command whenever the
+        // viewport had no size yet - first frame, or minimized - even with the
+        // depth filter switched off, which origin never did.
+        if (!projection_context_opt && filters.depth_filter) {
+            return {false, 0, "Invalid projection context"};
+        }
+        const SelectionProjectionContext projection_context =
+            projection_context_opt.value_or(SelectionProjectionContext{});
         return commitSelection(selection,
                                mode,
                                effectiveNodeMask(filters.restrict_to_selected_nodes),
                                filters,
+                               projection_context,
                                "selection.box",
                                options);
     }
@@ -1331,15 +1660,26 @@ namespace lfs::vis {
         const auto ellip_radii = core::Tensor::from_vector(
             {gizmo.ellipsoid_radii.x, gizmo.ellipsoid_radii.y, gizmo.ellipsoid_radii.z}, {3});
 
-        auto selection = core::Tensor::ones({total}, core::Device::CUDA, core::DataType::Bool);
+        auto selection = core::Tensor::ones({total}, core::Device::GPU, core::DataType::Bool);
         applyCropFilter(selection, nullptr, nullptr, nullptr, &ellip_t, &ellip_radii, false);
 
+        const auto viewer_context = resolveViewerViewportContext();
+        const auto projection_context_opt = viewer_context
+                                                ? projectionContextFromViewerContext(*viewer_context)
+                                                : std::nullopt;
         auto filters = defaultFilterState();
         filters.crop_filter = false;
+        // See selectInBox: the context is only needed when the depth filter is on.
+        if (!projection_context_opt && filters.depth_filter) {
+            return {false, 0, "Invalid projection context"};
+        }
+        const SelectionProjectionContext projection_context =
+            projection_context_opt.value_or(SelectionProjectionContext{});
         return commitSelection(selection,
                                mode,
                                effectiveNodeMask(filters.restrict_to_selected_nodes),
                                filters,
+                               projection_context,
                                "selection.sphere",
                                options);
     }
@@ -1354,12 +1694,25 @@ namespace lfs::vis {
             return {true, 0, {}};
         }
 
+        const auto viewer_context = resolveViewerViewportContext();
+        const auto projection_context_opt = viewer_context
+                                                ? projectionContextFromViewerContext(*viewer_context)
+                                                : std::nullopt;
         const auto filters = defaultFilterState();
-        auto selection = core::Tensor::ones({total}, core::Device::CUDA, core::DataType::Bool);
+        // See selectInBox: the context is only needed when the depth filter is on.
+        if (!projection_context_opt && filters.depth_filter) {
+            LOG_WARN("SelectionService: selectAllFiltered failed: no valid projection context");
+            return {false, 0, "Invalid projection context"};
+        }
+        const SelectionProjectionContext projection_context =
+            projection_context_opt.value_or(SelectionProjectionContext{});
+
+        auto selection = core::Tensor::ones({total}, core::Device::GPU, core::DataType::Bool);
         return commitSelection(selection,
                                SelectionMode::Replace,
                                effectiveNodeMask(filters.restrict_to_selected_nodes),
                                filters,
+                               projection_context,
                                "selection.all.filtered");
     }
 
@@ -1373,10 +1726,26 @@ namespace lfs::vis {
             return {true, 0, {}};
         }
 
+        const auto viewer_context = resolveViewerViewportContext();
+        const auto projection_context_opt = viewer_context
+                                                ? projectionContextFromViewerContext(*viewer_context)
+                                                : std::nullopt;
         const auto filters = defaultFilterState();
+        // See selectInBox: the context is only needed when the depth filter is on.
+        // The applyFilters guard below stays as the defensive check.
+        if (!projection_context_opt && filters.depth_filter) {
+            LOG_WARN("SelectionService: invertFiltered failed: no valid projection context");
+            return {false, 0, "Invalid projection context"};
+        }
+        const SelectionProjectionContext projection_context =
+            projection_context_opt.value_or(SelectionProjectionContext{});
+
         const auto node_mask = effectiveNodeMask(filters.restrict_to_selected_nodes);
-        auto filter_mask = core::Tensor::ones({total}, core::Device::CUDA, core::DataType::Bool);
-        applyFilters(filter_mask, filters, node_mask);
+        auto filter_mask = core::Tensor::ones({total}, core::Device::GPU, core::DataType::Bool);
+        if (!applyFilters(filter_mask, filters, node_mask, projection_context)) {
+            LOG_WARN("SelectionService: invertFiltered failed: projection filter could not be applied");
+            return {false, 0, "Invalid projection context"};
+        }
 
         const auto& scene = scene_manager_->getScene();
         const uint8_t group_id = scene.getActiveSelectionGroup();
@@ -1384,16 +1753,17 @@ namespace lfs::vis {
         const auto* existing = selectionMaskForSize(existing_mask, total);
         const auto current_active = existing
                                         ? existing->eq(group_id)
-                                        : core::Tensor::zeros({total}, core::Device::CUDA, core::DataType::Bool);
+                                        : core::Tensor::zeros({total}, core::Device::GPU, core::DataType::Bool);
         const auto any_selected = existing
                                       ? existing->gt(0.0f)
-                                      : core::Tensor::zeros({total}, core::Device::CUDA, core::DataType::Bool);
+                                      : core::Tensor::zeros({total}, core::Device::GPU, core::DataType::Bool);
         const auto other_selected = any_selected.logical_and(current_active.logical_not());
         const auto toggle_mask = filter_mask.logical_and(other_selected.logical_not());
         const auto inverted = current_active.logical_xor(toggle_mask);
 
+        SelectionProjectionContext empty_projection{};
         return commitSelection(
-            inverted, SelectionMode::Replace, {}, SelectionFilterState{}, "selection.invert.filtered");
+            inverted, SelectionMode::Replace, {}, SelectionFilterState{}, empty_projection, "selection.invert.filtered");
     }
 
     SelectionResult SelectionService::applyMask(const std::vector<uint8_t>& mask, SelectionMode mode) {
@@ -1423,7 +1793,7 @@ namespace lfs::vis {
             return {false, 0, "Mask size mismatch"};
         }
 
-        return commitSelection(mask, mode, {}, SelectionFilterState{}, "selection.mask");
+        return commitSelection(mask, mode, {}, SelectionFilterState{}, SelectionProjectionContext{}, "selection.mask");
     }
 
     SelectionResult SelectionService::previewMask(const core::Tensor& mask, SelectionMode mode) {
@@ -1439,7 +1809,7 @@ namespace lfs::vis {
 
         SelectionCommitOptions options;
         options.push_undo = false;
-        return commitSelection(mask, mode, {}, SelectionFilterState{}, "selection.preview", options);
+        return commitSelection(mask, mode, {}, SelectionFilterState{}, SelectionProjectionContext{}, "selection.preview", options);
     }
 
     void SelectionService::beginStroke() {
@@ -1484,9 +1854,22 @@ namespace lfs::vis {
             return {false, 0, "No active stroke"};
         }
 
+        const auto viewer_context = resolveViewerViewportContext();
+        const auto projection_context_opt = viewer_context
+                                                ? projectionContextFromViewerContext(*viewer_context)
+                                                : std::nullopt;
+        const auto filters = defaultFilterState();
+        // See selectInBox: the context is only needed when the depth filter is on.
+        if (!projection_context_opt && filters.depth_filter) {
+            LOG_WARN("SelectionService: finalizeStroke failed: no valid projection context");
+            return {false, 0, "Invalid projection context"};
+        }
+        const SelectionProjectionContext projection_context =
+            projection_context_opt.value_or(SelectionProjectionContext{});
+
         const auto result = commitSelection(stroke_selection_, mode,
                                             node_mask.empty() ? effectiveNodeMask(true) : node_mask,
-                                            defaultFilterState(), "selection.stroke");
+                                            filters, projection_context, "selection.stroke");
 
         selection_before_stroke_.reset();
         stroke_selection_ = core::Tensor();
@@ -1536,7 +1919,11 @@ namespace lfs::vis {
             return nullptr;
         }
 
-        return getScreenPositionsForContext(*context);
+        const auto projection_context = projectionContextFromViewerContext(*context);
+        if (!projection_context) {
+            return nullptr;
+        }
+        return renderScreenPositionsForProjectionContext(*projection_context);
     }
 
     void SelectionService::setTestingScreenPositions(std::shared_ptr<core::Tensor> screen_positions) {
@@ -1559,93 +1946,198 @@ namespace lfs::vis {
         testing_viewport_ = std::move(viewport);
     }
 
+    void SelectionService::setTestingContainmentIntrinsics(
+        std::optional<rendering::CameraIntrinsics> intrinsics) {
+        testing_containment_intrinsics_ = std::move(intrinsics);
+    }
+
     void SelectionService::setTestingHoveredGaussianId(std::optional<int> hovered_gaussian_id) {
         testing_hovered_gaussian_id_ = hovered_gaussian_id;
     }
 
-    std::optional<SelectionService::ViewerViewportContext> SelectionService::resolveViewerViewportContext(
-        const std::optional<glm::vec2> screen_point,
-        const std::optional<SplitViewPanelId> panel_override) const {
-        ViewerViewportContext context;
-        context.panel = panel_override.value_or(SplitViewPanelId::Left);
-
-        if (testing_viewport_ && testing_viewport_->valid()) {
-            static Viewport testing_viewport_source(1, 1);
-            context.info = *testing_viewport_;
-            context.viewport = &testing_viewport_source;
-            return context;
-        }
-
-        auto* const gm = services().guiOrNull();
-        if (!rendering_manager_ || !gm || !gm->getViewer()) {
-            return std::nullopt;
-        }
-
-        const auto viewport_pos = gm->getViewportPos();
-        const auto viewport_size = gm->getViewportSize();
-        const auto panel = rendering_manager_->resolveViewerPanel(
-            gm->getViewer()->getViewport(),
-            {viewport_pos.x, viewport_pos.y},
-            {viewport_size.x, viewport_size.y},
-            screen_point,
-            panel_override);
-        if (!panel) {
-            return std::nullopt;
-        }
-
-        context.panel = panel->panel;
-        context.info = ViewportInfo{
-            .x = panel->x,
-            .y = panel->y,
-            .width = panel->width,
-            .height = panel->height,
-            .render_width = panel->render_width,
-            .render_height = panel->render_height,
-        };
-        context.viewport = panel->viewport;
-        return context.info.valid() ? std::optional<ViewerViewportContext>(context) : std::nullopt;
+    void SelectionService::setTestingPanel(const SplitViewPanelId panel) {
+        testing_panel_ = panel;
     }
 
-    std::shared_ptr<core::Tensor> SelectionService::getScreenPositionsForContext(
-        const ViewerViewportContext& context) const {
-        if (testing_screen_positions_ && testing_screen_positions_->is_valid()) {
-            return testing_screen_positions_;
+    bool SelectionService::hasTestingScreenPositionsForCamera(const int camera_index) const {
+        if (camera_index < 0) {
+            return false;
         }
-        if (!context.info.valid()) {
-            return nullptr;
-        }
-        if (!scene_manager_ || !rendering_manager_ || !context.viewport) {
-            return nullptr;
-        }
+        const auto it = testing_camera_screen_positions_.find(camera_index);
+        return it != testing_camera_screen_positions_.end() && it->second && it->second->is_valid();
+    }
 
-        const size_t panel_index = splitViewPanelIndex(context.panel);
+    bool SelectionService::commandCameraValidationRequired(const int camera_index) const {
+        if (camera_index < 0) {
+            return false;
+        }
+        return !hasTestingScreenPositionsForCamera(camera_index);
+    }
+
+    std::optional<SelectionProjectionContext> SelectionService::projectionContextFromViewerContext(
+        const ViewerViewportContext& context) const {
+        if (!context.valid() || !rendering_manager_) {
+            return std::nullopt;
+        }
         const auto settings = rendering_manager_->getSettings();
         Viewport projection_viewport = *context.viewport;
         projection_viewport.windowSize = {context.info.render_width, context.info.render_height};
-        const auto viewport = viewportDataFromViewer(projection_viewport, context.info, settings);
+        SelectionProjectionContext projection_context;
+        projection_context.viewport = viewportDataFromViewer(projection_viewport, context.info, settings);
+        projection_context.equirectangular = settings.equirectangular;
+        projection_context.far_plane = settings.depth_clip_enabled ? settings.depth_clip_far
+                                                                   : lfs::rendering::DEFAULT_FAR_PLANE;
+        projection_context.viewer_layout = viewerLayoutFromInfo(context.info);
+        projection_context.panel = context.panel;
+        // GT comparison: the compare panel shows a dataset camera at gt_size, not the
+        // interactive viewport. Project committed selection against what is actually on
+        // screen. Returns nullopt whenever GT is off or its camera is unavailable, in which
+        // case everything below is exactly the interactive-viewer behaviour.
+        if (const auto gt = rendering_manager_->gtComparisonSelectionContext()) {
+            projection_context.viewport.rotation = gt->camera.rotation;
+            projection_context.viewport.translation = gt->camera.translation;
+            projection_context.viewport.size = gt->size;
+            projection_context.viewport.orthographic = false;
+            projection_context.viewport.ortho_scale = lfs::rendering::DEFAULT_ORTHO_SCALE;
+            // Equirect GT keeps its own camera model and carries no containment intrinsics:
+            // buildGTRenderCamera leaves them empty by design and equirect ignores cx/cy.
+            projection_context.equirectangular = gt->camera.equirectangular;
+            projection_context.containment_intrinsics = gt->camera.intrinsics;
+        }
+        // Test-only override of the viewer-derived containment intrinsics. In production the
+        // only writer of this field on a viewer-derived context is GT-C (M3.4), which needs a
+        // presented GT frame and therefore a live Vulkan context; this hook lets the cache and
+        // brush-invalidation contracts (M2.5, M2.6) be tested without one. Mirrors
+        // testing_viewport_ in resolveViewerViewportContext.
+        if (testing_containment_intrinsics_) {
+            projection_context.containment_intrinsics = testing_containment_intrinsics_;
+        }
+        return projection_context.valid() ? std::optional<SelectionProjectionContext>(projection_context)
+                                          : std::nullopt;
+    }
 
-        if (const auto* tm = scene_manager_->getTrainerManager()) {
-            if (tm->isCompletionPending() ||
-                tm->getState() == TrainingState::Stopping) {
-                return nullptr;
+    std::expected<SelectionProjectionContext, SelectionProjectionError> SelectionService::resolveCommandProjectionSnapshot(
+        const int camera_index,
+        const std::optional<glm::vec2> query_point,
+        const bool skip_explicit_camera_validation) const {
+        if (!rendering_manager_) {
+            return std::unexpected(SelectionProjectionError{
+                SelectionProjectionErrorCode::CAMERA_PROJECTION_UNAVAILABLE, "Camera projection unavailable"});
+        }
+        // Only -1 selects the viewer. A lower index names no camera and cannot be honoured, so it
+        // fails here instead of falling through to the viewer the way -1 does.
+        if (camera_index < -1) {
+            return std::unexpected(SelectionProjectionError{
+                SelectionProjectionErrorCode::CAMERA_INDEX_OUT_OF_RANGE, "Camera index out of range"});
+        }
+        if (camera_index >= 0) {
+            const bool validation_required = commandCameraValidationRequired(camera_index);
+            if (!skip_explicit_camera_validation && validation_required) {
+                if (!scene_manager_) {
+                    return std::unexpected(SelectionProjectionError{
+                        SelectionProjectionErrorCode::CAMERA_PROJECTION_UNAVAILABLE, "Camera projection unavailable"});
+                }
+                const auto cameras = scene_manager_->getScene().getAllCameras();
+                if (camera_index >= static_cast<int>(cameras.size())) {
+                    return std::unexpected(SelectionProjectionError{
+                        SelectionProjectionErrorCode::CAMERA_INDEX_OUT_OF_RANGE, "Camera index out of range"});
+                }
+                if (!cameras[camera_index]) {
+                    return std::unexpected(SelectionProjectionError{
+                        SelectionProjectionErrorCode::CAMERA_PROJECTION_UNAVAILABLE, "Camera projection unavailable"});
+                }
+            }
+
+            if (scene_manager_) {
+                const auto cameras = scene_manager_->getScene().getAllCameras();
+                if (camera_index < static_cast<int>(cameras.size()) && cameras[camera_index]) {
+                    SelectionProjectionContext projection_context;
+                    projection_context.viewport = viewportDataFromCamera(*cameras[camera_index]);
+                    projection_context.containment_intrinsics = containmentIntrinsicsFromCamera(
+                        *cameras[camera_index], projection_context.viewport.size);
+                    projection_context.equirectangular =
+                        cameras[camera_index]->camera_model_type() == core::CameraModelType::EQUIRECTANGULAR;
+                    projection_context.far_plane = lfs::rendering::DEFAULT_FAR_PLANE;
+                    if (projection_context.valid()) {
+                        return projection_context;
+                    }
+                    return std::unexpected(SelectionProjectionError{
+                        SelectionProjectionErrorCode::CAMERA_PROJECTION_UNAVAILABLE, "Camera projection unavailable"});
+                }
+            }
+
+            if (!skip_explicit_camera_validation) {
+                return std::unexpected(SelectionProjectionError{
+                    SelectionProjectionErrorCode::CAMERA_PROJECTION_UNAVAILABLE, "Camera projection unavailable"});
+            }
+        }
+        const auto viewer_context = resolveViewerViewportContext(query_point);
+        if (!viewer_context) {
+            return std::unexpected(SelectionProjectionError{
+                SelectionProjectionErrorCode::VIEWER_VIEWPORT_UNAVAILABLE, "Viewer viewport unavailable"});
+        }
+        if (const auto resolved = projectionContextFromViewerContext(*viewer_context)) {
+            return *resolved;
+        }
+        return std::unexpected(SelectionProjectionError{
+            SelectionProjectionErrorCode::VIEWER_PROJECTION_UNAVAILABLE, "Viewer projection unavailable"});
+    }
+
+    std::optional<rendering::FrameView> SelectionService::frameViewFromProjectionContext(
+        const SelectionProjectionContext& projection_context) const {
+        if (!rendering_manager_ || !projection_context.valid()) {
+            return std::nullopt;
+        }
+        const auto settings = rendering_manager_->getSettings();
+        return frameViewFromViewport(
+            projection_context.viewport,
+            settings.background_color,
+            projection_context.far_plane,
+            projection_context.containment_intrinsics);
+    }
+
+    std::shared_ptr<core::Tensor> SelectionService::renderScreenPositionsForProjectionContext(
+        const SelectionProjectionContext& projection_context) const {
+        if (!scene_manager_ || !rendering_manager_ || !projection_context.valid()) {
+            return nullptr;
+        }
+
+        const bool viewer_derived =
+            projection_context.panel.has_value() || projection_context.viewer_layout.has_value();
+
+        if (viewer_derived) {
+            if (testing_screen_positions_ && testing_screen_positions_->is_valid()) {
+                return testing_screen_positions_;
+            }
+
+            if (const auto* tm = scene_manager_->getTrainerManager()) {
+                if (tm->isCompletionPending() ||
+                    tm->getState() == TrainingState::Stopping) {
+                    return nullptr;
+                }
             }
         }
 
         auto render_lock = acquireLiveModelRenderLock(scene_manager_);
         SceneRenderState scene_state;
         std::shared_ptr<core::Tensor> screen_positions;
-        if (rendering_manager_->isPLYComparisonActive()) {
+        if (viewer_derived &&
+            projection_context.panel.has_value() &&
+            rendering_manager_->isPLYComparisonActive()) {
             scene_state = scene_manager_->buildRenderState({.metadata_only = true});
             const auto& scene = scene_manager_->getScene();
+            const auto settings = rendering_manager_->getSettings();
             const auto sample = resolvePlyComparisonDepthSample(
-                scene, settings.split_view_offset, context.panel);
+                scene, settings.split_view_offset, *projection_context.panel);
+            const size_t panel_index = splitViewPanelIndex(*projection_context.panel);
             ScreenPositionCacheKey key{
                 .valid = true,
                 .signature = makeScreenPositionCacheSignature(
                     scene_state,
-                    viewport,
-                    settings.equirectangular,
-                    rendering_manager_->getViewportProjectionGeneration()),
+                    projection_context.viewport,
+                    projection_context.equirectangular,
+                    rendering_manager_->getViewportProjectionGeneration(),
+                    projection_context.containment_intrinsics),
             };
             hashCombine(
                 key.signature,
@@ -1662,11 +2154,13 @@ namespace lfs::vis {
                     scene_coords::nodeVisualizerWorldTransform(scene, sample.node->id)};
                 auto local_positions = projectGaussianScreenPositions(
                     *sample.model,
-                    viewport,
-                    settings.equirectangular,
+                    projection_context.viewport,
+                    projection_context.equirectangular,
                     {.model_transforms = &node_transforms,
                      .transform_indices = nullptr,
-                     .node_visibility_mask = {}});
+                     .node_visibility_mask = {},
+                     .node_active_sh_degrees = {}},
+                    projection_context.containment_intrinsics);
                 const size_t visible_count = scene.getTotalGaussianCount();
                 const size_t local_count =
                     local_positions && local_positions->is_valid()
@@ -1710,36 +2204,162 @@ namespace lfs::vis {
 
         scene_state = scene_manager_->buildRenderState();
         if (!hasRenderableGaussians(scene_state.combined_model)) {
-            viewport_screen_positions_[panel_index].reset();
-            viewport_screen_position_keys_[panel_index] = {};
+            if (viewer_derived) {
+                const size_t panel_index = projection_context.panel.has_value()
+                                               ? splitViewPanelIndex(*projection_context.panel)
+                                               : 0u;
+                viewport_screen_positions_[panel_index].reset();
+                viewport_screen_position_keys_[panel_index] = {};
+            }
             return nullptr;
         }
 
-        const ScreenPositionCacheKey key{
-            .valid = true,
-            .signature = makeScreenPositionCacheSignature(
-                scene_state,
-                viewport,
-                settings.equirectangular,
-                rendering_manager_->getViewportProjectionGeneration()),
-        };
-        if (viewport_screen_position_keys_[panel_index] == key &&
-            viewport_screen_positions_[panel_index] &&
-            viewport_screen_positions_[panel_index]->is_valid()) {
-            return viewport_screen_positions_[panel_index];
+        if (viewer_derived) {
+            const size_t panel_index = projection_context.panel.has_value()
+                                           ? splitViewPanelIndex(*projection_context.panel)
+                                           : 0u;
+            const ScreenPositionCacheKey key{
+                .valid = true,
+                .signature = makeScreenPositionCacheSignature(
+                    scene_state,
+                    projection_context.viewport,
+                    projection_context.equirectangular,
+                    rendering_manager_->getViewportProjectionGeneration(),
+                    projection_context.containment_intrinsics),
+            };
+            if (viewport_screen_position_keys_[panel_index] == key &&
+                viewport_screen_positions_[panel_index] &&
+                viewport_screen_positions_[panel_index]->is_valid()) {
+                return viewport_screen_positions_[panel_index];
+            }
+
+            screen_positions = projectGaussianScreenPositions(
+                *scene_state.combined_model,
+                projection_context.viewport,
+                projection_context.equirectangular,
+                {.model_transforms = &scene_state.model_transforms,
+                 .transform_indices = scene_state.transform_indices,
+                 .node_visibility_mask = scene_state.node_visibility_mask},
+                projection_context.containment_intrinsics);
+            viewport_screen_positions_[panel_index] = screen_positions;
+            viewport_screen_position_keys_[panel_index] =
+                (screen_positions && screen_positions->is_valid()) ? key : ScreenPositionCacheKey{};
+            return screen_positions;
         }
 
-        screen_positions = projectGaussianScreenPositions(
+        return projectGaussianScreenPositions(
             *scene_state.combined_model,
-            viewport,
-            settings.equirectangular,
+            projection_context.viewport,
+            projection_context.equirectangular,
             {.model_transforms = &scene_state.model_transforms,
              .transform_indices = scene_state.transform_indices,
-             .node_visibility_mask = scene_state.node_visibility_mask});
-        viewport_screen_positions_[panel_index] = screen_positions;
-        viewport_screen_position_keys_[panel_index] =
-            (screen_positions && screen_positions->is_valid()) ? key : ScreenPositionCacheKey{};
-        return screen_positions;
+             .node_visibility_mask = scene_state.node_visibility_mask},
+            projection_context.containment_intrinsics);
+    }
+
+    std::shared_ptr<core::Tensor> SelectionService::screenPositionsForCommandPass(
+        const int camera_index, const SelectionProjectionContext& projection_context) const {
+        if (camera_index >= 0) {
+            if (const auto it = testing_camera_screen_positions_.find(camera_index);
+                it != testing_camera_screen_positions_.end() &&
+                it->second &&
+                it->second->is_valid()) {
+                return it->second;
+            }
+            return renderScreenPositionsForProjectionContext(projection_context);
+        }
+        if (testing_screen_positions_ && testing_screen_positions_->is_valid()) {
+            return testing_screen_positions_;
+        }
+        return renderScreenPositionsForProjectionContext(projection_context);
+    }
+
+    std::optional<SelectionService::ViewerViewportContext> SelectionService::resolveInteractiveSessionViewportContext(
+        const std::optional<glm::vec2> screen_point) const {
+        const auto& session = interactive_selection_;
+        if (!session.active || !session.viewport_context) {
+            return std::nullopt;
+        }
+        const auto panel = session.viewport_context->panel;
+        const auto context = resolveViewerViewportContext(screen_point, panel);
+        if (!context || context->panel != panel) {
+            return std::nullopt;
+        }
+        return context;
+    }
+
+    std::optional<SelectionService::ViewerViewportContext> SelectionService::resolveViewerViewportContext(
+        const std::optional<glm::vec2> screen_point,
+        const std::optional<SplitViewPanelId> panel_override) const {
+        ViewerViewportContext context;
+        context.panel = panel_override.value_or(SplitViewPanelId::Left);
+
+        if (testing_viewport_ && testing_viewport_->valid()) {
+            static Viewport testing_viewport_source(1, 1);
+            context.panel = testing_panel_.value_or(SplitViewPanelId::Left);
+            context.info = *testing_viewport_;
+            context.viewport = &testing_viewport_source;
+            return context;
+        }
+
+        // GT-C: the compare image is rendered at gt_size and composited across the whole
+        // letterboxed content rect, with the divider merely hiding its left portion — so the
+        // linear map from content-rect screen pixels to gt_size render pixels is the correct one
+        // for the full rect. This lives here, in the selection lane's own resolver, and NOT in
+        // RenderingManager::resolveViewerPanel: that function has nineteen non-selection callers
+        // (gizmos, alignment, sequencer, the guide-panel collector) which would otherwise combine
+        // GT layout and gt_size with the interactive pose.
+        if (const auto gt = rendering_manager_->gtComparisonSelectionContext()) {
+            auto* const gui = services().guiOrNull();
+            if (gui && gui->getViewer()) {
+                const auto viewport_pos = gui->getViewportPos();
+                const auto viewport_size = gui->getViewportSize();
+                const auto bounds = rendering_manager_->getContentBounds(
+                    glm::ivec2(static_cast<int>(viewport_size.x), static_cast<int>(viewport_size.y)));
+                context.panel = SplitViewPanelId::Right;
+                context.info = ViewportInfo{
+                    .x = viewport_pos.x + bounds.x,
+                    .y = viewport_pos.y + bounds.y,
+                    .width = bounds.width,
+                    .height = bounds.height,
+                    .render_width = gt->size.x,
+                    .render_height = gt->size.y,
+                };
+                context.viewport = &gui->getViewer()->getViewport();
+                if (context.info.valid()) {
+                    return context;
+                }
+            }
+        }
+
+        auto* const gm = services().guiOrNull();
+        if (!rendering_manager_ || !gm || !gm->getViewer()) {
+            return std::nullopt;
+        }
+
+        const auto viewport_pos = gm->getViewportPos();
+        const auto viewport_size = gm->getViewportSize();
+        const auto panel = rendering_manager_->resolveViewerPanel(
+            gm->getViewer()->getViewport(),
+            {viewport_pos.x, viewport_pos.y},
+            {viewport_size.x, viewport_size.y},
+            screen_point,
+            panel_override);
+        if (!panel) {
+            return std::nullopt;
+        }
+
+        context.panel = panel->panel;
+        context.info = ViewportInfo{
+            .x = panel->x,
+            .y = panel->y,
+            .width = panel->width,
+            .height = panel->height,
+            .render_width = panel->render_width,
+            .render_height = panel->render_height,
+        };
+        context.viewport = panel->viewport;
+        return context.info.valid() ? std::optional<ViewerViewportContext>(context) : std::nullopt;
     }
 
     bool SelectionService::beginInteractiveSelection(const SelectionShape shape, const SelectionMode mode,
@@ -1987,8 +2607,17 @@ namespace lfs::vis {
             return {false, 0, "No active interactive selection"};
         }
 
+        const auto viewport_context = resolveInteractiveSessionViewportContext();
+        const auto projection_context_opt = viewport_context
+                                                ? projectionContextFromViewerContext(*viewport_context)
+                                                : std::nullopt;
+        if (!viewport_context || !projection_context_opt) {
+            return {false, 0, "Invalid projection context"};
+        }
+        const SelectionProjectionContext projection_context = *projection_context_opt;
+
         core::Tensor selection;
-        if (!buildSelectionMaskForInteractiveSession(selection)) {
+        if (!buildSelectionMaskForInteractiveSession(selection, projection_context, false, nullptr, true)) {
             return {false, 0, "Interactive selection is incomplete"};
         }
 
@@ -2001,7 +2630,7 @@ namespace lfs::vis {
 
         const auto result = commitSelection(selection, session.mode,
                                             effectiveNodeMask(session.filters.restrict_to_selected_nodes),
-                                            session.filters, undo_name);
+                                            session.filters, projection_context, undo_name);
         clearInteractivePreviewState();
         interactive_selection_ = {};
         return result;
@@ -2088,36 +2717,53 @@ namespace lfs::vis {
 
         auto& selection = resetBoolScratchBuffer(command_selection_buffer_, total);
         int picked_ring_id = -1;
-        const auto exact_hit = buildRingSelectionForContext(*context, cursor_pos, selection, &picked_ring_id);
+        const auto projection_context = projectionContextFromViewerContext(*context);
+        if (!projection_context) {
+            rendering_manager_->clearCursorPreviewState();
+            return;
+        }
+        const auto exact_hit = buildRingSelectionForContext(*projection_context, cursor_pos, selection, &picked_ring_id);
         bool hit = exact_hit.value_or(false);
         if (!exact_hit.has_value()) {
-            const auto hovered_id = renderHoveredGaussianIdForViewerContext(*context, cursor_pos, filters);
+            const auto hovered_id = renderHoveredGaussianIdForViewerContext(*context, cursor_pos, filters, *projection_context);
             if (hovered_id && *hovered_id >= 0 && static_cast<size_t>(*hovered_id) < selection.numel()) {
-                rendering::set_selection_element(selection.ptr<bool>(), *hovered_id, true);
+                rendering::set_selection_element(selection, *hovered_id, true);
                 picked_ring_id = *hovered_id;
                 hit = true;
             }
         }
-        applyFilters(selection, filters, effectiveNodeMask(filters.restrict_to_selected_nodes));
-
-        rendering::count_selection_groups_async(selection, pending_passive_ring_count_.scratch);
-        rendering::enqueue_selection_group_count_read(
-            pending_passive_ring_count_.scratch,
-            pending_passive_ring_count_.host_counts,
-            pending_passive_ring_count_.ready_event);
-        pending_passive_ring_count_.mask = std::make_shared<core::Tensor>(selection);
-        pending_passive_ring_count_.apply_to_scene = false;
-        pending_passive_ring_count_.sequence = ++selection_count_sequence_;
-        pending_passive_ring_count_.pending = true;
-        passive_ring_preview_key_ = preview_key;
-        passive_ring_preview_key_valid_ = true;
-
-        // The previous completed flag is deliberately used here. The current
-        // flag is consumed on a later frame after its event is queried, so
-        // this path never synchronizes the render stream for a hover preview.
-        hit = passive_ring_has_hit_ && picked_ring_id >= 0;
-        if (!hit) {
+        if (!applyFilters(selection, filters, effectiveNodeMask(filters.restrict_to_selected_nodes), *projection_context)) {
             picked_ring_id = -1;
+            hit = false;
+        } else {
+            rendering::count_selection_groups_async(selection, pending_passive_ring_count_.scratch);
+            if (core::gpu_backend_of(pending_passive_ring_count_.scratch) ==
+                core::GpuBackend::Vulkan) {
+                rendering::enqueue_selection_group_count_read(
+                    pending_passive_ring_count_.scratch,
+                    pending_passive_ring_count_.host_counts,
+                    nullptr,
+                    &pending_passive_ring_count_.vulkan_ticket);
+            } else {
+                rendering::enqueue_selection_group_count_read(
+                    pending_passive_ring_count_.scratch,
+                    pending_passive_ring_count_.host_counts,
+                    pending_passive_ring_count_.ready_event);
+            }
+            pending_passive_ring_count_.mask = std::make_shared<core::Tensor>(selection);
+            pending_passive_ring_count_.apply_to_scene = false;
+            pending_passive_ring_count_.sequence = ++selection_count_sequence_;
+            pending_passive_ring_count_.pending = true;
+            passive_ring_preview_key_ = preview_key;
+            passive_ring_preview_key_valid_ = true;
+
+            // The previous completed flag is deliberately used here. The current
+            // flag is consumed on a later frame after its event is queried, so
+            // this path never synchronizes the render stream for a hover preview.
+            hit = passive_ring_has_hit_ && picked_ring_id >= 0;
+            if (!hit) {
+                picked_ring_id = -1;
+            }
         }
 
         const auto render_cursor = screenToRender(cursor_pos, context->info);
@@ -2184,11 +2830,19 @@ namespace lfs::vis {
         }
         LOG_TIMER("SelectionService::refreshInteractivePreview");
 
-        if (!session.viewport_context || !session.viewport_context->info.valid()) {
+        const auto live_viewport_context = resolveInteractiveSessionViewportContext();
+        if (!live_viewport_context || !live_viewport_context->info.valid()) {
+            clearInteractivePreviewState();
             return;
         }
-        const auto& context = *session.viewport_context;
+        const auto& context = *live_viewport_context;
         const auto& info = context.info;
+        const auto projection_context_opt = projectionContextFromViewerContext(context);
+        if (!projection_context_opt) {
+            clearInteractivePreviewState();
+            return;
+        }
+        const SelectionProjectionContext& projection_context = *projection_context_opt;
         const bool add_mode = (session.mode != SelectionMode::Remove);
 
         {
@@ -2246,7 +2900,7 @@ namespace lfs::vis {
             }
             case SelectionShape::Box:
             case SelectionShape::Sphere:
-                if (const auto geometry = buildInteractiveVolumeGeometry()) {
+                if (const auto geometry = buildInteractiveVolumeGeometry(projection_context)) {
                     publishInteractiveVolumeGeometry(*geometry);
                 }
                 break;
@@ -2259,10 +2913,12 @@ namespace lfs::vis {
             int picked_ring_id = -1;
             const bool has_preview_selection =
                 (session.shape == SelectionShape::Brush)
-                    ? buildInteractiveBrushPreviewIncremental()
-                    : buildSelectionMaskForInteractiveSession(selection, true, &picked_ring_id);
+                    ? buildInteractiveBrushPreviewIncremental(projection_context)
+                    : buildSelectionMaskForInteractiveSession(selection, projection_context, true, &picked_ring_id, false);
             if (has_preview_selection) {
                 rendering_manager_->setPreviewSelection(&interactive_selection_.working_selection, add_mode);
+            } else {
+                rendering_manager_->clearPreviewSelection();
             }
             if (session.shape == SelectionShape::Rings) {
                 const auto render_cursor = screenToRender(session.cursor_pos, info);
@@ -2276,9 +2932,16 @@ namespace lfs::vis {
         session.preview_dirty = false;
     }
 
+    void SelectionService::invalidateInteractiveBrushFilterCache() {
+        auto& session = interactive_selection_;
+        session.preview_dirty = true;
+        session.preview_brush_point_count = 0;
+    }
+
     SelectionResult SelectionService::commitSelection(const core::Tensor& selection, const SelectionMode mode,
                                                       const std::vector<bool>& node_mask,
                                                       const SelectionFilterState& filters,
+                                                      const SelectionProjectionContext& projection_context,
                                                       const char* undo_name,
                                                       const SelectionCommitOptions options) {
         LOG_TIMER("SelectionService::commitSelection");
@@ -2294,7 +2957,7 @@ namespace lfs::vis {
             return {false, 0, "Invalid selection mask"};
         }
 
-        if (selection_mask.device() == core::Device::CUDA) {
+        if (selection_mask.device() == core::Device::GPU) {
             LOG_TIMER_THRESHOLD("SelectionService::commitSelection.sync_selection_stream", 1.0);
             try {
                 selection_mask.sync_to_stream(core::getCurrentCUDAStream());
@@ -2304,8 +2967,10 @@ namespace lfs::vis {
         }
 
         {
-            LOG_TIMER_THRESHOLD("SelectionService::commitSelection.apply_filters", 1.0);
-            applyFilters(selection_mask, filters, node_mask);
+            LOG_TIMER("commitSelection.applyFilters");
+            if (!applyFilters(selection_mask, filters, node_mask, projection_context)) {
+                return {false, 0, "Invalid projection context"};
+            }
         }
 
         auto& scene = scene_manager_->getScene();
@@ -2465,149 +3130,90 @@ namespace lfs::vis {
         return {true, selected_count, {}};
     }
 
-    std::shared_ptr<core::Tensor> SelectionService::resolveCommandScreenPositions(const int camera_index) const {
-        if (camera_index >= 0) {
-            if (const auto it = testing_camera_screen_positions_.find(camera_index);
-                it != testing_camera_screen_positions_.end() &&
-                it->second &&
-                it->second->is_valid()) {
-                return it->second;
-            }
-            if (auto remote_positions = renderScreenPositionsForCamera(camera_index);
-                remote_positions && remote_positions->is_valid()) {
-                return remote_positions;
-            }
-        }
-        return getScreenPositions();
-    }
-
-    std::shared_ptr<core::Tensor> SelectionService::renderScreenPositionsForCamera(const int camera_index) const {
-        if (!scene_manager_ || !rendering_manager_ || camera_index < 0) {
-            return nullptr;
-        }
-
-        auto render_lock = acquireLiveModelRenderLock(scene_manager_);
-        auto cameras = scene_manager_->getScene().getAllCameras();
-        if (camera_index >= static_cast<int>(cameras.size()) || !cameras[camera_index]) {
-            return nullptr;
-        }
-
-        auto scene_state = scene_manager_->buildRenderState();
-        if (!scene_state.combined_model || scene_state.combined_model->size() == 0) {
-            return nullptr;
-        }
-
-        const auto settings = rendering_manager_->getSettings();
-        const auto viewport = viewportDataFromCamera(*cameras[camera_index]);
-        return projectGaussianScreenPositions(
-            *scene_state.combined_model,
-            viewport,
-            settings.equirectangular,
-            {.model_transforms = &scene_state.model_transforms,
-             .transform_indices = scene_state.transform_indices,
-             .node_visibility_mask = scene_state.node_visibility_mask});
-    }
-
-    std::shared_ptr<core::Tensor> SelectionService::renderScreenPositionsForCurrentViewport() const {
-        const auto context = resolveViewerViewportContext();
-        if (!context) {
-            return nullptr;
-        }
-        return getScreenPositionsForContext(*context);
-    }
-
     std::optional<int> SelectionService::resolveCommandHoveredGaussianId(const float x, const float y,
                                                                          const int camera_index,
-                                                                         const SelectionFilterState& filters) {
+                                                                         const SelectionFilterState& filters,
+                                                                         const SelectionProjectionContext& projection_context) {
         if (testing_hovered_gaussian_id_.has_value()) {
             return testing_hovered_gaussian_id_;
         }
 
         if (camera_index >= 0) {
-            if (auto hovered_id = renderHoveredGaussianIdForCamera(x, y, camera_index, filters);
-                hovered_id.has_value()) {
-                return hovered_id;
-            }
+            return renderHoveredGaussianIdForCamera(x, y, camera_index, filters, projection_context);
         }
 
-        return renderHoveredGaussianIdForCurrentViewport(x, y, filters);
+        return renderHoveredGaussianIdForCurrentViewport(x, y, filters, projection_context);
     }
 
     std::optional<int> SelectionService::renderHoveredGaussianIdForCamera(const float x, const float y,
                                                                           const int camera_index,
-                                                                          const SelectionFilterState& filters) {
+                                                                          const SelectionFilterState& filters,
+                                                                          const SelectionProjectionContext& projection_context) {
+        if (camera_index >= 0) {
+            if (const auto it = testing_camera_screen_positions_.find(camera_index);
+                it != testing_camera_screen_positions_.end() &&
+                it->second &&
+                it->second->is_valid()) {
+                return pickHoveredGaussianIdFromScreenPositions(*it->second, {x, y}, filters, projection_context);
+            }
+        }
+
         if (!scene_manager_ || camera_index < 0) {
             return std::nullopt;
         }
 
-        auto cameras = scene_manager_->getScene().getAllCameras();
-        if (camera_index >= static_cast<int>(cameras.size()) || !cameras[camera_index]) {
+        const auto screen_positions = renderScreenPositionsForProjectionContext(projection_context);
+        if (!screen_positions || !screen_positions->is_valid()) {
             return std::nullopt;
         }
-
-        return renderHoveredGaussianId(viewportDataFromCamera(*cameras[camera_index]), {x, y}, filters);
+        return pickHoveredGaussianIdFromScreenPositions(*screen_positions, {x, y}, filters, projection_context);
     }
 
     std::optional<int> SelectionService::renderHoveredGaussianIdForViewerContext(
         const ViewerViewportContext& context,
         const glm::vec2 cursor_pos,
-        const SelectionFilterState& filters) const {
+        const SelectionFilterState& filters,
+        const SelectionProjectionContext& projection_context) const {
         if (!context.valid()) {
             return std::nullopt;
         }
 
-        const auto screen_positions = getScreenPositionsForContext(context);
+        const auto screen_positions = renderScreenPositionsForProjectionContext(projection_context);
+        if (!screen_positions || !screen_positions->is_valid()) {
+            return std::nullopt;
+        }
+        const auto& layout = projection_context.viewer_layout
+                                 ? *projection_context.viewer_layout
+                                 : viewerLayoutFromInfo(context.info);
+        return pickHoveredGaussianIdFromScreenPositions(
+            *screen_positions,
+            screenToRender(cursor_pos, layout),
+            filters,
+            projection_context);
+    }
+
+    std::optional<int> SelectionService::renderHoveredGaussianIdForCurrentViewport(
+        const float x, const float y, const SelectionFilterState& filters,
+        const SelectionProjectionContext& projection_context) {
+        if (!projection_context.viewer_layout) {
+            return std::nullopt;
+        }
+        const auto screen_positions = renderScreenPositionsForProjectionContext(projection_context);
         if (!screen_positions || !screen_positions->is_valid()) {
             return std::nullopt;
         }
         return pickHoveredGaussianIdFromScreenPositions(
             *screen_positions,
-            screenToRender(cursor_pos, context.info),
-            filters);
-    }
-
-    std::optional<int> SelectionService::renderHoveredGaussianIdForCurrentViewport(
-        const float x, const float y, const SelectionFilterState& filters) {
-        const auto context = resolveViewerViewportContext(glm::vec2{x, y});
-        if (!context) {
-            return std::nullopt;
-        }
-        return renderHoveredGaussianIdForViewerContext(*context, {x, y}, filters);
-    }
-
-    std::optional<int> SelectionService::renderHoveredGaussianId(const rendering::ViewportData& viewport,
-                                                                 const glm::vec2 cursor_pos,
-                                                                 const SelectionFilterState& filters) const {
-        if (!scene_manager_ || !rendering_manager_) {
-            return std::nullopt;
-        }
-
-        auto render_lock = acquireLiveModelRenderLock(scene_manager_);
-        auto scene_state = scene_manager_->buildRenderState();
-        if (!scene_state.combined_model || scene_state.combined_model->size() == 0) {
-            return std::nullopt;
-        }
-
-        const auto settings = rendering_manager_->getSettings();
-        auto screen_positions = projectGaussianScreenPositions(
-            *scene_state.combined_model,
-            viewport,
-            settings.equirectangular,
-            {.model_transforms = &scene_state.model_transforms,
-             .transform_indices = scene_state.transform_indices,
-             .node_visibility_mask = scene_state.node_visibility_mask});
-        render_lock.reset();
-        if (!screen_positions || !screen_positions->is_valid()) {
-            return std::nullopt;
-        }
-
-        return pickHoveredGaussianIdFromScreenPositions(*screen_positions, cursor_pos, filters);
+            screenToRender({x, y}, *projection_context.viewer_layout),
+            filters,
+            projection_context);
     }
 
     std::optional<int> SelectionService::pickHoveredGaussianIdFromScreenPositions(
         const core::Tensor& screen_positions,
         const glm::vec2 cursor_pos,
-        const SelectionFilterState& filters) const {
+        const SelectionFilterState& filters,
+        const SelectionProjectionContext& projection_context) const {
         if (!scene_manager_) {
             return std::nullopt;
         }
@@ -2626,10 +3232,12 @@ namespace lfs::vis {
         if (filters.crop_filter || filters.depth_filter || filters.restrict_to_selected_nodes) {
             auto candidate = core::Tensor::zeros(
                 {activeSelectionGaussianCount(scene_manager_)},
-                core::Device::CUDA,
+                core::Device::GPU,
                 core::DataType::Bool);
-            rendering::set_selection_element(candidate.ptr<bool>(), hovered_id, true);
-            applyFilters(candidate, filters, effectiveNodeMask(filters.restrict_to_selected_nodes));
+            rendering::set_selection_element(candidate, hovered_id, true);
+            if (!applyFilters(candidate, filters, effectiveNodeMask(filters.restrict_to_selected_nodes), projection_context)) {
+                return std::nullopt;
+            }
             const auto candidate_value = candidate.slice(0, hovered_id, hovered_id + 1).cpu().contiguous();
             if (!candidate_value.ptr<bool>()[0]) {
                 return std::nullopt;
@@ -2639,13 +3247,17 @@ namespace lfs::vis {
         return hovered_id;
     }
 
-    core::Tensor& SelectionService::resetBoolScratchBuffer(core::Tensor& buffer, const size_t size) {
+    core::Tensor& SelectionService::resetBoolScratchBuffer(core::Tensor& buffer, const size_t size,
+                                                           const core::Tensor* const affinity) {
+        const auto backend = resolveGpuBackend(affinity);
         const bool needs_realloc = !buffer.is_valid() ||
-                                   buffer.device() != core::Device::CUDA ||
+                                   buffer.device() != core::Device::GPU ||
                                    buffer.dtype() != core::DataType::Bool ||
-                                   buffer.numel() != size;
+                                   buffer.numel() != size ||
+                                   !bufferMatchesBackend(buffer, backend);
         if (needs_realloc) {
-            buffer = core::Tensor::zeros({size}, core::Device::CUDA, core::DataType::Bool);
+            core::GpuBackendScope scope(backend);
+            buffer = core::Tensor::zeros({size}, core::Device::GPU, core::DataType::Bool);
             return buffer;
         }
 
@@ -2653,7 +3265,8 @@ namespace lfs::vis {
         return buffer;
     }
 
-    bool SelectionService::buildInteractiveBrushPreviewIncremental() {
+    bool SelectionService::buildInteractiveBrushPreviewIncremental(
+        const SelectionProjectionContext& projection_context) {
         LOG_TIMER("SelectionService::buildInteractiveBrushPreviewIncremental");
         auto& session = interactive_selection_;
         if (!session.active || session.shape != SelectionShape::Brush || !scene_manager_ || !rendering_manager_) {
@@ -2665,31 +3278,51 @@ namespace lfs::vis {
             return false;
         }
 
+        const auto preview_backend = core::default_gpu_backend();
         const bool needs_working_realloc =
             !session.working_selection.is_valid() ||
-            session.working_selection.device() != core::Device::CUDA ||
+            session.working_selection.device() != core::Device::GPU ||
             session.working_selection.dtype() != core::DataType::Bool ||
-            session.working_selection.numel() != total;
+            session.working_selection.numel() != total ||
+            !bufferMatchesBackend(session.working_selection, preview_backend);
         const auto node_mask = effectiveNodeMask(session.filters.restrict_to_selected_nodes);
         const bool node_scope_changed =
             session.preview_brush_point_count > 0 &&
             node_mask != session.live_preview_node_mask;
         if (needs_working_realloc) {
-            session.working_selection = core::Tensor::zeros({total}, core::Device::CUDA, core::DataType::Bool);
+            core::GpuBackendScope scope(preview_backend);
+            session.working_selection = core::Tensor::zeros({total}, core::Device::GPU, core::DataType::Bool);
             session.preview_brush_point_count = 0;
         } else if (session.preview_brush_point_count > session.points.size() || node_scope_changed) {
             session.working_selection.zero_();
             session.preview_brush_point_count = 0;
         }
 
+        if (!projection_context.viewer_layout) {
+            session.working_selection = {};
+            session.preview_brush_point_count = 0;
+            session.preview_brush_projection_signature_valid = false;
+            return false;
+        }
+        const std::size_t projection_signature = projectionContextSignature(projection_context);
+        if (session.preview_brush_projection_signature_valid &&
+            session.preview_brush_projection_signature != projection_signature) {
+            session.working_selection.zero_();
+            session.preview_brush_point_count = 0;
+        }
+        session.preview_brush_projection_signature = projection_signature;
+        session.preview_brush_projection_signature_valid = true;
+
         if (session.preview_brush_point_count == session.points.size()) {
-            return session.preview_brush_point_count > 0;
+            return session.working_selection.is_valid() && session.working_selection.numel() == total;
         }
 
         const size_t first_point =
             (session.preview_brush_point_count == 0) ? 0 : (session.preview_brush_point_count - 1);
         if (first_point >= session.points.size()) {
-            return session.preview_brush_point_count > 0;
+            session.working_selection = {};
+            session.preview_brush_point_count = 0;
+            return false;
         }
 
         std::vector<glm::vec2> delta_points;
@@ -2699,24 +3332,32 @@ namespace lfs::vis {
 
         const bool needs_delta_realloc =
             !session.live_delta_selection.is_valid() ||
-            session.live_delta_selection.device() != core::Device::CUDA ||
+            session.live_delta_selection.device() != core::Device::GPU ||
             session.live_delta_selection.dtype() != core::DataType::Bool ||
-            session.live_delta_selection.numel() != total;
+            session.live_delta_selection.numel() != total ||
+            !bufferMatchesBackend(session.live_delta_selection, preview_backend);
         if (needs_delta_realloc) {
-            session.live_delta_selection = core::Tensor::zeros({total}, core::Device::CUDA, core::DataType::Bool);
+            core::GpuBackendScope scope(preview_backend);
+            session.live_delta_selection = core::Tensor::zeros({total}, core::Device::GPU, core::DataType::Bool);
         }
         auto& delta_selection = session.live_delta_selection;
         delta_selection.fill_(0.0f, delta_selection.stream());
         {
             LOG_TIMER("SelectionService::buildInteractiveBrushPreviewIncremental.brush_delta");
-            if (!buildBrushSelection(delta_points, session.brush_radius, delta_selection)) {
-                return session.preview_brush_point_count > 0;
+            if (!buildBrushSelection(delta_points, session.brush_radius, delta_selection, projection_context)) {
+                session.working_selection = {};
+                session.preview_brush_point_count = 0;
+                return false;
             }
         }
 
         {
             LOG_TIMER("SelectionService::buildInteractiveBrushPreviewIncremental.applyFilters");
-            applyFilters(delta_selection, session.filters, node_mask);
+            if (!applyFilters(delta_selection, session.filters, node_mask, projection_context)) {
+                session.working_selection = {};
+                session.preview_brush_point_count = 0;
+                return false;
+            }
         }
 
         if (session.preview_brush_point_count == 0) {
@@ -2732,17 +3373,11 @@ namespace lfs::vis {
         return true;
     }
 
-    std::optional<SelectionService::ViewportInfo> SelectionService::resolveViewportInfo() const {
-        const auto context = resolveViewerViewportContext();
-        if (!context || !context->info.valid()) {
-            return std::nullopt;
-        }
-        return context->info;
-    }
-
     bool SelectionService::buildSelectionMaskForInteractiveSession(core::Tensor& selection_out,
+                                                                   const SelectionProjectionContext& projection_context,
                                                                    const bool include_polygon_cursor,
-                                                                   int* const picked_ring_id_out) {
+                                                                   int* const picked_ring_id_out,
+                                                                   const bool for_commit) {
         LOG_TIMER("SelectionService::buildSelectionMaskForInteractiveSession");
         if (picked_ring_id_out) {
             *picked_ring_id_out = -1;
@@ -2757,10 +3392,19 @@ namespace lfs::vis {
             return false;
         }
 
+        if (!projection_context.viewer_layout) {
+            return false;
+        }
+
         bool success = false;
         switch (session.shape) {
         case SelectionShape::Brush:
-            success = buildInteractiveBrushPreviewIncremental();
+            if (for_commit) {
+                selection_out = resetBoolScratchBuffer(session.working_selection, total);
+                success = buildBrushSelection(session.points, session.brush_radius, selection_out, projection_context);
+                break;
+            }
+            success = buildInteractiveBrushPreviewIncremental(projection_context);
             success = success && session.preview_brush_point_count == session.points.size() &&
                       session.working_selection.is_valid() && session.working_selection.numel() == total;
             if (success) {
@@ -2769,21 +3413,21 @@ namespace lfs::vis {
             break;
         case SelectionShape::Rectangle:
             selection_out = resetBoolScratchBuffer(session.working_selection, total);
-            success = buildRectangleSelection(session.start_pos, session.cursor_pos, selection_out);
+            success = buildRectangleSelection(session.start_pos, session.cursor_pos, selection_out, projection_context);
             break;
         case SelectionShape::Polygon: {
             selection_out = resetBoolScratchBuffer(session.working_selection, total);
             if (!session.polygon_world_points.empty()) {
-                success = buildWorldPolygonSelection(session.polygon_world_points, selection_out);
+                success = buildWorldPolygonSelection(session.polygon_world_points, selection_out, projection_context);
             } else {
                 const auto polygon_points = include_polygon_cursor ? getPolygonPreviewPoints() : session.points;
-                success = buildPolygonSelection(polygon_points, selection_out);
+                success = buildPolygonSelection(polygon_points, selection_out, projection_context);
             }
             break;
         }
         case SelectionShape::Lasso:
             selection_out = resetBoolScratchBuffer(session.working_selection, total);
-            success = buildPolygonSelection(session.points, selection_out);
+            success = buildPolygonSelection(session.points, selection_out, projection_context);
             break;
         case SelectionShape::Rings: {
             if (!session.working_selection.is_valid() || session.working_selection.numel() != total) {
@@ -2792,8 +3436,10 @@ namespace lfs::vis {
             }
             auto& hit = resetBoolScratchBuffer(session.live_delta_selection, total);
             int picked_ring_id = -1;
-            if (buildRingSelection(session.cursor_pos, hit, true, false, &picked_ring_id)) {
-                applyFilters(hit, session.filters, effectiveNodeMask(session.filters.restrict_to_selected_nodes));
+            if (buildRingSelection(session.cursor_pos, hit, projection_context, true, false, &picked_ring_id)) {
+                if (!applyFilters(hit, session.filters, effectiveNodeMask(session.filters.restrict_to_selected_nodes), projection_context)) {
+                    return false;
+                }
                 rendering::merge_selection_mask_or(session.working_selection, hit);
                 session.ring_has_hit |= picked_ring_id >= 0;
             }
@@ -2807,7 +3453,7 @@ namespace lfs::vis {
         case SelectionShape::Box:
         case SelectionShape::Sphere:
             selection_out = resetBoolScratchBuffer(session.working_selection, total);
-            if (const auto geometry = buildInteractiveVolumeGeometry()) {
+            if (const auto geometry = buildInteractiveVolumeGeometry(projection_context)) {
                 success = buildVolumeSelection(*geometry, selection_out);
             }
             break;
@@ -2817,45 +3463,42 @@ namespace lfs::vis {
             return false;
         }
 
-        applyFilters(selection_out, session.filters, effectiveNodeMask(session.filters.restrict_to_selected_nodes));
+        if (!applyFilters(selection_out, session.filters, effectiveNodeMask(session.filters.restrict_to_selected_nodes),
+                          projection_context)) {
+            return false;
+        }
         return true;
     }
 
     bool SelectionService::buildBrushSelection(const std::vector<glm::vec2>& points, const float radius,
-                                               core::Tensor& selection_out) const {
+                                               core::Tensor& selection_out,
+                                               const SelectionProjectionContext& projection_context) const {
         LOG_TIMER("SelectionService::buildBrushSelection");
-        if (points.empty()) {
+        if (points.empty() || !projection_context.viewer_layout) {
             return false;
         }
 
-        const auto& session = interactive_selection_;
-        if (!scene_manager_ || !rendering_manager_ || !session.viewport_context ||
-            !session.viewport_context->info.valid() || !session.viewport_context->viewport) {
+        if (!scene_manager_ || !rendering_manager_) {
             return false;
         }
-        const auto& info = session.viewport_context->info;
+        const auto info = viewportInfoFromLayout(*projection_context.viewer_layout);
 
         const auto primitives = buildBrushPrimitives(points, radius, info);
         if (primitives.empty()) {
             return false;
         }
-        const auto settings = rendering_manager_->getSettings();
         if (!testing_screen_positions_ && !testing_viewport_) {
-            Viewport projection_viewport = *session.viewport_context->viewport;
-            projection_viewport.windowSize = {info.render_width, info.render_height};
-            const auto frame_view = frameViewFromViewport(
-                viewportDataFromViewer(projection_viewport, info, settings),
-                settings.background_color,
-                settings.depth_clip_enabled ? settings.depth_clip_far : lfs::rendering::DEFAULT_FAR_PLANE);
-            if (auto selection = tryBuildVksplatSelectionMask(
-                    scene_manager_, rendering_manager_, frame_view, settings.equirectangular,
-                    RenderingManager::VksplatSelectionMaskShape::Brush, primitives);
-                selection && copySelectionIfSameSize(*selection, selection_out)) {
-                return true;
+            if (const auto frame_view = frameViewFromProjectionContext(projection_context)) {
+                if (auto selection = tryBuildVksplatSelectionMask(
+                        scene_manager_, rendering_manager_, *frame_view, projection_context.equirectangular,
+                        RenderingManager::VksplatSelectionMaskShape::Brush, primitives);
+                    selection && copySelectionIfSameSize(*selection, selection_out)) {
+                    return true;
+                }
             }
         }
 
-        const auto screen_positions = getScreenPositionsForContext(*session.viewport_context);
+        const auto screen_positions = renderScreenPositionsForProjectionContext(projection_context);
         if (!screen_positions || !screen_positions->is_valid() || screen_positions->size(0) != selection_out.numel()) {
             return false;
         }
@@ -2865,6 +3508,8 @@ namespace lfs::vis {
         constexpr float STEP_FACTOR = 0.5f;
         constexpr int MAX_BRUSH_STEPS = 128;
 
+        std::vector<float> disk_xy;
+        disk_xy.reserve(points.size() * 4);
         for (size_t i = 0; i < points.size(); ++i) {
             const glm::vec2 from = (i == 0) ? points[i] : points[i - 1];
             const glm::vec2 to = points[i];
@@ -2878,48 +3523,44 @@ namespace lfs::vis {
                                                  : static_cast<float>(step + 1) / static_cast<float>(num_steps);
                 const glm::vec2 sample = from + delta * t;
                 const auto render = screenToRender(sample, info);
-                rendering::brush_select_tensor(*screen_positions, render.x, render.y, scaled_radius, selection_out);
+                disk_xy.push_back(render.x);
+                disk_xy.push_back(render.y);
             }
         }
+        rendering::brush_select_disks_tensor(*screen_positions, disk_xy, scaled_radius, selection_out);
 
         return true;
     }
 
     bool SelectionService::buildRectangleSelection(const glm::vec2 start, const glm::vec2 end,
-                                                   core::Tensor& selection_out) const {
+                                                   core::Tensor& selection_out,
+                                                   const SelectionProjectionContext& projection_context) const {
         LOG_TIMER("SelectionService::buildRectangleSelection");
-        const auto& session = interactive_selection_;
-        if (!scene_manager_ || !rendering_manager_ || !session.viewport_context ||
-            !session.viewport_context->info.valid() || !session.viewport_context->viewport) {
+        if (!scene_manager_ || !rendering_manager_ || !projection_context.viewer_layout) {
             return false;
         }
-        const auto& info = session.viewport_context->info;
+        const auto& layout = *projection_context.viewer_layout;
 
-        const auto render_start = screenToRender(start, info);
-        const auto render_end = screenToRender(end, info);
+        const auto render_start = screenToRender(start, layout);
+        const auto render_end = screenToRender(end, layout);
         const std::vector<glm::vec4> primitives{{
             std::min(render_start.x, render_end.x),
             std::min(render_start.y, render_end.y),
             std::max(render_start.x, render_end.x),
             std::max(render_start.y, render_end.y),
         }};
-        const auto settings = rendering_manager_->getSettings();
         if (!testing_screen_positions_ && !testing_viewport_) {
-            Viewport projection_viewport = *session.viewport_context->viewport;
-            projection_viewport.windowSize = {info.render_width, info.render_height};
-            const auto frame_view = frameViewFromViewport(
-                viewportDataFromViewer(projection_viewport, info, settings),
-                settings.background_color,
-                settings.depth_clip_enabled ? settings.depth_clip_far : lfs::rendering::DEFAULT_FAR_PLANE);
-            if (auto selection = tryBuildVksplatSelectionMask(
-                    scene_manager_, rendering_manager_, frame_view, settings.equirectangular,
-                    RenderingManager::VksplatSelectionMaskShape::Rectangle, primitives);
-                selection && copySelectionIfSameSize(*selection, selection_out)) {
-                return true;
+            if (const auto frame_view = frameViewFromProjectionContext(projection_context)) {
+                if (auto selection = tryBuildVksplatSelectionMask(
+                        scene_manager_, rendering_manager_, *frame_view, projection_context.equirectangular,
+                        RenderingManager::VksplatSelectionMaskShape::Rectangle, primitives);
+                    selection && copySelectionIfSameSize(*selection, selection_out)) {
+                    return true;
+                }
             }
         }
 
-        const auto screen_positions = getScreenPositionsForContext(*session.viewport_context);
+        const auto screen_positions = renderScreenPositionsForProjectionContext(projection_context);
         if (!screen_positions || !screen_positions->is_valid() || screen_positions->size(0) != selection_out.numel()) {
             return false;
         }
@@ -2934,81 +3575,70 @@ namespace lfs::vis {
     }
 
     bool SelectionService::buildPolygonSelection(const std::vector<glm::vec2>& points,
-                                                 core::Tensor& selection_out) const {
+                                                 core::Tensor& selection_out,
+                                                 const SelectionProjectionContext& projection_context) const {
         LOG_TIMER("SelectionService::buildPolygonSelection");
-        if (points.size() < 3) {
+        if (points.size() < 3 || !projection_context.viewer_layout) {
             return false;
         }
 
-        const auto& session = interactive_selection_;
-        if (!scene_manager_ || !rendering_manager_ || !session.viewport_context ||
-            !session.viewport_context->info.valid() || !session.viewport_context->viewport) {
+        if (!scene_manager_ || !rendering_manager_) {
             return false;
         }
-        const auto& info = session.viewport_context->info;
+        const auto& layout = *projection_context.viewer_layout;
 
         std::vector<glm::vec2> render_points;
         render_points.reserve(points.size());
         for (const auto& point : points) {
-            render_points.push_back(screenToRender(point, info));
+            render_points.push_back(screenToRender(point, layout));
         }
 
-        const auto settings = rendering_manager_->getSettings();
         if (!testing_screen_positions_ && !testing_viewport_) {
-            Viewport projection_viewport = *session.viewport_context->viewport;
-            projection_viewport.windowSize = {info.render_width, info.render_height};
-            const auto frame_view = frameViewFromViewport(
-                viewportDataFromViewer(projection_viewport, info, settings),
-                settings.background_color,
-                settings.depth_clip_enabled ? settings.depth_clip_far : lfs::rendering::DEFAULT_FAR_PLANE);
-            if (auto selection = tryBuildVksplatPolygonSelectionMask(
-                    scene_manager_, rendering_manager_, frame_view, settings.equirectangular, render_points);
-                selection && copySelectionIfSameSize(*selection, selection_out)) {
-                return true;
+            if (const auto frame_view = frameViewFromProjectionContext(projection_context)) {
+                if (auto selection = tryBuildVksplatPolygonSelectionMask(
+                        scene_manager_, rendering_manager_, *frame_view, projection_context.equirectangular, render_points);
+                    selection && copySelectionIfSameSize(*selection, selection_out)) {
+                    return true;
+                }
             }
         }
 
-        const auto screen_positions = getScreenPositionsForContext(*session.viewport_context);
+        const auto screen_positions = renderScreenPositionsForProjectionContext(projection_context);
         if (!screen_positions || !screen_positions->is_valid() || screen_positions->size(0) != selection_out.numel()) {
             return false;
         }
 
-        auto& polygon =
-            uploadFloat2PointsToBuffer(render_points, polygon_vertex_host_buffer_, polygon_vertex_device_buffer_);
+        auto& polygon = uploadFloat2PointsToBuffer(
+            render_points, polygon_vertex_host_buffer_, polygon_vertex_device_buffer_, screen_positions.get());
         rendering::polygon_select_tensor(*screen_positions, polygon, selection_out);
         return true;
     }
 
     bool SelectionService::buildWorldPolygonSelection(const std::vector<glm::vec3>& world_points,
-                                                      core::Tensor& selection_out) const {
+                                                      core::Tensor& selection_out,
+                                                      const SelectionProjectionContext& projection_context) const {
         LOG_TIMER("SelectionService::buildWorldPolygonSelection");
-        if (world_points.size() < 3) {
+        if (world_points.size() < 3 || !projection_context.valid()) {
             return false;
         }
 
-        const auto& session = interactive_selection_;
-        if (!scene_manager_ || !rendering_manager_ || !session.viewport_context ||
-            !session.viewport_context->viewport || !session.viewport_context->info.valid()) {
+        if (!scene_manager_ || !rendering_manager_) {
             return false;
         }
 
-        Viewport projection_viewport = *session.viewport_context->viewport;
-        projection_viewport.windowSize = {
-            session.viewport_context->info.render_width,
-            session.viewport_context->info.render_height};
-        const auto settings = rendering_manager_->getSettings();
+        const auto& viewport = projection_context.viewport;
 
         std::vector<glm::vec2> render_points;
         render_points.reserve(world_points.size());
         for (const auto& wp : world_points) {
             const auto projected = rendering::projectWorldPoint(
-                projection_viewport.camera.R,
-                projection_viewport.camera.t,
-                {session.viewport_context->info.render_width, session.viewport_context->info.render_height},
+                viewport.rotation,
+                viewport.translation,
+                {viewport.size.x, viewport.size.y},
                 wp,
-                settings.focal_length_mm,
-                settings.orthographic,
-                settings.ortho_scale);
+                viewport.focal_length_mm,
+                viewport.orthographic,
+                viewport.ortho_scale);
             if (!projected) {
                 return false;
             }
@@ -3016,43 +3646,42 @@ namespace lfs::vis {
         }
 
         if (!testing_screen_positions_ && !testing_viewport_) {
-            const auto frame_view = frameViewFromViewport(
-                viewportDataFromViewer(projection_viewport, session.viewport_context->info, settings),
-                settings.background_color,
-                settings.depth_clip_enabled ? settings.depth_clip_far : lfs::rendering::DEFAULT_FAR_PLANE);
-            if (auto selection = tryBuildVksplatPolygonSelectionMask(
-                    scene_manager_, rendering_manager_, frame_view, settings.equirectangular, render_points);
-                selection && copySelectionIfSameSize(*selection, selection_out)) {
-                return true;
+            if (const auto frame_view = frameViewFromProjectionContext(projection_context)) {
+                if (auto selection = tryBuildVksplatPolygonSelectionMask(
+                        scene_manager_, rendering_manager_, *frame_view, projection_context.equirectangular, render_points);
+                    selection && copySelectionIfSameSize(*selection, selection_out)) {
+                    return true;
+                }
             }
         }
 
-        const auto screen_positions = getScreenPositionsForContext(*session.viewport_context);
+        const auto screen_positions = renderScreenPositionsForProjectionContext(projection_context);
         if (!screen_positions || !screen_positions->is_valid() || screen_positions->size(0) != selection_out.numel()) {
             return false;
         }
 
-        auto& polygon =
-            uploadFloat2PointsToBuffer(render_points, polygon_vertex_host_buffer_, polygon_vertex_device_buffer_);
+        auto& polygon = uploadFloat2PointsToBuffer(
+            render_points, polygon_vertex_host_buffer_, polygon_vertex_device_buffer_, screen_positions.get());
         rendering::polygon_select_tensor(*screen_positions, polygon, selection_out);
         return true;
     }
 
     bool SelectionService::buildRingSelection(const glm::vec2 cursor_pos, core::Tensor& selection_out,
+                                              const SelectionProjectionContext& projection_context,
                                               const bool try_exact_ring_pick,
                                               const bool require_exact_ring_hit,
                                               int* const picked_ring_id_out) const {
         if (picked_ring_id_out) {
             *picked_ring_id_out = -1;
         }
-        if (!rendering_manager_) {
+        if (!rendering_manager_ || !projection_context.viewer_layout) {
             return false;
         }
 
         const auto& session = interactive_selection_;
         int hovered_id = testing_hovered_gaussian_id_.value_or(-1);
         if (hovered_id >= 0 && static_cast<size_t>(hovered_id) < selection_out.numel()) {
-            rendering::set_selection_element(selection_out.ptr<bool>(), hovered_id, true);
+            rendering::set_selection_element(selection_out, hovered_id, true);
             if (picked_ring_id_out) {
                 *picked_ring_id_out = hovered_id;
             }
@@ -3061,59 +3690,59 @@ namespace lfs::vis {
 
         if (try_exact_ring_pick &&
             scene_manager_ &&
-            session.viewport_context &&
-            session.viewport_context->info.valid() &&
-            session.viewport_context->viewport &&
             !testing_screen_positions_ &&
             !testing_viewport_) {
             if (const auto exact_hit =
-                    buildRingSelectionForContext(*session.viewport_context, cursor_pos, selection_out, picked_ring_id_out)) {
+                    buildRingSelectionForContext(projection_context, cursor_pos, selection_out, picked_ring_id_out)) {
                 return *exact_hit || !require_exact_ring_hit;
             }
         }
 
-        if (!session.viewport_context) {
-            return false;
+        if (const auto screen_positions = renderScreenPositionsForProjectionContext(projection_context);
+            screen_positions && screen_positions->is_valid()) {
+            hovered_id = pickHoveredGaussianIdFromScreenPositions(
+                             *screen_positions,
+                             screenToRender(cursor_pos, *projection_context.viewer_layout),
+                             session.filters,
+                             projection_context)
+                             .value_or(-1);
+        } else {
+            hovered_id = -1;
         }
-        hovered_id =
-            renderHoveredGaussianIdForViewerContext(*session.viewport_context, cursor_pos, session.filters)
-                .value_or(-1);
         if (hovered_id < 0 || static_cast<size_t>(hovered_id) >= selection_out.numel()) {
             return !require_exact_ring_hit;
         }
 
-        rendering::set_selection_element(selection_out.ptr<bool>(), hovered_id, true);
+        rendering::set_selection_element(selection_out, hovered_id, true);
         if (picked_ring_id_out) {
             *picked_ring_id_out = hovered_id;
         }
         return true;
     }
 
-    std::optional<bool> SelectionService::buildRingSelectionForContext(const ViewerViewportContext& context,
-                                                                       const glm::vec2 cursor_pos,
-                                                                       core::Tensor& selection_out,
-                                                                       int* const picked_ring_id_out) const {
+    std::optional<bool> SelectionService::buildRingSelectionForContext(
+        const SelectionProjectionContext& projection_context,
+        const glm::vec2 cursor_pos,
+        core::Tensor& selection_out,
+        int* const picked_ring_id_out) const {
         if (picked_ring_id_out) {
             *picked_ring_id_out = -1;
         }
-        if (!scene_manager_ || !rendering_manager_ || !context.info.valid() || !context.viewport) {
+        if (!scene_manager_ || !rendering_manager_ || !projection_context.viewer_layout) {
             return std::nullopt;
         }
 
-        const auto& info = context.info;
-        const auto settings = rendering_manager_->getSettings();
-        const auto render_cursor = screenToRender(cursor_pos, info);
-        const float render_padding = RING_PICK_PADDING_PX * (static_cast<float>(info.render_width) / info.width);
+        const auto& layout = *projection_context.viewer_layout;
+        const auto render_cursor = screenToRender(cursor_pos, layout);
+        const float render_padding = RING_PICK_PADDING_PX * (static_cast<float>(layout.render_width) / layout.width);
         const std::vector<glm::vec4> primitives{{render_cursor.x, render_cursor.y, render_padding, 0.0f}};
-        Viewport projection_viewport = *context.viewport;
-        projection_viewport.windowSize = {info.render_width, info.render_height};
-        const auto frame_view = frameViewFromViewport(
-            viewportDataFromViewer(projection_viewport, info, settings),
-            settings.background_color,
-            settings.depth_clip_enabled ? settings.depth_clip_far : lfs::rendering::DEFAULT_FAR_PLANE);
+        const auto frame_view = frameViewFromProjectionContext(projection_context);
+        if (!frame_view) {
+            return std::nullopt;
+        }
         std::uint32_t picked_ring_id = std::numeric_limits<std::uint32_t>::max();
         if (auto selection = tryBuildVksplatSelectionMask(
-                scene_manager_, rendering_manager_, frame_view, settings.equirectangular,
+                scene_manager_, rendering_manager_, *frame_view, projection_context.equirectangular,
                 RenderingManager::VksplatSelectionMaskShape::Ring, primitives, &picked_ring_id);
             selection && copySelectionIfSameSize(*selection, selection_out)) {
             if (picked_ring_id != std::numeric_limits<std::uint32_t>::max() &&
@@ -3127,12 +3756,12 @@ namespace lfs::vis {
     }
 
     std::optional<SelectionService::InteractiveVolumeGeometry>
-    SelectionService::buildInteractiveVolumeGeometry() const {
+    SelectionService::buildInteractiveVolumeGeometry(
+        const SelectionProjectionContext& projection_context) const {
         const auto& session = interactive_selection_;
         if (!rendering_manager_ || !session.active ||
             (session.shape != SelectionShape::Box && session.shape != SelectionShape::Sphere) ||
-            !session.viewport_context || !session.viewport_context->viewport ||
-            !session.viewport_context->info.valid()) {
+            !projection_context.viewer_layout) {
             return std::nullopt;
         }
 
@@ -3141,29 +3770,29 @@ namespace lfs::vis {
         }
         const glm::vec3 center_world = *session.volume_center_world;
 
-        const auto& info = session.viewport_context->info;
-        Viewport projection_viewport = *session.viewport_context->viewport;
-        projection_viewport.windowSize = {info.render_width, info.render_height};
+        const auto& layout = *projection_context.viewer_layout;
+        const auto& viewport_data = projection_context.viewport;
+        const auto render_point = screenToRender(session.cursor_pos, layout);
 
-        const auto settings = rendering_manager_->getSettings();
-        const auto render_point = screenToRender(session.cursor_pos, info);
-        const glm::vec3 forward = rendering::cameraForward(projection_viewport.camera.R);
-        float depth = glm::dot(center_world - projection_viewport.camera.t, forward);
+        const glm::vec3 forward = rendering::cameraForward(viewport_data.rotation);
+        float depth = glm::dot(center_world - viewport_data.translation, forward);
         if (!std::isfinite(depth) || depth <= 0.0f) {
-            depth = glm::length(center_world - projection_viewport.camera.t);
+            depth = glm::length(center_world - viewport_data.translation);
         }
         if (!std::isfinite(depth) || depth <= 0.0f) {
             return std::nullopt;
         }
 
-        const float ortho_scale = projection_viewport.ortho_scale_override.value_or(settings.ortho_scale);
-        const glm::vec3 drag_world = projection_viewport.unprojectPixel(
+        const glm::vec3 drag_world = rendering::unprojectScreenPoint(
+            viewport_data.rotation,
+            viewport_data.translation,
+            glm::ivec2(layout.render_width, layout.render_height),
             render_point.x,
             render_point.y,
             depth,
-            settings.focal_length_mm,
-            settings.orthographic,
-            ortho_scale);
+            viewport_data.focal_length_mm,
+            viewport_data.orthographic,
+            viewport_data.ortho_scale);
         if (!Viewport::isValidWorldPosition(drag_world)) {
             return std::nullopt;
         }
@@ -3347,9 +3976,9 @@ namespace lfs::vis {
     }
 
     std::optional<glm::vec3> SelectionService::resolveInteractivePolygonWorldPoint(const glm::vec2 screen_point) const {
-        const auto& session = interactive_selection_;
-        if (!rendering_manager_ || !session.viewport_context || !session.viewport_context->viewport ||
-            !session.viewport_context->info.valid()) {
+        const auto viewport_context = resolveInteractiveSessionViewportContext(screen_point);
+        if (!rendering_manager_ || !viewport_context || !viewport_context->viewport ||
+            !viewport_context->info.valid()) {
             return std::nullopt;
         }
         const glm::ivec2 rendered_size = rendering_manager_->getRenderedSize();
@@ -3358,13 +3987,66 @@ namespace lfs::vis {
         }
 
         const auto settings = rendering_manager_->getSettings();
-        const auto& info = session.viewport_context->info;
-        Viewport projection_viewport = *session.viewport_context->viewport;
+        const auto& info = viewport_context->info;
+        Viewport projection_viewport = *viewport_context->viewport;
         projection_viewport.windowSize = {info.render_width, info.render_height};
         const auto render_point = screenToRender(screen_point, info);
+
+        if (const auto gt = rendering_manager_->gtComparisonSelectionContext()) {
+            // Equirect GT has empty intrinsics by construction (split_view_service.cpp:78-103).
+            // Falling through would unproject through the interactive camera — the path the
+            // STOP-3 comment below forbids. Inverse of filterSelectionByScreenWindowKernel.
+            if (gt->camera.equirectangular) {
+                projection_viewport.camera.R = gt->camera.rotation;
+                projection_viewport.camera.t = gt->camera.translation;
+
+                const float pivot_distance = glm::length(projection_viewport.camera.pivot - projection_viewport.camera.t);
+                const float fallback_distance = pivot_distance > 0.1f ? pivot_distance : 10.0f;
+                const glm::vec3 vis_dir = equirectVisualizerDirectionFromRenderPixel(
+                    render_point, info.render_width, info.render_height);
+                const glm::vec3 world =
+                    projection_viewport.camera.R * (vis_dir * fallback_distance) + projection_viewport.camera.t;
+                if (Viewport::isValidWorldPosition(world)) {
+                    return world;
+                }
+                const glm::vec3 forward = rendering::cameraForward(projection_viewport.camera.R);
+                return projection_viewport.camera.t + forward * fallback_distance;
+            }
+            if (gt->camera.intrinsics) {
+                projection_viewport.camera.R = gt->camera.rotation;
+                projection_viewport.camera.t = gt->camera.translation;
+
+                const float pivot_distance = glm::length(projection_viewport.camera.pivot - projection_viewport.camera.t);
+                const float fallback_distance = pivot_distance > 0.1f ? pivot_distance : 10.0f;
+
+                // Same pinhole inverse as rendering::unprojectScreenPoint, but with the displayed GT
+                // camera's real intrinsics instead of the image-centred, aspect-derived ones that helper
+                // assumes (coordinate_conventions.hpp:278-282). Distance along the ray uses the existing
+                // pivot-distance heuristic rather than a depth-buffer read: in GT the reachable depth is
+                // either addressed in the wrong space or belongs to a held, older frame (see above).
+                const auto& gt_intrinsics = *gt->camera.intrinsics;
+                const glm::vec3 view_pos(
+                    (render_point.x - gt_intrinsics.center_x) * fallback_distance / gt_intrinsics.focal_x,
+                    (gt_intrinsics.center_y - render_point.y) * fallback_distance / gt_intrinsics.focal_y,
+                    -fallback_distance);
+                const glm::vec3 world = projection_viewport.camera.R * view_pos + projection_viewport.camera.t;
+                if (Viewport::isValidWorldPosition(world)) {
+                    return world;
+                }
+                // Deliberate GT-only terminal fallback (not a duplicate of the shared
+                // one below): falling through would cross the getDepthAtPixel read the
+                // STOP-3 ruling forbids on the GT path, and the shared fallback
+                // unprojects through unprojectPixel, which hard-centres the principal
+                // point and derives symmetric focals — exactly what the GT ray must
+                // not use. A forward ray at the fallback distance needs no intrinsics.
+                const glm::vec3 forward = rendering::cameraForward(projection_viewport.camera.R);
+                return projection_viewport.camera.t + forward * fallback_distance;
+            }
+        }
+
         const float depth = rendering_manager_->getDepthAtPixel(
-            static_cast<int>(render_point.x), static_cast<int>(render_point.y), session.viewport_context->panel);
-        const float ortho_scale = projection_viewport.ortho_scale_override.value_or(settings.ortho_scale);
+            static_cast<int>(render_point.x), static_cast<int>(render_point.y), viewport_context->panel);
+        const float ortho_scale = effectiveOrthoScale(projection_viewport, settings);
 
         if (depth > 0.0f) {
             const glm::vec3 world = projection_viewport.unprojectPixel(
@@ -3398,17 +4080,51 @@ namespace lfs::vis {
     }
 
     std::optional<glm::vec2> SelectionService::projectInteractivePolygonWorldPoint(const glm::vec3 world_point) const {
-        const auto& session = interactive_selection_;
-        if (!rendering_manager_ || !session.viewport_context || !session.viewport_context->viewport ||
-            !session.viewport_context->info.valid()) {
+        const auto viewport_context = resolveInteractiveSessionViewportContext();
+        if (!rendering_manager_ || !viewport_context || !viewport_context->viewport ||
+            !viewport_context->info.valid()) {
             return std::nullopt;
         }
 
-        const auto& info = session.viewport_context->info;
-        Viewport projection_viewport = *session.viewport_context->viewport;
+        const auto& info = viewport_context->info;
+        Viewport projection_viewport = *viewport_context->viewport;
         projection_viewport.windowSize = {info.render_width, info.render_height};
         const auto settings = rendering_manager_->getSettings();
-        const float ortho_scale = projection_viewport.ortho_scale_override.value_or(settings.ortho_scale);
+        const float ortho_scale = effectiveOrthoScale(projection_viewport, settings);
+
+        if (const auto gt = rendering_manager_->gtComparisonSelectionContext()) {
+            // Forward of filterSelectionByScreenWindowKernel's equirect branch. Must
+            // not fall through to projectWorldPoint's interactive-camera pinhole.
+            if (gt->camera.equirectangular) {
+                const glm::vec3 view =
+                    glm::transpose(gt->camera.rotation) * (world_point - gt->camera.translation);
+                const auto projected = equirectRenderPixelFromVisualizerView(
+                    view, info.render_width, info.render_height);
+                if (!projected) {
+                    return std::nullopt;
+                }
+                const float scale_x = info.width / static_cast<float>(std::max(info.render_width, 1));
+                const float scale_y = info.height / static_cast<float>(std::max(info.render_height, 1));
+                return glm::vec2(info.x + projected->x * scale_x,
+                                 info.y + projected->y * scale_y);
+            }
+            if (gt->camera.intrinsics) {
+                const glm::vec3 view = glm::transpose(gt->camera.rotation) * (world_point - gt->camera.translation);
+                if (!lfs::rendering::isFiniteVec3(view) || view.z >= -1e-6f) {
+                    return std::nullopt;
+                }
+                const auto& gt_intrinsics = *gt->camera.intrinsics;
+                const float depth = -view.z;
+                const glm::vec2 projected(
+                    gt_intrinsics.center_x + view.x * gt_intrinsics.focal_x / depth,
+                    gt_intrinsics.center_y - view.y * gt_intrinsics.focal_y / depth);
+                const float scale_x = info.width / static_cast<float>(std::max(info.render_width, 1));
+                const float scale_y = info.height / static_cast<float>(std::max(info.render_height, 1));
+                return glm::vec2(info.x + projected.x * scale_x,
+                                 info.y + projected.y * scale_y);
+            }
+        }
+
         const auto projected = rendering::projectWorldPoint(
             projection_viewport.camera.R,
             projection_viewport.camera.t,
@@ -3447,11 +4163,12 @@ namespace lfs::vis {
                glm::distance(close_anchor, session.cursor_pos) < POLYGON_CLOSE_DISTANCE_PX;
     }
 
-    void SelectionService::applyFilters(core::Tensor& selection, const SelectionFilterState& filters,
-                                        const std::vector<bool>& node_mask) const {
+    bool SelectionService::applyFilters(core::Tensor& selection, const SelectionFilterState& filters,
+                                        const std::vector<bool>& node_mask,
+                                        const SelectionProjectionContext& projection_context) const {
         LOG_TIMER("SelectionService::applyFilters");
         if (!scene_manager_ || !rendering_manager_ || !selection.is_valid()) {
-            return;
+            return false;
         }
 
         if (nodeMaskRestrictsSelection(node_mask)) {
@@ -3466,8 +4183,12 @@ namespace lfs::vis {
             applyCropFilter(selection);
         }
         if (filters.depth_filter) {
-            applyDepthFilter(selection);
+            if (!projection_context.valid()) {
+                return false;
+            }
+            applyDepthFilter(selection, projection_context);
         }
+        return true;
     }
 
     void SelectionService::applyCropFilter(core::Tensor& selection,
@@ -3558,8 +4279,9 @@ namespace lfs::vis {
         core::Tensor model_transforms_cuda;
         const core::Tensor* model_transforms_ptr = nullptr;
         if (!render_state.model_transforms.empty()) {
-            LOG_TIMER("applyCropFilter.uploadModelTransformsToCuda");
-            model_transforms_cuda = uploadModelTransformsToCuda(render_state.model_transforms);
+            LOG_TIMER("applyCropFilter.uploadModelTransformsToGpu");
+            model_transforms_cuda = uploadModelTransformsToGpu(
+                render_state.model_transforms, resolveGpuBackend(&selection));
             model_transforms_ptr = &model_transforms_cuda;
         }
 
@@ -3567,11 +4289,12 @@ namespace lfs::vis {
         const core::Tensor* transform_indices_ptr = nullptr;
         if (render_state.transform_indices && render_state.transform_indices->is_valid() &&
             render_state.transform_indices->numel() == means.size(0)) {
-            if (render_state.transform_indices->device() == core::Device::CUDA) {
+            if (render_state.transform_indices->device() == core::Device::GPU) {
                 transform_indices_ptr = render_state.transform_indices.get();
             } else {
-                LOG_TIMER("applyCropFilter.transform_indices_to_cuda");
-                transform_indices_cuda = render_state.transform_indices->cuda();
+                LOG_TIMER("applyCropFilter.transform_indices_to_gpu");
+                core::GpuBackendScope scope(resolveGpuBackend(&selection));
+                transform_indices_cuda = render_state.transform_indices->cpu().to(core::Device::GPU);
                 transform_indices_ptr = &transform_indices_cuda;
             }
         }
@@ -3592,9 +4315,10 @@ namespace lfs::vis {
         }
     }
 
-    void SelectionService::applyDepthFilter(core::Tensor& selection) const {
+    void SelectionService::applyDepthFilter(core::Tensor& selection,
+                                            const SelectionProjectionContext& projection_context) const {
         LOG_TIMER("SelectionService::applyDepthFilter");
-        if (!scene_manager_ || !rendering_manager_ || !selection.is_valid()) {
+        if (!scene_manager_ || !rendering_manager_ || !selection.is_valid() || !projection_context.valid()) {
             return;
         }
 
@@ -3617,14 +4341,6 @@ namespace lfs::vis {
             return;
         }
 
-        const glm::mat4 world_to_filter = settings.depth_filter_transform.inv().toMat4();
-        const float* const t_ptr = glm::value_ptr(world_to_filter);
-        const auto depth_t = core::Tensor::from_vector(std::vector<float>(t_ptr, t_ptr + 16), {4, 4});
-        const auto depth_min = core::Tensor::from_vector(
-            {settings.depth_filter_min.x, settings.depth_filter_min.y, settings.depth_filter_min.z}, {3});
-        const auto depth_max = core::Tensor::from_vector(
-            {settings.depth_filter_max.x, settings.depth_filter_max.y, settings.depth_filter_max.z}, {3});
-
         const auto render_state = [&] {
             LOG_TIMER("applyDepthFilter.buildRenderState");
             return scene_manager_->buildRenderState();
@@ -3632,8 +4348,9 @@ namespace lfs::vis {
         core::Tensor model_transforms_cuda;
         const core::Tensor* model_transforms_ptr = nullptr;
         if (!render_state.model_transforms.empty()) {
-            LOG_TIMER("applyDepthFilter.uploadModelTransformsToCuda");
-            model_transforms_cuda = uploadModelTransformsToCuda(render_state.model_transforms);
+            LOG_TIMER("applyDepthFilter.uploadModelTransformsToGpu");
+            model_transforms_cuda = uploadModelTransformsToGpu(
+                render_state.model_transforms, resolveGpuBackend(&selection));
             model_transforms_ptr = &model_transforms_cuda;
         }
 
@@ -3641,21 +4358,100 @@ namespace lfs::vis {
         const core::Tensor* transform_indices_ptr = nullptr;
         if (render_state.transform_indices && render_state.transform_indices->is_valid() &&
             render_state.transform_indices->numel() == means.size(0)) {
-            if (render_state.transform_indices->device() == core::Device::CUDA) {
+            if (render_state.transform_indices->device() == core::Device::GPU) {
                 transform_indices_ptr = render_state.transform_indices.get();
             } else {
-                LOG_TIMER("applyDepthFilter.transform_indices_to_cuda");
-                transform_indices_cuda = render_state.transform_indices->cuda();
+                LOG_TIMER("applyDepthFilter.transform_indices_to_gpu");
+                core::GpuBackendScope scope(resolveGpuBackend(&selection));
+                transform_indices_cuda = render_state.transform_indices->cpu().to(core::Device::GPU);
                 transform_indices_ptr = &transform_indices_cuda;
             }
         }
 
         {
-            LOG_TIMER("applyDepthFilter.filter_selection_by_crop");
-            rendering::filter_selection_by_crop(
-                selection, means,
-                &depth_t, &depth_min, &depth_max, false,
-                nullptr, nullptr, false,
+            LOG_TIMER("applyDepthFilter.filter_selection_by_screen_window");
+            const auto& viewport = projection_context.viewport;
+            // The displayed camera's real intrinsics when we have them. computePixelFocalLengths
+            // reconstructs fx from fy and the aspect ratio, which silently discards asymmetric
+            // focals, so a carried intrinsics set must win outright rather than contribute only
+            // its principal point.
+            const auto& containment = projection_context.containment_intrinsics;
+            const auto [derived_focal_x, derived_focal_y] = rendering::computePixelFocalLengths(
+                {viewport.size.x, viewport.size.y}, viewport.focal_length_mm);
+            const float pixel_focal_x = containment ? containment->focal_x : derived_focal_x;
+            const float pixel_focal_y = containment ? containment->focal_y : derived_focal_y;
+            const float center_x = containment ? containment->center_x
+                                               : 0.5f * static_cast<float>(viewport.size.x);
+            const float center_y = containment ? containment->center_y
+                                               : 0.5f * static_cast<float>(viewport.size.y);
+            const std::array<float, 9> view_rotation_rows{
+                viewport.rotation[0][0],
+                viewport.rotation[0][1],
+                viewport.rotation[0][2],
+                viewport.rotation[1][0],
+                viewport.rotation[1][1],
+                viewport.rotation[1][2],
+                viewport.rotation[2][0],
+                viewport.rotation[2][1],
+                viewport.rotation[2][2],
+            };
+            const std::array<float, 3> translation{
+                viewport.translation.x,
+                viewport.translation.y,
+                viewport.translation.z,
+            };
+            const auto camera_model = projection_context.equirectangular
+                                          ? rendering::ScreenWindowCameraModel::Equirectangular
+                                      : viewport.orthographic
+                                          ? rendering::ScreenWindowCameraModel::Orthographic
+                                          : rendering::ScreenWindowCameraModel::Pinhole;
+            // Same substitution the Vulkan lane applies before handing the scale
+            // to the shader (vksplat_viewport_renderer.cpp), so the selection the
+            // kernel computes matches the window the viewport draws. The invalid
+            // domain is the whole of "not finite or not above the threshold", not
+            // just values near zero: a negative or NaN scale is equally unusable.
+            const float sanitized_ortho_scale =
+                (std::isfinite(viewport.ortho_scale) && viewport.ortho_scale > 1.0e-5f)
+                    ? viewport.ortho_scale
+                    : lfs::rendering::DEFAULT_ORTHO_SCALE;
+            const bool use_panel_depth_window =
+                settings.split_view_mode == SplitViewMode::IndependentDual &&
+                projection_context.panel.has_value();
+            float depth_near = -settings.depth_filter_max.z;
+            float depth_far = -settings.depth_filter_min.z;
+            float scale_x = settings.depth_filter_scale_x;
+            float scale_y = settings.depth_filter_scale_y;
+            float offset_x = settings.depth_filter_offset_x;
+            float offset_y = settings.depth_filter_offset_y;
+            if (use_panel_depth_window) {
+                const auto panel_window =
+                    rendering_manager_->getDepthWindowForPanel(*projection_context.panel);
+                depth_near = panel_window.near_plane;
+                depth_far = panel_window.far_plane;
+                scale_x = panel_window.scale_x;
+                scale_y = panel_window.scale_y;
+                offset_x = panel_window.offset_x;
+                offset_y = panel_window.offset_y;
+            }
+            rendering::filter_selection_by_screen_window(
+                selection,
+                means,
+                view_rotation_rows,
+                translation,
+                camera_model,
+                viewport.size.x,
+                viewport.size.y,
+                pixel_focal_x,
+                pixel_focal_y,
+                center_x,
+                center_y,
+                sanitized_ortho_scale,
+                depth_near,
+                depth_far,
+                scale_x,
+                scale_y,
+                offset_x,
+                offset_y,
                 model_transforms_ptr,
                 transform_indices_ptr);
         }

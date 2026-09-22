@@ -145,6 +145,8 @@ namespace lfs::vis::input {
         SELECT_ALL_SCENE_NODES,
         TOGGLE_SCENE_SELECTION_VISIBILITY,
         TOGGLE_SCENE_SELECTION_TRAINING,
+        DEPTH_ADJUST_SIZE,
+        DEPTH_WINDOW_DRAG,
         GROUP_SELECTED_SCENE_NODES,
         UNGROUP_SELECTED_SCENE_NODE,
         // Asset Manager consumes these only while its grid has focus.

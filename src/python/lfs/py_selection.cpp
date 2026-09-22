@@ -13,6 +13,7 @@
 #include "visualizer/ipc/view_context.hpp"
 #include "visualizer/operation/undo_entry.hpp"
 #include "visualizer/operation/undo_history.hpp"
+#include "visualizer/post_work_utils.hpp"
 #include "visualizer/rendering/rendering_manager.hpp"
 #include "visualizer/scene/scene_manager.hpp"
 #include "visualizer/selection/selection_service.hpp"
@@ -20,6 +21,8 @@
 #include "visualizer_impl.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <functional>
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <nanobind/nanobind.h>
@@ -28,6 +31,10 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
+#include <optional>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
 
 namespace nb = nanobind;
 
@@ -35,8 +42,33 @@ namespace lfs::python {
 
     namespace {
         constexpr float DEPTH_FILTER_HALF_HEIGHT = 10000.0f;
+        constexpr float DEFAULT_WINDOW_SCALE = 0.35f;
+        constexpr float MIN_WINDOW_SCALE = 0.05f;
+        constexpr float MAX_WINDOW_SCALE = 1.0f;
+        constexpr float DEFAULT_LEGACY_HALF_WIDTH = 1.35f;
+        // The range the depth getters report when no near/far band is in effect.
+        // Matches what they already return with no rendering manager.
+        constexpr float DEFAULT_LEGACY_DEPTH_NEAR = 0.0f;
+        constexpr float DEFAULT_LEGACY_DEPTH_FAR = 100.0f;
+
+        float g_last_legacy_half_width = DEFAULT_LEGACY_HALF_WIDTH;
 
         vis::RenderingManager* get_rm() { return get_rendering_manager(); }
+
+        // Marshal unprotected, viewer-owned state reads to the viewer thread.
+        template <typename F>
+        auto invoke_on_viewer(F&& fn, std::invoke_result_t<F> fallback) {
+            auto* const viewer = get_visualizer();
+            if (!viewer || viewer->isOnViewerThread())
+                return std::invoke(std::forward<F>(fn));
+            if (!viewer->acceptsPostedWork())
+                return fallback;
+            nb::gil_scoped_release release;
+            return vis::post_work_and_wait(
+                [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
+                std::forward<F>(fn),
+                [fallback]() { return fallback; });
+        }
 
         vis::SceneManager* get_sm() { return get_scene_manager(); }
 
@@ -59,6 +91,72 @@ namespace lfs::python {
             vis::op::pushSceneSnapshotIfChanged(std::move(snapshot));
         }
 
+        [[nodiscard]] bool viewport_available(const std::optional<vis::ViewInfo>& view) {
+            return view.has_value() && view->width > 0 && view->height > 0;
+        }
+
+        // KEEP IN SYNC: this converter pair inverts the far-plane width mapping
+        // that depthWindowFarPlaneHalfExtents (selection_tool.cpp) computes from
+        // pixel focal lengths / ortho scale. Known divergence: the tool honors
+        // viewport.ortho_scale_override; these use the main view's ortho_scale.
+        [[nodiscard]] float convert_legacy_half_width_to_scale(const float half_width,
+                                                               const float depth_far,
+                                                               const vis::RenderSettings& settings) {
+            const auto view = vis::get_current_view_info();
+            if (!viewport_available(view) || settings.equirectangular) {
+                return DEFAULT_WINDOW_SCALE;
+            }
+            if (settings.orthographic) {
+                const float ortho_width =
+                    static_cast<float>(view->width) / std::max(view->ortho_scale, 1.0e-5f);
+                const float denom = 0.5f * ortho_width;
+                if (!(denom > 1.0e-8f)) {
+                    return DEFAULT_WINDOW_SCALE;
+                }
+                return std::clamp(half_width / denom, MIN_WINDOW_SCALE, MAX_WINDOW_SCALE);
+            }
+            if (!(depth_far > 1.0e-3f)) {
+                return DEFAULT_WINDOW_SCALE;
+            }
+            const float vfov_rad = glm::radians(view->fov);
+            const float aspect =
+                static_cast<float>(view->width) / static_cast<float>(view->height);
+            const float tan_hfov_half = std::tan(vfov_rad * 0.5f) * aspect;
+            const float denom = tan_hfov_half * depth_far;
+            if (!(denom > 1.0e-8f)) {
+                return DEFAULT_WINDOW_SCALE;
+            }
+            return std::clamp(half_width / denom, MIN_WINDOW_SCALE, MAX_WINDOW_SCALE);
+        }
+
+        [[nodiscard]] float convert_scale_to_legacy_half_width(const float scale,
+                                                               const float depth_far,
+                                                               const vis::RenderSettings& settings) {
+            const auto view = vis::get_current_view_info();
+            if (!viewport_available(view) || settings.equirectangular) {
+                return g_last_legacy_half_width;
+            }
+            if (settings.orthographic) {
+                const float ortho_width =
+                    static_cast<float>(view->width) / std::max(view->ortho_scale, 1.0e-5f);
+                return scale * 0.5f * ortho_width;
+            }
+            if (!(depth_far > 1.0e-3f)) {
+                return g_last_legacy_half_width;
+            }
+            const float vfov_rad = glm::radians(view->fov);
+            const float aspect =
+                static_cast<float>(view->width) / static_cast<float>(view->height);
+            const float tan_hfov_half = std::tan(vfov_rad * 0.5f) * aspect;
+            return scale * tan_hfov_half * depth_far;
+        }
+
+        [[nodiscard]] float informational_half_width_from_settings(const vis::RenderSettings& settings,
+                                                                   const float depth_far) {
+            return convert_scale_to_legacy_half_width(settings.depth_filter_scale_x, depth_far,
+                                                      settings); // legacy converters are X-only by contract
+        }
+
         void configure_depth_filter(vis::RenderSettings& settings, const bool enabled,
                                     const float depth_near, const float depth_far,
                                     const float frustum_half_width) {
@@ -67,8 +165,8 @@ namespace lfs::python {
             const float clamped_width = std::max(frustum_half_width, 0.05f);
 
             settings.depth_filter_enabled = enabled;
-            settings.depth_filter_min = glm::vec3(-clamped_width, -DEPTH_FILTER_HALF_HEIGHT, clamped_near);
-            settings.depth_filter_max = glm::vec3(clamped_width, DEPTH_FILTER_HALF_HEIGHT, clamped_far);
+            settings.depth_filter_min = glm::vec3(-clamped_width, -DEPTH_FILTER_HALF_HEIGHT, -clamped_far);
+            settings.depth_filter_max = glm::vec3(clamped_width, DEPTH_FILTER_HALF_HEIGHT, -clamped_near);
 
             if (!enabled) {
                 return;
@@ -88,6 +186,234 @@ namespace lfs::python {
                               view_info->translation[1],
                               view_info->translation[2]));
             }
+        }
+
+        void write_legacy_window_scale(vis::RenderSettings& settings,
+                                       const float frustum_half_width,
+                                       const float depth_far) {
+            const float clamped_scale =
+                convert_legacy_half_width_to_scale(frustum_half_width, depth_far, settings);
+            settings.depth_filter_scale_x = clamped_scale;
+            settings.depth_filter_scale_y = clamped_scale;
+        }
+
+        void apply_legacy_depth_filter(const bool enabled,
+                                       const float depth_near,
+                                       const float depth_far,
+                                       const float frustum_half_width) {
+            g_last_legacy_half_width = std::max(frustum_half_width, 0.05f);
+            auto* const tool = get_selection_tool();
+            auto* const rm = get_rm();
+            // Skip the scale pre-write when the tool exists but is disabled: the
+            // tool ignores setDepthFilterRange in that state, and a lone scale
+            // write would half-apply the request. Legacy calls defer all values
+            // atomically, matching the pre-window behavior.
+            if (rm && (!tool || tool->isEnabled())) {
+                auto settings = rm->getSettings();
+                write_legacy_window_scale(settings, frustum_half_width, depth_far);
+                rm->updateSettings(settings);
+            }
+            if (tool) {
+                tool->setDepthFilterRange(enabled, depth_near, depth_far, g_last_legacy_half_width);
+                return;
+            }
+            if (!rm) {
+                return;
+            }
+            auto settings = rm->getSettings();
+            configure_depth_filter(settings, enabled, depth_near, depth_far, frustum_half_width);
+            write_legacy_window_scale(settings, frustum_half_width, depth_far);
+            rm->updateSettings(settings);
+        }
+
+        void apply_depth_filter_window(const bool enabled,
+                                       const float depth_near,
+                                       const float depth_far,
+                                       const float scale,
+                                       const float offset_x,
+                                       const float offset_y,
+                                       const std::optional<float> scale_y) {
+            auto* const tool = get_selection_tool();
+            if (tool && !tool->isEnabled()) {
+                // A disable request cannot half-apply; skip everything so the call
+                // stays atomic (the toolbar data-model init passes enabled=false
+                // before any tool is active).
+                if (!enabled) {
+                    return;
+                }
+                // The tool ignores setDepthFilterRange while disabled; writing the window
+                // fields into settings anyway would half-apply the request.
+                // Known residual: this gate cannot see the tool's one-shot
+                // preserve_restored_render_state_ window during project restore. An
+                // enable/modify call there self-heals within one frame (the per-frame
+                // update() stamp is not preserve-gated); only disabling the filter in
+                // that window can leave the restored render-side flag stale until the
+                // tool is next enabled (or another apply path stamps settings).
+                throw std::runtime_error("Selection tool is not active/enabled; activate it before setting the depth filter window");
+            }
+            const float clamped_scale_x = std::clamp(scale, MIN_WINDOW_SCALE, MAX_WINDOW_SCALE);
+            const float clamped_scale_y =
+                std::clamp(scale_y.value_or(scale), MIN_WINDOW_SCALE, MAX_WINDOW_SCALE);
+            const float clamped_offset_x = std::clamp(offset_x, -1.0f, 1.0f);
+            const float clamped_offset_y = std::clamp(offset_y, -1.0f, 1.0f);
+            auto* const rm = get_rm();
+            if (rm) {
+                auto settings = rm->getSettings();
+                settings.depth_filter_scale_x = clamped_scale_x;
+                settings.depth_filter_scale_y = clamped_scale_y;
+                settings.depth_filter_offset_x = clamped_offset_x;
+                settings.depth_filter_offset_y = clamped_offset_y;
+                rm->updateSettings(settings);
+            }
+            const float informational_half_width = rm
+                                                       ? informational_half_width_from_settings(
+                                                             rm->getSettings(), std::max(depth_far, 0.0f))
+                                                       : g_last_legacy_half_width;
+            if (tool) {
+                tool->setDepthFilterRange(enabled, depth_near, depth_far,
+                                          std::max(informational_half_width, 0.05f));
+                return;
+            }
+            if (!rm) {
+                return;
+            }
+            auto settings = rm->getSettings();
+            configure_depth_filter(settings, enabled, depth_near, depth_far,
+                                   std::max(informational_half_width, 0.05f));
+            settings.depth_filter_scale_x = clamped_scale_x;
+            settings.depth_filter_scale_y = clamped_scale_y;
+            settings.depth_filter_offset_x = clamped_offset_x;
+            settings.depth_filter_offset_y = clamped_offset_y;
+            rm->updateSettings(settings);
+        }
+
+        // Keyword-only panel= defaults to None for the legacy projection path, unlike
+        // py_rendering.cpp's main default. Explicit main resolves focus; main/left/right
+        // use the panel-targeted manager API.
+        [[nodiscard]] std::optional<vis::SplitViewPanelId>
+        parseDepthWindowPanelArg(const std::string& panel) {
+            if (panel == "left")
+                return vis::SplitViewPanelId::Left;
+            if (panel == "right")
+                return vis::SplitViewPanelId::Right;
+            if (panel == "main")
+                return std::nullopt; // resolved to the focused panel by the caller
+            throw std::invalid_argument("panel must be 'main', 'left', or 'right'");
+        }
+
+        // Resolve a slot or nullopt for projection. Unknown tokens raise ValueError
+        // before state access, preventing partial application.
+        [[nodiscard]] std::optional<vis::SplitViewPanelId>
+        resolveDepthWindowPanel(const std::optional<std::string>& panel) {
+            if (!panel.has_value())
+                return std::nullopt;
+            const auto parsed = parseDepthWindowPanelArg(*panel);
+            if (parsed)
+                return parsed;
+            // Resolve explicit main on the viewer thread; focused_panel_ is unprotected.
+            return invoke_on_viewer(
+                []() -> std::optional<vis::SplitViewPanelId> {
+                    auto* const rm = get_rm();
+                    if (!rm)
+                        return std::nullopt;
+                    return rm->getFocusedSplitPanel();
+                },
+                std::optional<vis::SplitViewPanelId>{});
+        }
+
+        [[nodiscard]] std::tuple<float, float> fallback_depth_near_far(const vis::RenderSettings& settings) {
+            // The constructor default is not in the near/far encoding - session
+            // restore makes the same distinction before decoding a box. Decoding
+            // it anyway reads it as near 0 / far 0, so a script that read the
+            // range and wrote it back would build a zero-width band. Report the
+            // legacy range instead, which is what the no-manager branches of
+            // these getters already return.
+            //
+            // Test the sentinel, not merely the disabled flag:
+            // configure_depth_filter writes a real near/far box before it returns
+            // for a disabled request, so a caller can legitimately hold a band
+            // with the filter switched off, and that band must still read back.
+            if (!settings.depth_filter_enabled &&
+                settings.depth_filter_min.z == 0.0f &&
+                settings.depth_filter_max.z == 100.0f) {
+                return {DEFAULT_LEGACY_DEPTH_NEAR, DEFAULT_LEGACY_DEPTH_FAR};
+            }
+            const float depth_near = std::max(-settings.depth_filter_max.z, 0.0f);
+            const float depth_far = std::max(-settings.depth_filter_min.z, depth_near);
+            return {depth_near, depth_far};
+        }
+
+        // Use the panel setter so near/far update the projection generation.
+        // Apply global enabled afterward, preserving the band's resulting position;
+        // the legacy setDepthFilterRange protection covers only the projection path.
+        void apply_depth_filter_window_panel(const vis::SplitViewPanelId panel,
+                                             const bool enabled,
+                                             const float depth_near,
+                                             const float depth_far,
+                                             const float scale,
+                                             const float offset_x,
+                                             const float offset_y,
+                                             const std::optional<float> scale_y) {
+            auto* const tool = get_selection_tool();
+            if (tool && !tool->isEnabled()) {
+                // Same atomicity contract as the projection path.
+                if (!enabled) {
+                    return;
+                }
+                throw std::runtime_error("Selection tool is not active/enabled; activate it before setting the depth filter window");
+            }
+            auto* const rm = get_rm();
+            if (!rm) {
+                return;
+            }
+
+            vis::DepthWindowState state = rm->getDepthWindowForPanel(panel);
+            state.near_plane = depth_near;
+            state.far_plane = depth_far;
+            state.scale_x = std::clamp(scale, MIN_WINDOW_SCALE, MAX_WINDOW_SCALE);
+            state.scale_y = std::clamp(scale_y.value_or(scale), MIN_WINDOW_SCALE, MAX_WINDOW_SCALE);
+            state.offset_x = std::clamp(offset_x, -1.0f, 1.0f);
+            state.offset_y = std::clamp(offset_y, -1.0f, 1.0f);
+            // The manager clamps near/far with the tool's clamps and bumps the
+            // projection generation whenever it touches the projection.
+            if (!rm->setDepthWindowForPanel(panel, state)) {
+                if (enabled) {
+                    throw std::runtime_error("Panel depth windows are suspended while an independent pair is parked in GT comparison");
+                }
+                return;
+            }
+
+            // Carry the global enabled flag without moving the band: re-read the
+            // projection the write just settled and hand those values back.
+            const auto& settings = rm->getSettings();
+            const auto [projected_near, projected_far] = fallback_depth_near_far(settings);
+            const float informational_half_width = std::max(
+                informational_half_width_from_settings(settings, std::max(projected_far, 0.0f)), 0.05f);
+            if (tool) {
+                tool->setDepthFilterRange(enabled, projected_near, projected_far, informational_half_width);
+                return;
+            }
+            auto write = rm->getSettings();
+            configure_depth_filter(write, enabled, projected_near, projected_far, informational_half_width);
+            rm->updateSettings(write);
+        }
+
+        [[nodiscard]] std::tuple<bool, float, float, float, float, float, float>
+        read_depth_filter_window_panel(const vis::SplitViewPanelId panel) {
+            auto* const rm = get_rm();
+            if (!rm)
+                return {false, 0.0f, 100.0f, DEFAULT_WINDOW_SCALE, DEFAULT_WINDOW_SCALE, 0.0f, 0.0f};
+            const auto state = rm->getDepthWindowForPanel(panel);
+            const auto* const tool = get_selection_tool();
+            const bool enabled = tool ? tool->isDepthFilterEnabled()
+                                      : rm->getSettings().depth_filter_enabled;
+            return {enabled,
+                    state.near_plane,
+                    state.far_plane,
+                    state.scale_x,
+                    state.scale_y,
+                    state.offset_x,
+                    state.offset_y};
         }
     } // namespace
 
@@ -290,68 +616,162 @@ namespace lfs::python {
 
         sel.def(
             "set_depth_filter", [](bool enabled, float depth_far, float frustum_half_width, float depth_near) {
-                if (auto* const tool = get_selection_tool()) {
-                    tool->setDepthFilterRange(enabled, depth_near, depth_far, frustum_half_width);
-                    return;
-                }
-                auto* rm = get_rm();
-                if (!rm)
-                    return;
-                auto settings = rm->getSettings();
-                configure_depth_filter(settings, enabled, depth_near, depth_far, frustum_half_width);
-                rm->updateSettings(settings);
+                apply_legacy_depth_filter(enabled, depth_near, depth_far, frustum_half_width);
             },
-            nb::arg("enabled"), nb::arg("depth_far") = 100.0f, nb::arg("frustum_half_width") = 50.0f, nb::arg("depth_near") = 0.0f, "Set selection depth filter in camera space.");
+            nb::arg("enabled"), nb::arg("depth_far") = 100.0f, nb::arg("frustum_half_width") = 50.0f, nb::arg("depth_near") = 0.0f, "Deprecated. Set selection depth filter in camera space.\n"
+                                                                                                                                    "frustum_half_width is converted to a screen-space window scale:\n"
+                                                                                                                                    "- pinhole: scale = clamp(half_width / (tan(hfov/2) * far), 0.05, 1.0) when far > 1e-3 "
+                                                                                                                                    "and a viewport is available; otherwise scale = 0.35\n"
+                                                                                                                                    "- ortho: scale = clamp(half_width / (0.5 * ortho_width), 0.05, 1.0)\n"
+                                                                                                                                    "- equirect or no viewport: scale = 0.35 (no single equivalent exists)\n"
+                                                                                                                                    "Prefer set_depth_filter_window.");
 
         sel.def(
             "set_depth_filter_range", [](bool enabled, float depth_near, float depth_far, float frustum_half_width) {
-                if (auto* const tool = get_selection_tool()) {
-                    tool->setDepthFilterRange(enabled, depth_near, depth_far, frustum_half_width);
+                apply_legacy_depth_filter(enabled, depth_near, depth_far, frustum_half_width);
+            },
+            nb::arg("enabled"), nb::arg("depth_near") = 0.0f, nb::arg("depth_far") = 100.0f, nb::arg("frustum_half_width") = 50.0f, "Deprecated. Set selection depth filter range in camera space as (near, far, width).\n"
+                                                                                                                                    "frustum_half_width is converted to a screen-space window scale:\n"
+                                                                                                                                    "- pinhole: scale = clamp(half_width / (tan(hfov/2) * far), 0.05, 1.0) when far > 1e-3 "
+                                                                                                                                    "and a viewport is available; otherwise scale = 0.35\n"
+                                                                                                                                    "- ortho: scale = clamp(half_width / (0.5 * ortho_width), 0.05, 1.0)\n"
+                                                                                                                                    "- equirect or no viewport: scale = 0.35 (no single equivalent exists)\n"
+                                                                                                                                    "Prefer set_depth_filter_window.");
+
+        sel.def(
+            "set_depth_filter_window", [](bool enabled, float depth_near, float depth_far, float scale, float offset_x, float offset_y, std::optional<float> scale_y, std::optional<std::string> panel) {
+                // None resolves without state access and retains the legacy projection path.
+                if (const auto slot = resolveDepthWindowPanel(panel)) {
+                    apply_depth_filter_window_panel(*slot, enabled, depth_near, depth_far, scale, offset_x, offset_y, scale_y);
                     return;
                 }
-                auto* rm = get_rm();
-                if (!rm)
-                    return;
-                auto settings = rm->getSettings();
-                configure_depth_filter(settings, enabled, depth_near, depth_far, frustum_half_width);
-                rm->updateSettings(settings);
+                apply_depth_filter_window(enabled, depth_near, depth_far, scale, offset_x, offset_y, scale_y);
             },
-            nb::arg("enabled"), nb::arg("depth_near") = 0.0f, nb::arg("depth_far") = 100.0f, nb::arg("frustum_half_width") = 50.0f, "Set selection depth filter range in camera space as (near, far, width).");
+            nb::arg("enabled"), nb::arg("depth_near") = 0.0f, nb::arg("depth_far") = 100.0f, nb::arg("scale") = 0.35f, nb::arg("offset_x") = 0.0f, nb::arg("offset_y") = 0.0f, nb::arg("scale_y") = nb::none(), nb::kw_only(), nb::arg("panel") = nb::none(), "Set the screen-space selection depth window.\n"
+                                                                                                                                                                                                                                                              "scale is the X-axis on-screen fraction of the viewport (0.05-1.0, default 0.35).\n"
+                                                                                                                                                                                                                                                              "scale_y is the Y-axis fraction; None uses scale for isotropic compatibility.\n"
+                                                                                                                                                                                                                                                              "offset_x/offset_y are fractions of available travel (-1 to 1, default 0).\n"
+                                                                                                                                                                                                                                                              "When the Selection tool exists but is not active/enabled, enable/modify\n"
+                                                                                                                                                                                                                                                              "requests (enabled=True) raise RuntimeError because they cannot be applied\n"
+                                                                                                                                                                                                                                                              "atomically; disable requests (enabled=False) are silent atomic no-ops,\n"
+                                                                                                                                                                                                                                                              "matching the legacy calls' contract.\n"
+                                                                                                                                                                                                                                                              "panel (keyword-only) selects which split panel the window belongs to:\n"
+                                                                                                                                                                                                                                                              "- None (default): today's behavior -- writes the projection, which is the\n"
+                                                                                                                                                                                                                                                              "  focused panel in unsynced independent-dual split and the single global\n"
+                                                                                                                                                                                                                                                              "  window everywhere else.\n"
+                                                                                                                                                                                                                                                              "- 'main': the focused panel, addressed explicitly.\n"
+                                                                                                                                                                                                                                                              "- 'left' / 'right': that panel's own window. Outside unsynced\n"
+                                                                                                                                                                                                                                                              "  independent-dual split, or while panel sync is on, the write fans out\n"
+                                                                                                                                                                                                                                                              "  to both panels exactly as a global write does.\n"
+                                                                                                                                                                                                                                                              "Explicit panel requests are refused while an independent pair is parked\n"
+                                                                                                                                                                                                                                                              "in GT: enabled=True raises RuntimeError; enabled=False is a silent atomic\n"
+                                                                                                                                                                                                                                                              "no-op, including the global enabled flag. panel=None remains global.\n"
+                                                                                                                                                                                                                                                              "A retained Disabled interval accepts global edits; changed geometry\n"
+                                                                                                                                                                                                                                                              "discards the retained pair. No-op geometry and enable-only edits retain it.\n"
+                                                                                                                                                                                                                                                              "Any other string raises ValueError. The enabled flag is global in every\n"
+                                                                                                                                                                                                                                                              "case; only the window geometry is per-panel.");
 
         sel.def(
             "get_depth_filter", []() -> std::tuple<bool, float, float> {
                 if (const auto* const tool = get_selection_tool()) {
+                    const auto* const rm = get_rm();
+                    const float informational_half_width = rm
+                                                               ? informational_half_width_from_settings(
+                                                                     rm->getSettings(), tool->getDepthFar())
+                                                               : g_last_legacy_half_width;
                     return {tool->isDepthFilterEnabled(),
                             tool->getDepthFar(),
-                            tool->getDepthFrustumHalfWidth()};
+                            informational_half_width};
                 }
                 auto* rm = get_rm();
                 if (!rm)
-                    return {false, 100.0f, 50.0f};
+                    return {false, 100.0f, g_last_legacy_half_width};
                 const auto& settings = rm->getSettings();
-                return {settings.depth_filter_enabled, settings.depth_filter_max.z,
-                        settings.depth_filter_max.x};
+                const auto [depth_near, depth_far] = fallback_depth_near_far(settings);
+                (void)depth_near;
+                return {settings.depth_filter_enabled, depth_far,
+                        informational_half_width_from_settings(settings, depth_far)};
             },
-            "Get depth filter state: (enabled, depth_far, frustum_half_width).");
+            "Get depth filter state: (enabled, depth_far, frustum_half_width).\n"
+            "frustum_half_width is a derived informational read-back of the far-plane-equivalent "
+            "window half-width (inverse of the set_depth_filter_range conversion).");
 
         sel.def(
             "get_depth_filter_range", []() -> std::tuple<bool, float, float, float> {
                 if (const auto* const tool = get_selection_tool()) {
+                    const auto* const rm = get_rm();
+                    const float informational_half_width = rm
+                                                               ? informational_half_width_from_settings(
+                                                                     rm->getSettings(), tool->getDepthFar())
+                                                               : g_last_legacy_half_width;
                     return {tool->isDepthFilterEnabled(),
                             tool->getDepthNear(),
                             tool->getDepthFar(),
-                            tool->getDepthFrustumHalfWidth()};
+                            informational_half_width};
                 }
                 auto* rm = get_rm();
                 if (!rm)
-                    return {false, 0.0f, 100.0f, 50.0f};
+                    return {false, 0.0f, 100.0f, g_last_legacy_half_width};
                 const auto& settings = rm->getSettings();
+                const auto [depth_near, depth_far] = fallback_depth_near_far(settings);
                 return {settings.depth_filter_enabled,
-                        std::max(settings.depth_filter_min.z, 0.0f),
-                        settings.depth_filter_max.z,
-                        settings.depth_filter_max.x};
+                        depth_near,
+                        depth_far,
+                        informational_half_width_from_settings(settings, depth_far)};
             },
-            "Get selection depth filter state: (enabled, depth_near, depth_far, frustum_half_width).");
+            "Get selection depth filter state: (enabled, depth_near, depth_far, frustum_half_width).\n"
+            "frustum_half_width is a derived informational read-back of the far-plane-equivalent "
+            "window half-width (inverse of the set_depth_filter_range conversion).");
+
+        sel.def(
+            "get_depth_filter_window", [](std::optional<std::string> panel) -> std::tuple<bool, float, float, float, float, float, float> {
+                if (const auto slot = resolveDepthWindowPanel(panel)) {
+                    return read_depth_filter_window_panel(*slot);
+                }
+                if (const auto* const tool = get_selection_tool()) {
+                    const auto* const rm = get_rm();
+                    float scale_x = DEFAULT_WINDOW_SCALE;
+                    float scale_y = DEFAULT_WINDOW_SCALE;
+                    float offset_x = 0.0f;
+                    float offset_y = 0.0f;
+                    if (rm) {
+                        const auto& settings = rm->getSettings();
+                        scale_x = settings.depth_filter_scale_x;
+                        scale_y = settings.depth_filter_scale_y;
+                        offset_x = settings.depth_filter_offset_x;
+                        offset_y = settings.depth_filter_offset_y;
+                    }
+                    return {tool->isDepthFilterEnabled(),
+                            tool->getDepthNear(),
+                            tool->getDepthFar(),
+                            scale_x,
+                            scale_y,
+                            offset_x,
+                            offset_y};
+                }
+                auto* rm = get_rm();
+                if (!rm)
+                    return {false, 0.0f, 100.0f, DEFAULT_WINDOW_SCALE, DEFAULT_WINDOW_SCALE, 0.0f, 0.0f};
+                const auto& settings = rm->getSettings();
+                const auto [depth_near, depth_far] = fallback_depth_near_far(settings);
+                return {settings.depth_filter_enabled,
+                        depth_near,
+                        depth_far,
+                        settings.depth_filter_scale_x,
+                        settings.depth_filter_scale_y,
+                        settings.depth_filter_offset_x,
+                        settings.depth_filter_offset_y};
+            },
+            nb::kw_only(), nb::arg("panel") = nb::none(), "Get the screen-space selection depth window:\n"
+                                                          "(enabled, near, far, scale_x, scale_y, offset_x, offset_y).\n"
+                                                          "panel (keyword-only) selects which split panel is read:\n"
+                                                          "- None (default): today's behavior -- the projection, which is the\n"
+                                                          "  focused panel in unsynced independent-dual split and the single\n"
+                                                          "  global window everywhere else.\n"
+                                                          "- 'main': the focused panel, addressed explicitly.\n"
+                                                          "- 'left' / 'right': that panel's own stored window, whatever the\n"
+                                                          "  split mode. Any other string raises ValueError.\n"
+                                                          "The enabled flag is global in every case.");
 
         // ─────────────────────────────────────────────────────────────────────
         // CROP FILTER

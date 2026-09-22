@@ -8,6 +8,8 @@
 #include "core/services.hpp"
 #include "core/user_paths.hpp"
 #include "gui/gui_focus_state.hpp"
+#include "gui/gui_manager.hpp"
+#include "input/frame_input_buffer.hpp"
 #include "input/input_controller.hpp"
 #include "input/input_router.hpp"
 #include "input/key_codes.hpp"
@@ -18,6 +20,7 @@
 #include "scene/scene_manager.hpp"
 #include "tools/tool_base.hpp"
 #include "visualizer/visualizer.hpp"
+#include "visualizer_impl.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -27,6 +30,7 @@
 #include <gtest/gtest.h>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <variant>
@@ -608,6 +612,150 @@ namespace lfs::vis {
 
         EXPECT_EQ(router.state().pointer_capture, input::InputTarget::None);
         EXPECT_EQ(router.pointerTarget(2500.0, 2500.0), input::InputTarget::None);
+    }
+
+    TEST_F(InputControllerFocusTest, FreshLeftDockEdgePressUsesOneOwnershipVerdict) {
+        struct DockPanel final : gui::IPanel {
+            void draw(const gui::PanelDrawContext&) override {}
+            gui::PanelRenderCapabilities renderCapabilities() const override {
+                return {.direct = true};
+            }
+            gui::PanelDirectRenderResult renderDirect(
+                const gui::PanelDirectRenderRequest&, const gui::PanelDrawContext&) override {
+                return {.handled = true, .height = 100.0f};
+            }
+        };
+        struct RegisteredDockPanel {
+            RegisteredDockPanel() {
+                gui::PanelInfo info;
+                info.id = "test.input.focus.left-dock";
+                info.label = info.id;
+                info.space = gui::PanelSpace::LeftDock;
+                info.panel = std::make_shared<DockPanel>();
+                gui::PanelRegistry::instance().register_panel(std::move(info));
+            }
+            ~RegisteredDockPanel() {
+                gui::PanelRegistry::instance().unregister_panel("test.input.focus.left-dock");
+            }
+        };
+
+        ViewerOptions options;
+        options.show_startup_overlay = false;
+        options.safe_mode = true;
+        VisualizerImpl viewer(options);
+        RegisteredDockPanel registered_panel;
+        auto& gui = *viewer.getGuiManager();
+        // This fixture does not initialize the GUI, where the startup option is applied.
+        gui.dismissStartupOverlay();
+        ASSERT_FALSE(gui.isStartupBlockingInput());
+        gui::ScreenState screen{.work_pos = {0.0f, 0.0f}, .work_size = {1280.0f, 720.0f}};
+        gui::UIContext ui;
+        gui::PanelDrawContext draw_ctx{.ui = &ui};
+        gui::PanelInputState previous_input;
+        previous_input.mouse_x = 1000.0f;
+        previous_input.mouse_y = 400.0f;
+        gui.panelLayout().renderLeftDock(draw_ctx, true, false, previous_input, screen);
+        ASSERT_TRUE(gui.panelLayout().isLeftDockVisible());
+        ASSERT_FALSE(gui.panelLayout().isResizingPanel());
+        gui.last_ui_layout_work_pos_ = screen.work_pos;
+        gui.last_ui_layout_work_size_ = screen.work_size;
+        gui.viewport_layout_ = gui.panelLayout().computeViewportLayout(true, false, false, screen);
+
+        const auto edge = gui::PanelLayoutManager::leftDockResizeRect(
+            screen.work_pos.x, screen.work_pos.y, screen.work_size.y,
+            lfs::python::get_shared_dpi_scale(), gui.panelLayout().getLeftDockWidth());
+        const float x = (edge.x0 + 3.0f * edge.x1) / 4.0f;
+        const float y = 400.0f;
+        ASSERT_TRUE(gui.isPositionInViewport(x, y));
+        const auto hover_hit = gui.hitTestPointer(x, y);
+        ASSERT_FALSE(hover_hit.blocks_pointer);
+        ASSERT_FALSE(hover_hit.blocks_mouse_button);
+
+        Viewport viewport(1280, 720);
+        InputController controller(nullptr, viewport);
+        const auto viewport_pos = gui.getViewportPos();
+        const auto viewport_size = gui.getViewportSize();
+        controller.updateViewportBounds(viewport_pos.x, viewport_pos.y, viewport_size.x, viewport_size.y);
+        ASSERT_TRUE(controller.isViewportPoint(x, y));
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        router.focusViewportKeyboard();
+        ASSERT_EQ(router.hoverTarget(x, y), input::InputTarget::Viewport);
+
+        FrameInputBuffer frame;
+        SDL_Event event{};
+        event.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
+        event.button.button = SDL_BUTTON_MIDDLE;
+        event.button.x = x;
+        event.button.y = y;
+        frame.processEvent(event);
+        const auto hit = gui.hitTestMouseButton(x, y);
+        frame.notePressOwner(event.button.button, hit.blocks_pointer || hit.blocks_mouse_button);
+        router.beginMouseButton(input::ACTION_PRESS, x, y, hit);
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_PRESS, x, y);
+
+        ASSERT_EQ(frame.mouse_button_events.size(), 1);
+        EXPECT_TRUE(frame.mouse_button_events.front().gui_owned);
+        EXPECT_EQ(router.state().pointer_capture, input::InputTarget::Gui);
+        EXPECT_EQ(router.state().keyboard_focus, input::InputTarget::Viewport);
+        EXPECT_EQ(router.hoverTarget(x, y), input::InputTarget::Viewport);
+        EXPECT_FALSE(controller.isContinuousInputActive());
+    }
+
+    TEST_F(InputControllerFocusTest, MouseButtonVerdictPreservesCrossButtonCapture) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        controller.updateViewportBounds(0.0f, 0.0f, 200.0f, 200.0f);
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        router.focusViewportKeyboard();
+
+        router.beginMouseButton(input::ACTION_PRESS, 40.0, 50.0,
+                                {.blocks_mouse_button = true});
+        EXPECT_EQ(router.state().pointer_capture, input::InputTarget::Gui);
+        EXPECT_EQ(router.state().keyboard_focus, input::InputTarget::Viewport);
+        router.beginMouseButton(input::ACTION_PRESS, 250.0, 250.0, {});
+        EXPECT_EQ(router.state().pointer_capture, input::InputTarget::Gui);
+        router.endMouseButton(input::ACTION_RELEASE);
+        EXPECT_EQ(router.state().pointer_capture, input::InputTarget::Gui);
+        router.endMouseButton(input::ACTION_RELEASE);
+        EXPECT_EQ(router.state().pointer_capture, input::InputTarget::None);
+
+        router.beginMouseButton(input::ACTION_PRESS, 40.0, 50.0, {});
+        router.beginMouseButton(input::ACTION_PRESS, 250.0, 250.0,
+                                {.blocks_pointer = true, .takes_keyboard_focus = true});
+        EXPECT_EQ(router.state().pointer_capture, input::InputTarget::Viewport);
+        EXPECT_EQ(router.state().keyboard_focus, input::InputTarget::Viewport);
+        router.endMouseButton(input::ACTION_RELEASE);
+        EXPECT_EQ(router.state().pointer_capture, input::InputTarget::Viewport);
+        router.endMouseButton(input::ACTION_RELEASE);
+        EXPECT_EQ(router.state().pointer_capture, input::InputTarget::None);
+    }
+
+    TEST_F(InputControllerFocusTest, EmptyMouseButtonVerdictRetainsNoGuiViewportFallback) {
+        Viewport viewport(200, 200);
+        InputController controller(nullptr, viewport);
+        controller.updateViewportBounds(0.0f, 0.0f, 200.0f, 200.0f);
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+
+        router.beginMouseButton(input::ACTION_PRESS, 40.0, 50.0, {});
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_PRESS, 40.0, 50.0);
+        EXPECT_EQ(router.state().pointer_capture, input::InputTarget::Viewport);
+        EXPECT_TRUE(controller.hasViewportKeyboardFocus());
+        EXPECT_TRUE(controller.isContinuousInputActive());
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_RELEASE, 40.0, 50.0);
+        router.endMouseButton(input::ACTION_RELEASE);
+
+        router.beginMouseButton(input::ACTION_PRESS, 250.0, 250.0, {});
+        EXPECT_EQ(router.state().pointer_capture, input::InputTarget::None);
+        EXPECT_EQ(router.state().keyboard_focus, input::InputTarget::None);
     }
 
     TEST_F(InputControllerFocusTest, HoverTargetIgnoresPointerCapture) {
@@ -1408,7 +1556,7 @@ namespace lfs::vis {
         std::ifstream persisted(profile_path);
         ASSERT_TRUE(persisted.is_open());
         const std::string contents((std::istreambuf_iterator<char>(persisted)), {});
-        EXPECT_NE(contents.find("\"version\": 29"), std::string::npos); // PROFILE_VERSION
+        EXPECT_NE(contents.find("\"version\": 30"), std::string::npos); // PROFILE_VERSION
         EXPECT_NE(contents.find("Gallery Primary Action"), std::string::npos);
         EXPECT_NE(contents.find("Copy Gallery Link"), std::string::npos);
         EXPECT_NE(contents.find("Refresh Assets"), std::string::npos);
@@ -1419,7 +1567,73 @@ namespace lfs::vis {
         std::filesystem::remove_all(root, filesystem_error);
     }
 
-    TEST_F(InputControllerFocusTest, WindowProfileMigratesWithoutReusingWindowActionIds) {
+    TEST_F(InputControllerFocusTest, VersionTwentyOneProfileMigratesWithSingleCurrentVersionStamp) {
+        const auto root = std::filesystem::temp_directory_path() /
+                          "lfs_input_bindings_v21_through_v27";
+        std::error_code filesystem_error;
+        std::filesystem::remove_all(root, filesystem_error);
+        const ScopedEnvironmentVariable home("LFS_HOME", root.string());
+        const auto paths = core::UserPaths::resolve();
+        ASSERT_TRUE(paths);
+        ASSERT_TRUE(paths->ensureDirectories());
+
+        const auto profile_path = paths->keymapDir() / "Default.json";
+        std::filesystem::create_directories(profile_path.parent_path());
+        {
+            std::ofstream file(profile_path);
+            ASSERT_TRUE(file.is_open());
+            file << R"({
+  "name": "Default",
+  "version": 21,
+  "bindings": []
+})";
+        }
+
+        input::InputBindings::setPersistenceEnabled(true);
+        input::InputBindings loaded;
+        ASSERT_TRUE(loaded.loadProfileFromFile(profile_path));
+        input::InputBindings::setPersistenceEnabled(false);
+
+        EXPECT_EQ(loaded.getActionForKey(input::ToolMode::GLOBAL,
+                                         input::KEY_M,
+                                         input::MODIFIER_CTRL | input::MODIFIER_SHIFT),
+                  input::Action::TOGGLE_MCP_SERVER);
+        EXPECT_EQ(loaded.getActionForKey(input::ToolMode::GLOBAL,
+                                         input::KEY_N,
+                                         input::MODIFIER_CTRL | input::MODIFIER_SHIFT),
+                  input::Action::TOGGLE_MCP_BINDING);
+        EXPECT_EQ(loaded.getActionForKey(input::ToolMode::GLOBAL,
+                                         input::KEY_G,
+                                         input::MODIFIER_ALT),
+                  input::Action::TOGGLE_GRID);
+        EXPECT_EQ(loaded.getActionForScroll(input::ToolMode::SELECTION,
+                                            input::MODIFIER_SHIFT | input::MODIFIER_ALT),
+                  input::Action::DEPTH_ADJUST_SIZE);
+        EXPECT_EQ(loaded.getActionForDrag(input::ToolMode::SELECTION,
+                                          input::MouseButton::LEFT,
+                                          input::MODIFIER_SHIFT | input::MODIFIER_ALT),
+                  input::Action::DEPTH_WINDOW_DRAG);
+        EXPECT_EQ(loaded.getActionForDrag(input::ToolMode::SELECTION,
+                                          input::MouseButton::LEFT,
+                                          input::MODIFIER_CTRL | input::MODIFIER_SHIFT | input::MODIFIER_ALT),
+                  input::Action::DEPTH_WINDOW_DRAG);
+
+        std::ifstream persisted(profile_path);
+        ASSERT_TRUE(persisted.is_open());
+        const std::string contents((std::istreambuf_iterator<char>(persisted)), {});
+        const auto version_key = contents.find("\"version\":");
+        ASSERT_NE(version_key, std::string::npos);
+        EXPECT_EQ(contents.find("\"version\":", version_key + 1), std::string::npos);
+        EXPECT_NE(contents.find("\"version\": 30"), std::string::npos);
+        EXPECT_NE(contents.find("Toggle MCP Server"), std::string::npos);
+        EXPECT_NE(contents.find("Window size"), std::string::npos);
+        EXPECT_NE(contents.find("Window drag"), std::string::npos);
+
+        persisted.close();
+        std::filesystem::remove_all(root, filesystem_error);
+    }
+
+    TEST_F(InputControllerFocusTest, DevVersionTwentyEightRetainsDepthAndGroupBindings) {
         const auto path = std::filesystem::temp_directory_path() / "lfs_keymap_v28.json";
         {
             std::ofstream file(path);
@@ -1435,7 +1649,8 @@ namespace lfs::vis {
         using namespace input;
         InputBindings bindings;
         ASSERT_TRUE(bindings.loadProfileFromFile(path));
-        EXPECT_TRUE(bindings.getBindingsForMode(ToolMode::SELECTION).empty());
+        EXPECT_EQ(bindings.getActionForScroll(ToolMode::SELECTION, MODIFIER_SHIFT | MODIFIER_ALT), Action::DEPTH_ADJUST_SIZE);
+        EXPECT_EQ(bindings.getActionForDrag(ToolMode::SELECTION, MouseButton::LEFT, MODIFIER_SHIFT | MODIFIER_ALT), Action::DEPTH_WINDOW_DRAG);
         EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_G, MODIFIER_CTRL), Action::GROUP_SELECTED_SCENE_NODES);
         EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_G, MODIFIER_CTRL | MODIFIER_SHIFT), Action::UNGROUP_SELECTED_SCENE_NODE);
         EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_F5, MODIFIER_NONE), Action::TOGGLE_GRID);
@@ -1445,6 +1660,8 @@ namespace lfs::vis {
         ASSERT_TRUE(bindings.saveProfileToFile(path));
         ASSERT_TRUE(bindings.loadProfileFromFile(path));
         EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_ENTER, MODIFIER_CTRL), Action::NONE);
+        EXPECT_EQ(bindings.getActionForScroll(ToolMode::SELECTION, MODIFIER_SHIFT | MODIFIER_ALT), Action::DEPTH_ADJUST_SIZE);
+        EXPECT_EQ(bindings.getActionForDrag(ToolMode::SELECTION, MouseButton::LEFT, MODIFIER_SHIFT | MODIFIER_ALT), Action::DEPTH_WINDOW_DRAG);
         std::filesystem::remove(path);
     }
 
@@ -1455,12 +1672,13 @@ namespace lfs::vis {
         {
             std::ofstream file(path);
             file << R"({"name":"Legacy","version":27,"bindings":[
-                {"mode":1,"action":85,"description":"Window size","trigger_type":"scroll","modifiers":5},
-                {"mode":1,"action":86,"description":"Window drag","trigger_type":"drag","button":0,"modifiers":5}
+                {"mode":1,"action":85,"description":"Window size","trigger_type":"scroll","modifiers":6},
+                {"mode":1,"action":86,"description":"Window drag","trigger_type":"drag","button":0,"modifiers":6}
             ]})";
         }
         ASSERT_TRUE(bindings.loadProfileFromFile(path));
-        EXPECT_TRUE(bindings.getBindingsForMode(ToolMode::SELECTION).empty());
+        EXPECT_EQ(bindings.getActionForScroll(ToolMode::SELECTION, MODIFIER_CTRL | MODIFIER_ALT), Action::DEPTH_ADJUST_SIZE);
+        EXPECT_EQ(bindings.getActionForDrag(ToolMode::SELECTION, MouseButton::LEFT, MODIFIER_CTRL | MODIFIER_ALT), Action::DEPTH_WINDOW_DRAG);
         EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_ENTER, MODIFIER_CTRL), Action::ASSET_GALLERY_PRIMARY);
         {
             std::ofstream file(path);
@@ -1469,6 +1687,53 @@ namespace lfs::vis {
         ASSERT_TRUE(bindings.loadProfileFromFile(path));
         EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_ENTER, MODIFIER_CTRL), Action::NONE);
         EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_F5, MODIFIER_NONE), Action::NONE);
+        std::filesystem::remove(path);
+    }
+
+    TEST_F(InputControllerFocusTest, DevVersionTwentyEightPreservesUnboundDepthControls) {
+        const auto path = std::filesystem::temp_directory_path() / "lfs_keymap_dev_v28_unbound.json";
+        {
+            std::ofstream file(path);
+            ASSERT_TRUE(file.is_open());
+            file << R"({"name":"Unbound","version":28,"bindings":[]})";
+        }
+        using namespace input;
+        InputBindings bindings;
+        ASSERT_TRUE(bindings.loadProfileFromFile(path));
+        EXPECT_EQ(bindings.getActionForScroll(ToolMode::SELECTION, MODIFIER_SHIFT | MODIFIER_ALT), Action::NONE);
+        EXPECT_EQ(bindings.getActionForDrag(ToolMode::SELECTION, MouseButton::LEFT, MODIFIER_SHIFT | MODIFIER_ALT), Action::NONE);
+        EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_ENTER, MODIFIER_CTRL), Action::ASSET_GALLERY_PRIMARY);
+        std::filesystem::remove(path);
+    }
+
+    TEST_F(InputControllerFocusTest, MasterVersionTwentyNineNumericActionsPreserveGroupingAndGallery) {
+        const auto path = std::filesystem::temp_directory_path() / "lfs_keymap_master_v29.json";
+        {
+            std::ofstream file(path);
+            ASSERT_TRUE(file.is_open());
+            file << R"({"name":"Master","version":29,"bindings":[
+                {"mode":0,"action":85,"trigger_type":"key","key":71,"modifiers":2},
+                {"mode":0,"action":86,"trigger_type":"key","key":71,"modifiers":3},
+                {"mode":0,"action":87,"trigger_type":"key","key":257,"modifiers":2},
+                {"mode":0,"action":88,"trigger_type":"key","key":67,"modifiers":3},
+                {"mode":0,"action":89,"trigger_type":"key","key":294,"modifiers":0}
+            ]})";
+        }
+        using namespace input;
+        InputBindings bindings;
+        ASSERT_TRUE(bindings.loadProfileFromFile(path));
+        EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_G, MODIFIER_CTRL), Action::GROUP_SELECTED_SCENE_NODES);
+        EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_G, MODIFIER_CTRL | MODIFIER_SHIFT), Action::UNGROUP_SELECTED_SCENE_NODE);
+        EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_ENTER, MODIFIER_CTRL), Action::ASSET_GALLERY_PRIMARY);
+        EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_C, MODIFIER_CTRL | MODIFIER_SHIFT), Action::ASSET_GALLERY_COPY_LINK);
+        EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_F5, MODIFIER_NONE), Action::ASSET_REFRESH);
+        EXPECT_EQ(bindings.getActionForScroll(ToolMode::SELECTION, MODIFIER_SHIFT | MODIFIER_ALT), Action::DEPTH_ADJUST_SIZE);
+        bindings.clearBinding(ToolMode::GLOBAL, Action::ASSET_GALLERY_PRIMARY);
+        ASSERT_TRUE(bindings.saveProfileToFile(path));
+        ASSERT_TRUE(bindings.loadProfileFromFile(path));
+        EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_ENTER, MODIFIER_CTRL), Action::NONE);
+        EXPECT_EQ(bindings.getActionForScroll(ToolMode::SELECTION, MODIFIER_SHIFT | MODIFIER_ALT), Action::DEPTH_ADJUST_SIZE);
+        EXPECT_EQ(bindings.getActionForDrag(ToolMode::SELECTION, MouseButton::LEFT, MODIFIER_SHIFT | MODIFIER_ALT), Action::DEPTH_WINDOW_DRAG);
         std::filesystem::remove(path);
     }
 

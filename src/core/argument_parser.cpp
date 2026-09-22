@@ -538,7 +538,13 @@ namespace {
             ::args::ValueFlag<std::string> view_ply(mode_group, "path", "View file(s). Supports projects (.licht), splat (.ply, .sog, .ssog, .spz, .rad, .usd, .usda, .usdc, .usdz) and mesh (.obj, .fbx, .gltf, .glb, .stl) formats. If directory, loads all.", {'v', "view"});
             ::args::ValueFlag<std::string> resume_checkpoint(mode_group, "checkpoint", "Resume training from a .resume checkpoint or .licht project", {"resume"});
             ::args::ValueFlag<std::string> render_camera_path(mode_group, "path", "Render a JSON camera-keyframe path to video, headless (no GUI/window). Requires --render-load and --render-output; see RENDER PATH options.", {"render-camera-path"});
+            ::args::ValueFlag<std::string> tensor_backend_selftest(
+                mode_group, "backend",
+                "Run the tensor backend selftest and exit",
+                {"tensor-backend-selftest"},
+                ::args::Options::Hidden);
             ::args::CompletionFlag completion(parser, {"complete"});
+            (void)tensor_backend_selftest;
 
             // =============================================================================
             // TRAINING PATHS
@@ -701,6 +707,7 @@ namespace {
             ::args::Flag ppisp_freeze_from_sidecar(rendering_group, "ppisp_freeze", lfs::core::args::optimization_cli_help("--ppisp-freeze"), {"ppisp-freeze"});
             ::args::ValueFlag<std::string> ppisp_sidecar_path(rendering_group, "path", "Path to PPISP sidecar (.ppisp) used for frozen PPISP training", {"ppisp-sidecar"});
             ::args::Flag gut(rendering_group, "gut", lfs::core::args::optimization_cli_help("--gut"), {"gut"});
+            ::args::ValueFlag<std::string> raster_backend(rendering_group, "raster_backend", "Training raster backend: 3dgs or 3dgut (--gut is the legacy 3dgut alias)", {"raster-backend"});
 
             // =============================================================================
             // OUTPUT OPTIONS
@@ -864,6 +871,17 @@ namespace {
 
             params.include_provenance = !no_provenance;
 
+            std::optional<lfs::core::param::RasterBackendId> selected_backend;
+            if (raster_backend) {
+                selected_backend = lfs::core::param::parse_training_backend(::args::get(raster_backend));
+                if (!selected_backend)
+                    return std::unexpected("Unknown --raster-backend; expected 3dgs or 3dgut");
+                if (gut && *selected_backend != lfs::core::param::RasterBackendId::ThreeDGUT)
+                    return std::unexpected("Conflicting --gut with a 3DGS --raster-backend selection");
+            } else if (gut) {
+                selected_backend = lfs::core::param::RasterBackendId::ThreeDGUT;
+            }
+
             // NO ARGUMENTS = VIEWER MODE (empty)
             if (args.size() == 1) {
                 return std::make_tuple(ParseResult::Success, std::function<void()>{});
@@ -887,9 +905,8 @@ namespace {
                         return std::unexpected(applied.error());
                 }
 
-                if (gut) {
-                    params.optimization.gut = true;
-                }
+                if (selected_backend)
+                    params.optimization.set_raster_backend(*selected_backend);
                 if (!valid_mcp_port(per_launch_mcp_port)) {
                     return std::unexpected(kMcpPortRangeError);
                 }
@@ -898,8 +915,16 @@ namespace {
                 // after this return; re-apply so --no-splash survives.
                 return std::make_tuple(
                     ParseResult::Success,
-                    std::function<void()>([&params, per_launch_no_splash,
+                    std::function<void()>([&params, per_launch_no_splash, selected_backend,
                                            per_launch_mcp_port]() {
+                        if (selected_backend) {
+                            params.optimization.set_raster_backend(*selected_backend);
+                            lfs::core::param::merge_explicit_json_overlay(
+                                params.overrides.optimization_json,
+                                nlohmann::json{{"gut", params.optimization.gut},
+                                               {"raster_backend", std::string(lfs::core::param::training_backend_descriptor(*selected_backend).wire_name)}}
+                                    .dump());
+                        }
                         apply_per_launch_ui_flags(
                             params, per_launch_no_splash, per_launch_mcp_port);
                     }));
@@ -1310,6 +1335,7 @@ namespace {
                                         bg_color_val = parsed_bg_color,
                                         bg_image_path_val = cli_option_present({"--bg-image-path"}) ? std::optional<std::string>(::args::get(bg_image_path)) : std::optional<std::string>(),
                                         random_flag = bool(random),
+                                        selected_backend,
                                         gut_flag = bool(gut),
                                         undistort_flag = bool(undistort),
                                         enable_sparsity_flag = bool(enable_sparsity),
@@ -1475,6 +1501,8 @@ namespace {
                 }
                 setFlag(random_flag, opt.random);
                 setFlag(gut_flag, opt.gut);
+                if (selected_backend)
+                    opt.set_raster_backend(*selected_backend);
                 setFlag(undistort_flag, opt.undistort);
                 setFlag(enable_sparsity_flag, opt.enable_sparsity);
                 if (no_error_map_flag)
@@ -1590,7 +1618,8 @@ namespace {
                 note_opt("bg_color", bg_color_val.has_value());
                 note_opt("bg_image_path", bg_image_path_val.has_value());
                 note_opt("random", random_flag);
-                note_opt("gut", gut_flag);
+                note_opt("gut", selected_backend.has_value());
+                note_opt("raster_backend", selected_backend.has_value());
                 note_opt("undistort", undistort_flag);
                 note_opt("enable_sparsity", enable_sparsity_flag);
                 note_opt("use_error_map", no_error_map_flag);
@@ -2147,6 +2176,38 @@ namespace {
 
 std::expected<lfs::core::args::ParsedArgs, std::string>
 lfs::core::args::parse_args(const int argc, const char* const argv[]) {
+    constexpr std::string_view kSelftestFlag = "--tensor-backend-selftest";
+    constexpr std::string_view kSelftestPrefix = "--tensor-backend-selftest=";
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        std::string_view value;
+        if (arg == kSelftestFlag) {
+            if (i + 1 >= argc) {
+                return std::unexpected(
+                    "Usage: LichtFeld-Studio --tensor-backend-selftest <cuda|vulkan>");
+            }
+            value = argv[i + 1];
+        } else if (arg.starts_with(kSelftestPrefix)) {
+            value = arg.substr(kSelftestPrefix.size());
+        } else {
+            continue;
+        }
+
+        std::string normalized(value);
+        for (char& character : normalized) {
+            character = static_cast<char>(std::tolower(static_cast<unsigned char>(character)));
+        }
+        if (normalized == "cuda") {
+            return TensorBackendSelftestMode{GpuBackend::CUDA};
+        }
+        if (normalized == "vulkan") {
+            return TensorBackendSelftestMode{GpuBackend::Vulkan};
+        }
+        return std::unexpected(
+            std::format("Invalid --tensor-backend-selftest backend '{}'. Use: cuda, vulkan",
+                        value));
+    }
+
     if (argc >= 2) {
         const std::string_view arg1 = argv[1];
 

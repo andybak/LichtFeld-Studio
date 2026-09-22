@@ -23,7 +23,7 @@ if(BUILD_LOCALIZATION_TESTS)
         USES_TERMINAL
     )
     message(STATUS "Registered headless localization contract tests (no LibTorch)")
-    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_VISUALIZER_TESTS)
+    if(NOT BUILD_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_TEMPORAL_CPU_TESTS AND NOT BUILD_PANEL_LAYOUT_TESTS AND NOT BUILD_VISUALIZER_TESTS)
         return()
     endif()
 endif()
@@ -75,7 +75,7 @@ if(BUILD_VISUALIZER_TESTS)
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
         TIMEOUT 30
     )
-    if(NOT BUILD_TESTS AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_PANEL_LAYOUT_TESTS)
+    if(NOT BUILD_TESTS AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_PANEL_LAYOUT_TESTS AND NOT BUILD_TEMPORAL_CPU_TESTS)
         return()
     endif()
 endif()
@@ -94,7 +94,7 @@ if(BUILD_PANEL_LAYOUT_TESTS)
         $<TARGET_PROPERTY:${PROJECT_NAME},LINK_LIBRARIES>
         GTest::gtest_main
     )
-    if(NOT BUILD_TESTS AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_VISUALIZER_TESTS)
+    if(NOT BUILD_TESTS AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_UNICODE_TEST_ONLY AND NOT BUILD_TEMPORAL_CPU_TESTS AND NOT BUILD_VISUALIZER_TESTS)
         return()
     endif()
 endif()
@@ -173,10 +173,81 @@ if(BUILD_UNICODE_TEST_ONLY)
     )
 
     message(STATUS "Building standalone Unicode path tests (no CUDA runtime linkage)")
-    if(NOT BUILD_TESTS AND NOT BUILD_FORMAT_TESTS)
+    if(NOT BUILD_TESTS AND NOT BUILD_FORMAT_TESTS AND NOT BUILD_TEMPORAL_CPU_TESTS)
         return()  # Skip the remaining targets when only standalone coverage was requested.
     endif()
 endif()
+
+# =============================================================================
+# Standalone temporal reconstruction contracts (CPU execution only)
+# =============================================================================
+if(BUILD_TEMPORAL_CPU_TESTS)
+    add_executable(lichtfeld_temporal_cpu_tests
+        test_scene_motion_contract.cpp
+        test_scene_temporal_coordinator.cpp
+        test_scene_temporal_plan.cpp
+        test_scene_temporal_resolve.cpp
+        test_temporal_frame_tracker.cpp
+        ${CMAKE_SOURCE_DIR}/src/visualizer/rendering/scene_temporal_coordinator.cpp
+        ${CMAKE_SOURCE_DIR}/src/visualizer/rendering/scene_temporal_plan.cpp
+        ${CMAKE_SOURCE_DIR}/src/visualizer/rendering/scene_temporal_resolve.cpp
+        ${CMAKE_SOURCE_DIR}/src/visualizer/rendering/temporal_frame_tracker.cpp
+        ${CMAKE_SOURCE_DIR}/src/visualizer/rendering/passes/vulkan_scene_dlss_pipeline_contract.cpp
+        ${CMAKE_SOURCE_DIR}/src/visualizer/rendering/passes/vulkan_scene_temporal_pipeline_contract.cpp
+    )
+    target_include_directories(lichtfeld_temporal_cpu_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/core/include
+        ${CMAKE_SOURCE_DIR}/src/rendering/include
+        ${CMAKE_SOURCE_DIR}/src/visualizer
+        ${CMAKE_SOURCE_DIR}/src/visualizer/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_BINARY_DIR}/include
+        ${Vulkan_INCLUDE_DIRS}
+    )
+    target_compile_definitions(lichtfeld_temporal_cpu_tests PRIVATE
+        LFS_VIS_EXPORTS
+    )
+    target_link_libraries(lichtfeld_temporal_cpu_tests PRIVATE
+        GTest::gtest_main
+        glm::glm
+    )
+    set_target_properties(lichtfeld_temporal_cpu_tests PROPERTIES
+        CXX_STANDARD 23
+        CXX_STANDARD_REQUIRED ON
+    )
+    if(COMMAND lfs_enable_fast_cxx_compile)
+        lfs_enable_fast_cxx_compile(lichtfeld_temporal_cpu_tests)
+    endif()
+    add_test(NAME lichtfeld.temporal.cpu
+        COMMAND $<TARGET_FILE:lichtfeld_temporal_cpu_tests> --gtest_color=no
+    )
+    set_tests_properties(lichtfeld.temporal.cpu PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        LABELS "fast;cpu;temporal"
+        TIMEOUT 120
+    )
+endif()
+
+if(NOT BUILD_FORMAT_TESTS AND NOT BUILD_TESTS)
+    message(STATUS "Building standalone temporal reconstruction CPU tests")
+    return()
+endif()
+
+# Headless SDL boundary regression tests, also built in the CPU-only CI configuration.
+# Do not link SDL itself: this isolated executable provides the four SDL state
+# queries used by the production coordinate helpers and frame finalization.
+add_executable(lichtfeld_sdl_coordinate_tests test_sdl_pixel_coordinates.cpp)
+target_compile_features(lichtfeld_sdl_coordinate_tests PRIVATE cxx_std_23)
+target_include_directories(lichtfeld_sdl_coordinate_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/visualizer
+)
+target_link_libraries(lichtfeld_sdl_coordinate_tests PRIVATE
+    GTest::gtest_main
+    SDL3::Headers
+    glm::glm
+)
+add_test(NAME lichtfeld.sdl_coordinates COMMAND lichtfeld_sdl_coordinate_tests)
+set_tests_properties(lichtfeld.sdl_coordinates PROPERTIES LABELS "fast;cpu;input" TIMEOUT 30)
 
 # MSVC resolves every object reference before /OPT:REF, while GNU ld can discard
 # unreferenced function sections before resolution. Keep the dependency-heavy
@@ -306,8 +377,8 @@ set_tests_properties(lichtfeld_format_tests PROPERTIES
 )
 
 if(NOT BUILD_TESTS)
-    message(STATUS "Building CPU-only format tests (no CUDA); full suite disabled")
-    return()  # lichtfeld_format_tests is defined above; the rest needs CUDA/Torch
+    message(STATUS "Building standalone CPU-only tests; full LibTorch/CUDA suite disabled")
+    return()
 endif()
 
 # Reuse nanobind headers for Python UI regression tests
@@ -385,8 +456,16 @@ set(TEST_FILES
     test_splat_data_clone.cpp
     test_tensor_reduction.cpp
     test_tensor_reduction_alignment.cpp
+    test_tensor_integer_and_reduce_policy.cpp
+    test_selection_attribute_ops.cpp
+    test_selection_screen_ops.cpp
+    test_selection_tensor_projection.cpp
+    test_export_band_pack.cpp
+    test_point_cloud_merge.cpp
+    test_display_tensors.cpp
     test_tensor_views.cpp
     test_tensor_advanced.cpp
+    test_tensor_async_consts.cpp
     test_tensor_stress.cpp
     test_tensor_matrix.cpp
     test_slice_mm_bug.cpp
@@ -423,6 +502,8 @@ set(TEST_FILES
     test_training_cropbox_mask.cpp
     test_training_parameters.cpp
     test_tensor_index_select_uint8.cpp
+    test_tensor_cuda_byte_image.cpp
+    test_image_tensor.cpp
     test_tensor_uint8_inversion.cpp
     test_tensor_uint8_masking.cpp
     test_tensor_serialization.cpp
@@ -482,6 +563,7 @@ set(TEST_FILES
     test_mcp_sequencer_tools.cpp
     test_tcp_publisher.cpp
     test_view_info_json.cpp
+    test_video_reconstruction.cpp
     test_video_export_utils.cpp
     test_video_frame_extractor_naming.cpp
     test_video_cuda_frame_handoff.cpp
@@ -536,13 +618,23 @@ set(TEST_FILES
     test_render_settings_defaults.cpp
     test_portal_render_profile.cpp
     test_scene_upscaler_registry.cpp
+    test_scene_upscaler_plugin_api.cpp
+    test_scene_motion_contract.cpp
+    test_scene_temporal_coordinator.cpp
+    test_scene_temporal_plan.cpp
+    test_scene_temporal_resolve.cpp
+    test_temporal_frame_tracker.cpp
     test_selection_rasterization_ops.cpp
+    test_selection_screen_window.cpp
+    test_depth_window_panels.cpp
+    test_depth_window_panels_interaction.cpp
     test_rendering_refactor_services.cpp
     test_point_cloud_raster_orientation.cpp
     test_theme_registry.cpp
     test_viewport.cpp
     test_input_controller_focus.cpp
     test_input_controller_dataset_load.cpp
+    test_input_controller_panel_camera.cpp
     test_selection_service_interactions.cpp
     test_scene_graph_identity.cpp
     test_undo_history.cpp
@@ -569,11 +661,18 @@ set(TEST_FILES
     test_rml_static_style_boundaries.cpp
     test_sequencer_regressions.cpp
     test_tensor_storage_version.cpp
+    test_tensor_backend_selection.cpp
+    test_tensor_backend_selftest.cpp
+    test_tensor_seam_regressions.cpp
+    test_tensor_backend_facade.cpp
+    test_tensor_backend_facade_c.cpp
     test_modal_registry_regression.cpp
     test_tensor_nn_ops.cpp
     test_nn_ops.cpp
     test_weight_file_paths.cpp
     test_moge2.cpp
+    test_romav1.cpp
+    test_sam2.cpp
     test_lpips.cpp
     test_ppisp_controller.cpp
     test_ppisp_regularization.cpp
@@ -634,7 +733,29 @@ set(TEST_FILES
     test_run_guarded.cpp
     test_tcp_responder.cpp
     test_error_envelope.cpp
+    test_plugin_localization.cpp
 )
+if(LFS_TENSOR_VULKAN)
+    list(APPEND TEST_FILES
+        test_tensor_backend_validators.cpp
+        test_tensor_vulkan_runtime.cpp
+        test_tensor_vulkan_allocation_padding.cpp
+        test_tensor_vulkan_adoption.cpp
+        test_tensor_vulkan_pointwise.cpp
+        test_tensor_vulkan_reduce.cpp
+        test_tensor_vulkan_index.cpp
+        test_tensor_vulkan_matrix_nn.cpp
+        test_tensor_vulkan_random.cpp
+        test_tensor_vulkan_buffer.cpp
+        test_tensor_vulkan_cuda_bridge.cpp
+        test_tensor_backend_parity.cpp
+        test_ply_vulkan_q16_bands.cpp
+        test_viewer_vulkan_load.cpp
+        test_viewer_no_cuda.cpp
+        test_selection_mask_ops.cpp
+        test_sh_quant_tensor_program.cpp
+    )
+endif()
 
 # Preference tests are part of the focused CPU visualizer suite when that
 # target is enabled (notably on Windows CI), and remain in the full suite on
@@ -965,6 +1086,32 @@ set_tests_properties(lichtfeld.fast PROPERTIES
     TIMEOUT 60
 )
 
+if(NOT BUILD_TEMPORAL_CPU_TESTS)
+    string(CONCAT LFS_TEMPORAL_CPU_TEST_FILTER
+        "TemporalFrameTracker.*:"
+        "SceneTemporalPlan.*:"
+        "SceneHistoryContract.*:"
+        "SceneHistoryTracker.*:"
+        "SceneTemporalCoordinator.*:"
+        "SceneMotionReprojection.*:"
+        "VulkanSceneMotionContract.*:"
+        "SceneTemporalResolve.*:"
+        "SceneTemporalQualityRegression.*:"
+        "VulkanSceneTemporalResolveContract.*:"
+        "VulkanSceneTemporalPipelineContract.*"
+    )
+    add_test(NAME lichtfeld.temporal.cpu
+        COMMAND $<TARGET_FILE:lichtfeld_tests>
+            "--gtest_filter=${LFS_TEMPORAL_CPU_TEST_FILTER}"
+            --gtest_color=no
+    )
+    set_tests_properties(lichtfeld.temporal.cpu PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        LABELS "fast;cpu"
+        TIMEOUT 120
+    )
+endif()
+
 add_test(NAME lichtfeld.slow
     COMMAND $<TARGET_FILE:lichtfeld_tests>
         "--gtest_filter=${LFS_SLOW_TEST_FILTER}-${LFS_NIGHTLY_TEST_FILTER}"
@@ -1047,7 +1194,7 @@ set(LFS_PYTHON_FAST_TESTS
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_asset_identity.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_bug_report.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_core_abi_stamp.py
-    ${CMAKE_CURRENT_SOURCE_DIR}/python/test_event_keypad_mapping.py
+    ${CMAKE_CURRENT_SOURCE_DIR}/python/test_dense_matching.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_export_panel.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_gizmo_context.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_histogram_panel.py
@@ -1065,6 +1212,7 @@ set(LFS_PYTHON_FAST_TESTS
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_project_operations.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_plugin_api_surface.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_plugin_marketplace_panel.py
+    ${CMAKE_CURRENT_SOURCE_DIR}/python/test_plugin_localization.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_plugin_system.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_plugin_templates.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_plugin_validator.py
@@ -1185,6 +1333,7 @@ add_test(NAME lichtfeld.python.gpu
         -m gpu
         ${CMAKE_CURRENT_SOURCE_DIR}/python/test_tensor.py
         ${CMAKE_CURRENT_SOURCE_DIR}/python/test_tensor_property.py
+        ${CMAKE_CURRENT_SOURCE_DIR}/python/test_nn_sam2.py
 )
 set_tests_properties(lichtfeld.python.gpu PROPERTIES
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -1289,6 +1438,71 @@ target_link_libraries(bench_tensor_launch_overhead PRIVATE
     CUDA::cudart
 )
 
+# Standalone GUI-workload tensor bench. Built with tests; NOT registered with
+# ctest. Public tensor API plus tensor_backend selection/sync.
+add_executable(bench_tensor_gui
+    bench_tensor_gui.cpp
+)
+set_target_properties(bench_tensor_gui PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(bench_tensor_gui PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_BINARY_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+target_link_libraries(bench_tensor_gui PRIVATE
+    lfs_core
+    CUDA::cudart
+)
+
+add_executable(bench_selection_tensor EXCLUDE_FROM_ALL bench_selection_tensor.cpp)
+set_target_properties(bench_selection_tensor PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(bench_selection_tensor PRIVATE ${CMAKE_SOURCE_DIR}/external)
+target_link_libraries(bench_selection_tensor PRIVATE lfs_rendering CUDA::cudart)
+
+add_executable(tensor_backend_corpus
+    tensor_backend_corpus.cpp
+)
+set_target_properties(tensor_backend_corpus PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(tensor_backend_corpus PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_BINARY_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+target_link_libraries(tensor_backend_corpus PRIVATE
+    lfs_core
+    CUDA::cudart
+)
+
+add_executable(tensor_interface_freeze
+    test_tensor_interface_freeze.cpp
+)
+set_target_properties(tensor_interface_freeze PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(tensor_interface_freeze PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_BINARY_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+target_link_libraries(tensor_interface_freeze PRIVATE
+    lfs_core
+    CUDA::cudart
+)
+add_test(NAME tensor_interface_freeze COMMAND tensor_interface_freeze)
+
 add_executable(bench_nn_ops EXCLUDE_FROM_ALL
     bench_nn_ops.cpp
 )
@@ -1329,7 +1543,7 @@ message(STATUS "  Unit tests: ${TEST_COUNT} files -> lichtfeld_tests")
 message(STATUS "  Build tests: ninja lichtfeld_tests")
 message(STATUS "  Run tests: ninja run_tests")
 message(STATUS "  Run full tests: ninja run_full_tests")
-message(STATUS "  Bench (not ctest): bench_tensor_launch_overhead")
+message(STATUS "  Bench (not ctest): bench_tensor_launch_overhead bench_tensor_gui")
 message(STATUS "  Phase 6C device-fault tests: test_device_fault.cpp + device_fault_cuda_utils.cu")
 
 add_test(NAME lichtfeld.decimate.perf

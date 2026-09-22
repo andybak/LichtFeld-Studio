@@ -32,6 +32,7 @@
 #include "operation/undo_history.hpp"
 #include "operator/operator_registry.hpp"
 #include "operator/ops/align_ops.hpp"
+#include "operator/ops/depth_window_ops.hpp"
 #include "operator/ops/edit_ops.hpp"
 #include "operator/ops/scene_ops.hpp"
 #include "operator/ops/selection_ops.hpp"
@@ -323,6 +324,7 @@ namespace lfs::vis {
         op::registerTransformOperators();
         op::registerAlignOperators();
         op::registerSelectionOperators();
+        op::registerDepthWindowOperators();
         op::registerEditOperators();
         op::registerSceneOperators();
 
@@ -355,6 +357,7 @@ namespace lfs::vis {
         // Clear operator system
         op::unregisterEditOperators();
         op::unregisterSceneOperators();
+        op::unregisterDepthWindowOperators();
         op::unregisterSelectionOperators();
         op::unregisterAlignOperators();
         op::unregisterTransformOperators();
@@ -970,7 +973,7 @@ namespace lfs::vis {
             viewport_.camera.setPivot(target);
 
             if (rendering_manager_)
-                rendering_manager_->markCameraPoseChanged();
+                rendering_manager_->markCameraCut();
         });
         callback_cleanup_.add([] { vis::set_set_view_callback(nullptr); });
 
@@ -993,7 +996,7 @@ namespace lfs::vis {
             vp.setViewMatrix(*rotation, eye);
             vp.camera.setPivot(target);
 
-            rendering_manager_->markCameraPoseChanged();
+            rendering_manager_->markCameraCut();
         });
         callback_cleanup_.add([] { vis::set_set_view_for_panel_callback(nullptr); });
 
@@ -1067,14 +1070,19 @@ namespace lfs::vis {
                 return rendering_manager_ ? std::optional{vis::to_proxy(rendering_manager_->getSettings())}
                                           : std::nullopt;
             },
-            [this](const vis::RenderSettingsProxy& proxy) {
+            [this](const vis::RenderSettingsProxy& proxy,
+                   const vis::RenderSettingsUpdateIntent intent) {
                 if (!rendering_manager_)
                     return;
                 auto s = rendering_manager_->getSettings();
                 const std::string previous_upscaler = s.scene_upscaler;
                 const std::string previous_preset = s.scene_upscaler_preset;
                 vis::apply_proxy(s, proxy);
-                rendering_manager_->updateSettings(s);
+                const auto preset_update =
+                    intent.scene_upscaler_explicit && !intent.scene_upscaler_preset_explicit
+                        ? SceneUpscalerPresetUpdate::RestoreRememberedForBackend
+                        : SceneUpscalerPresetUpdate::UseRequested;
+                rendering_manager_->updateSettings(s, DirtyFlag::ALL, preset_update);
                 const auto& applied = rendering_manager_->getSettings();
                 if (applied.scene_upscaler != previous_upscaler ||
                     applied.scene_upscaler_preset != previous_preset) {
@@ -2588,7 +2596,7 @@ namespace lfs::vis {
         RenderingManager::RenderContext context{
             .viewport = viewport_,
             .settings = rendering_manager_->getSettings(),
-            .logical_screen_size = window_manager_->getWindowSize(),
+            .logical_screen_size = window_manager_->getFramebufferSize(),
             .viewport_region = has_viewport_region ? &viewport_region : nullptr,
             .scene_manager = scene_manager_.get(),
             .vulkan_context = window_manager_->getVulkanContext()};
@@ -3028,6 +3036,12 @@ namespace lfs::vis {
         if (trainer_manager_) {
             trainer_manager_.reset();
         }
+
+        // Cancel any running modal operator while the tool context is still
+        // alive: a modal's cancel/destructor path may reach back into a tool
+        // (e.g. the depth-window drag latch), and the tools hold raw pointers
+        // to this context.
+        op::operators().cancelModalOperator();
 
         // Clean up tool context
         tool_context_.reset();
@@ -3903,6 +3917,7 @@ namespace lfs::vis {
         state.iteration = session.iteration;
         state.max_iterations = session.max_iterations;
         state.strategy = session.strategy;
+        state.raster_backend = session.raster_backend;
         state.completed = session.completed;
         state.hydrated = session.hydrated;
         state.restoring = session.restoring;
@@ -3927,23 +3942,31 @@ namespace lfs::vis {
     std::expected<void, std::string> VisualizerImpl::startTraining() {
         if (!trainer_manager_)
             return std::unexpected("Trainer manager not initialized");
-        if (project_lifecycle_ &&
-            !trainer_manager_->hasTrainer()) {
+        const auto reject = [this](std::string message) {
+            static_cast<void>(trainer_manager_->rejectStart(
+                message, lfs::ErrorCode::FailedPrecondition));
+            return std::unexpected(std::move(message));
+        };
+        if (project_lifecycle_) {
+            if (project_lifecycle_->isHydrating()) {
+                return reject("Project is still loading. Retry Start after loading completes.");
+            }
             const auto session =
                 project_lifecycle_->trainingSessionState();
             if (session.available && !session.hydrated) {
                 if (auto restored =
                         project_lifecycle_
-                            ->restoreTrainingSession(true);
+                            ->restoreTrainingSession(false);
                     !restored) {
-                    return std::unexpected(
-                        lfs::format_for_developer(
-                            restored.error()));
+                    return reject(std::string(restored.error().user_message()));
                 }
-                return {};
+                return reject("Project training session is being restored. Retry Start after restoration completes.");
             }
         }
         if (trainer_manager_->isPaused()) {
+            if (auto preflight = trainer_manager_->preflightStartParameters(); !preflight) {
+                return std::unexpected(std::string(preflight.error().user_message()));
+            }
             if (project_lifecycle_) {
                 if (auto* const trainer = getTrainer()) {
                     const auto policy =
@@ -3955,38 +3978,48 @@ namespace lfs::vis {
                                 project_lifecycle_
                                     ->prepareTrainingStartProject();
                             !prepared) {
-                            return std::unexpected(
-                                lfs::format_for_developer(
-                                    prepared.error()));
+                            return reject(std::string(prepared.error().user_message()));
                         }
                     }
                 }
             }
-            trainer_manager_->resumeTraining();
+            if (auto resumed = trainer_manager_->resumeTraining(); !resumed) {
+                return std::unexpected(std::string(resumed.error().user_message()));
+            }
             return {};
         }
         if (!trainer_manager_->canStart()) {
             if (trainer_manager_->isFinished()) {
-                return std::unexpected(std::format(
+                return reject(std::format(
                     "Training already completed at iteration {}; starting a new training run requires overwrite consent.",
                     trainer_manager_->getCurrentIteration()));
             }
-            return std::unexpected(std::string(
+            return reject(std::string(
                 trainer_manager_->getActionBlockedReason(
                     TrainingAction::Start)));
+        }
+        if (auto preflight =
+                trainer_manager_->preflightStartParameters();
+            !preflight) {
+            return std::unexpected(std::string(preflight.error().user_message()));
         }
         if (project_lifecycle_) {
             if (auto prepared =
                     project_lifecycle_
                         ->prepareTrainingStartProject();
                 !prepared) {
-                return std::unexpected(
-                    lfs::format_for_developer(
-                        prepared.error()));
+                return reject(std::string(prepared.error().user_message()));
             }
         }
-        if (!trainer_manager_->startTraining())
+        if (!trainer_manager_->startTraining()) {
+            if (const auto typed = trainer_manager_->lastTrainingError()) {
+                return std::unexpected(std::string(typed->user_message()));
+            }
+            if (!trainer_manager_->getLastError().empty()) {
+                return std::unexpected(trainer_manager_->getLastError());
+            }
             return std::unexpected("The training manager rejected the start request");
+        }
         return {};
     }
 

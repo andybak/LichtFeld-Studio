@@ -793,6 +793,17 @@ namespace lfs::vis::gui {
         prev_mouse_y_ = input.mouse_y;
     }
 
+    bool PanelLayoutManager::isPositionOverLeftDockResizeEdge(const float x, const float y,
+                                                              const float work_x,
+                                                              const float work_y,
+                                                              const float work_h) const {
+        if (!left_dock_visible_ || left_dock_width_ <= 0.0f || work_h <= 0.0f)
+            return false;
+
+        const float dpi = lfs::python::get_shared_dpi_scale();
+        return leftDockResizeRect(work_x, work_y, work_h, dpi, left_dock_width_).contains(x, y);
+    }
+
     void PanelLayoutManager::renderLeftDock(const PanelDrawContext& draw_ctx,
                                             const bool show_main_panel,
                                             const bool ui_hidden,
@@ -851,12 +862,12 @@ namespace lfs::vis::gui {
         float panel_w = left_dock_width_;
         const float panel_x = dock_layout.panel_x;
 
+        // Same rectangle the press-time predicate uses -- one definition only.
         left_dock_hovering_edge_ =
             !float_blocks_left_dock &&
-            dock_input.mouse_x >= dock_layout.edge_min_x &&
-            dock_input.mouse_x < dock_layout.edge_max_x &&
-            dock_input.mouse_y >= screen.work_pos.y &&
-            dock_input.mouse_y <= screen.work_pos.y + panel_h;
+            leftDockResizeRect(screen.work_pos.x, screen.work_pos.y, panel_h, dpi,
+                               left_dock_width_)
+                .contains(dock_input.mouse_x, dock_input.mouse_y);
 
         if (left_dock_resizing_) {
             left_dock_width_ = std::clamp(left_dock_width_ + delta_x, min_panel_w, max_panel_w);
@@ -1115,16 +1126,14 @@ namespace lfs::vis::gui {
         const float panel_w = computeLeftDockReservedWidth(show_main_panel, ui_hidden, screen);
         const float edge_x = screen.work_pos.x + panel_w;
         const float toolbar_inset = TOOLBAR_INSET * dpi;
-        const float edge_grab_w = std::min(std::max(SPLITTER_H * dpi, 8.0f * dpi), toolbar_inset);
+        const auto resize_rect = leftDockResizeRect(screen.work_pos.x, screen.work_pos.y,
+                                                    screen.work_size.y, dpi, panel_w);
         return {
             .panel_x = screen.work_pos.x,
             .panel_width = panel_w,
             .toolbar_x = edge_x + toolbar_inset,
-            // Keep the resize hit area outside the dock. Extending it into the
-            // panel overlaps RmlUi's vertical scrollbar and turns a scrollbar
-            // thumb drag into a simultaneous dock resize.
-            .edge_min_x = edge_x,
-            .edge_max_x = edge_x + edge_grab_w,
+            .edge_min_x = resize_rect.x0,
+            .edge_max_x = resize_rect.x1,
         };
     }
 

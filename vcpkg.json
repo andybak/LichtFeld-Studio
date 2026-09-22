@@ -12,8 +12,8 @@
         "avfilter",
         "avformat",
         "nvcodec",
-        "swscale",
-        "x264"
+        "openh264",
+        "swscale"
       ]
     },
     "freetype",
@@ -79,7 +79,10 @@
         "tools"
       ]
     },
-    "shader-slang",
+    {
+      "name": "shader-slang",
+      "host": true
+    },
     "xxhash",
     "zstd"
   ],

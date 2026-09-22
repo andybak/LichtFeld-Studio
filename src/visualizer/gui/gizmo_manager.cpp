@@ -736,7 +736,7 @@ namespace lfs::vis::gui {
             (selection && selection->is_valid() && selection->numel() == selection_count)
                 ? std::make_shared<core::Tensor>(selection->clone())
                 : std::make_shared<core::Tensor>(
-                      core::Tensor::zeros({selection_count}, core::Device::CUDA, core::DataType::Bool));
+                      core::Tensor::zeros({selection_count}, core::Device::GPU, core::DataType::Bool));
     }
 
     bool GizmoManager::applySelectionVolumeFromGizmo(const bool push_undo) {
@@ -3042,6 +3042,7 @@ namespace lfs::vis::gui {
                             if (released_panel->viewport->camera.snapToNearestAxisView(
                                     kAxisSnapAngleDegrees, &snapped_axis, nullptr)) {
                                 rendering_manager->setGridPlaneForPanel(released_panel->panel, snapped_axis);
+                                rendering_manager->markCameraCut();
                             }
                         }
                         rendering_manager->markCameraPoseChanged();

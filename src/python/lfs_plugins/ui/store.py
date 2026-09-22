@@ -320,6 +320,13 @@ class RuntimeState:
     scripts_generation = StateSignal[int]("scripts_generation", 0)
     language_generation = StateSignal[int]("language_generation", 0)
     render_settings_generation = StateSignal[int]("render_settings_generation", 0)
+    depth_window_draw_generation = StateSignal[int]("depth_window_draw_generation", 0)
+    # Draw-commit companion: {"generation": int, "panel": "left"|"right"}.
+    # Rebase the named panel's Size reference, even when another panel is displayed.
+    depth_window_draw_commit = StateSignal[dict[str, object]](
+        "depth_window_draw_commit",
+        {"generation": 0, "panel": "left"},
+    )
 
     # Compatibility names from the old AppState surface.
     is_training = training_running
@@ -391,6 +398,8 @@ class RuntimeState:
         cls.splat_simplify_state.value = {}
         cls.scripts_generation.value = 0
         cls.language_generation.value = 0
+        cls.depth_window_draw_generation.value = 0
+        cls.depth_window_draw_commit.value = {"generation": 0, "panel": "left"}
         cls.has_scene.value = False
         cls.scene_path.value = ""
         cls.has_selection.value = False

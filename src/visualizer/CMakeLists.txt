@@ -46,8 +46,14 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         rendering/rendering_manager.cpp
         rendering/rendering_manager_events.cpp
         rendering/rendering_manager_vulkan.cpp
+        rendering/display_tensors.cpp
         rendering/rendering_manager_viewport.cpp
+        rendering/nvidia_dlss_plugin.cpp
         rendering/scene_upscaler_registry.cpp
+        rendering/scene_temporal_coordinator.cpp
+        rendering/scene_temporal_plan.cpp
+        rendering/scene_temporal_resolve.cpp
+        rendering/temporal_frame_tracker.cpp
         rendering/lod_page_cache.cpp
         rendering/lod_upload_engine.cpp
         rendering/spark_lod_controller.cpp
@@ -61,6 +67,14 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         rendering/passes/vulkan_scene_image_uploader.cpp
         rendering/passes/vulkan_viewport_pass.cpp
         rendering/passes/vulkan_mesh_pass.cpp
+        rendering/passes/vulkan_scene_motion_pass.cpp
+        rendering/passes/vulkan_scene_dlss_depth_pass.cpp
+        rendering/passes/vulkan_scene_dlss_pipeline_contract.cpp
+        rendering/passes/vulkan_scene_dlss_pipeline.cpp
+        rendering/passes/vulkan_scene_depth_history_pass.cpp
+        rendering/passes/vulkan_scene_temporal_resolve_pass.cpp
+        rendering/passes/vulkan_scene_temporal_pipeline_contract.cpp
+        rendering/passes/vulkan_scene_temporal_pipeline.cpp
         rendering/passes/vulkan_environment_pass.cpp
         rendering/passes/vulkan_depth_blit_pass.cpp
         rendering/passes/vulkan_split_view_pass.cpp
@@ -102,6 +116,7 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         gui/film_strip_renderer.cpp
         gui/sequencer_ui_manager.cpp
         gui/rml_modal_overlay.cpp
+        gui/rml_progress_overlay.cpp
         gui/rml_toast_overlay.cpp
         gui/gui_error_consumer.cpp
         gui/error_event_bridge.cpp
@@ -130,6 +145,7 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
 
         # Scene management
         scene/scene_manager.cpp
+        scene/point_cloud_merge.cpp
         scene/selection_state.cpp
         scene/viewer_splat_quantize.cpp
 
@@ -166,6 +182,7 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
         operator/operator_id.cpp
         operator/operator_registry.cpp
         operator/ops/align_ops.cpp
+        operator/ops/depth_window_ops.cpp
         operator/ops/edit_ops.cpp
         operator/ops/scene_ops.cpp
         operator/ops/selection_ops.cpp
@@ -173,6 +190,7 @@ add_library(lfs_visualizer ${LFS_VIS_LIB_TYPE}
 
         # Compositional operations system
         operation/undo_entry.cpp
+        operation/depth_window_undo_entry.cpp
         operation/undo_history.cpp
         operation/operation.cpp
         operation/pipeline.cpp
@@ -337,6 +355,10 @@ compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/depth_blit.frag
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/split_view.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/split_view.frag.spv.h" kSplitViewFragSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/vksplat_compose.comp" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/vksplat_compose.comp.spv.h" kVkSplatComposeCompSpv
     "${CMAKE_SOURCE_DIR}/src/rendering/rasterizer/vulkan/shader/src/slang/display_color.inc")
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/scene_motion_reproject.comp" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/scene_motion_reproject.comp.spv.h" kSceneMotionReprojectCompSpv)
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/scene_dlss_depth.comp" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/scene_dlss_depth.comp.spv.h" kSceneDlssDepthCompSpv)
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/scene_temporal_resolve.comp" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/scene_temporal_resolve.comp.spv.h" kSceneTemporalResolveCompSpv)
+compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/scene_depth_history.comp" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/scene_depth_history.comp.spv.h" kSceneDepthHistoryCompSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/point_cloud.vert" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/point_cloud.vert.spv.h" kPointCloudVertSpv)
 compile_shader(lfs_visualizer "${LFS_VIEWPORT_SHADER_SOURCE_DIR}/point_cloud.frag" "${LFS_VIEWPORT_SHADER_BINARY_DIR}/point_cloud.frag.spv.h" kPointCloudFragSpv)
 
@@ -344,7 +366,8 @@ target_link_libraries(lfs_visualizer
         PRIVATE
         Vulkan::Vulkan
         GPUOpen::VulkanMemoryAllocator
-        volk::volk_headers)
+        volk::volk_headers
+        ${CMAKE_DL_LIBS})
 target_link_libraries(lfs_visualizer PRIVATE lfs_vulkan_rasterizer)
 if(WIN32)
     target_compile_definitions(lfs_visualizer PRIVATE VK_USE_PLATFORM_WIN32_KHR)

@@ -6,6 +6,8 @@
 #include "geometry/euclidean_transform.hpp"
 #include "gui/gui_focus_state.hpp"
 #include "gui/gui_manager.hpp"
+#include "input/sdl_coordinate_utils.hpp"
+#include "rendering/coordinate_conventions.hpp"
 #include "rendering/rendering.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "rendering/screen_overlay_renderer.hpp"
@@ -34,20 +36,40 @@ namespace lfs::vis::tools {
             return rm ? rm->getScreenOverlayRenderer() : nullptr;
         }
 
-        [[nodiscard]] float depthBoxHalfHeight(const ToolContext& ctx, const float half_width) {
-            const auto& bounds = ctx.getViewportBounds();
-            const float aspect = (bounds.height > 0.0f)
-                                     ? std::max(bounds.width / bounds.height, 0.1f)
-                                     : 1.0f;
-            return std::max(half_width / aspect, 0.05f);
-        }
-
         [[nodiscard]] const Viewport& selectionFilterViewport(const ToolContext& ctx) {
             auto* const rm = ctx.getRenderingManager();
             if (rm) {
                 return rm->resolveFocusedViewport(ctx.getViewport());
             }
             return ctx.getViewport();
+        }
+
+        // KEEP IN SYNC: the legacy width<->scale converters in py_selection.cpp
+        // (convert_legacy_half_width_to_scale / convert_scale_to_legacy_half_width)
+        // invert this mapping via the vertical fov; they do not see
+        // ortho_scale_override.
+        [[nodiscard]] glm::vec2 depthWindowFarPlaneHalfExtents(
+            const Viewport& viewport,
+            const RenderSettings& settings,
+            const float far_depth,
+            const float window_scale_x,
+            const float window_scale_y) {
+            const glm::ivec2 size = glm::max(viewport.windowSize, glm::ivec2(1));
+            const float half_w_pixels = 0.5f * window_scale_x * static_cast<float>(size.x);
+            const float half_h_pixels = 0.5f * window_scale_y * static_cast<float>(size.y);
+            if (settings.orthographic) {
+                const float pixels_per_world =
+                    viewport.ortho_scale_override.value_or(settings.ortho_scale);
+                const float valid_scale = std::max(pixels_per_world, 1.0e-5f);
+                return {half_w_pixels / valid_scale, half_h_pixels / valid_scale};
+            }
+
+            const auto [pixel_focal_x, pixel_focal_y] =
+                lfs::rendering::computePixelFocalLengths(size, settings.focal_length_mm);
+            return {
+                half_w_pixels * far_depth / pixel_focal_x,
+                half_h_pixels * far_depth / pixel_focal_y,
+            };
         }
 
         [[nodiscard]] bool pointInViewportBounds(const ViewportBounds& bounds, const glm::vec2 point) {
@@ -99,10 +121,12 @@ namespace lfs::vis::tools {
         }
 
         float mx, my;
-        const SDL_MouseButtonFlags mouse_buttons = SDL_GetMouseState(&mx, &my);
+        const SDL_MouseButtonFlags mouse_buttons = input::mouseStateInPixels(ctx.getWindow(), &mx, &my);
         last_mouse_pos_ = glm::vec2(mx, my);
 
-        if (depth_filter_enabled_ || crop_filter_enabled_) {
+        if ((depth_filter_enabled_ || crop_filter_enabled_) &&
+            depth_window_drag_count_ == 0) {
+            refreshDepthNearFarFromProjection(ctx);
             applySelectionFilterSettings(ctx);
         }
 
@@ -178,6 +202,7 @@ namespace lfs::vis::tools {
             return;
         }
         if (enabled) {
+            refreshDepthNearFarFromProjection(*tool_context_);
             applySelectionFilterSettings(*tool_context_);
         } else {
             clearSelectionRenderState(*tool_context_);
@@ -194,16 +219,16 @@ namespace lfs::vis::tools {
             return;
         }
 
+        refreshDepthNearFarFromProjection(*tool_context_);
         applySelectionFilterSettings(*tool_context_);
     }
 
     void SelectionTool::setDepthFilterRange(const bool enabled,
                                             const float depth_near,
                                             const float depth_far,
-                                            const float frustum_half_width) {
+                                            const float informational_half_width) {
         depth_near_ = std::clamp(depth_near, 0.0f, DEPTH_MAX - DEPTH_MIN);
         depth_far_ = std::clamp(depth_far, depth_near_ + DEPTH_MIN, DEPTH_MAX);
-        frustum_half_width_ = std::max(frustum_half_width, 0.05f);
 
         depth_filter_enabled_ = enabled;
         if (!tool_context_ || !isEnabled() ||
@@ -211,11 +236,41 @@ namespace lfs::vis::tools {
             return;
         }
 
-        applySelectionFilterSettings(*tool_context_);
+        applySelectionFilterSettings(*tool_context_, std::max(informational_half_width, 0.05f));
     }
 
     void SelectionTool::adjustDepthFar(const float scale) {
+        if (tool_context_) {
+            refreshDepthNearFarFromProjection(*tool_context_);
+        }
         depth_far_ = std::clamp(depth_far_ * scale, std::max(DEPTH_MIN, depth_near_ + DEPTH_MIN), DEPTH_MAX);
+        if (tool_context_ && isEnabled() && depth_filter_enabled_) {
+            applySelectionFilterSettings(*tool_context_);
+        }
+    }
+
+    void SelectionTool::adjustWindowScale(const float factor) {
+        // Isotropic by contract: both axes scale by ONE common factor, bounded so
+        // that neither axis leaves [0.05, 1.0]. Clamping the axes separately let a
+        // window that hit a limit on one axis keep changing on the other and
+        // silently change shape.
+        if (tool_context_) {
+            refreshDepthNearFarFromProjection(*tool_context_);
+            if (auto* const rm = tool_context_->getRenderingManager()) {
+                auto settings = rm->getSettings();
+                // Same bound formula as selection_controls._scale_factor_bounds,
+                // applied here to the current scales rather than its drawn-reference
+                // scales. Inputs are already sanitized to [0.05, 1.0].
+                const float sx = settings.depth_filter_scale_x;
+                const float sy = settings.depth_filter_scale_y;
+                const float f_min = std::max(0.05f / sx, 0.05f / sy);
+                const float f_max = std::min(1.0f / sx, 1.0f / sy);
+                const float f = std::clamp(factor, f_min, std::max(f_min, f_max));
+                settings.depth_filter_scale_x = std::clamp(sx * f, 0.05f, 1.0f);
+                settings.depth_filter_scale_y = std::clamp(sy * f, 0.05f, 1.0f);
+                rm->updateSettings(settings);
+            }
+        }
         if (tool_context_ && isEnabled() && depth_filter_enabled_) {
             applySelectionFilterSettings(*tool_context_);
         }
@@ -231,6 +286,7 @@ namespace lfs::vis::tools {
             return;
         }
 
+        refreshDepthNearFarFromProjection(*tool_context_);
         auto settings = rm->getSettings();
         settings.crop_filter_for_selection = crop_filter_enabled_;
         if (crop_filter_enabled_) {
@@ -239,12 +295,24 @@ namespace lfs::vis::tools {
         }
         settings.depth_filter_enabled = depth_filter_enabled_;
         const glm::quat camera_quat = glm::quat_cast(viewport.camera.R);
-        const float half_height = depthBoxHalfHeight(*tool_context_, frustum_half_width_);
+        const glm::vec2 half_extents =
+            depthWindowFarPlaneHalfExtents(viewport, settings, depth_far_, settings.depth_filter_scale_x,
+                                           settings.depth_filter_scale_y);
         settings.depth_filter_transform = lfs::geometry::EuclideanTransform(camera_quat, viewport.camera.t);
-        settings.depth_filter_min = glm::vec3(-frustum_half_width_, -half_height, -depth_far_);
-        settings.depth_filter_max = glm::vec3(frustum_half_width_, half_height, -depth_near_);
+        settings.depth_filter_min = glm::vec3(-half_extents.x, -half_extents.y, -depth_far_);
+        settings.depth_filter_max = glm::vec3(half_extents.x, half_extents.y, -depth_near_);
         rm->updateSettings(settings);
         rm->markDirty(DirtyFlag::SELECTION);
+    }
+
+    void SelectionTool::setDepthWindowDragInProgress(const bool in_progress) {
+        const int previous = depth_window_drag_count_;
+        depth_window_drag_count_ = std::max(0, previous + (in_progress ? 1 : -1));
+        if (previous > 0 && depth_window_drag_count_ == 0 &&
+            tool_context_ && isEnabled() && depth_filter_enabled_) {
+            refreshDepthNearFarFromProjection(*tool_context_);
+            applySelectionFilterSettings(*tool_context_);
+        }
     }
 
     void SelectionTool::setCropFilterEnabled(const bool enabled) {
@@ -252,10 +320,32 @@ namespace lfs::vis::tools {
         if (!tool_context_ || !isEnabled()) {
             return;
         }
+        refreshDepthNearFarFromProjection(*tool_context_);
         applySelectionFilterSettings(*tool_context_);
     }
 
-    void SelectionTool::applySelectionFilterSettings(const ToolContext& ctx) const {
+    void SelectionTool::refreshDepthNearFarFromProjection(const ToolContext& ctx) {
+        // Separate generation-read/stamp locks can miss an intervening projection
+        // write for one frame; the next reapply refreshes it.
+        auto* const rm = ctx.getRenderingManager();
+        if (!rm) {
+            return;
+        }
+
+        const auto generation = rm->depthWindowProjectionGeneration();
+        if (generation == depth_projection_generation_) {
+            return;
+        }
+        depth_projection_generation_ = generation;
+
+        const auto settings = rm->getSettings();
+        depth_near_ = std::clamp(-settings.depth_filter_max.z, 0.0f, DEPTH_MAX - DEPTH_MIN);
+        depth_far_ = std::clamp(-settings.depth_filter_min.z, depth_near_ + DEPTH_MIN, DEPTH_MAX);
+    }
+
+    void SelectionTool::applySelectionFilterSettings(
+        const ToolContext& ctx,
+        const std::optional<float> informational_half_width) const {
         auto* const rm = ctx.getRenderingManager();
         if (!rm) {
             return;
@@ -268,13 +358,25 @@ namespace lfs::vis::tools {
             settings.show_ellipsoid = true;
         }
         settings.depth_filter_enabled = depth_filter_enabled_;
+        // Window scale/offset live on RenderSettings. Read them from settings and
+        // do not stamp tool members — crop-filter toggles and enable/disable
+        // reach this path and would otherwise revert Python/slider/MCP writes.
         if (depth_filter_enabled_) {
             const auto& viewport = selectionFilterViewport(ctx);
             const glm::quat camera_quat = glm::quat_cast(viewport.camera.R);
-            const float half_height = depthBoxHalfHeight(ctx, frustum_half_width_);
+            glm::vec2 half_extents =
+                depthWindowFarPlaneHalfExtents(viewport, settings, depth_far_, settings.depth_filter_scale_x,
+                                               settings.depth_filter_scale_y);
+            if (informational_half_width) {
+                const glm::ivec2 size = glm::max(viewport.windowSize, glm::ivec2(1));
+                const float aspect = std::max(
+                    static_cast<float>(size.x) / static_cast<float>(size.y), 0.1f);
+                half_extents = {*informational_half_width,
+                                std::max(*informational_half_width / aspect, 0.05f)};
+            }
             settings.depth_filter_transform = lfs::geometry::EuclideanTransform(camera_quat, viewport.camera.t);
-            settings.depth_filter_min = glm::vec3(-frustum_half_width_, -half_height, -depth_far_);
-            settings.depth_filter_max = glm::vec3(frustum_half_width_, half_height, -depth_near_);
+            settings.depth_filter_min = glm::vec3(-half_extents.x, -half_extents.y, -depth_far_);
+            settings.depth_filter_max = glm::vec3(half_extents.x, half_extents.y, -depth_near_);
         }
         rm->updateSettings(settings);
         rm->markDirty(DirtyFlag::SELECTION);
@@ -328,7 +430,7 @@ namespace lfs::vis::tools {
 
         float mouse_x = 0.0f;
         float mouse_y = 0.0f;
-        SDL_GetMouseState(&mouse_x, &mouse_y);
+        input::mouseStateInPixels(tool_context_->getWindow(), &mouse_x, &mouse_y);
         const glm::vec2 mp{mouse_x, mouse_y};
         const auto& t = theme();
 
@@ -356,10 +458,17 @@ namespace lfs::vis::tools {
             }
         }
 
+        // Under GT comparison the depth-window chord has no meaning, so the label
+        // is never suppressed there.
+        const auto* const label_rm = tool_context_ ? tool_context_->getRenderingManager() : nullptr;
+        const bool label_gt_active = label_rm && label_rm->isGTComparisonActive();
         const bool hardware_ring_active =
             tool_context_->getGuiManager() &&
             tool_context_->getGuiManager()->isHardwareSelectionRingActive();
-        if (mode_name && !hardware_ring_active) {
+        if (mode_name &&
+            !hardware_ring_active &&
+            !((kmods & SDL_KMOD_SHIFT) && (kmods & SDL_KMOD_ALT) && depth_filter_enabled_ &&
+              !label_gt_active)) {
             char label_buf[32];
             std::snprintf(label_buf, sizeof(label_buf), "%s%s", mode_name, op_suffix);
             const float label_size = t.fonts.large_size;

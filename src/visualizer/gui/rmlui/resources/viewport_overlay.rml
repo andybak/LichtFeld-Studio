@@ -113,6 +113,7 @@
             </div>
         </div>
 
+        <!-- Primary gizmo buttons address Left regardless of focus. -->
         <div id="primary-viewport-gizmo-controls" class="viewport-gizmo-controls">
             <div class="viewport-gizmo-control-row">
                 <div class="icon-btn"
@@ -123,7 +124,7 @@
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
-                     data-event-click="toolbar_action(button.action, button.value)">
+                     data-event-click="toolbar_action(button.action, button.value, 'left')">
                     <img data-attr-src="button.icon_src" />
                 </div>
             </div>
@@ -385,6 +386,8 @@
             </div>
         </div>
 
+        <!-- Secondary gizmo buttons address Right; outside independent-dual,
+             Right resolves to the shared camera. -->
         <div id="secondary-viewport-gizmo-controls" class="viewport-gizmo-controls">
             <div class="viewport-gizmo-control-row">
                 <div class="icon-btn"
@@ -395,7 +398,7 @@
                      data-attr-title="button.tooltip_text"
                      data-attrif-disabled="!button.enabled"
                      data-class-disabled="!button.enabled"
-                     data-event-click="toolbar_action(button.action, button.value)">
+                     data-event-click="toolbar_action(button.action, button.value, 'right')">
                     <img data-attr-src="button.icon_src" />
                 </div>
             </div>
@@ -721,7 +724,15 @@
             <div class="viewport-selection-depth-fields"
                  data-if="selection_depth_mode_active"
                  data-tooltip="tooltip.selection_depth_range">
-                <div class="viewport-transform-axis viewport-selection-depth-axis" data-tooltip="tooltip.selection_depth_near">
+                <div class="depth-axis-group depth-axis-group-nf">
+                <!-- Keep the chip first in the centered Near/Far group at every width.
+                     As a direct child of the wrapping row, it would take a separate line
+                     before the flex-basis:100% group, with the pinned sync toggle beside it.
+                     Keep the chip in flow, not pinned to the row's left edge. -->
+                <span class="viewport-selection-depth-panel-chip"
+                      data-if="selection_panel_chip_visible"
+                      data-tooltip="tooltip.selection_depth_panel_chip">{{selection_panel_chip_label}}</span>
+                <div class="viewport-transform-axis viewport-selection-depth-axis depth-axis-near" data-tooltip="tooltip.selection_depth_near">
                     <span class="viewport-transform-axis-label">{{ui_near_label}}</span>
                     <input type="range"
                            id="selection-depth-near-slider"
@@ -739,7 +750,7 @@
                            data-value="selection_depth_near_str"
                            data-attrif-disabled="!selection_has_scene" />
                 </div>
-                <div class="viewport-transform-axis viewport-selection-depth-axis" data-tooltip="tooltip.selection_depth_far">
+                <div class="viewport-transform-axis viewport-selection-depth-axis depth-axis-far" data-tooltip="tooltip.selection_depth_far">
                     <span class="viewport-transform-axis-label">{{ui_far_label}}</span>
                     <input type="range"
                            id="selection-depth-far-slider"
@@ -757,6 +768,78 @@
                            data-value="selection_depth_far_str"
                            data-attrif-disabled="!selection_has_scene" />
                 </div>
+                </div>
+                <div class="depth-axis-group depth-axis-group-sxy">
+                <div class="viewport-transform-axis viewport-selection-depth-axis depth-axis-size" data-tooltip="tooltip.selection_depth_size">
+                    <span class="viewport-transform-axis-label">{{ui_size_label}}</span>
+                    <input type="range"
+                           id="selection-depth-scale-slider"
+                           class="setting-slider viewport-selection-slider"
+                           min="5"
+                           max="100"
+                           data-attr-min="selection_depth_scale_slider_min"
+                           data-attr-max="selection_depth_scale_slider_max"
+                           step="1"
+                           data-value="selection_depth_scale_value"
+                           data-attrif-disabled="!selection_has_scene" />
+                    <input type="text"
+                           class="number-input viewport-selection-depth-input"
+                           id="selection-depth-scale"
+                           data-value="selection_depth_scale_str"
+                           data-attrif-disabled="!selection_has_scene" />
+                </div>
+                <div class="viewport-transform-axis viewport-selection-depth-axis depth-axis-x" data-tooltip="tooltip.selection_depth_offset_x">
+                    <span class="viewport-transform-axis-label">{{ui_offset_x_label}}</span>
+                    <input type="range"
+                           id="selection-depth-offset-x-slider"
+                           class="setting-slider viewport-selection-slider"
+                           min="-100"
+                           max="100"
+                           data-attr-min="selection_depth_offset_x_slider_min"
+                           data-attr-max="selection_depth_offset_x_slider_max"
+                           step="1"
+                           data-value="selection_depth_offset_x_value"
+                           data-attrif-disabled="!selection_has_scene" />
+                    <input type="text"
+                           class="number-input viewport-selection-depth-input"
+                           id="selection-depth-offset-x"
+                           data-value="selection_depth_offset_x_str"
+                           data-attrif-disabled="!selection_has_scene" />
+                </div>
+                <div class="viewport-transform-axis viewport-selection-depth-axis depth-axis-y" data-tooltip="tooltip.selection_depth_offset_y">
+                    <span class="viewport-transform-axis-label">{{ui_offset_y_label}}</span>
+                    <input type="range"
+                           id="selection-depth-offset-y-slider"
+                           class="setting-slider viewport-selection-slider"
+                           min="-100"
+                           max="100"
+                           data-attr-min="selection_depth_offset_y_slider_min"
+                           data-attr-max="selection_depth_offset_y_slider_max"
+                           step="1"
+                           data-value="selection_depth_offset_y_value"
+                           data-attrif-disabled="!selection_has_scene" />
+                    <input type="text"
+                           class="number-input viewport-selection-depth-input"
+                           id="selection-depth-offset-y"
+                           data-value="selection_depth_offset_y_str"
+                           data-attrif-disabled="!selection_has_scene" />
+                </div>
+                </div>
+                <button class="icon-btn viewport-transform-action viewport-selection-sync-action"
+                        data-if="selection_panel_chip_visible"
+                        data-attr-title="selection_depth_sync_label"
+                        data-tooltip="tooltip.selection_depth_sync"
+                        data-attrif-disabled="!selection_has_scene"
+                        data-event-click="selection_action('toggle_sync')">
+                    <img data-attr-src="selection_depth_sync_icon" />
+                </button>
+                <button class="icon-btn viewport-transform-action viewport-selection-viz-action"
+                        data-attr-title="selection_viz_mode_label"
+                        data-tooltip="tooltip.selection_viz_mode"
+                        data-attrif-disabled="!selection_has_scene"
+                        data-event-click="selection_action('cycle_viz')">
+                    <img data-attr-src="selection_viz_mode_icon" />
+                </button>
             </div>
         </div>
     </div>
@@ -838,7 +921,40 @@
                         <option value="rgb">RGB</option>
                         <option value="normal">@tr:ui.normal</option>
                         <option value="depth">@tr:ui.depth</option>
+                        <option value="loss">@tr:status.loss</option>
                     </select>
+                </div>
+            </div>
+            <div class="viewport-gt-color-legend"
+                 data-if="gt_compare_mode_value == 'depth'">
+                <div class="viewport-gt-color-scale"
+                     data-if="gt_compare_depth_mode_value == 'palette'">
+                    <span class="viewport-gt-color-scale__segment viewport-gt-color-scale__segment--depth-far"></span>
+                    <span class="viewport-gt-color-scale__segment viewport-gt-color-scale__segment--depth-far-mid"></span>
+                    <span class="viewport-gt-color-scale__segment viewport-gt-color-scale__segment--depth-mid"></span>
+                    <span class="viewport-gt-color-scale__segment viewport-gt-color-scale__segment--depth-near-mid"></span>
+                    <span class="viewport-gt-color-scale__segment viewport-gt-color-scale__segment--depth-near"></span>
+                </div>
+                <div class="viewport-gt-color-scale"
+                     data-if="gt_compare_depth_mode_value == 'gray'">
+                    <span class="viewport-gt-color-scale__segment viewport-gt-color-scale__segment--depth-gray"></span>
+                </div>
+                <div class="viewport-gt-color-labels">
+                    <span>@tr:ui.far</span>
+                    <span>@tr:ui.near</span>
+                </div>
+            </div>
+            <div class="viewport-gt-color-legend"
+                 data-if="gt_compare_mode_value == 'loss'">
+                <div class="viewport-gt-color-scale">
+                    <span class="viewport-gt-color-scale__segment viewport-gt-color-scale__segment--loss-lowest"></span>
+                    <span class="viewport-gt-color-scale__segment viewport-gt-color-scale__segment--loss-low"></span>
+                    <span class="viewport-gt-color-scale__segment viewport-gt-color-scale__segment--loss-medium"></span>
+                    <span class="viewport-gt-color-scale__segment viewport-gt-color-scale__segment--loss-high"></span>
+                </div>
+                <div class="viewport-gt-color-labels">
+                    <span>@tr:tooltip.gt_loss_lower_error</span>
+                    <span>@tr:tooltip.gt_loss_higher_error</span>
                 </div>
             </div>
         </div>
@@ -1257,47 +1373,6 @@
         <span class="viewport-transfer-detail" data-class-status-error="gallery_transfer_message_error" data-if="gallery_transfer_message != ''">{{gallery_transfer_message}}</span>
     </div>
 
-    <div id="import-status-overlay"
-         class="viewport-status-overlay hidden"
-         data-class-hidden="!show_import_overlay">
-        <div class="viewport-status-backdrop"
-             data-class-hidden="!show_import_backdrop"></div>
-        <div class="viewport-status-panel">
-            <span class="viewport-status-title"
-                  data-attr-class="'viewport-status-title ' + import_title_class">{{ import_title }}</span>
-            <span class="viewport-status-path text-disabled" data-if="show_import_path">{{ import_path }}</span>
-            <div class="viewport-status-progress" data-if="show_import_progress">
-                <progress max="1" data-attr-value="import_progress_value"></progress>
-                <span class="progress__text">{{ import_progress_pct }}</span>
-            </div>
-            <span class="viewport-status-stage text-disabled" data-if="show_import_stage">{{ import_stage }}</span>
-            <span class="status-success" data-if="show_import_counts">{{ import_counts }}</span>
-            <span class="status-error" data-if="show_import_error">{{ import_error }}</span>
-            <div class="viewport-status-actions" data-if="show_import_dismiss">
-                <button class="btn btn--primary"
-                        data-event-click="overlay_action('dismiss_import')">{{ import_dismiss_label }}</button>
-            </div>
-        </div>
-    </div>
-
-    <div id="video-status-overlay"
-         class="viewport-status-overlay hidden"
-         data-class-hidden="!show_video_overlay">
-        <div class="viewport-status-backdrop"></div>
-        <div class="viewport-status-panel">
-            <span class="viewport-status-title">{{ video_title }}</span>
-            <div class="viewport-status-progress">
-                <progress max="1" data-attr-value="video_progress_value"></progress>
-                <span class="progress__text">{{ video_progress_pct }}</span>
-            </div>
-            <span class="viewport-status-stage">{{ video_frame_text }}</span>
-            <span class="viewport-status-stage text-disabled" data-if="show_video_stage">{{ video_stage }}</span>
-            <div class="viewport-status-actions">
-                <button class="btn btn--secondary"
-                        data-event-click="overlay_action('cancel_video_export')">{{ video_cancel_label }}</button>
-            </div>
-        </div>
-    </div>
     </div>
 </body>
 </rml>

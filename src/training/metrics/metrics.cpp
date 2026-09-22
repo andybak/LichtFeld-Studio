@@ -153,7 +153,7 @@ namespace lfs::training {
             image_data.reset();
 
             cam.set_image_dimensions(width, height);
-            return chw.to(lfs::core::Device::CUDA);
+            return chw.to(lfs::core::Device::GPU);
         }
     } // namespace
 
@@ -608,7 +608,7 @@ namespace lfs::training {
             const auto& weights_path = *_lpips_weights_path;
             try {
                 auto loaded = lfs::core::nn::models::Lpips::load(
-                    weights_path, lfs::core::Device::CUDA, lfs::core::DataType::Float16,
+                    weights_path, lfs::core::Device::GPU, lfs::core::DataType::Float16,
                     lfs::core::nn::models::InputScaling::Identity);
                 if (loaded) {
                     _lpips_metric.emplace(std::move(*loaded));
@@ -651,7 +651,7 @@ namespace lfs::training {
             mask_mode == lfs::core::param::MaskMode::SegmentAndIgnore;
 
         bool render_normal = false;
-        if (!_params.optimization.gut) {
+        if (_params.optimization.raster_backend() == lfs::core::param::RasterBackendId::ThreeDGS) {
             for (size_t image_idx = 0; image_idx < val_dataset_size; ++image_idx) {
                 if (val_dataset->get_camera(image_idx)->has_normal()) {
                     render_normal = true;
@@ -693,7 +693,7 @@ namespace lfs::training {
 
             auto& splatData_mutable = const_cast<lfs::core::SplatData&>(splatData);
             RenderOutput r_output;
-            if (_params.optimization.gut) {
+            if (_params.optimization.raster_backend() == lfs::core::param::RasterBackendId::ThreeDGUT) {
                 r_output = gsplat_rasterize(*cam, splatData_mutable, background,
                                             1.0f, false, GsplatRenderMode::RGB, true);
             } else {
@@ -736,7 +736,7 @@ namespace lfs::training {
                 try {
                     const auto pred_lpips = mask_image_for_lpips(r_output.image, mask);
                     const auto target_lpips = mask_image_for_lpips(
-                        gt_float.to(lfs::core::Device::CUDA), mask);
+                        gt_float.to(lfs::core::Device::GPU), mask);
                     const int image_height = static_cast<int>(gt_image.shape()[1]);
                     const int image_width = static_cast<int>(gt_image.shape()[2]);
                     const std::pair<int, int> image_size{image_height, image_width};

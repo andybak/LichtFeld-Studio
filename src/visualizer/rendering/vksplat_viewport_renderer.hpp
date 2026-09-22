@@ -5,6 +5,7 @@
 #pragma once
 
 #include "core/error.hpp"
+#include "core/export.hpp"
 #include "core/exportable_storage.hpp"
 #include "core/splat_data.hpp"
 #include "lod_page_cache.hpp"
@@ -398,6 +399,13 @@ namespace lfs::vis {
             std::shared_ptr<lfs::core::ExportableBlock> block;
             VulkanContext::ExternalBuffer buffer{};
             lfs::core::Tensor copy_keep_alive;
+            lfs::core::Tensor vulkan_selection_mask;
+            lfs::core::Tensor vulkan_preview_mask;
+            lfs::core::Tensor vulkan_selection_colors;
+            lfs::core::Tensor vulkan_transform_indices;
+            lfs::core::Tensor vulkan_node_mask;
+            lfs::core::Tensor vulkan_overlay_params;
+            lfs::core::Tensor vulkan_model_transforms;
             std::array<std::size_t, kOverlayRegionCount> region_offset{};
             std::array<std::size_t, kOverlayRegionCount> region_bytes{};
             lfs::core::Tensor selection_source;
@@ -431,6 +439,13 @@ namespace lfs::vis {
             std::shared_ptr<lfs::core::ExportableBlock> block;
             VulkanContext::ExternalBuffer buffer{};
             lfs::core::Tensor copy_keep_alive;
+            lfs::core::Tensor vulkan_transform_indices;
+            lfs::core::Tensor vulkan_node_mask;
+            lfs::core::Tensor vulkan_primitives;
+            lfs::core::Tensor vulkan_model_transforms;
+            lfs::core::Tensor vulkan_polygon_vertices;
+            lfs::core::Tensor vulkan_polygon_mask;
+            lfs::core::Tensor vulkan_ring_pick;
             std::array<std::size_t, kSelectionQueryRegionCount> region_offset{};
             std::array<std::size_t, kSelectionQueryRegionCount> region_bytes{};
             std::array<std::size_t, kSelectionQueryRegionCount> region_capacity_bytes{};
@@ -755,6 +770,8 @@ namespace lfs::vis {
         // borrow value" GPU-side before its next in-place parameter writes.
         VulkanContext::ExternalSemaphore render_complete_external_{};
         lfs::rendering::CudaTimelineSemaphore render_complete_cuda_{};
+        VkSemaphore vulkan_query_complete_timeline_ = VK_NULL_HANDLE;
+        std::uint64_t vulkan_query_complete_value_ = 0;
 
         // The last completion value whose frame read the persistent (non-ring)
         // lod_page_inputs_ buffer; next-frame page uploads wait on it GPU-side.
@@ -763,9 +780,25 @@ namespace lfs::vis {
         // Zero-copy input storages bound to in-flight frames, keyed by the
         // completion value at which the GPU is done reading them. Keeps
         // VkBuffer + external memory + CUDA allocation alive across trainer
-        // topology reallocations.
+        // topology reallocations. Vulkan-backend tensors pin the same way
+        // through TensorVulkanBuffer::keep_alive.
         std::vector<std::pair<std::uint64_t, std::vector<std::shared_ptr<void>>>>
             retired_input_storages_;
+        std::uint64_t last_vulkan_tensor_input_wait_value_ = 0;
+        struct VulkanDebugSplatInputs {
+            lfs::core::Tensor means;
+            lfs::core::Tensor sh0;
+            lfs::core::Tensor rotation;
+            lfs::core::Tensor scaling;
+            lfs::core::Tensor opacity;
+            lfs::core::Tensor shN;
+            lfs::core::Tensor shN_bounds;
+            lfs::core::Tensor deleted;
+        };
+        [[nodiscard]] const VulkanDebugSplatInputs* vulkanDebugSplatInputs(
+            const lfs::core::SplatData& splat_data, const ModelInputSnapshot& snapshot);
+        VulkanDebugSplatInputs vulkan_debug_inputs_{};
+        ModelInputSnapshot vulkan_debug_inputs_key_{};
 
         // Async RAD page streaming: decoded pages are packed and copied on the
         // engine's own thread/stream; render frames only publish completions.
@@ -774,5 +807,50 @@ namespace lfs::vis {
         std::uint64_t lod_upload_log_batches_ = 0;
         bool lod_upload_log_converged_ = false;
     };
+
+    namespace detail {
+        // Slot indices for the overlay parameter table. Defined here (not in the .cpp anonymous
+        // namespace) so the slot-12 packing test can name detail::ViewIntrinsics.
+        enum OverlayParamIndex : std::size_t {
+            CropFlags = 0,
+            CropMin = 1,
+            CropMax = 2,
+            CropTransform = 3,
+            EllipsoidFlags = 7,
+            EllipsoidRadii = 8,
+            EllipsoidTransform = 9,
+            ViewIntrinsics = 12,
+            ViewFlags = 13,
+            ViewMin = 14,
+            ViewMax = 15,
+            ViewTransform = 16,
+            EmphasisFlags = 20,
+            CursorFlags = 21,
+            MarkerFlags = 22,
+            SelectionCursor = 23,
+            SelectionFlags = 24,
+            VisibilityFlags = 25,
+            CropExtraBase = 26,
+            CropParamStride = 7,
+            CropExtraCount = 15,
+            EllipsoidExtraBase = CropExtraBase + CropParamStride * CropExtraCount,
+            EllipsoidParamStride = 5,
+            EllipsoidExtraCount = 15,
+            ViewWindow = EllipsoidExtraBase + EllipsoidParamStride * EllipsoidExtraCount,
+            ParamCount = ViewWindow + 1,
+        };
+        static_assert(EllipsoidFlags + EllipsoidParamStride <= ViewIntrinsics);
+        static_assert(EllipsoidExtraBase + EllipsoidParamStride * EllipsoidExtraCount == ViewWindow);
+
+        // Exposed for tests (O4): pure function over the request, no device state.
+        [[nodiscard]] LFS_VIS_API std::expected<std::vector<float>, std::string>
+        buildOverlayParamsCpuFloats(
+            const lfs::rendering::ViewportRenderRequest& request,
+            bool selection_enabled,
+            bool preview_enabled,
+            bool transform_indices_enabled,
+            std::size_t node_mask_count,
+            bool node_visibility_cull);
+    } // namespace detail
 
 } // namespace lfs::vis

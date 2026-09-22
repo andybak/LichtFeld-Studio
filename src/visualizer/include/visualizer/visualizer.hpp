@@ -334,6 +334,7 @@ namespace lfs::vis {
             bool hydrated = false;
             bool restoring = false;
             std::string error;
+            std::string raster_backend;
         };
 
         [[nodiscard]] virtual ProjectTrainingSessionState

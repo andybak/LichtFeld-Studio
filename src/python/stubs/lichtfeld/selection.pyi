@@ -70,19 +70,76 @@ def get_screen_positions() -> lichtfeld.Tensor | None:
     """Get screen positions tensor [N, 2]"""
 
 def set_depth_filter(enabled: bool, depth_far: float = 100.0, frustum_half_width: float = 50.0, depth_near: float = 0.0) -> None:
-    """Set selection depth filter in camera space."""
+    """
+    Deprecated. Set selection depth filter in camera space.
+    frustum_half_width is converted to a screen-space window scale:
+    - pinhole: scale = clamp(half_width / (tan(hfov/2) * far), 0.05, 1.0) when far > 1e-3 and a viewport is available; otherwise scale = 0.35
+    - ortho: scale = clamp(half_width / (0.5 * ortho_width), 0.05, 1.0)
+    - equirect or no viewport: scale = 0.35 (no single equivalent exists)
+    Prefer set_depth_filter_window.
+    """
 
 def set_depth_filter_range(enabled: bool, depth_near: float = 0.0, depth_far: float = 100.0, frustum_half_width: float = 50.0) -> None:
     """
-    Set selection depth filter range in camera space as (near, far, width).
+    Deprecated. Set selection depth filter range in camera space as (near, far, width).
+    frustum_half_width is converted to a screen-space window scale:
+    - pinhole: scale = clamp(half_width / (tan(hfov/2) * far), 0.05, 1.0) when far > 1e-3 and a viewport is available; otherwise scale = 0.35
+    - ortho: scale = clamp(half_width / (0.5 * ortho_width), 0.05, 1.0)
+    - equirect or no viewport: scale = 0.35 (no single equivalent exists)
+    Prefer set_depth_filter_window.
+    """
+
+def set_depth_filter_window(enabled: bool, depth_near: float = 0.0, depth_far: float = 100.0, scale: float = 0.3499999940395355, offset_x: float = 0.0, offset_y: float = 0.0, scale_y: float | None = None, *, panel: str | None = None) -> None:
+    """
+    Set the screen-space selection depth window.
+    scale is the X-axis on-screen fraction of the viewport (0.05-1.0, default 0.35).
+    scale_y is the Y-axis fraction; None uses scale for isotropic compatibility.
+    offset_x/offset_y are fractions of available travel (-1 to 1, default 0).
+    When the Selection tool exists but is not active/enabled, enable/modify
+    requests (enabled=True) raise RuntimeError because they cannot be applied
+    atomically; disable requests (enabled=False) are silent atomic no-ops,
+    matching the legacy calls' contract.
+    panel (keyword-only) selects which split panel the window belongs to:
+    - None (default): today's behavior -- writes the projection, which is the
+      focused panel in unsynced independent-dual split and the single global
+      window everywhere else.
+    - 'main': the focused panel, addressed explicitly.
+    - 'left' / 'right': that panel's own window. Outside unsynced
+      independent-dual split, or while panel sync is on, the write fans out
+      to both panels exactly as a global write does.
+    Explicit panel requests are refused while an independent pair is parked
+    in GT: enabled=True raises RuntimeError; enabled=False is a silent atomic
+    no-op, including the global enabled flag. panel=None remains global.
+    A retained Disabled interval accepts global edits; changed geometry
+    discards the retained pair. No-op geometry and enable-only edits retain it.
+    Any other string raises ValueError. The enabled flag is global in every
+    case; only the window geometry is per-panel.
     """
 
 def get_depth_filter() -> tuple[bool, float, float]:
-    """Get depth filter state: (enabled, depth_far, frustum_half_width)."""
+    """
+    Get depth filter state: (enabled, depth_far, frustum_half_width).
+    frustum_half_width is a derived informational read-back of the far-plane-equivalent window half-width (inverse of the set_depth_filter_range conversion).
+    """
 
 def get_depth_filter_range() -> tuple[bool, float, float, float]:
     """
     Get selection depth filter state: (enabled, depth_near, depth_far, frustum_half_width).
+    frustum_half_width is a derived informational read-back of the far-plane-equivalent window half-width (inverse of the set_depth_filter_range conversion).
+    """
+
+def get_depth_filter_window(*, panel: str | None = None) -> tuple[bool, float, float, float, float, float, float]:
+    """
+    Get the screen-space selection depth window:
+    (enabled, near, far, scale_x, scale_y, offset_x, offset_y).
+    panel (keyword-only) selects which split panel is read:
+    - None (default): today's behavior -- the projection, which is the
+      focused panel in unsynced independent-dual split and the single
+      global window everywhere else.
+    - 'main': the focused panel, addressed explicitly.
+    - 'left' / 'right': that panel's own stored window, whatever the
+      split mode. Any other string raises ValueError.
+    The enabled flag is global in every case.
     """
 
 def set_crop_filter(enabled: bool) -> None:

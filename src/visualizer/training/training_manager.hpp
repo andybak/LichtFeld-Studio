@@ -83,11 +83,15 @@ namespace lfs::vis {
         }
 
         bool startTraining();
+        [[nodiscard]] lfs::Status
+        preflightStartParameters();
+        [[nodiscard]] lfs::Error
+        rejectStart(std::string message, lfs::ErrorCode code);
         // Wait for the off-thread initialization phase. Callers must not be the
         // viewer thread; the GUI start path intentionally returns in Starting.
         [[nodiscard]] lfs::Result<void> waitForInitialization();
         void pauseTraining();
-        void resumeTraining();
+        lfs::Status resumeTraining();
         void stopTraining();
         bool requestSaveProject();
         // Suppress the completion notification modal for the next TrainingCompleted
@@ -210,7 +214,7 @@ namespace lfs::vis {
         const lfs::core::param::OptimizationParameters& getEditableOptParams() const { return pending_opt_params_; }
         lfs::core::param::DatasetConfig& getEditableDatasetParams() { return pending_dataset_params_; }
         const lfs::core::param::DatasetConfig& getEditableDatasetParams() const { return pending_dataset_params_; }
-        void applyPendingParams();
+        [[nodiscard]] lfs::Status applyPendingParams();
 
     private:
         struct TrainingCompletionData {
@@ -242,7 +246,6 @@ namespace lfs::vis {
         void completionReaperLoop(std::stop_token stop_token);
         void finishTrainingThreadJoin();
         void dispatchTrainingCompleted(TrainingCompletionData completion);
-
         // State management
         void handleTrainingComplete(bool success, const std::string& error = "",
                                     bool resource_exhausted = false,
@@ -336,6 +339,10 @@ namespace lfs::vis {
             restored_accumulated_training_time_;
         std::optional<lfs::io::project::TrainingFinishReason>
             restored_finish_reason_;
+        // Frozen at Start so worker-side application cannot observe a newer
+        // ParameterManager state than the one synchronously validated.
+        std::optional<lfs::core::param::TrainingParameters>
+            start_params_candidate_;
         bool restored_finish_published_ = false;
         bool stored_session_presentation_active_ = false;
         bool stored_session_presentation_completed_ = false;
@@ -344,6 +351,7 @@ namespace lfs::vis {
         std::string stored_session_presentation_strategy_;
 
         [[nodiscard]] FinishReason resolvedRestoredFinishReason() const;
+        [[nodiscard]] lfs::core::param::TrainingParameters pendingParamsCandidate() const;
         void applyRestoredCheckpointPresentation();
         void publishRestoredTrainingStore();
         void clearStoredSessionPresentation();

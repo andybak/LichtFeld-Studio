@@ -12,9 +12,17 @@
 #include "core/scene.hpp"
 #include "core/services.hpp"
 #include "core/tensor.hpp"
+#include "input/key_codes.hpp"
 #include "io/cache_image_loader.hpp"
 #include "operation/undo_history.hpp"
+#include "operator/operator_registry.hpp"
+#include "operator/ops/depth_window_ops.hpp"
+#include "operator/ops/selection_ops.hpp"
 #include "rendering/coordinate_conventions.hpp"
+#include "rendering/render_constants.hpp"
+#include "rendering/vksplat_viewport_renderer.hpp"
+#include "selection/selection_service.hpp"
+#include "tools/selection_tool.hpp"
 #include "visualizer/gui_capabilities.hpp"
 #include "visualizer/rendering/gt_comparison_cache_utils.hpp"
 #include "visualizer/rendering/render_pass.hpp"
@@ -27,6 +35,7 @@
 #include "visualizer/rendering/viewport_request_builder.hpp"
 #include "visualizer/scene/scene_manager.hpp"
 #include "visualizer/scene_coordinate_utils.hpp"
+#include "visualizer_impl.hpp"
 
 #include <array>
 #include <chrono>
@@ -392,6 +401,43 @@ namespace lfs::vis {
         EXPECT_FALSE(idle_info.enabled);
         EXPECT_TRUE(idle_info.left_name.empty());
         EXPECT_TRUE(idle_info.right_name.empty());
+    }
+
+    TEST(GTComparisonTest, LossHeatmapIsBlackForMatchingPixelsAndHighlightsLargerErrors) {
+        const glm::vec3 ground_truth(0.4f, 0.5f, 0.6f);
+        const glm::vec3 matching = gtLossHeatmapColor(ground_truth, ground_truth);
+        const glm::vec3 small_error = gtLossHeatmapColor(
+            ground_truth, ground_truth + glm::vec3(0.01f));
+        const glm::vec3 large_error = gtLossHeatmapColor(
+            ground_truth, ground_truth + glm::vec3(0.5f));
+
+        EXPECT_EQ(matching, glm::vec3(0.0f));
+        EXPECT_GT(small_error.r + small_error.g + small_error.b, 0.0f);
+        EXPECT_GT(large_error.r + large_error.g + large_error.b,
+                  small_error.r + small_error.g + small_error.b);
+    }
+
+    TEST(GTComparisonTest, LossModeSurvivesSettingsSanitization) {
+        RenderSettings settings;
+        settings.gt_comparison_mode = GTComparisonMode::Loss;
+
+        sanitizeGTComparisonSettings(settings);
+
+        EXPECT_EQ(settings.gt_comparison_mode, GTComparisonMode::Loss);
+    }
+
+    TEST_F(RenderingManagerEventsTest, LossModeDoesNotExposeDraggableDivider) {
+        RenderingManager manager;
+        auto settings = manager.getSettings();
+        settings.split_view_mode = SplitViewMode::GTComparison;
+        settings.gt_comparison_mode = GTComparisonMode::RGB;
+        manager.updateSettings(settings);
+        ASSERT_TRUE(manager.getSplitDividerScreenX({10.0f, 20.0f}, {800.0f, 600.0f}).has_value());
+
+        settings.gt_comparison_mode = GTComparisonMode::Loss;
+        manager.updateSettings(settings);
+
+        EXPECT_FALSE(manager.getSplitDividerScreenX({10.0f, 20.0f}, {800.0f, 600.0f}).has_value());
     }
 
     TEST(SplitViewServiceTest, SceneClearedDisablesSplitViewAndResetsOffset) {
@@ -2564,14 +2610,14 @@ namespace lfs::vis {
                               std::vector<float>(512, 1.0f),
                               {size_t{1}, size_t{1}, size_t{512}},
                               lfs::core::Device::CPU)
-                              .cuda();
+                              .gpu();
         auto right_values = std::vector<float>(512, 2.0f);
         right_values[256] = 42.0f;
         auto right_depth = lfs::core::Tensor::from_vector(
                                right_values,
                                {size_t{1}, size_t{1}, size_t{512}},
                                lfs::core::Device::CPU)
-                               .cuda();
+                               .gpu();
 
         FrameResources resources;
         resources.cached_metadata = CachedRenderMetadata{
@@ -2831,6 +2877,329 @@ namespace lfs::vis {
         EXPECT_TRUE(settings.equirectangular);
         EXPECT_EQ(settings.raster_backend, Backend::ThreeDgut);
         EXPECT_TRUE(settings.gut);
+    }
+
+    TEST_F(RenderingManagerEventsTest, EnablingDepthFilterMigratesConstructorDefaultPositiveZBox) {
+        RenderingManager manager;
+        auto settings = manager.getSettings();
+        ASSERT_FALSE(settings.depth_filter_enabled);
+        ASSERT_EQ(settings.depth_filter_min.z, 0.0f);
+        ASSERT_EQ(settings.depth_filter_max.z, 100.0f);
+
+        settings.depth_filter_enabled = true;
+        manager.updateSettings(settings);
+
+        settings = manager.getSettings();
+        EXPECT_EQ(settings.depth_filter_min.z, -100.0f);
+        EXPECT_EQ(settings.depth_filter_max.z, 0.0f);
+
+        manager.updateSettings(settings);
+        settings = manager.getSettings();
+        EXPECT_EQ(settings.depth_filter_min.z, -100.0f);
+        EXPECT_EQ(settings.depth_filter_max.z, 0.0f);
+    }
+
+    TEST(OverlayParamPackingTest, GTComparisonRenderCameraReplacesDrawAndContainmentIntrinsics) {
+        using lfs::core::Camera;
+        using lfs::core::CameraModelType;
+        using lfs::core::Device;
+        using lfs::core::Tensor;
+
+        Camera camera(
+            Tensor::from_vector({1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f}, {size_t{3}, size_t{3}}, Device::CPU),
+            Tensor::from_vector({0.0f, 0.0f, 0.0f}, {size_t{3}}, Device::CPU),
+            500.0f, 600.0f, 320.0f, 240.0f,
+            Tensor(), Tensor(), CameraModelType::PINHOLE,
+            "test.png", {}, {}, 640, 480, 7);
+        glm::mat4 scene_transform(1.0f);
+        scene_transform = glm::translate(scene_transform, glm::vec3(1.0f, 2.0f, 3.0f));
+        scene_transform = glm::scale(scene_transform, glm::vec3(2.0f, 3.0f, 4.0f));
+        const auto render_camera = detail::buildGTRenderCamera(camera, {1280, 960}, scene_transform);
+        ASSERT_TRUE(render_camera.has_value());
+
+        lfs::rendering::FrameView frame_view{};
+        frame_view.intrinsics_override = lfs::rendering::CameraIntrinsics{
+            .focal_x = 111.0f,
+            .focal_y = 122.0f,
+            .center_x = 133.0f,
+            .center_y = 144.0f};
+        frame_view.containment_intrinsics = lfs::rendering::CameraIntrinsics{
+            .focal_x = 211.0f,
+            .focal_y = 222.0f,
+            .center_x = 233.0f,
+            .center_y = 244.0f};
+        bool equirectangular = true;
+        applyGTComparisonRenderCamera(frame_view, equirectangular, *render_camera);
+
+        ASSERT_TRUE(frame_view.intrinsics_override.has_value());
+        ASSERT_TRUE(frame_view.containment_intrinsics.has_value());
+        EXPECT_FLOAT_EQ(frame_view.intrinsics_override->focal_x, 1000.0f);
+        EXPECT_FLOAT_EQ(frame_view.intrinsics_override->focal_y, 1200.0f);
+        EXPECT_FLOAT_EQ(frame_view.intrinsics_override->center_x, 640.0f);
+        EXPECT_FLOAT_EQ(frame_view.intrinsics_override->center_y, 480.0f);
+        EXPECT_FLOAT_EQ(frame_view.containment_intrinsics->focal_x, 1000.0f);
+        EXPECT_FLOAT_EQ(frame_view.containment_intrinsics->focal_y, 1200.0f);
+        EXPECT_FLOAT_EQ(frame_view.containment_intrinsics->center_x, 640.0f);
+        EXPECT_FLOAT_EQ(frame_view.containment_intrinsics->center_y, 480.0f);
+        EXPECT_FALSE(frame_view.orthographic);
+        EXPECT_FLOAT_EQ(frame_view.ortho_scale, lfs::rendering::DEFAULT_ORTHO_SCALE);
+        EXPECT_FALSE(equirectangular);
+    }
+
+    TEST(OverlayParamPackingTest, OverlayParamsCarryUnjitteredContainmentIntrinsics) {
+        lfs::rendering::ViewportRenderRequest request{};
+        request.frame_view.size = {640, 480};
+        request.frame_view.intrinsics_override = lfs::rendering::CameraIntrinsics{
+            .focal_x = 111.0f,
+            .focal_y = 122.0f,
+            .center_x = 133.25f,
+            .center_y = 144.125f};
+        request.frame_view.containment_intrinsics = lfs::rendering::CameraIntrinsics{
+            .focal_x = 211.0f,
+            .focal_y = 222.0f,
+            .center_x = 233.0f,
+            .center_y = 244.0f};
+        request.filters.view_volume = lfs::rendering::BoundingBox{
+            .min = glm::vec3(-1.0f),
+            .max = glm::vec3(1.0f),
+            .transform = glm::mat4(1.0f)};
+        request.filters.screen_window = lfs::rendering::SelectionScreenWindow{};
+
+        const auto packed = detail::buildOverlayParamsCpuFloats(request, false, false, false, 0, false);
+        ASSERT_TRUE(packed.has_value());
+        const std::size_t base = static_cast<std::size_t>(detail::ViewIntrinsics) * 4u;
+        EXPECT_FLOAT_EQ((*packed)[base + 0], 211.0f);
+        EXPECT_FLOAT_EQ((*packed)[base + 1], 222.0f);
+        EXPECT_FLOAT_EQ((*packed)[base + 2], 233.0f);
+        EXPECT_FLOAT_EQ((*packed)[base + 3], 244.0f);
+    }
+
+    TEST(OverlayParamPackingTest, OverlayParamsSlotTwelveStaysZeroWithoutContainmentIntrinsics) {
+        lfs::rendering::ViewportRenderRequest request{};
+        request.frame_view.size = {640, 480};
+        request.frame_view.intrinsics_override = lfs::rendering::CameraIntrinsics{
+            .focal_x = 111.0f,
+            .focal_y = 122.0f,
+            .center_x = 133.0f,
+            .center_y = 144.0f};
+        request.filters.view_volume = lfs::rendering::BoundingBox{
+            .min = glm::vec3(-1.0f),
+            .max = glm::vec3(1.0f),
+            .transform = glm::mat4(1.0f)};
+        request.filters.screen_window = lfs::rendering::SelectionScreenWindow{};
+
+        const auto packed = detail::buildOverlayParamsCpuFloats(request, false, false, false, 0, false);
+        ASSERT_TRUE(packed.has_value());
+        const std::size_t base = static_cast<std::size_t>(detail::ViewIntrinsics) * 4u;
+        EXPECT_FLOAT_EQ((*packed)[base + 0], 0.0f);
+        EXPECT_FLOAT_EQ((*packed)[base + 1], 0.0f);
+        EXPECT_FLOAT_EQ((*packed)[base + 2], 0.0f);
+        EXPECT_FLOAT_EQ((*packed)[base + 3], 0.0f);
+    }
+
+    TEST(OverlayParamPackingTest, OverlayParamsSlotTwelveStaysZeroForOrthographic) {
+        lfs::rendering::ViewportRenderRequest request{};
+        request.frame_view.size = {640, 480};
+        request.frame_view.orthographic = true;
+        request.frame_view.containment_intrinsics = lfs::rendering::CameraIntrinsics{
+            .focal_x = 211.0f,
+            .focal_y = 222.0f,
+            .center_x = 233.0f,
+            .center_y = 244.0f};
+        request.filters.view_volume = lfs::rendering::BoundingBox{
+            .min = glm::vec3(-1.0f),
+            .max = glm::vec3(1.0f),
+            .transform = glm::mat4(1.0f)};
+        request.filters.screen_window = lfs::rendering::SelectionScreenWindow{};
+
+        const auto packed = detail::buildOverlayParamsCpuFloats(request, false, false, false, 0, false);
+        ASSERT_TRUE(packed.has_value());
+        const std::size_t base = static_cast<std::size_t>(detail::ViewIntrinsics) * 4u;
+        EXPECT_FLOAT_EQ((*packed)[base + 0], 0.0f);
+        EXPECT_FLOAT_EQ((*packed)[base + 1], 0.0f);
+        EXPECT_FLOAT_EQ((*packed)[base + 2], 0.0f);
+        EXPECT_FLOAT_EQ((*packed)[base + 3], 0.0f);
+    }
+
+    TEST(OverlayParamPackingTest, OverlayParamLayoutAndAnisotropicScreenWindowPacking) {
+        static_assert(detail::ViewIntrinsics == 12);
+        static_assert(detail::ViewWindow == 206);
+        static_assert(detail::ParamCount == 207);
+
+        lfs::rendering::ViewportRenderRequest request{};
+        request.frame_view.size = {640, 480};
+        request.filters.view_volume = lfs::rendering::BoundingBox{
+            .min = glm::vec3(-1.0f),
+            .max = glm::vec3(1.0f),
+            .transform = glm::mat4(1.0f)};
+        request.filters.screen_window = lfs::rendering::SelectionScreenWindow{
+            .scale_x = 0.25f,
+            .scale_y = 0.75f,
+            .offset_x = 0.15f,
+            .offset_y = -0.35f,
+        };
+
+        const auto packed = detail::buildOverlayParamsCpuFloats(request, false, false, false, 0, false);
+        ASSERT_TRUE(packed.has_value());
+
+        const std::size_t view_flags_base = static_cast<std::size_t>(detail::ViewFlags) * 4u;
+        EXPECT_FLOAT_EQ((*packed)[view_flags_base + 3], 0.0f);
+
+        const std::size_t view_window_base = static_cast<std::size_t>(detail::ViewWindow) * 4u;
+        EXPECT_FLOAT_EQ((*packed)[view_window_base + 0], 0.25f);
+        EXPECT_FLOAT_EQ((*packed)[view_window_base + 1], 0.75f);
+        EXPECT_FLOAT_EQ((*packed)[view_window_base + 2], 0.0f);
+        EXPECT_FLOAT_EQ((*packed)[view_window_base + 3], 0.0f);
+    }
+
+    TEST(OverlayParamPackingTest, ViewWindowZPacksDepthWindowDragPreviewFlag) {
+        const std::size_t view_window_base = static_cast<std::size_t>(detail::ViewWindow) * 4u;
+
+        lfs::rendering::ViewportRenderRequest preview_on{};
+        preview_on.frame_view.size = {640, 480};
+        preview_on.filters.view_volume = lfs::rendering::BoundingBox{
+            .min = glm::vec3(-1.0f),
+            .max = glm::vec3(1.0f),
+            .transform = glm::mat4(1.0f)};
+        preview_on.filters.screen_window = lfs::rendering::SelectionScreenWindow{
+            .scale_x = 0.25f,
+            .scale_y = 0.75f,
+            .drag_preview = true,
+        };
+
+        const auto packed_on =
+            detail::buildOverlayParamsCpuFloats(preview_on, false, false, false, 0, false);
+        ASSERT_TRUE(packed_on.has_value());
+        EXPECT_FLOAT_EQ((*packed_on)[view_window_base + 2], 1.0f);
+        EXPECT_FLOAT_EQ((*packed_on)[view_window_base + 3], 0.0f);
+
+        lfs::rendering::ViewportRenderRequest preview_off = preview_on;
+        preview_off.filters.screen_window->drag_preview = false;
+
+        const auto packed_off =
+            detail::buildOverlayParamsCpuFloats(preview_off, false, false, false, 0, false);
+        ASSERT_TRUE(packed_off.has_value());
+        EXPECT_FLOAT_EQ((*packed_off)[view_window_base + 2], 0.0f);
+        EXPECT_FLOAT_EQ((*packed_off)[view_window_base + 3], 0.0f);
+    }
+
+    class DepthWindowGtHookTest : public ::testing::Test {
+    protected:
+        void SetUp() override {
+            lfs::event::EventBridge::instance().clear_all();
+            lfs::core::event::bus().clear_all();
+            lfs::vis::services().clear();
+            lfs::vis::op::undoHistory().clear();
+
+            options_.show_startup_overlay = false;
+            options_.width = 200;
+            options_.height = 200;
+            viewer_ = std::make_unique<lfs::vis::VisualizerImpl>(options_);
+            viewer_->initializeTools();
+
+            rendering_manager_ = viewer_->getRenderingManager();
+            selection_tool_ = viewer_->getSelectionTool();
+            ASSERT_NE(rendering_manager_, nullptr);
+            ASSERT_NE(selection_tool_, nullptr);
+
+            const std::vector<float> means_data{0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+            const std::vector<float> rotation_data{1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f};
+            auto means = lfs::core::Tensor::from_vector(means_data, {size_t{2}, size_t{3}}, lfs::core::Device::GPU).to(lfs::core::DataType::Float32);
+            auto sh0 = lfs::core::Tensor::zeros({size_t{2}, size_t{1}, size_t{3}}, lfs::core::Device::GPU, lfs::core::DataType::Float32);
+            auto shN = lfs::core::Tensor::zeros({size_t{2}, size_t{3}, size_t{3}}, lfs::core::Device::GPU, lfs::core::DataType::Float32);
+            auto scaling = lfs::core::Tensor::zeros({size_t{2}, size_t{3}}, lfs::core::Device::GPU, lfs::core::DataType::Float32);
+            auto rotation = lfs::core::Tensor::from_vector(rotation_data, {size_t{2}, size_t{4}}, lfs::core::Device::GPU).to(lfs::core::DataType::Float32);
+            auto opacity = lfs::core::Tensor::zeros({size_t{2}, size_t{1}}, lfs::core::Device::GPU, lfs::core::DataType::Float32);
+            viewer_->getSceneManager()->getScene().addSplat(
+                "depth_window_test",
+                std::make_unique<lfs::core::SplatData>(1, std::move(means), std::move(sh0), std::move(shN), std::move(scaling), std::move(rotation), std::move(opacity), 1.0f));
+            viewer_->getSceneManager()->initSelectionService();
+            if (auto* const service = viewer_->getSceneManager()->getSelectionService()) {
+                service->setTestingViewport({
+                    .x = 0.0f,
+                    .y = 0.0f,
+                    .width = static_cast<float>(options_.width),
+                    .height = static_cast<float>(options_.height),
+                    .render_width = options_.width,
+                    .render_height = options_.height,
+                });
+            }
+            selection_tool_->setEnabled(true);
+
+            auto settings = rendering_manager_->getSettings();
+            settings.depth_filter_enabled = true;
+            settings.depth_filter_scale_x = 0.5f;
+            settings.depth_filter_scale_y = 0.5f;
+            rendering_manager_->updateSettings(settings);
+            selection_tool_->setDepthFilterEnabled(true);
+        }
+
+        void TearDown() override {
+            lfs::vis::op::operators().cancelModalOperator();
+            lfs::event::EventBridge::instance().clear_all();
+            lfs::core::event::bus().clear_all();
+            lfs::vis::services().clear();
+            viewer_.reset();
+            lfs::vis::op::undoHistory().clear();
+        }
+
+        bool startDepthDrag() {
+            lfs::vis::op::OperatorProperties props;
+            props.set("x", 10.0);
+            props.set("y", 10.0);
+            props.set("viewport_x", 0.0f);
+            props.set("viewport_y", 0.0f);
+            props.set("viewport_width", static_cast<float>(options_.width));
+            props.set("viewport_height", static_cast<float>(options_.height));
+            props.set("modifiers", lfs::vis::input::KEYMOD_SHIFT | lfs::vis::input::KEYMOD_ALT);
+            const auto result = lfs::vis::op::operators().invoke(lfs::vis::op::BuiltinOp::DepthWindowDrag, &props);
+            return result.status == lfs::vis::op::OperatorResult::RUNNING_MODAL;
+        }
+
+        lfs::vis::ViewerOptions options_{};
+        std::unique_ptr<lfs::vis::VisualizerImpl> viewer_;
+        lfs::vis::RenderingManager* rendering_manager_ = nullptr;
+        lfs::vis::tools::SelectionTool* selection_tool_ = nullptr;
+    };
+
+    TEST_F(DepthWindowGtHookTest, GtToggleCancelsDepthWindowDragAndClearsHover) {
+        ASSERT_TRUE(startDepthDrag());
+        const op::ModalEvent move{
+            .type = op::ModalEvent::Type::MOUSE_MOVE,
+            .data = MouseMoveEvent{
+                .position = {60.0, 60.0},
+                .delta = {50.0, 50.0},
+            },
+        };
+        ASSERT_EQ(op::operators().dispatchModalEvent(move), op::OperatorResult::RUNNING_MODAL);
+        ASSERT_TRUE(rendering_manager_->depthWindowDragPreview());
+        (void)lfs::vis::op::updateDepthWindowHover(
+            glm::vec2(50.0f, 50.0f),
+            glm::vec4(0.0f, 0.0f, static_cast<float>(options_.width), static_cast<float>(options_.height)),
+            true);
+
+        lfs::core::events::cmd::ToggleGTComparison{}.emit();
+
+        EXPECT_FALSE(rendering_manager_->depthWindowDragPreview());
+        EXPECT_FALSE(lfs::vis::op::operators().hasModalOperator());
+        EXPECT_FALSE(lfs::vis::op::depthWindowOverlayState().visible);
+        EXPECT_EQ(lfs::vis::op::depthWindowOverlayState().hovered_handle, lfs::vis::op::DepthWindowHandle::None);
+    }
+
+    TEST_F(DepthWindowGtHookTest, GtToggleLeavesUnrelatedSelectionStrokeModalActive) {
+        lfs::vis::op::OperatorProperties stroke_props;
+        stroke_props.set("mode", 0);
+        stroke_props.set("op", 0);
+        stroke_props.set("x", 30.0);
+        stroke_props.set("y", 30.0);
+        const auto stroke = lfs::vis::op::operators().invoke(lfs::vis::op::BuiltinOp::SelectionStroke, &stroke_props);
+        ASSERT_EQ(stroke.status, lfs::vis::op::OperatorResult::RUNNING_MODAL);
+
+        lfs::core::events::cmd::ToggleGTComparison{}.emit();
+
+        EXPECT_TRUE(lfs::vis::op::operators().hasModalOperator());
+        EXPECT_EQ(lfs::vis::op::operators().activeModalId(), "selection.stroke");
+        lfs::vis::op::operators().cancelModalOperator();
     }
 
 } // namespace lfs::vis

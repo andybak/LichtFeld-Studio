@@ -41,6 +41,7 @@
 #include "training/trainer.hpp"
 #include "training/training_setup.hpp"
 #include "visualizer/app_store.hpp"
+#include "visualizer/core/parameter_manager.hpp"
 #include "visualizer/core/services.hpp"
 #include "visualizer/operation/undo_history.hpp"
 #include "visualizer/scene/scene_manager.hpp"
@@ -195,9 +196,9 @@ namespace lfs::python {
 
         lfs::training::BilateralGrid grid(1, 2, 2, 2, 100);
         auto cpu_image = core::Tensor::ones({3, 2, 2}, core::Device::CPU);
-        auto wrong_channels = core::Tensor::ones({2, 2, 2}, core::Device::CUDA);
-        auto image = core::Tensor::ones({3, 2, 2}, core::Device::CUDA);
-        auto wrong_grad = core::Tensor::ones({3, 2, 1}, core::Device::CUDA);
+        auto wrong_channels = core::Tensor::ones({2, 2, 2}, core::Device::GPU);
+        auto image = core::Tensor::ones({3, 2, 2}, core::Device::GPU);
+        auto wrong_grad = core::Tensor::ones({3, 2, 1}, core::Device::GPU);
 
         EXPECT_THROW((void)grid.apply(cpu_image, 0), std::invalid_argument);
         EXPECT_THROW((void)grid.apply(wrong_channels, 0), std::invalid_argument);
@@ -206,8 +207,8 @@ namespace lfs::python {
 
     TEST(BilateralGridValidationTest, SingletonImageAxesRemainFinite) {
         lfs::training::BilateralGrid grid(1, 2, 2, 2, 100);
-        auto image = core::Tensor::ones({3, 1, 1}, core::Device::CUDA);
-        auto grad = core::Tensor::ones({3, 1, 1}, core::Device::CUDA);
+        auto image = core::Tensor::ones({3, 1, 1}, core::Device::GPU);
+        auto grad = core::Tensor::ones({3, 1, 1}, core::Device::GPU);
 
         const auto output = grid.apply(image, 0).cpu().to_vector();
         const auto grad_input = grid.backward(image, grad, 0).cpu().to_vector();
@@ -224,12 +225,12 @@ namespace lfs::python {
         std::vector<float> rotation{1.0f, 0.0f, 0.0f, 0.0f};
         return std::make_unique<core::SplatData>(
             0,
-            core::Tensor::zeros({n, 3}, core::Device::CUDA),
-            core::Tensor::zeros({n, 1, 3}, core::Device::CUDA),
-            core::Tensor::zeros({n, 0, 3}, core::Device::CUDA),
-            core::Tensor::zeros({n, 3}, core::Device::CUDA),
-            core::Tensor::from_vector(rotation, {n, 4}, core::Device::CUDA),
-            core::Tensor::zeros({n, 1}, core::Device::CUDA),
+            core::Tensor::zeros({n, 3}, core::Device::GPU),
+            core::Tensor::zeros({n, 1, 3}, core::Device::GPU),
+            core::Tensor::zeros({n, 0, 3}, core::Device::GPU),
+            core::Tensor::zeros({n, 3}, core::Device::GPU),
+            core::Tensor::from_vector(rotation, {n, 4}, core::Device::GPU),
+            core::Tensor::zeros({n, 1}, core::Device::GPU),
             1.0f);
     }
 
@@ -331,7 +332,7 @@ namespace lfs::python {
         core::param::TrainingParameters initial;
         initial.optimization.iterations = 1;
         initial.dataset.output_name = "generation_1";
-        trainer.setParams(initial);
+        ASSERT_TRUE(trainer.setParams(initial));
 
         std::atomic<bool> writer_done{false};
         std::thread writer([&] {
@@ -339,7 +340,7 @@ namespace lfs::python {
                 auto params = trainer.getParams();
                 params.optimization.iterations = generation;
                 params.dataset.output_name = "generation_" + std::to_string(generation);
-                trainer.setParams(params);
+                static_cast<void>(trainer.setParams(params));
             }
             writer_done.store(true, std::memory_order_release);
         });
@@ -354,6 +355,34 @@ namespace lfs::python {
         const auto final_snapshot = trainer.getParams();
         EXPECT_EQ(final_snapshot.dataset.output_name,
                   "generation_" + std::to_string(final_snapshot.optimization.iterations));
+    }
+
+    TEST(TrainerConstructionTest, InvalidParameterUpdateReturnsTheRejectionReason) {
+        core::Scene scene;
+        const auto cameras = scene.addGroup("Cameras");
+        scene.addCamera("camera.png", cameras, make_test_camera());
+        training::Trainer trainer(scene);
+        const auto original = trainer.getParams();
+        auto invalid = original;
+        invalid.optimization.gut = true;
+        invalid.optimization.use_depth_loss = true;
+
+        const auto updated = trainer.setParams(invalid);
+
+        ASSERT_FALSE(updated.has_value());
+        EXPECT_NE(
+            updated.error().user_message().find("Depth Loss"),
+            std::string::npos);
+        EXPECT_EQ(
+            trainer.getParams().optimization.to_json(),
+            original.optimization.to_json());
+
+        const auto restored = trainer.setParams(original);
+        ASSERT_TRUE(restored.has_value())
+            << lfs::format_for_developer(restored.error());
+        EXPECT_EQ(
+            trainer.getParams().optimization.to_json(),
+            original.optimization.to_json());
     }
 
     TEST(TrainerConstructionTest, InitializeRejectsInvalidIntervalsBeforeTraining) {
@@ -602,7 +631,7 @@ namespace lfs::python {
 
         std::shared_ptr<core::MeshData> make_test_mesh(const core::Device device = core::Device::CPU) {
             auto mesh = std::make_shared<core::MeshData>(make_test_mesh_data());
-            if (device == core::Device::CUDA) {
+            if (device == core::Device::GPU) {
                 mesh->vertices = mesh->vertices.to(device);
                 mesh->indices = mesh->indices.to(device);
             }
@@ -717,24 +746,26 @@ namespace lfs::python {
         const auto no_camera_node_count = scene.getNodeCount();
         ASSERT_EQ(manager.getState(), lfs::vis::TrainingState::Ready);
 
-        std::promise<std::string> completion_error;
-        auto completion_future = completion_error.get_future();
-        const auto handler_id = lfs::core::events::state::TrainingCompleted::when(
+        std::string rejection_error;
+        int completions = 0;
+        const auto completion_id = lfs::core::events::state::TrainingCompleted::when(
+            [&](const auto&) { ++completions; });
+        const auto handler_id = lfs::core::events::state::TrainingStartRejected::when(
             [&](const auto& event) {
-                if (!event.success) {
-                    completion_error.set_value(event.error.value_or(""));
-                }
+                rejection_error = event.error;
             });
 
         ASSERT_FALSE(manager.startTraining());
         EXPECT_EQ(manager.getState(), lfs::vis::TrainingState::Ready);
         EXPECT_FALSE(manager.isCompletionPending());
-        ASSERT_EQ(completion_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
-        EXPECT_FALSE(completion_future.get().empty());
+        EXPECT_FALSE(rejection_error.empty());
+        EXPECT_EQ(completions, 0);
         EXPECT_TRUE(manager.lastTrainingError().has_value());
 
         lfs::event::EventBridge::instance().unsubscribe(
-            typeid(lfs::core::events::state::TrainingCompleted), handler_id);
+            typeid(lfs::core::events::state::TrainingStartRejected), handler_id);
+        lfs::event::EventBridge::instance().unsubscribe(
+            typeid(lfs::core::events::state::TrainingCompleted), completion_id);
 
         EXPECT_EQ(initial_node_count, no_camera_node_count + 2);
         EXPECT_EQ(scene.getNodeCount(), no_camera_node_count);
@@ -743,11 +774,83 @@ namespace lfs::python {
         EXPECT_EQ(scene.getTrainingModel()->size(), 1u);
     }
 
+    TEST(TrainerConstructionTest, StartRejectsInvalidPendingParamsBeforeTransition) {
+        struct EventScope {
+            EventScope() { lfs::event::EventBridge::instance().clear_all(); }
+            ~EventScope() { lfs::event::EventBridge::instance().clear_all(); }
+        } event_scope;
+        struct ServicesScope {
+            ServicesScope() { lfs::vis::services().clear(); }
+            ~ServicesScope() { lfs::vis::services().clear(); }
+        } services_scope;
+
+        core::Scene scene;
+        const auto cameras = scene.addGroup("Cameras");
+        ASSERT_NE(scene.addCamera("camera.png", cameras, make_test_camera()),
+                  core::NULL_NODE);
+        auto trainer = std::make_unique<training::Trainer>(scene);
+        const auto installed_params = trainer->getParams();
+
+        lfs::vis::ParameterManager parameter_manager;
+        ASSERT_TRUE(parameter_manager.ensureLoaded());
+        parameter_manager.setActiveStrategy("mcmc");
+        parameter_manager.modifyActiveParams([](auto& pending) {
+            pending.gut = true;
+            pending.use_depth_loss = true;
+        });
+        lfs::vis::services().set(&parameter_manager);
+        lfs::vis::TrainerManager manager;
+        manager.setScene(&scene);
+        manager.setTrainer(std::move(trainer));
+
+        EXPECT_FALSE(manager.startTraining());
+        EXPECT_EQ(manager.getState(), lfs::vis::TrainingState::Ready);
+        EXPECT_NE(manager.getLastError().find("Depth Loss"),
+                  std::string::npos);
+        // No run was accepted: a command rejection is not an initialization result.
+        EXPECT_TRUE(manager.waitForInitialization());
+        ASSERT_NE(manager.getTrainer(), nullptr);
+        EXPECT_EQ(manager.getTrainer()->getParams().optimization.to_json(),
+                  installed_params.optimization.to_json());
+    }
+
+    TEST(TrainerConstructionTest, ResumeRejectsInvalidPendingParamsWithoutLeavingPaused) {
+        struct EventScope {
+            EventScope() { lfs::event::EventBridge::instance().clear_all(); }
+            ~EventScope() { lfs::event::EventBridge::instance().clear_all(); }
+        } event_scope;
+        struct ServicesScope {
+            ServicesScope() { lfs::vis::services().clear(); }
+            ~ServicesScope() { lfs::vis::services().clear(); }
+        } services_scope;
+        core::Scene scene;
+        const auto cameras = scene.addGroup("Cameras");
+        ASSERT_NE(scene.addCamera("camera.png", cameras, make_test_camera()), core::NULL_NODE);
+        lfs::vis::TrainerManager manager;
+        manager.setScene(&scene);
+        manager.setTrainerFromCheckpoint(std::make_unique<training::Trainer>(scene), 1);
+        ASSERT_TRUE(manager.isPaused());
+        auto& pending = manager.getEditableOptParams();
+        pending.gut = true;
+        pending.mip_filter = true;
+        const auto resumed = manager.resumeTraining();
+        ASSERT_FALSE(resumed);
+        EXPECT_NE(resumed.error().user_message().find("Mip Filter"), std::string::npos);
+        EXPECT_TRUE(manager.isPaused());
+        EXPECT_FALSE(manager.isCompletionPending());
+        EXPECT_NE(manager.getLastError().find("Mip Filter"), std::string::npos);
+        EXPECT_TRUE(manager.waitForInitialization());
+    }
+
     TEST(TrainerConstructionTest, StartAcknowledgesBeforeWorkerInitializationFailure) {
         struct EventScope {
             EventScope() { lfs::event::EventBridge::instance().clear_all(); }
             ~EventScope() { lfs::event::EventBridge::instance().clear_all(); }
         } event_scope;
+        struct ServicesScope {
+            ServicesScope() { lfs::vis::services().clear(); }
+            ~ServicesScope() { lfs::vis::services().clear(); }
+        } services_scope;
 
         core::Scene scene;
         const auto model_id = scene.addSplat("Model", make_test_splat(1));
@@ -763,7 +866,7 @@ namespace lfs::python {
         params.init_path = (std::filesystem::temp_directory_path() /
                             "lichtfeld-missing-training-init.ply")
                                .string();
-        trainer->setParams(params);
+        ASSERT_TRUE(trainer->setParams(params));
         std::unique_lock initialization_lock(trainer->getRenderMutex());
 
         lfs::vis::TrainerManager manager;
@@ -792,8 +895,20 @@ namespace lfs::python {
         ASSERT_TRUE(manager.startTraining());
         EXPECT_EQ(manager.getState(), lfs::vis::TrainingState::Starting);
         EXPECT_FALSE(weights_prepared);
+        // The worker must apply the exact candidate accepted by Start, even if
+        // a script changes the pending slot before initialization acquires it.
+        manager.getEditableOptParams().enable_eval = false;
+        const auto rejected = manager.rejectStart("Training is starting.", lfs::ErrorCode::FailedPrecondition);
+        EXPECT_EQ(rejected.user_message(), "Training is starting.");
+        EXPECT_TRUE(manager.getLastError().empty());
+        EXPECT_FALSE(manager.lastTrainingError());
+        auto initialization_result = std::async(std::launch::async, [&] {
+            return manager.waitForInitialization();
+        });
+        EXPECT_EQ(initialization_result.wait_for(std::chrono::milliseconds(50)),
+                  std::future_status::timeout);
         initialization_lock.unlock();
-        ASSERT_FALSE(manager.waitForInitialization());
+        ASSERT_FALSE(initialization_result.get());
         EXPECT_TRUE(weights_prepared);
         ASSERT_EQ(completion_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
 
@@ -1292,7 +1407,7 @@ namespace lfs::python {
                     const std::string_view name) {
                 EXPECT_EQ(dtype, core::DataType::Float32);
                 calls->push_back({std::string{name}, requested_capacity});
-                auto tensor = core::Tensor::zeros_direct(std::move(shape), requested_capacity, core::Device::CUDA);
+                auto tensor = core::Tensor::zeros_direct(std::move(shape), requested_capacity, core::Device::GPU);
                 tensor.set_name(std::string{name});
                 return tensor;
             };
@@ -1346,7 +1461,7 @@ namespace lfs::python {
                     const std::string_view name) {
                 EXPECT_EQ(dtype, core::DataType::Float32);
                 calls->push_back({std::string{name}, requested_capacity});
-                auto tensor = core::Tensor::zeros_direct(std::move(shape), requested_capacity, core::Device::CUDA);
+                auto tensor = core::Tensor::zeros_direct(std::move(shape), requested_capacity, core::Device::GPU);
                 tensor.set_name(std::string{name});
                 return tensor;
             };
@@ -1421,7 +1536,7 @@ namespace lfs::python {
                                 const core::DataType,
                                 const std::string_view) {
                 ++allocation_calls;
-                return core::Tensor::zeros_direct(std::move(shape), requested_capacity, core::Device::CUDA);
+                return core::Tensor::zeros_direct(std::move(shape), requested_capacity, core::Device::GPU);
             };
 
         auto* training_model = dummy_scene_.getTrainingModel();
@@ -1467,7 +1582,7 @@ namespace lfs::python {
                                 const core::DataType,
                                 const std::string_view name) {
                 ++allocation_calls;
-                auto tensor = core::Tensor::zeros_direct(std::move(shape), requested_capacity, core::Device::CUDA);
+                auto tensor = core::Tensor::zeros_direct(std::move(shape), requested_capacity, core::Device::GPU);
                 tensor.set_name(std::string{name});
                 return tensor;
             };
@@ -1670,7 +1785,7 @@ namespace lfs::python {
 
     TEST_F(SceneValidityTest, SceneManagerClearReleasesMeshRayPickCpuCache) {
         lfs::vis::SceneManager scene_manager;
-        auto mesh = make_test_mesh(core::Device::CUDA);
+        auto mesh = make_test_mesh(core::Device::GPU);
         ASSERT_NE(scene_manager.getScene().addMesh("Triangle", mesh), core::NULL_NODE);
         const auto before_pick = core::PinnedMemoryAllocator::instance().get_stats();
 

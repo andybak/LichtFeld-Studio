@@ -215,7 +215,7 @@ TEST_F(SceneConsolidationExtractTest, SingleVisibleNodeAliasesWithoutAllocatorUs
                            lfs::core::DataType dtype,
                            std::string_view) {
             ++allocator_calls;
-            return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+            return Tensor::empty(std::move(shape), Device::GPU, dtype);
         });
 
     const auto* combined = scene.getCombinedModel();
@@ -248,7 +248,7 @@ TEST_F(SceneConsolidationExtractTest, WorkerBuildMatchesSynchronousCombinedModel
             allocation_shape_rows.push_back(shape[0]);
             allocation_capacities.push_back(capacity);
             allocation_names.emplace_back(name);
-            return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+            return Tensor::empty(std::move(shape), Device::GPU, dtype);
         };
 
     Tensor::trim_memory_pool();
@@ -296,6 +296,7 @@ TEST_F(SceneConsolidationExtractTest, WorkerBuildMatchesSynchronousCombinedModel
               lfs::core::NULL_NODE);
     ASSERT_NE(synchronous.addSplat("second", std::make_unique<SplatData>(second->clone())),
               lfs::core::NULL_NODE);
+    ASSERT_EQ(synchronous.consolidateNodeModels(), 2u);
     const auto* expected = synchronous.getCombinedModel();
     ASSERT_NE(expected, nullptr);
 
@@ -304,7 +305,7 @@ TEST_F(SceneConsolidationExtractTest, WorkerBuildMatchesSynchronousCombinedModel
     EXPECT_EQ(worker_build->model->scaling_raw().to_vector(), expected->scaling_raw().to_vector());
     EXPECT_EQ(worker_build->model->rotation_raw().to_vector(), expected->rotation_raw().to_vector());
     EXPECT_EQ(worker_build->model->opacity_raw().to_vector(), expected->opacity_raw().to_vector());
-    EXPECT_EQ(worker_build->model->shN_raw().to_vector(), expected->shN_raw().to_vector());
+    expect_shN_q16(worker_build->model->shN_canonical().to_vector(), expected->shN_canonical().to_vector());
 }
 
 TEST_F(SceneConsolidationExtractTest, SceneDestructionJoinsCombinedModelWorker) {
@@ -335,7 +336,7 @@ TEST_F(SceneConsolidationExtractTest, SceneDestructionJoinsCombinedModelWorker) 
                 allocator_entered = true;
                 gate_changed.notify_all();
                 gate_changed.wait(lock, [&] { return release_allocator; });
-                return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+                return Tensor::empty(std::move(shape), Device::GPU, dtype);
             });
         scene.requestCombinedModelBuild(true);
     }
@@ -362,7 +363,7 @@ TEST_F(SceneConsolidationExtractTest, RemovingNodeRetiresModelUntilWorkerPoll) {
             allocator_entered = true;
             gate_changed.notify_all();
             gate_changed.wait(lock, [&] { return release_allocator; });
-            return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+            return Tensor::empty(std::move(shape), Device::GPU, dtype);
         });
 
     scene.requestCombinedModelBuild(true);
@@ -414,7 +415,7 @@ TEST_F(SceneConsolidationExtractTest, ReplacingNodeModelRetiresPreviousUntilWork
             allocator_entered = true;
             gate_changed.notify_all();
             gate_changed.wait(lock, [&] { return release_allocator; });
-            return Tensor::empty(std::move(shape), Device::CUDA, dtype);
+            return Tensor::empty(std::move(shape), Device::GPU, dtype);
         });
 
     scene.requestCombinedModelBuild(true);
@@ -446,6 +447,10 @@ TEST_F(SceneConsolidationExtractTest, ReplacingNodeModelRetiresPreviousUntilWork
     // rejected.
     scene.removeNodeById(second_id);
     EXPECT_EQ(scene.getCombinedModel(), replaced->model.get());
+    while (scene.combinedModelBuildPending()) {
+        std::this_thread::yield();
+        static_cast<void>(scene.getCombinedModel());
+    }
     EXPECT_FALSE(scene.combinedModelBuildPending());
 }
 

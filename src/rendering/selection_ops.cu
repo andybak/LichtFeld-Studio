@@ -5,10 +5,16 @@
 #include "selection_ops.hpp"
 
 #include "core/cuda_error.hpp"
-#include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/gpu_backend_fwd.hpp"
+#include "core/logger.hpp"
+#include "core/tensor/backend/cuda/runtime/cuda_stream_context.hpp"
+#include "core/tensor/backend/gpu_backend_ops.hpp"
+#include "rendering/render_constants.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -16,7 +22,6 @@
 
 namespace lfs::rendering {
     namespace {
-        constexpr float kInvalidScreenPositionThreshold = -1000.0f;
         constexpr int kBlockSize = 256;
         constexpr int kCountMaxBlocks = 4096;
         constexpr int kSelectionGroupCount = 256;
@@ -31,6 +36,11 @@ namespace lfs::rendering {
             return static_cast<int>(value);
         }
 
+        [[nodiscard]] bool isCudaGpu(const Tensor& tensor) {
+            return tensor.is_valid() && tensor.device() == lfs::core::Device::GPU &&
+                   lfs::core::gpu_backend_of(tensor) == lfs::core::GpuBackend::CUDA;
+        }
+
         [[nodiscard]] cudaStream_t currentSelectionStream(const Tensor* const tensor = nullptr) {
             if (const cudaStream_t stream = lfs::core::getCurrentCUDAStream()) {
                 return stream;
@@ -41,6 +51,14 @@ namespace lfs::rendering {
         template <std::size_t N>
         void copySelectionCountsToHost(const Tensor& counts_scratch,
                                        std::array<int, N>& host_counts) {
+            if (lfs::core::gpu_backend_of(counts_scratch) == lfs::core::GpuBackend::Vulkan) {
+                const Tensor host = counts_scratch.cpu().contiguous();
+                if (!host.is_valid() || host.numel() < N || host.ptr<int>() == nullptr) {
+                    throw std::runtime_error("invalid Vulkan selection-count scratch");
+                }
+                std::memcpy(host_counts.data(), host.ptr<int>(), sizeof(host_counts));
+                return;
+            }
             const cudaStream_t stream = currentSelectionStream(&counts_scratch);
             if (const cudaError_t status = cudaMemcpyAsync(host_counts.data(),
                                                            counts_scratch.ptr<int>(),
@@ -81,25 +99,44 @@ namespace lfs::rendering {
         };
 
         [[nodiscard]] Tensor uploadBoolMask(const std::vector<bool>& mask) {
+            // This helper feeds raw CUDA kernels even when the app default is Vulkan.
+            lfs::core::GpuBackendScope cuda_scope(lfs::core::GpuBackend::CUDA);
             auto tensor = Tensor::empty({mask.size()}, lfs::core::Device::CPU, lfs::core::DataType::UInt8);
             auto* const ptr = tensor.ptr<uint8_t>();
             for (std::size_t i = 0; i < mask.size(); ++i) {
                 ptr[i] = mask[i] ? 1 : 0;
             }
-            return tensor.cuda();
+            return tensor.gpu();
         }
 
         [[nodiscard]] bool nodeMaskRestrictsSelection(const std::vector<bool>& mask) {
             return std::any_of(mask.begin(), mask.end(), [](const bool enabled) { return !enabled; });
         }
 
+        [[nodiscard]] std::array<uint32_t, 8> copyLockedGroupsHost(const uint32_t* const locked_groups) {
+            std::array<uint32_t, 8> words{};
+            if (locked_groups == nullptr) {
+                return words;
+            }
+            if (const cudaError_t status = cudaMemcpy(
+                    words.data(), locked_groups, sizeof(words), cudaMemcpyDefault);
+                status == cudaSuccess) {
+                return words;
+            }
+            (void)cudaGetLastError();
+            std::memcpy(words.data(), locked_groups, sizeof(words));
+            return words;
+        }
+
         void prepareSelectionGroupCountsScratch(Tensor& counts_scratch) {
+            lfs::core::GpuBackendScope cuda_scope(lfs::core::GpuBackend::CUDA);
             if (!counts_scratch.is_valid() ||
-                counts_scratch.device() != lfs::core::Device::CUDA ||
+                counts_scratch.device() != lfs::core::Device::GPU ||
+                lfs::core::gpu_backend_of(counts_scratch) != lfs::core::GpuBackend::CUDA ||
                 counts_scratch.dtype() != lfs::core::DataType::Int32 ||
                 counts_scratch.numel() != kSelectionGroupScratchWords) {
                 counts_scratch = Tensor::zeros(
-                    {kSelectionGroupScratchWords}, lfs::core::Device::CUDA, lfs::core::DataType::Int32);
+                    {kSelectionGroupScratchWords}, lfs::core::Device::GPU, lfs::core::DataType::Int32);
             } else {
                 counts_scratch.zero_();
             }
@@ -175,7 +212,9 @@ namespace lfs::rendering {
             const float3 translation,
             const float pixel_focal_x,
             const float pixel_focal_y,
-            const bool orthographic,
+            const float center_x,
+            const float center_y,
+            const std::uint32_t camera_model,
             const float ortho_scale,
             const float* __restrict__ model_transforms,
             const int* __restrict__ transform_indices,
@@ -213,14 +252,46 @@ namespace lfs::rendering {
             const float view_x = view_row0.x * dx + view_row0.y * dy + view_row0.z * dz;
             const float view_y = view_row1.x * dx + view_row1.y * dy + view_row1.z * dz;
             const float view_z = view_row2.x * dx + view_row2.y * dy + view_row2.z * dz;
-            if (!isfinite(view_x) || !isfinite(view_y) || !isfinite(view_z) || view_z >= -1.0e-6f) {
+            if (!isfinite(view_x) || !isfinite(view_y) || !isfinite(view_z)) {
                 writeInvalidScreenPosition(output, idx);
                 return;
             }
 
-            const float cx = static_cast<float>(width) * 0.5f;
-            const float cy = static_cast<float>(height) * 0.5f;
-            if (orthographic) {
+            // Equirect sees every direction, including behind the camera. The
+            // z-sign reject is pinhole/ortho only; the finite check above still
+            // applies to all three models.
+            const bool equirectangular =
+                camera_model == static_cast<std::uint32_t>(ScreenWindowCameraModel::Equirectangular);
+            if (!equirectangular && view_z >= -1.0e-6f) {
+                writeInvalidScreenPosition(output, idx);
+                return;
+            }
+
+            const float cx = center_x;
+            const float cy = center_y;
+            if (equirectangular) {
+                // Same vksplat-axis negation as filterSelectionByScreenWindowKernel's
+                // equirect branch: vis is +X right, +Y up, -Z forward; vk is +X
+                // right, +Y down, +Z forward. The resulting px/py match that kernel.
+                const float eq_x = view_x;
+                const float eq_y = -view_y;
+                const float eq_z = -view_z;
+                const float len = sqrtf(eq_x * eq_x + eq_y * eq_y + eq_z * eq_z);
+                if (len <= 1.0e-6f || !isfinite(len)) {
+                    writeInvalidScreenPosition(output, idx);
+                    return;
+                }
+                const float dir_x = eq_x / len;
+                const float dir_y = eq_y / len;
+                const float dir_z = eq_z / len;
+                constexpr float pi = 3.14159265358979323846f;
+                output[idx] = make_float2(
+                    (atan2f(dir_x, dir_z) / (2.0f * pi) + 0.5f) * static_cast<float>(width),
+                    (asinf(fminf(fmaxf(dir_y, -1.0f), 1.0f)) / pi + 0.5f) * static_cast<float>(height));
+                return;
+            }
+
+            if (camera_model == static_cast<std::uint32_t>(ScreenWindowCameraModel::Orthographic)) {
                 if (!isfinite(ortho_scale) || ortho_scale <= 0.0f) {
                     writeInvalidScreenPosition(output, idx);
                     return;
@@ -233,137 +304,6 @@ namespace lfs::rendering {
             output[idx] = make_float2(
                 cx + view_x * pixel_focal_x / depth,
                 cy - view_y * pixel_focal_y / depth);
-        }
-
-        __device__ __forceinline__ bool betterPickCandidate(
-            const float dist_sq,
-            const int index,
-            const float best_dist_sq,
-            const int best_index) {
-            return index >= 0 &&
-                   (best_index < 0 ||
-                    dist_sq < best_dist_sq ||
-                    (dist_sq == best_dist_sq && index > best_index));
-        }
-
-        __global__ void pickProjectedGaussianBlocksKernel(
-            const float2* __restrict__ positions,
-            const float x,
-            const float y,
-            const float max_dist_sq,
-            float* __restrict__ block_dist_sq,
-            int* __restrict__ block_index,
-            const int n) {
-            __shared__ float shared_dist[kBlockSize];
-            __shared__ int shared_index[kBlockSize];
-
-            float best_dist_sq = max_dist_sq;
-            int best_index = -1;
-            for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
-                 idx < n;
-                 idx += blockDim.x * gridDim.x) {
-                const float2 pos = positions[idx];
-                if (pos.x < kInvalidScreenPositionThreshold ||
-                    pos.y < kInvalidScreenPositionThreshold ||
-                    !isfinite(pos.x) ||
-                    !isfinite(pos.y)) {
-                    continue;
-                }
-
-                const float dx = pos.x - x;
-                const float dy = pos.y - y;
-                const float dist_sq = dx * dx + dy * dy;
-                if (dist_sq <= max_dist_sq &&
-                    betterPickCandidate(dist_sq, idx, best_dist_sq, best_index)) {
-                    best_dist_sq = dist_sq;
-                    best_index = idx;
-                }
-            }
-
-            shared_dist[threadIdx.x] = best_dist_sq;
-            shared_index[threadIdx.x] = best_index;
-            __syncthreads();
-
-            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-                if (threadIdx.x < stride) {
-                    const float other_dist = shared_dist[threadIdx.x + stride];
-                    const int other_index = shared_index[threadIdx.x + stride];
-                    if (betterPickCandidate(
-                            other_dist, other_index, shared_dist[threadIdx.x], shared_index[threadIdx.x])) {
-                        shared_dist[threadIdx.x] = other_dist;
-                        shared_index[threadIdx.x] = other_index;
-                    }
-                }
-                __syncthreads();
-            }
-
-            if (threadIdx.x == 0) {
-                block_dist_sq[blockIdx.x] = shared_dist[0];
-                block_index[blockIdx.x] = shared_index[0];
-            }
-        }
-
-        __global__ void reduceProjectedGaussianPickKernel(
-            const float* __restrict__ block_dist_sq,
-            const int* __restrict__ block_index,
-            int* __restrict__ result_index,
-            const int block_count) {
-            __shared__ float shared_dist[kBlockSize];
-            __shared__ int shared_index[kBlockSize];
-
-            float best_dist_sq = 0.0f;
-            int best_index = -1;
-            for (int idx = threadIdx.x; idx < block_count; idx += blockDim.x) {
-                const int candidate = block_index[idx];
-                const float dist_sq = block_dist_sq[idx];
-                if (betterPickCandidate(dist_sq, candidate, best_dist_sq, best_index)) {
-                    best_dist_sq = dist_sq;
-                    best_index = candidate;
-                }
-            }
-
-            shared_dist[threadIdx.x] = best_dist_sq;
-            shared_index[threadIdx.x] = best_index;
-            __syncthreads();
-
-            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-                if (threadIdx.x < stride) {
-                    const float other_dist = shared_dist[threadIdx.x + stride];
-                    const int other_index = shared_index[threadIdx.x + stride];
-                    if (betterPickCandidate(
-                            other_dist, other_index, shared_dist[threadIdx.x], shared_index[threadIdx.x])) {
-                        shared_dist[threadIdx.x] = other_dist;
-                        shared_index[threadIdx.x] = other_index;
-                    }
-                }
-                __syncthreads();
-            }
-
-            if (threadIdx.x == 0) {
-                result_index[0] = shared_index[0];
-            }
-        }
-
-        __global__ void rectSelectKernel(
-            const float2* __restrict__ positions,
-            const float x0,
-            const float y0,
-            const float x1,
-            const float y1,
-            bool* __restrict__ selection,
-            const int n) {
-            const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-            if (idx >= n) {
-                return;
-            }
-
-            const float2 pos = positions[idx];
-            if (pos.x < kInvalidScreenPositionThreshold || pos.y < kInvalidScreenPositionThreshold) {
-                return;
-            }
-            if (pos.x >= x0 && pos.x <= x1 && pos.y >= y0 && pos.y <= y1) {
-                selection[idx] = true;
-            }
         }
 
         __global__ void polygonSelectKernel(
@@ -683,6 +623,115 @@ namespace lfs::rendering {
                 }
             }
         }
+
+        __global__ void filterSelectionByScreenWindowKernel(
+            bool* __restrict__ selection,
+            const float3* __restrict__ means,
+            const float3 view_row0,
+            const float3 view_row1,
+            const float3 view_row2,
+            const float3 translation,
+            const std::uint32_t camera_model,
+            const int width,
+            const int height,
+            const float pixel_focal_x,
+            const float pixel_focal_y,
+            const float center_x,
+            const float center_y,
+            const float ortho_scale,
+            const float near_depth,
+            const float far_depth,
+            const float scale_x,
+            const float scale_y,
+            const float offset_x,
+            const float offset_y,
+            const float* __restrict__ model_transforms,
+            const int* __restrict__ transform_indices,
+            const int num_model_transforms,
+            const int n) {
+            const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx >= n || !selection[idx]) {
+                return;
+            }
+
+            float3 pos = means[idx];
+            if (model_transforms != nullptr && num_model_transforms > 0) {
+                const int transform_idx = transform_indices != nullptr
+                                              ? min(max(transform_indices[idx], 0), num_model_transforms - 1)
+                                              : 0;
+                const float* const m = model_transforms + transform_idx * 16;
+                pos = make_float3(
+                    m[0] * pos.x + m[1] * pos.y + m[2] * pos.z + m[3],
+                    m[4] * pos.x + m[5] * pos.y + m[6] * pos.z + m[7],
+                    m[8] * pos.x + m[9] * pos.y + m[10] * pos.z + m[11]);
+            }
+
+            const float dx = pos.x - translation.x;
+            const float dy = pos.y - translation.y;
+            const float dz = pos.z - translation.z;
+            const float visualizer_x = view_row0.x * dx + view_row0.y * dy + view_row0.z * dz;
+            const float visualizer_y = view_row1.x * dx + view_row1.y * dy + view_row1.z * dz;
+            const float visualizer_z = view_row2.x * dx + view_row2.y * dy + view_row2.z * dz;
+
+            // VkSplat camera space is +X right, +Y down, +Z forward. The supplied
+            // visualizer camera pose is +X right, +Y up, -Z forward.
+            const float view_x = visualizer_x;
+            const float view_y = -visualizer_y;
+            const float view_z = -visualizer_z;
+
+            const float image_width = static_cast<float>(width);
+            const float image_height = static_cast<float>(height);
+            float px = 0.0f;
+            float py = 0.0f;
+            float depth = view_z;
+
+            if (camera_model == static_cast<std::uint32_t>(ScreenWindowCameraModel::Pinhole)) {
+                px = center_x + pixel_focal_x * view_x / view_z;
+                py = center_y + pixel_focal_y * view_y / view_z;
+            } else if (camera_model == static_cast<std::uint32_t>(ScreenWindowCameraModel::Orthographic)) {
+                px = 0.5f * image_width + ortho_scale * view_x;
+                py = 0.5f * image_height + ortho_scale * view_y;
+            } else {
+                const float len = sqrtf(view_x * view_x + view_y * view_y + view_z * view_z);
+                if (len <= 1.0e-6f || !isfinite(len)) {
+                    depth = -1.0f;
+                } else {
+                    const float dir_x = view_x / len;
+                    const float dir_y = view_y / len;
+                    const float dir_z = view_z / len;
+                    constexpr float pi = 3.14159265358979323846f;
+                    px = (atan2f(dir_x, dir_z) / (2.0f * pi) + 0.5f) * image_width;
+                    py = (asinf(fminf(fmaxf(dir_y, -1.0f), 1.0f)) / pi + 0.5f) * image_height;
+                    depth = len;
+                }
+            }
+
+            // KEEP IN SYNC: the screen-window formula lives in four places — this
+            // kernel, vertex_shader.slang compute_splat_active_state, the CPU
+            // reference in tests/test_selection_screen_window.cpp, and (rect only,
+            // no depth test) the 2D overlay in gui_manager.cpp
+            // appendScreenWindowOverlay.
+            // Contract: the window RECTANGLE is framebuffer-centred in all four copies;
+            // the splat projection uses the displayed camera's real unjittered intrinsics;
+            // jitter moves the draw sample, not the containment boundary.
+            // The transform/projection above is mathematically equivalent to
+            // projectScreenPositionsKernel in this file (pinhole, ortho, and
+            // equirect); conventions differ because that kernel keeps visualizer
+            // view Y and flips its sign at the principal point (cy - ...),
+            // negating only Z up front (depth = -view_z), while this one negates
+            // view_y and view_z up front so it can add, mirroring the slang
+            // formula verbatim. The equirect branch in that kernel applies the
+            // same vis→vk negation used here so px/py match.
+            const float half_w = 0.5f * scale_x * image_width;
+            const float half_h = 0.5f * scale_y * image_height;
+            const float cx = 0.5f * image_width + offset_x * (0.5f * image_width - half_w);
+            const float cy = 0.5f * image_height + offset_y * (0.5f * image_height - half_h);
+            const bool inside_rect = fabsf(px - cx) <= half_w && fabsf(py - cy) <= half_h;
+            const bool inside = inside_rect && depth >= near_depth && depth <= far_depth && depth > 0.0f;
+            if (!inside) {
+                selection[idx] = false;
+            }
+        }
     } // namespace
 
     void brush_select(
@@ -699,23 +748,6 @@ namespace lfs::rendering {
         brushSelectKernel<<<grid_size, kBlockSize, 0, currentSelectionStream()>>>(
             screen_positions, mouse_x, mouse_y, radius * radius, selection_out, n_primitives);
         LFS_CUDA_LAUNCH_CHECK(currentSelectionStream(), "render.selection.brush");
-    }
-
-    void rect_select(
-        const float2* const positions,
-        const float x0,
-        const float y0,
-        const float x1,
-        const float y1,
-        bool* const selection,
-        const int n_primitives) {
-        if (n_primitives <= 0) {
-            return;
-        }
-        const int grid_size = (n_primitives + kBlockSize - 1) / kBlockSize;
-        rectSelectKernel<<<grid_size, kBlockSize, 0, currentSelectionStream()>>>(
-            positions, x0, y0, x1, y1, selection, n_primitives);
-        LFS_CUDA_LAUNCH_CHECK(currentSelectionStream(), "render.selection.rect");
     }
 
     void polygon_select(
@@ -749,11 +781,13 @@ namespace lfs::rendering {
         const std::array<float, 3>& translation,
         const float pixel_focal_x,
         const float pixel_focal_y,
-        const bool orthographic,
+        const ScreenWindowCameraModel camera_model,
         const float ortho_scale) {
         return project_screen_positions_tensor(
             means, width, height, view_rotation_rows, translation,
-            pixel_focal_x, pixel_focal_y, orthographic, ortho_scale,
+            pixel_focal_x, pixel_focal_y,
+            0.5f * static_cast<float>(width), 0.5f * static_cast<float>(height),
+            camera_model, ortho_scale,
             nullptr, nullptr, {});
     }
 
@@ -765,12 +799,14 @@ namespace lfs::rendering {
         const std::array<float, 3>& translation,
         const float pixel_focal_x,
         const float pixel_focal_y,
-        const bool orthographic,
+        const ScreenWindowCameraModel camera_model,
         const float ortho_scale,
         const Tensor* const model_transforms) {
         return project_screen_positions_tensor(
             means, width, height, view_rotation_rows, translation,
-            pixel_focal_x, pixel_focal_y, orthographic, ortho_scale,
+            pixel_focal_x, pixel_focal_y,
+            0.5f * static_cast<float>(width), 0.5f * static_cast<float>(height),
+            camera_model, ortho_scale,
             model_transforms, nullptr, {});
     }
 
@@ -782,13 +818,15 @@ namespace lfs::rendering {
         const std::array<float, 3>& translation,
         const float pixel_focal_x,
         const float pixel_focal_y,
-        const bool orthographic,
+        const ScreenWindowCameraModel camera_model,
         const float ortho_scale,
         const Tensor* const model_transforms,
         const Tensor* const transform_indices) {
         return project_screen_positions_tensor(
             means, width, height, view_rotation_rows, translation,
-            pixel_focal_x, pixel_focal_y, orthographic, ortho_scale,
+            pixel_focal_x, pixel_focal_y,
+            0.5f * static_cast<float>(width), 0.5f * static_cast<float>(height),
+            camera_model, ortho_scale,
             model_transforms, transform_indices, {});
     }
 
@@ -800,7 +838,9 @@ namespace lfs::rendering {
         const std::array<float, 3>& translation,
         const float pixel_focal_x,
         const float pixel_focal_y,
-        const bool orthographic,
+        const float center_x,
+        const float center_y,
+        const ScreenWindowCameraModel camera_model,
         const float ortho_scale,
         const Tensor* const model_transforms,
         const Tensor* const transform_indices,
@@ -808,21 +848,29 @@ namespace lfs::rendering {
         if (!means.is_valid() || means.size(0) == 0) {
             return {};
         }
-        if (means.device() != lfs::core::Device::CUDA ||
+        if (means.device() != lfs::core::Device::GPU ||
             means.dtype() != lfs::core::DataType::Float32 ||
             means.ndim() != 2 ||
             means.size(1) != 3) {
-            throw std::runtime_error("project_screen_positions_tensor expects a CUDA Float32 [N, 3] means tensor");
+            throw std::runtime_error("project_screen_positions_tensor expects a GPU Float32 [N, 3] means tensor");
         }
         if (width <= 0 || height <= 0) {
             return {};
         }
+        if (!isCudaGpu(means)) {
+            return project_screen_positions_tensor_program(
+                means, width, height, view_rotation_rows, translation,
+                pixel_focal_x, pixel_focal_y, center_x, center_y,
+                camera_model, ortho_scale, model_transforms, transform_indices,
+                node_visibility_mask);
+        }
 
+        lfs::core::GpuBackendScope cuda_scope(lfs::core::GpuBackend::CUDA);
         const int n = checkedToInt(means.size(0), "screen position count exceeds int range");
         const Tensor means_contig = means.is_contiguous() ? means : means.contiguous();
         Tensor output = Tensor::empty(
             {static_cast<std::size_t>(n), std::size_t{2}},
-            lfs::core::Device::CUDA,
+            lfs::core::Device::GPU,
             lfs::core::DataType::Float32);
 
         Tensor model_transforms_contig;
@@ -832,8 +880,9 @@ namespace lfs::rendering {
             if (model_transforms_contig.dtype() != lfs::core::DataType::Float32) {
                 model_transforms_contig = model_transforms_contig.to(lfs::core::DataType::Float32);
             }
-            if (model_transforms_contig.device() != lfs::core::Device::CUDA) {
-                model_transforms_contig = model_transforms_contig.cuda();
+            if (model_transforms_contig.device() != lfs::core::Device::GPU ||
+                lfs::core::gpu_backend_of(model_transforms_contig) != lfs::core::GpuBackend::CUDA) {
+                model_transforms_contig = model_transforms_contig.cpu().to(lfs::core::Device::GPU);
             }
             if (!model_transforms_contig.is_contiguous()) {
                 model_transforms_contig = model_transforms_contig.contiguous();
@@ -850,8 +899,9 @@ namespace lfs::rendering {
             if (transform_indices_contig.dtype() != lfs::core::DataType::Int32) {
                 transform_indices_contig = transform_indices_contig.to(lfs::core::DataType::Int32);
             }
-            if (transform_indices_contig.device() != lfs::core::Device::CUDA) {
-                transform_indices_contig = transform_indices_contig.cuda();
+            if (transform_indices_contig.device() != lfs::core::Device::GPU ||
+                lfs::core::gpu_backend_of(transform_indices_contig) != lfs::core::GpuBackend::CUDA) {
+                transform_indices_contig = transform_indices_contig.cpu().to(lfs::core::Device::GPU);
             }
             if (!transform_indices_contig.is_contiguous()) {
                 transform_indices_contig = transform_indices_contig.contiguous();
@@ -868,7 +918,7 @@ namespace lfs::rendering {
             visibility_count = checkedToInt(node_visibility_mask.size(), "node visibility count exceeds int range");
         }
 
-        const int grid_size = std::min((n + kBlockSize - 1) / kBlockSize, kCountMaxBlocks);
+        const int grid_size = (n + kBlockSize - 1) / kBlockSize;
         const cudaStream_t stream = currentSelectionStream(&output);
         projectScreenPositionsKernel<<<grid_size, kBlockSize, 0, stream>>>(
             reinterpret_cast<const float3*>(means_contig.ptr<float>()),
@@ -882,7 +932,9 @@ namespace lfs::rendering {
             make_float3(translation[0], translation[1], translation[2]),
             pixel_focal_x,
             pixel_focal_y,
-            orthographic,
+            center_x,
+            center_y,
+            static_cast<std::uint32_t>(camera_model),
             ortho_scale,
             prepared_transforms.ptr,
             transform_indices_ptr,
@@ -897,50 +949,6 @@ namespace lfs::rendering {
         return output;
     }
 
-    int pick_projected_gaussian_tensor(
-        const Tensor& screen_positions,
-        const float x,
-        const float y,
-        const float radius) {
-        if (!screen_positions.is_valid() || screen_positions.size(0) == 0) {
-            return -1;
-        }
-        if (screen_positions.device() != lfs::core::Device::CUDA ||
-            screen_positions.dtype() != lfs::core::DataType::Float32 ||
-            screen_positions.ndim() != 2 ||
-            screen_positions.size(1) != 2) {
-            throw std::runtime_error("pick_projected_gaussian_tensor expects a CUDA Float32 [N, 2] tensor");
-        }
-
-        const int n = checkedToInt(screen_positions.size(0), "n_primitives exceeds int range");
-        const int block_count = std::min((n + kBlockSize - 1) / kBlockSize, kCountMaxBlocks);
-        Tensor block_dist_sq = Tensor::empty(
-            {static_cast<std::size_t>(block_count)}, lfs::core::Device::CUDA, lfs::core::DataType::Float32);
-        Tensor block_index = Tensor::empty(
-            {static_cast<std::size_t>(block_count)}, lfs::core::Device::CUDA, lfs::core::DataType::Int32);
-        Tensor result_index = Tensor::empty({1}, lfs::core::Device::CUDA, lfs::core::DataType::Int32);
-
-        const cudaStream_t stream = currentSelectionStream(&screen_positions);
-        pickProjectedGaussianBlocksKernel<<<block_count, kBlockSize, 0, stream>>>(
-            reinterpret_cast<const float2*>(screen_positions.ptr<float>()),
-            x,
-            y,
-            radius * radius,
-            block_dist_sq.ptr<float>(),
-            block_index.ptr<int>(),
-            n);
-        LFS_CUDA_LAUNCH_CHECK(stream, "render.selection.pick_blocks");
-        reduceProjectedGaussianPickKernel<<<1, kBlockSize, 0, stream>>>(
-            block_dist_sq.ptr<float>(),
-            block_index.ptr<int>(),
-            result_index.ptr<int>(),
-            block_count);
-        LFS_CUDA_LAUNCH_CHECK(stream, "render.selection.pick_reduce");
-
-        const auto result_cpu = result_index.cpu().contiguous();
-        return result_cpu.ptr<int>()[0];
-    }
-
     void brush_select_tensor(
         const Tensor& screen_positions,
         const float mouse_x,
@@ -948,6 +956,11 @@ namespace lfs::rendering {
         const float radius,
         Tensor& selection_out) {
         if (!screen_positions.is_valid() || screen_positions.size(0) == 0) {
+            return;
+        }
+        if (!isCudaGpu(screen_positions) || !isCudaGpu(selection_out)) {
+            brush_select_tensor_program(
+                screen_positions, mouse_x, mouse_y, radius, selection_out);
             return;
         }
         const int n = checkedToInt(screen_positions.size(0), "n_primitives exceeds int range");
@@ -959,26 +972,6 @@ namespace lfs::rendering {
                      n);
     }
 
-    void rect_select_tensor(
-        const Tensor& screen_positions,
-        const float x0,
-        const float y0,
-        const float x1,
-        const float y1,
-        Tensor& selection_out) {
-        if (!screen_positions.is_valid() || screen_positions.size(0) == 0) {
-            return;
-        }
-        const int n = checkedToInt(screen_positions.size(0), "n_primitives exceeds int range");
-        rect_select(reinterpret_cast<const float2*>(screen_positions.ptr<float>()),
-                    x0,
-                    y0,
-                    x1,
-                    y1,
-                    selection_out.ptr<bool>(),
-                    n);
-    }
-
     void polygon_select_tensor(
         const Tensor& screen_positions,
         const Tensor& polygon_vertices,
@@ -987,6 +980,11 @@ namespace lfs::rendering {
             return;
         }
         if (!polygon_vertices.is_valid() || polygon_vertices.size(0) < 3) {
+            return;
+        }
+        if (!isCudaGpu(screen_positions) || !isCudaGpu(polygon_vertices) ||
+            !isCudaGpu(selection_out)) {
+            polygon_select_tensor_program(screen_positions, polygon_vertices, selection_out);
             return;
         }
         const int num_vertices = checkedToInt(polygon_vertices.size(0), "polygon vertex count exceeds int range");
@@ -1010,6 +1008,22 @@ namespace lfs::rendering {
         const bool replace_mode,
         Tensor* const group_counts_scratch) {
         if (!cumulative_selection.is_valid() || cumulative_selection.size(0) == 0) {
+            return;
+        }
+        if (lfs::core::gpu_backend_of(cumulative_selection) == lfs::core::GpuBackend::Vulkan ||
+            lfs::core::gpu_backend_of(output_mask) == lfs::core::GpuBackend::Vulkan) {
+            const auto locked_host = copyLockedGroupsHost(locked_groups);
+            apply_selection_group_tensor_mask_program(
+                cumulative_selection,
+                existing_mask,
+                output_mask,
+                group_id,
+                locked_host.data(),
+                add_mode,
+                transform_indices,
+                valid_nodes,
+                replace_mode,
+                group_counts_scratch);
             return;
         }
 
@@ -1066,6 +1080,22 @@ namespace lfs::rendering {
         const bool replace_mode) {
         if (!visible_selection.is_valid() || !visible_indices.is_valid() ||
             !output_mask.is_valid() || visible_selection.size(0) == 0) {
+            return;
+        }
+        if (lfs::core::gpu_backend_of(visible_selection) == lfs::core::GpuBackend::Vulkan ||
+            lfs::core::gpu_backend_of(output_mask) == lfs::core::GpuBackend::Vulkan) {
+            const auto locked_host = copyLockedGroupsHost(locked_groups);
+            apply_selection_group_indexed_tensor_mask_program(
+                visible_selection,
+                visible_indices,
+                existing_mask,
+                output_mask,
+                group_id,
+                locked_host.data(),
+                add_mode,
+                transform_indices,
+                valid_nodes,
+                replace_mode);
             return;
         }
 
@@ -1138,11 +1168,15 @@ namespace lfs::rendering {
         if (!selection_mask.is_valid() || selection_mask.numel() == 0) {
             return;
         }
-        if (selection_mask.device() != lfs::core::Device::CUDA) {
+        if (selection_mask.device() != lfs::core::Device::GPU) {
             throw std::runtime_error("count_selection_groups_async requires a CUDA mask");
         }
+        if (lfs::core::gpu_backend_of(selection_mask) == lfs::core::GpuBackend::Vulkan) {
+            count_selection_groups_tensor_program(selection_mask, counts_scratch);
+            return;
+        }
 
-        prepareSelectionGroupCountsScratch(counts_scratch);
+        prepare_cuda_selection_group_counts_scratch(counts_scratch);
 
         const int n = checkedToInt(selection_mask.numel(), "selection mask size exceeds int range");
         const int grid_size = std::min((n + kBlockSize - 1) / kBlockSize, kCountMaxBlocks);
@@ -1156,7 +1190,46 @@ namespace lfs::rendering {
     void enqueue_selection_group_count_read(const Tensor& counts_scratch,
                                             int* const pinned_host_counts,
                                             const cudaEvent_t ready_event) {
-        if (!counts_scratch.is_valid() || pinned_host_counts == nullptr || ready_event == nullptr) {
+        enqueue_selection_group_count_read(
+            counts_scratch, pinned_host_counts, ready_event, nullptr);
+    }
+
+    void enqueue_selection_group_count_read(const Tensor& counts_scratch,
+                                            int* const pinned_host_counts,
+                                            const cudaEvent_t ready_event,
+                                            SelectionCountTicket* const vulkan_ticket) {
+        if (!counts_scratch.is_valid() || pinned_host_counts == nullptr) {
+            throw std::runtime_error("invalid asynchronous selection-count destination");
+        }
+        if (counts_scratch.device() != lfs::core::Device::GPU ||
+            counts_scratch.dtype() != lfs::core::DataType::Int32 ||
+            !counts_scratch.is_contiguous() ||
+            counts_scratch.numel() < kSelectionGroupScratchWords) {
+            throw std::runtime_error("invalid asynchronous selection-count scratch");
+        }
+        if (lfs::core::gpu_backend_of(counts_scratch) == lfs::core::GpuBackend::Vulkan) {
+            if (vulkan_ticket == nullptr) {
+                // The original overload has no way to return or poll a Vulkan
+                // ticket. Preserve its completed-host-copy contract.
+                const Tensor host = counts_scratch.cpu();
+                std::memcpy(pinned_host_counts, host.ptr<int>(),
+                            kSelectionGroupScratchWords * sizeof(int));
+                if (ready_event != nullptr) {
+                    LFS_CUDA_CHECK(cudaEventRecord(ready_event, nullptr));
+                }
+                return;
+            }
+            auto& ops = lfs::core::internal::backend_ops_for(counts_scratch);
+            const lfs::core::internal::ReadbackTicket ticket = ops.enqueue_readback(
+                lfs::core::internal::storage_ref(counts_scratch),
+                kSelectionGroupScratchWords * sizeof(int),
+                lfs::core::internal::ExecContext{});
+            vulkan_ticket->id = ticket.id;
+            vulkan_ticket->timeline_value = ticket.timeline_value;
+            vulkan_ticket->bytes = ticket.bytes;
+            return;
+        }
+        if (ready_event == nullptr) {
             throw std::runtime_error("invalid asynchronous selection-count destination");
         }
         const cudaStream_t stream = currentSelectionStream(&counts_scratch);
@@ -1168,6 +1241,24 @@ namespace lfs::rendering {
         LFS_CUDA_CHECK(cudaEventRecord(ready_event, stream));
     }
 
+    bool poll_selection_group_count_readback(const SelectionCountTicket& ticket,
+                                             int* const pinned_host_counts) {
+        if (ticket.id == 0) {
+            return true;
+        }
+        if (pinned_host_counts == nullptr) {
+            return false;
+        }
+        const lfs::core::internal::ReadbackTicket backend_ticket{
+            .backend = lfs::core::GpuBackend::Vulkan,
+            .timeline_value = ticket.timeline_value,
+            .id = ticket.id,
+            .bytes = ticket.bytes,
+        };
+        return lfs::core::internal::backend_ops(lfs::core::GpuBackend::Vulkan)
+            .readback_poll(backend_ticket, pinned_host_counts);
+    }
+
     std::array<size_t, 256> count_selection_groups(
         const Tensor& selection_mask,
         Tensor& counts_scratch) {
@@ -1175,7 +1266,7 @@ namespace lfs::rendering {
         if (!selection_mask.is_valid() || selection_mask.numel() == 0) {
             return result;
         }
-        if (selection_mask.device() != lfs::core::Device::CUDA) {
+        if (selection_mask.device() != lfs::core::Device::GPU) {
             const auto mask_cpu = selection_mask.cpu();
             const auto* const data = mask_cpu.ptr<uint8_t>();
             const size_t n = mask_cpu.numel();
@@ -1196,7 +1287,7 @@ namespace lfs::rendering {
     SelectionGroupCountResult read_selection_group_count_result(const Tensor& counts_scratch) {
         SelectionGroupCountResult result{};
         if (!counts_scratch.is_valid() ||
-            counts_scratch.device() != lfs::core::Device::CUDA ||
+            counts_scratch.device() != lfs::core::Device::GPU ||
             counts_scratch.dtype() != lfs::core::DataType::Int32 ||
             counts_scratch.numel() != kSelectionGroupScratchWords) {
             return result;
@@ -1214,7 +1305,7 @@ namespace lfs::rendering {
     SelectionGroupDeltaResult read_selection_group_delta_result(const Tensor& counts_scratch) {
         SelectionGroupDeltaResult result{};
         if (!counts_scratch.is_valid() ||
-            counts_scratch.device() != lfs::core::Device::CUDA ||
+            counts_scratch.device() != lfs::core::Device::GPU ||
             counts_scratch.dtype() != lfs::core::DataType::Int32 ||
             counts_scratch.numel() != kSelectionGroupScratchWords) {
             return result;
@@ -1239,8 +1330,13 @@ namespace lfs::rendering {
             accumulated_mask.numel() != delta_mask.numel()) {
             return;
         }
-        if (accumulated_mask.device() != lfs::core::Device::CUDA ||
-            delta_mask.device() != lfs::core::Device::CUDA ||
+        if (lfs::core::gpu_backend_of(accumulated_mask) == lfs::core::GpuBackend::Vulkan ||
+            lfs::core::gpu_backend_of(delta_mask) == lfs::core::GpuBackend::Vulkan) {
+            merge_selection_mask_or_program(accumulated_mask, delta_mask);
+            return;
+        }
+        if (accumulated_mask.device() != lfs::core::Device::GPU ||
+            delta_mask.device() != lfs::core::Device::GPU ||
             accumulated_mask.dtype() != lfs::core::DataType::Bool ||
             delta_mask.dtype() != lfs::core::DataType::Bool) {
             accumulated_mask = accumulated_mask | delta_mask;
@@ -1266,7 +1362,15 @@ namespace lfs::rendering {
         if (!nodeMaskRestrictsSelection(valid_nodes)) {
             return;
         }
+        if (lfs::core::gpu_backend_of(selection) == lfs::core::GpuBackend::Vulkan ||
+            lfs::core::gpu_backend_of(transform_indices) == lfs::core::GpuBackend::Vulkan) {
+            filter_selection_by_node_mask_program(selection, transform_indices, valid_nodes);
+            return;
+        }
         const int n = checkedToInt(selection.size(0), "selection size exceeds int range");
+        if (n <= 0) {
+            return;
+        }
         if (transform_indices.numel() != static_cast<std::size_t>(n)) {
             return;
         }
@@ -1295,6 +1399,22 @@ namespace lfs::rendering {
         const Tensor* const model_transforms,
         const Tensor* const transform_indices) {
         if (!selection.is_valid() || !means.is_valid()) {
+            return;
+        }
+        if (lfs::core::gpu_backend_of(selection) == lfs::core::GpuBackend::Vulkan ||
+            lfs::core::gpu_backend_of(means) == lfs::core::GpuBackend::Vulkan) {
+            filter_selection_by_crop_program(
+                selection,
+                means,
+                crop_box_transform,
+                crop_box_min,
+                crop_box_max,
+                crop_inverse,
+                ellipsoid_transform,
+                ellipsoid_radii,
+                ellipsoid_inverse,
+                model_transforms,
+                transform_indices);
             return;
         }
 
@@ -1353,6 +1473,121 @@ namespace lfs::rendering {
             prepared_transforms.count,
             n);
         LFS_CUDA_LAUNCH_CHECK(currentSelectionStream(&selection), "render.selection.filter_crop");
+    }
+
+    void filter_selection_by_screen_window(
+        Tensor& selection,
+        const Tensor& means,
+        const std::array<float, 9>& view_rotation_rows,
+        const std::array<float, 3>& translation,
+        const ScreenWindowCameraModel camera_model,
+        const int width,
+        const int height,
+        const float pixel_focal_x,
+        const float pixel_focal_y,
+        const float center_x,
+        const float center_y,
+        const float ortho_scale,
+        const float near_depth,
+        const float far_depth,
+        const float scale_x,
+        const float scale_y,
+        const float offset_x,
+        const float offset_y,
+        const Tensor* const model_transforms,
+        const Tensor* const transform_indices) {
+        const auto model = static_cast<std::uint32_t>(camera_model);
+        if (model != static_cast<std::uint32_t>(ScreenWindowCameraModel::Pinhole) &&
+            model != static_cast<std::uint32_t>(ScreenWindowCameraModel::Orthographic) &&
+            model != static_cast<std::uint32_t>(ScreenWindowCameraModel::Equirectangular)) {
+            LOG_WARN("filter_selection_by_screen_window: unsupported camera model {}; leaving selection unchanged",
+                     model);
+            return;
+        }
+        if (!selection.is_valid() || !means.is_valid() || width <= 0 || height <= 0) {
+            return;
+        }
+        if (lfs::core::gpu_backend_of(selection) == lfs::core::GpuBackend::Vulkan ||
+            lfs::core::gpu_backend_of(means) == lfs::core::GpuBackend::Vulkan) {
+            filter_selection_by_screen_window_program(
+                selection,
+                means,
+                view_rotation_rows,
+                translation,
+                camera_model,
+                width,
+                height,
+                pixel_focal_x,
+                pixel_focal_y,
+                center_x,
+                center_y,
+                ortho_scale,
+                near_depth,
+                far_depth,
+                scale_x,
+                scale_y,
+                offset_x,
+                offset_y,
+                model_transforms,
+                transform_indices);
+            return;
+        }
+
+        const int n = checkedToInt(selection.size(0), "selection size exceeds int range");
+        if (means.size(0) != static_cast<std::size_t>(n)) {
+            return;
+        }
+
+        const auto prepared_transforms = PreparedModelTransforms::from(model_transforms);
+        Tensor transform_indices_contig;
+        const int* transform_indices_ptr = nullptr;
+        if (transform_indices != nullptr && transform_indices->is_valid() &&
+            transform_indices->numel() == static_cast<std::size_t>(n)) {
+            transform_indices_contig = transform_indices->is_contiguous()
+                                           ? *transform_indices
+                                           : transform_indices->contiguous();
+            transform_indices_ptr = transform_indices_contig.ptr<int>();
+        }
+
+        // Match the Vulkan lane's substitution exactly. vksplat_viewport_renderer
+        // replaces any non-finite or sub-threshold ortho_scale with
+        // DEFAULT_ORTHO_SCALE before it reaches the shader; running the kernel on
+        // the raw value instead would project every splat onto the principal point
+        // (scale 0) or poison the comparison (NaN), so the two lanes would disagree
+        // about which splats are inside the window. Guarding here rather than only
+        // in SelectionService also covers callers that reach this entry point
+        // directly.
+        const float sanitized_ortho_scale =
+            (std::isfinite(ortho_scale) && ortho_scale > 1.0e-5f) ? ortho_scale
+                                                                  : DEFAULT_ORTHO_SCALE;
+
+        const int grid_size = (n + kBlockSize - 1) / kBlockSize;
+        filterSelectionByScreenWindowKernel<<<grid_size, kBlockSize, 0, currentSelectionStream(&selection)>>>(
+            selection.ptr<bool>(),
+            reinterpret_cast<const float3*>(means.ptr<float>()),
+            make_float3(view_rotation_rows[0], view_rotation_rows[1], view_rotation_rows[2]),
+            make_float3(view_rotation_rows[3], view_rotation_rows[4], view_rotation_rows[5]),
+            make_float3(view_rotation_rows[6], view_rotation_rows[7], view_rotation_rows[8]),
+            make_float3(translation[0], translation[1], translation[2]),
+            model,
+            width,
+            height,
+            pixel_focal_x,
+            pixel_focal_y,
+            center_x,
+            center_y,
+            sanitized_ortho_scale,
+            near_depth,
+            far_depth,
+            scale_x,
+            scale_y,
+            offset_x,
+            offset_y,
+            prepared_transforms.ptr,
+            transform_indices_ptr,
+            prepared_transforms.count,
+            n);
+        LFS_CUDA_LAUNCH_CHECK(currentSelectionStream(&selection), "render.selection.filter_screen_window");
     }
 
     namespace config {

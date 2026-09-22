@@ -52,7 +52,7 @@ namespace lfs::vis {
         }
 
         struct SplitPush {
-            float split[4];               // x = position, y = left_flip_y, z = right_flip_y, w = pad
+            float split[4];               // x = position, y/z = flip_y, w = loss visualization
             float rect[4];                // x, y, w, h
             float panel_norm[4];          // left_start, left_end, right_start, right_end
             float panel_flags[4];         // left_normalize, right_normalize, left_filter, right_filter
@@ -151,6 +151,8 @@ namespace lfs::vis {
             VkImageView right_view = VK_NULL_HANDLE;
             std::uint64_t left_generation = 0;
             std::uint64_t right_generation = 0;
+            VkImageLayout left_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkImageLayout right_layout = VK_IMAGE_LAYOUT_UNDEFINED;
             bool ready = false;
         };
         std::vector<FrameDescriptor> frame_descriptors;
@@ -1064,20 +1066,28 @@ namespace lfs::vis {
                 left_spec.external_image_view != VK_NULL_HANDLE ? left_spec.external_image_generation : 0;
             const std::uint64_t right_generation =
                 right_spec.external_image_view != VK_NULL_HANDLE ? right_spec.external_image_generation : 0;
+            const VkImageLayout left_layout = left_spec.external_image_view != VK_NULL_HANDLE
+                                                  ? left_spec.external_image_layout
+                                                  : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            const VkImageLayout right_layout = right_spec.external_image_view != VK_NULL_HANDLE
+                                                   ? right_spec.external_image_layout
+                                                   : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             const bool changed =
                 left_view != descriptor.left_view ||
                 right_view != descriptor.right_view ||
                 left_generation != descriptor.left_generation ||
-                right_generation != descriptor.right_generation;
+                right_generation != descriptor.right_generation ||
+                left_layout != descriptor.left_layout ||
+                right_layout != descriptor.right_layout;
             if (!changed) {
                 descriptor.ready = true;
                 return true;
             }
             std::array<VkDescriptorImageInfo, 2> infos{};
-            infos[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            infos[0].imageLayout = left_layout;
             infos[0].imageView = left_view;
             infos[0].sampler = sampler;
-            infos[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            infos[1].imageLayout = right_layout;
             infos[1].imageView = right_view;
             infos[1].sampler = sampler;
             std::array<VkWriteDescriptorSet, 2> writes{};
@@ -1095,6 +1105,8 @@ namespace lfs::vis {
             descriptor.left_generation = left_generation;
             descriptor.right_view = right_view;
             descriptor.right_generation = right_generation;
+            descriptor.left_layout = left_layout;
+            descriptor.right_layout = right_layout;
             descriptor.ready = true;
             return true;
         }
@@ -1168,6 +1180,7 @@ namespace lfs::vis {
             push.split[0] = std::clamp(params.split_position, 0.0f, 1.0f);
             push.split[1] = params.left.flip_y ? 1.0f : 0.0f;
             push.split[2] = params.right.flip_y ? 1.0f : 0.0f;
+            push.split[3] = params.loss_visualization ? 1.0f : 0.0f;
 
             const float rect_x = static_cast<float>(params.content_rect.x);
             const float rect_y = static_cast<float>(params.content_rect.y);

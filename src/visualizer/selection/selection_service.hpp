@@ -7,10 +7,13 @@
 #include "core/scene.hpp"
 #include "core/tensor.hpp"
 #include "operation/undo_entry.hpp"
+#include "rendering/rendering.hpp"
 #include "rendering/rendering_types.hpp"
+#include "rendering/selection_ops.hpp"
 #include <array>
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <expected>
 #include <glm/mat4x4.hpp>
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
@@ -60,6 +63,52 @@ namespace lfs::vis {
         bool restrict_to_selected_nodes = true;
     };
 
+    struct SelectionProjectionContext {
+        struct ViewerLayout {
+            float x = 0.0f;
+            float y = 0.0f;
+            float width = 0.0f;
+            float height = 0.0f;
+            int render_width = 0;
+            int render_height = 0;
+
+            [[nodiscard]] bool valid() const {
+                return width > 0.0f && height > 0.0f && render_width > 0 && render_height > 0;
+            }
+
+            [[nodiscard]] friend bool operator==(const ViewerLayout&, const ViewerLayout&) = default;
+        };
+
+        rendering::ViewportData viewport{};
+        bool equirectangular = false;
+        float far_plane = rendering::DEFAULT_FAR_PLANE;
+        // Real unjittered intrinsics of the displayed camera for depth-window containment.
+        // Empty means "image-centred with FoV-derived focals", which is correct for every
+        // synthetic-intrinsics viewport. Populated for the explicit-camera lane (M2) and the
+        // GT compare panel (M3).
+        std::optional<rendering::CameraIntrinsics> containment_intrinsics;
+        std::optional<ViewerLayout> viewer_layout;
+        std::optional<SplitViewPanelId> panel;
+
+        [[nodiscard]] bool valid() const { return viewport.size.x > 0 && viewport.size.y > 0; }
+    };
+
+    // Typed failure for command projection resolution, following
+    // PlySequenceResolveError in the sequencer: a code callers can branch on,
+    // and the message a caller surfaces to the user. The codes are exactly the
+    // distinct failures resolveCommandProjectionSnapshot can return.
+    enum class SelectionProjectionErrorCode : uint8_t {
+        CAMERA_PROJECTION_UNAVAILABLE,
+        CAMERA_INDEX_OUT_OF_RANGE,
+        VIEWER_VIEWPORT_UNAVAILABLE,
+        VIEWER_PROJECTION_UNAVAILABLE,
+    };
+
+    struct SelectionProjectionError {
+        SelectionProjectionErrorCode code = SelectionProjectionErrorCode::CAMERA_PROJECTION_UNAVAILABLE;
+        std::string message;
+    };
+
     struct SelectionCommitOptions {
         const core::Tensor* base_selection = nullptr;
         bool push_undo = true;
@@ -87,14 +136,14 @@ namespace lfs::vis {
         SelectionService& operator=(const SelectionService&) = delete;
 
         [[nodiscard]] SelectionResult selectBrush(float x, float y, float radius, SelectionMode mode,
-                                                  int camera_index = 0);
+                                                  int camera_index = -1);
         [[nodiscard]] SelectionResult selectRect(float x0, float y0, float x1, float y1, SelectionMode mode,
-                                                 int camera_index = 0);
+                                                 int camera_index = -1);
         [[nodiscard]] SelectionResult selectPolygon(const std::vector<glm::vec2>& vertices, SelectionMode mode,
-                                                    int camera_index = 0);
+                                                    int camera_index = -1);
         [[nodiscard]] SelectionResult selectLasso(const std::vector<glm::vec2>& vertices, SelectionMode mode,
-                                                  int camera_index = 0);
-        [[nodiscard]] SelectionResult selectRing(float x, float y, SelectionMode mode, int camera_index = 0);
+                                                  int camera_index = -1);
+        [[nodiscard]] SelectionResult selectRing(float x, float y, SelectionMode mode, int camera_index = -1);
         [[nodiscard]] SelectionResult selectByColorAt(float x, float y, SelectionMode mode,
                                                       SelectionFilterState filters = {},
                                                       int camera_index = -1);
@@ -132,6 +181,10 @@ namespace lfs::vis {
         [[nodiscard]] SelectionResult finishInteractiveSelection();
         void cancelInteractiveSelection();
         void refreshInteractivePreview();
+        // Forces the next interactive-preview refresh to restart the incremental
+        // brush filter from point zero and re-apply filters (used when the depth
+        // window changes under an unchanged brush point set, e.g. a drag commit).
+        void invalidateInteractiveBrushFilterCache();
         [[nodiscard]] bool isInteractiveSelectionActive() const { return interactive_selection_.active; }
         [[nodiscard]] SelectionShape getInteractiveSelectionShape() const { return interactive_selection_.shape; }
         [[nodiscard]] bool isInteractiveSelectionClosed() const { return interactive_selection_.polygon_closed; }
@@ -144,10 +197,18 @@ namespace lfs::vis {
                                             SelectionMode mode);
         void suppressPassiveHoverPreview();
         void setInteractiveSelectionMode(SelectionMode mode) { interactive_selection_.mode = mode; }
+        // Test-only observable for the incremental brush-preview cache: the number of
+        // brush points already folded into the interactive preview. Zero after
+        // invalidateInteractiveBrushFilterCache(); restored by the next refresh.
+        [[nodiscard]] std::size_t interactiveBrushPreviewPointCountForTest() const {
+            return interactive_selection_.preview_brush_point_count;
+        }
         void setTestingScreenPositions(std::shared_ptr<core::Tensor> screen_positions);
         void setTestingScreenPositionsForCamera(int camera_index, std::shared_ptr<core::Tensor> screen_positions);
         void setTestingViewport(ViewportInfo viewport);
+        void setTestingContainmentIntrinsics(std::optional<rendering::CameraIntrinsics> intrinsics);
         void setTestingHoveredGaussianId(std::optional<int> hovered_gaussian_id);
+        void setTestingPanel(SplitViewPanelId panel);
         // Applies completed GPU count readbacks without waiting. The scene
         // manager calls this once per render-state build; selection commands
         // also poll before starting a new commit.
@@ -169,6 +230,7 @@ namespace lfs::vis {
             core::Tensor scratch;
             int* host_counts = nullptr;
             cudaEvent_t ready_event = nullptr;
+            lfs::rendering::SelectionCountTicket vulkan_ticket;
             bool pending = false;
             bool apply_to_scene = true;
             uint64_t sequence = 0;
@@ -209,6 +271,8 @@ namespace lfs::vis {
             bool ring_has_hit = false;
             std::vector<bool> live_preview_node_mask;
             size_t preview_brush_point_count = 0;
+            std::size_t preview_brush_projection_signature = 0;
+            bool preview_brush_projection_signature_valid = false;
             uint64_t generation = 0;
         };
         struct InteractiveVolumeGeometry {
@@ -230,57 +294,64 @@ namespace lfs::vis {
         [[nodiscard]] SelectionResult commitSelection(const core::Tensor& selection, SelectionMode mode,
                                                       const std::vector<bool>& node_mask,
                                                       const SelectionFilterState& filters,
+                                                      const SelectionProjectionContext& projection_context,
                                                       const char* undo_name,
                                                       SelectionCommitOptions options = {});
-        [[nodiscard]] core::Tensor& resetBoolScratchBuffer(core::Tensor& buffer, size_t size);
+        [[nodiscard]] core::Tensor& resetBoolScratchBuffer(core::Tensor& buffer, size_t size,
+                                                           const core::Tensor* affinity = nullptr);
         [[nodiscard]] std::optional<ViewerViewportContext> resolveViewerViewportContext(
             std::optional<glm::vec2> screen_point = std::nullopt,
             std::optional<SplitViewPanelId> panel_override = std::nullopt) const;
-        [[nodiscard]] std::optional<ViewportInfo> resolveViewportInfo() const;
-        [[nodiscard]] std::shared_ptr<core::Tensor> getScreenPositionsForContext(
-            const ViewerViewportContext& context) const;
-        [[nodiscard]] std::shared_ptr<core::Tensor> resolveCommandScreenPositions(int camera_index) const;
-        [[nodiscard]] std::optional<rendering::FrameView> resolveCommandFrameView(int camera_index) const;
-        [[nodiscard]] std::shared_ptr<core::Tensor> renderScreenPositionsForCamera(int camera_index) const;
-        [[nodiscard]] std::shared_ptr<core::Tensor> renderScreenPositionsForCurrentViewport() const;
         [[nodiscard]] std::optional<int> resolveCommandHoveredGaussianId(float x, float y, int camera_index,
-                                                                         const SelectionFilterState& filters);
+                                                                         const SelectionFilterState& filters,
+                                                                         const SelectionProjectionContext& projection_context);
         [[nodiscard]] std::optional<int> renderHoveredGaussianIdForViewerContext(
             const ViewerViewportContext& context,
             glm::vec2 cursor_pos,
-            const SelectionFilterState& filters) const;
-        [[nodiscard]] std::optional<int> renderHoveredGaussianId(const rendering::ViewportData& viewport,
-                                                                 glm::vec2 cursor_pos,
-                                                                 const SelectionFilterState& filters) const;
+            const SelectionFilterState& filters,
+            const SelectionProjectionContext& projection_context) const;
         [[nodiscard]] std::optional<int> pickHoveredGaussianIdFromScreenPositions(
             const core::Tensor& screen_positions,
             glm::vec2 cursor_pos,
-            const SelectionFilterState& filters) const;
+            const SelectionFilterState& filters,
+            const SelectionProjectionContext& projection_context) const;
         [[nodiscard]] std::optional<int> renderHoveredGaussianIdForCamera(float x, float y, int camera_index,
-                                                                          const SelectionFilterState& filters);
-        [[nodiscard]] std::optional<int> renderHoveredGaussianIdForCurrentViewport(float x, float y,
-                                                                                   const SelectionFilterState& filters);
-        [[nodiscard]] bool buildSelectionMaskForInteractiveSession(core::Tensor& selection_out,
-                                                                   bool include_polygon_cursor = false,
-                                                                   int* picked_ring_id_out = nullptr);
-        [[nodiscard]] bool buildInteractiveBrushPreviewIncremental();
+                                                                          const SelectionFilterState& filters,
+                                                                          const SelectionProjectionContext& projection_context);
+        [[nodiscard]] std::optional<int> renderHoveredGaussianIdForCurrentViewport(
+            float x, float y, const SelectionFilterState& filters,
+            const SelectionProjectionContext& projection_context);
+        [[nodiscard]] bool buildSelectionMaskForInteractiveSession(
+            core::Tensor& selection_out,
+            const SelectionProjectionContext& projection_context,
+            bool include_polygon_cursor = false,
+            int* picked_ring_id_out = nullptr,
+            bool for_commit = false);
+        [[nodiscard]] bool buildInteractiveBrushPreviewIncremental(
+            const SelectionProjectionContext& projection_context);
         [[nodiscard]] bool buildBrushSelection(const std::vector<glm::vec2>& points, float radius,
-                                               core::Tensor& selection_out) const;
+                                               core::Tensor& selection_out,
+                                               const SelectionProjectionContext& projection_context) const;
         [[nodiscard]] bool buildRectangleSelection(glm::vec2 start, glm::vec2 end,
-                                                   core::Tensor& selection_out) const;
+                                                   core::Tensor& selection_out,
+                                                   const SelectionProjectionContext& projection_context) const;
         [[nodiscard]] bool buildPolygonSelection(const std::vector<glm::vec2>& points,
-                                                 core::Tensor& selection_out) const;
+                                                 core::Tensor& selection_out,
+                                                 const SelectionProjectionContext& projection_context) const;
         [[nodiscard]] bool buildWorldPolygonSelection(const std::vector<glm::vec3>& world_points,
-                                                      core::Tensor& selection_out) const;
-        [[nodiscard]] std::optional<bool> buildRingSelectionForContext(const ViewerViewportContext& context,
+                                                      core::Tensor& selection_out,
+                                                      const SelectionProjectionContext& projection_context) const;
+        [[nodiscard]] std::optional<bool> buildRingSelectionForContext(const SelectionProjectionContext& projection_context,
                                                                        glm::vec2 cursor_pos,
                                                                        core::Tensor& selection_out,
                                                                        int* picked_ring_id_out = nullptr) const;
         [[nodiscard]] bool buildRingSelection(glm::vec2 cursor_pos, core::Tensor& selection_out,
+                                              const SelectionProjectionContext& projection_context,
                                               bool try_exact_ring_pick = true,
                                               bool require_exact_ring_hit = true,
                                               int* picked_ring_id_out = nullptr) const;
-        [[nodiscard]] std::optional<InteractiveVolumeGeometry> buildInteractiveVolumeGeometry() const;
+        [[nodiscard]] std::optional<InteractiveVolumeGeometry> buildInteractiveVolumeGeometry(
+            const SelectionProjectionContext& projection_context) const;
         [[nodiscard]] bool buildVolumeSelection(const InteractiveVolumeGeometry& geometry,
                                                 core::Tensor& selection_out) const;
         void publishInteractiveVolumeGeometry(const InteractiveVolumeGeometry& geometry) const;
@@ -291,8 +362,9 @@ namespace lfs::vis {
         [[nodiscard]] std::optional<glm::vec3> resolveInteractivePolygonWorldPoint(glm::vec2 screen_point) const;
         [[nodiscard]] std::optional<glm::vec2> projectInteractivePolygonWorldPoint(glm::vec3 world_point) const;
         [[nodiscard]] bool shouldClosePolygonPreview() const;
-        void applyFilters(core::Tensor& selection, const SelectionFilterState& filters,
-                          const std::vector<bool>& node_mask) const;
+        [[nodiscard]] bool applyFilters(core::Tensor& selection, const SelectionFilterState& filters,
+                                        const std::vector<bool>& node_mask,
+                                        const SelectionProjectionContext& projection_context) const;
         void applyCropFilter(core::Tensor& selection,
                              const core::Tensor* crop_box_transform = nullptr,
                              const core::Tensor* crop_box_min = nullptr,
@@ -300,7 +372,24 @@ namespace lfs::vis {
                              const core::Tensor* ellipsoid_transform = nullptr,
                              const core::Tensor* ellipsoid_radii = nullptr,
                              bool use_scene_filters = true) const;
-        void applyDepthFilter(core::Tensor& selection) const;
+        void applyDepthFilter(core::Tensor& selection,
+                              const SelectionProjectionContext& projection_context) const;
+        [[nodiscard]] std::optional<ViewerViewportContext> resolveInteractiveSessionViewportContext(
+            std::optional<glm::vec2> screen_point = std::nullopt) const;
+        [[nodiscard]] std::expected<SelectionProjectionContext, SelectionProjectionError> resolveCommandProjectionSnapshot(
+            int camera_index,
+            std::optional<glm::vec2> query_point = std::nullopt,
+            bool skip_explicit_camera_validation = false) const;
+        [[nodiscard]] std::optional<SelectionProjectionContext> projectionContextFromViewerContext(
+            const ViewerViewportContext& context) const;
+        [[nodiscard]] std::optional<rendering::FrameView> frameViewFromProjectionContext(
+            const SelectionProjectionContext& projection_context) const;
+        [[nodiscard]] std::shared_ptr<core::Tensor> screenPositionsForCommandPass(
+            int camera_index, const SelectionProjectionContext& projection_context) const;
+        [[nodiscard]] std::shared_ptr<core::Tensor> renderScreenPositionsForProjectionContext(
+            const SelectionProjectionContext& projection_context) const;
+        [[nodiscard]] bool hasTestingScreenPositionsForCamera(int camera_index) const;
+        [[nodiscard]] bool commandCameraValidationRequired(int camera_index) const;
         void clearInteractivePreviewState();
         bool allowPassiveHoverPreview(glm::vec2 cursor_pos);
         [[nodiscard]] std::vector<bool> effectiveNodeMask(bool restrict_to_selected_nodes) const;
@@ -327,7 +416,9 @@ namespace lfs::vis {
         std::shared_ptr<core::Tensor> testing_screen_positions_;
         std::unordered_map<int, std::shared_ptr<core::Tensor>> testing_camera_screen_positions_;
         std::optional<ViewportInfo> testing_viewport_;
+        std::optional<rendering::CameraIntrinsics> testing_containment_intrinsics_;
         std::optional<int> testing_hovered_gaussian_id_;
+        std::optional<SplitViewPanelId> testing_panel_;
         mutable bool passive_ring_preview_key_valid_ = false;
         mutable std::size_t passive_ring_preview_key_ = 0;
         mutable bool passive_ring_has_hit_ = false;

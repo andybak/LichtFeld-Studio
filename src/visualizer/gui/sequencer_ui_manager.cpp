@@ -10,7 +10,7 @@
 #include "core/path_utils.hpp"
 #include "core/sh_value_quant.hpp"
 #include "core/splat_data.hpp"
-#include "core/tensor/internal/cuda_stream_context.hpp"
+#include "core/tensor/backend/cuda/runtime/cuda_stream_context.hpp"
 #include "gui/gui_focus_state.hpp"
 #include "gui/panel_input_utils.hpp"
 #include "gui/rml_sequencer_overlay.hpp"
@@ -375,7 +375,7 @@ namespace lfs::vis::gui {
 
         if (auto* const rm = viewer_->getRenderingManager()) {
             rm->setFocalLength(state.focal_length_mm);
-            rm->markCameraPoseChanged();
+            rm->markCameraCut();
         }
     }
 
@@ -1365,11 +1365,9 @@ namespace lfs::vis::gui {
         }
 
         if (panel_->consumeExportRequest() && controller_.timeline().realKeyframeCount() > 0) {
-            lfs::core::events::cmd::SequencerExportVideo{
-                .width = ui_state_.outputWidth(),
-                .height = ui_state_.outputHeight(),
-                .framerate = ui_state_.framerate,
-                .crf = ui_state_.quality}
+            ui_state_.videoExportRequest(
+                         ui_state_.outputWidth(), ui_state_.outputHeight(),
+                         ui_state_.framerate, ui_state_.quality)
                 .emit();
         }
 
@@ -1669,7 +1667,7 @@ namespace lfs::vis::gui {
 
         const auto& t = theme();
         const auto* const wm = viewer_->getWindowManager();
-        const glm::ivec2 screen_size = wm ? wm->getWindowSize() : glm::ivec2{};
+        const glm::ivec2 screen_size = wm ? wm->getFramebufferSize() : glm::ivec2{};
         const glm::ivec2 framebuffer_size = wm ? wm->getFramebufferSize() : glm::ivec2{};
         const int screen_w = screen_size.x;
         const int screen_h = screen_size.y;

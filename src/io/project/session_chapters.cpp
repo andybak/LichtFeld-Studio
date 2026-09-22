@@ -163,6 +163,7 @@ namespace lfs::io::project {
                 {"desaturate_unselected", false},
                 {"desaturate_cropping", false},
                 {"hide_outside_depth_box", false},
+                {"depth_filter_viz_mode", 1},
                 {"crop_filter_for_selection", false},
                 {"apply_appearance_correction", false},
                 {"ppisp_mode", 1},
@@ -403,6 +404,13 @@ namespace lfs::io::project {
                      {"show_pip_preview", true},
                      {"pip_preview_scale", 1.0},
                      {"show_film_strip", true},
+                     {"reconstruction",
+                      {
+                          {"version", 1},
+                          {"backend_id", "native"},
+                          {"preset_id", "native"},
+                          {"fallback", "abort"},
+                      }},
                  }},
             };
         }

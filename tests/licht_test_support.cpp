@@ -131,6 +131,7 @@ namespace lfs::test::licht {
         "sh_degree":2,"render_scale":0.75,"camera_metrics_mode":2,
         "show_crop_box":true,"use_crop_box":true,"show_ellipsoid":true,"use_ellipsoid":true,
         "desaturate_unselected":true,"desaturate_cropping":true,"hide_outside_depth_box":true,
+        "depth_filter_viz_mode":2,
         "crop_filter_for_selection":true,"apply_appearance_correction":true,"ppisp_mode":0,
         "background_color":[0.1,0.2,0.3],"environment_builtin":null,
         "environment_exposure":1.75,"environment_rotation_degrees":42.0,
@@ -598,7 +599,7 @@ namespace lfs::test::licht {
     }
 
     std::unique_ptr<core::SplatData> make_matrix_splat(const bool cuda) {
-        const Device device = cuda ? Device::CUDA : Device::CPU;
+        const Device device = cuda ? Device::GPU : Device::CPU;
         constexpr std::size_t count = 4;
         std::vector<float> means{
             1.0f,

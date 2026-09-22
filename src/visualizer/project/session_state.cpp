@@ -616,7 +616,52 @@ namespace lfs::vis::project {
                 required_field("use_ellipsoid", &RenderSettings::use_ellipsoid),
                 required_field("desaturate_unselected", &RenderSettings::desaturate_unselected),
                 required_field("desaturate_cropping", &RenderSettings::desaturate_cropping),
-                required_field("hide_outside_depth_box", &RenderSettings::hide_outside_depth_box),
+                custom_field<RenderSettings>(
+                    "hide_outside_depth_box",
+                    [](const RenderSettings& settings) {
+                        return Json(settings.depth_filter_viz_mode == 2);
+                    },
+                    [](const Json& json, RenderSettings& settings,
+                       std::string_view prefix, std::string_view field) {
+                        if (json.contains("depth_filter_viz_mode")) {
+                            return lfs::Result<void>{};
+                        }
+                        bool value = false;
+                        if (auto status = assign_required(json, field, value, prefix); !status) {
+                            return status;
+                        }
+                        settings.depth_filter_viz_mode = value ? 2 : 0;
+                        return lfs::Result<void>{};
+                    }),
+                custom_field<RenderSettings>(
+                    "depth_filter_viz_mode",
+                    [](const RenderSettings& settings) {
+                        return Json(settings.depth_filter_viz_mode);
+                    },
+                    [](const Json& json, RenderSettings& settings,
+                       std::string_view prefix, std::string_view field) {
+                        if (!json.contains(field)) {
+                            if (json.contains("hide_outside_depth_box")) {
+                                return lfs::Result<void>{};
+                            }
+                            return fail<void>(
+                                lfs::ErrorCode::DataLoss,
+                                "VIEW depth-filter visualization mode is missing",
+                                std::string(prefix) + "." + std::string(field));
+                        }
+                        int value = 0;
+                        if (auto status = assign_required(json, field, value, prefix); !status) {
+                            return status;
+                        }
+                        if (value < 0 || value > 2) {
+                            return fail<void>(
+                                lfs::ErrorCode::DataLoss,
+                                "Unsupported depth-filter visualization mode",
+                                std::string(prefix) + "." + std::string(field));
+                        }
+                        settings.depth_filter_viz_mode = value;
+                        return lfs::Result<void>{};
+                    }),
                 required_field("crop_filter_for_selection", &RenderSettings::crop_filter_for_selection),
                 required_field("apply_appearance_correction", &RenderSettings::apply_appearance_correction),
                 enum_field("ppisp_mode", &RenderSettings::ppisp_mode,
@@ -1356,6 +1401,29 @@ namespace lfs::vis::project {
                     lfs::ErrorCode::DataLoss,
                     "SEQR playhead or playback speed is invalid",
                     "SEQR");
+            }
+
+            if (const auto preferences = find_required_object(root, "preferences");
+                preferences != root.end()) {
+                const auto reconstruction = preferences->find("reconstruction");
+                if (reconstruction != preferences->end()) {
+                    if (!reconstruction->is_object()) {
+                        return fail<void>(
+                            lfs::ErrorCode::DataLoss,
+                            "SEQR video reconstruction selection must be an object",
+                            "SEQR.preferences.reconstruction");
+                    }
+                    if (const auto selection =
+                            lfs::io::video::deserializeVideoReconstructionSelection(
+                                reconstruction->dump());
+                        !selection && selection.error().issue !=
+                                          lfs::io::video::VideoReconstructionSelectionIssue::UnsupportedVersion) {
+                        return fail<void>(
+                            lfs::ErrorCode::DataLoss,
+                            selection.error().message,
+                            "SEQR.preferences.reconstruction");
+                    }
+                }
             }
             return {};
         }
@@ -2256,6 +2324,13 @@ namespace lfs::vis::project {
             viewer.getSelectionTool();
         const auto& sequencer_ui =
             gui_manager->getSequencerUIState();
+        const auto reconstruction_json =
+            lfs::io::video::serializeVideoReconstructionSelection(sequencer_ui.reconstruction);
+        if (!reconstruction_json) {
+            return fail<lfs::io::project::ProjectSessionChapters>(
+                lfs::ErrorCode::InvalidArgument, reconstruction_json.error().message,
+                "SEQR.preferences.reconstruction");
+        }
         auto project_render_settings =
             renderSettingsToProjectJson(settings);
         if (!settings.environment_map_path.empty() &&
@@ -2581,6 +2656,18 @@ namespace lfs::vis::project {
             }
             clips.push_back(std::move(saved_clip));
         }
+        auto sequencer_preferences = fields_to_json(sequencer_ui, sequencer_preference_fields());
+        sequencer_preferences["reconstruction"] = Json::parse(*reconstruction_json);
+        if (const auto retained_selection = result.sequencer.dom().get_json("preferences.reconstruction")) {
+            const auto parsed = lfs::io::video::deserializeVideoReconstructionSelection(retained_selection->dump());
+            if (!parsed && parsed.error().issue ==
+                               lfs::io::video::VideoReconstructionSelectionIssue::UnsupportedVersion) {
+                // Do not merge a future schema's opaque members into version 1.
+                // Same-version unknown members retain the normal SEQR preservation rules.
+                if (auto removed = result.sequencer.dom().remove("preferences.reconstruction"); !removed)
+                    return std::move(removed).error();
+            }
+        }
         const Json sequencer_known{
             {"version", 1},
             {"timeline", std::move(timeline)},
@@ -2591,10 +2678,7 @@ namespace lfs::vis::project {
                  controller.loopMode())},
             {"playback_speed",
              controller.playbackSpeed()},
-            {"preferences",
-             fields_to_json(
-                 sequencer_ui,
-                 sequencer_preference_fields())},
+            {"preferences", std::move(sequencer_preferences)},
             {"view",
              {
                  {"zoom",
@@ -3435,6 +3519,9 @@ namespace lfs::vis::project {
             const bool sequencer_visible =
                 gui_manager->panelLayout().isShowSequencer();
             const auto finish = [&] {
+                // Seed both slots from final restored tool values with sync off on every exit.
+                rendering
+                    ->restoreDepthWindowStateFromProject();
                 viewer.getEditorContext()
                     .armToolRestoreGuard();
                 gui_manager->panelLayout()
@@ -3576,30 +3663,6 @@ namespace lfs::vis::project {
                                 renderSettingsFromProjectJson(
                                     *render_json,
                                     rendering->getSettings())) {
-                            // Disabled constructor-default boxes are not in near/far encoding.
-                            if (settings
-                                    ->depth_filter_enabled) {
-                                const float near_plane =
-                                    std::max(0.0f,
-                                             -settings
-                                                  ->depth_filter_max.z);
-                                const float far_plane =
-                                    std::max(near_plane + 0.01f,
-                                             -settings
-                                                  ->depth_filter_min.z);
-                                const float half_width =
-                                    std::max(
-                                        std::abs(settings
-                                                     ->depth_filter_min.x),
-                                        std::abs(settings
-                                                     ->depth_filter_max.x));
-                                selection_tool
-                                    ->setDepthFilterRange(
-                                        settings
-                                            ->depth_filter_enabled,
-                                        near_plane, far_plane,
-                                        half_width);
-                            }
                             auto restored =
                                 rendering->getSettings();
                             restored.crop_filter_for_selection =
@@ -3613,6 +3676,35 @@ namespace lfs::vis::project {
                             restored.depth_filter_transform =
                                 settings->depth_filter_transform;
                             rendering->updateSettings(restored);
+
+                            // Seed the tool from what the manager actually kept,
+                            // never from the saved box. A project written while
+                            // the filter was enabled can still hold the legacy
+                            // positive-Z box; decoding that raw yields near 0 /
+                            // far 0.01, and the tool's per-frame writer would
+                            // then stamp that 1cm band back over the migrated
+                            // settings. updateSettings normalizes it first, so
+                            // read the applied copy - `restored` is this
+                            // function's own local and still holds the raw box.
+                            const auto applied =
+                                rendering->getSettings();
+                            if (applied.depth_filter_enabled) {
+                                const float near_plane =
+                                    std::max(0.0f,
+                                             -applied.depth_filter_max.z);
+                                const float far_plane =
+                                    std::max(near_plane + 0.01f,
+                                             -applied.depth_filter_min.z);
+                                const float half_width =
+                                    std::max(
+                                        std::abs(applied.depth_filter_min.x),
+                                        std::abs(applied.depth_filter_max.x));
+                                selection_tool
+                                    ->setDepthFilterRange(
+                                        applied.depth_filter_enabled,
+                                        near_plane, far_plane,
+                                        half_width);
+                            }
                         }
                     }
                 }
@@ -3764,6 +3856,7 @@ namespace lfs::vis::project {
             auto& ui =
                 gui_manager
                     ->getSequencerUIState();
+            ui.reconstruction = {};
             if (const auto preferences =
                     find_required_object(
                         root, "preferences");
@@ -3773,6 +3866,16 @@ namespace lfs::vis::project {
                     ui,
                     "SEQR.preferences",
                     sequencer_preference_fields());
+                if (const auto found = preferences->find("reconstruction"); found != preferences->end()) {
+                    auto selection = lfs::io::video::deserializeVideoReconstructionSelection(found->dump());
+                    if (selection) {
+                        ui.reconstruction = std::move(*selection);
+                    } else if (selection.error().issue ==
+                               lfs::io::video::VideoReconstructionSelectionIssue::UnsupportedVersion) {
+                        LOG_WARN("Unsupported project video reconstruction selection version; using native");
+                        lfs::ErrorBus::instance().publish(gui::unsupportedVideoReconstructionVersionNotification());
+                    }
+                }
             }
             // Controller values are canonical over the UI mirrors.
             ui.playback_speed =
