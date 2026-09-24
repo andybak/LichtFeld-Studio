@@ -219,7 +219,7 @@ def test_menu_helpers_and_builtin_schemas(monkeypatch):
     assert edit_mod.EditMenu.order < select_mod.SelectMenu.order < tools_mod.ToolsMenu.order
 
     select_items = select_mod.SelectMenu().menu_items()
-    assert len(select_items) == 7
+    assert len(select_items) == 9
     assert select_items[0]["label"] == "tr:menu.select.copy_selection"
     assert select_items[0]["shortcut"] == "Ctrl+C"
     assert select_items[0]["enabled"] is True
@@ -247,6 +247,11 @@ def test_menu_helpers_and_builtin_schemas(monkeypatch):
     assert select_items[6]["enabled"] is True
     select_items[6]["callback"]()
     assert state["deselect_all_called"] is True
+    assert select_items[7]["type"] == "separator"
+    assert select_items[8]["label"] == "tr:menu.select.selection_groups"
+    assert select_items[8]["enabled"] is True
+    assert select_items[8]["callback"]() is True
+    assert state["panel_enabled"] == [("lfs.selection_groups", True)]
 
     state["has_gaussian_selection"] = False
     state["has_gaussian_clipboard"] = True
@@ -260,11 +265,16 @@ def test_menu_helpers_and_builtin_schemas(monkeypatch):
     select_items = select_mod.SelectMenu().menu_items()
     assert select_items[4]["enabled"] is True
     assert select_items[5]["enabled"] is False
+    activated = []
+    monkeypatch.setattr(select_mod, "_activate_select_tool", lambda: activated.append("select") or True)
+    assert select_items[8]["callback"]() is True
+    assert activated == ["select"]
+    assert state["panel_enabled"][-1] == ("lfs.selection_groups", True)
 
     state["active_tool"] = "builtin.select"
     state["can_edit_gaussian_selection"] = False
     select_items = select_mod.SelectMenu().menu_items()
-    assert [item.get("enabled") for item in select_items if item["type"] == "item"] == [False] * 6
+    assert [item.get("enabled") for item in select_items if item["type"] == "item"] == [False] * 7
 
     view_items = view_mod.ViewMenu().menu_items()
     assert view_items[0]["type"] == "submenu"
@@ -345,6 +355,30 @@ def test_tools_menu_includes_gallery_entries(monkeypatch):
     assert items[2]["type"] == "separator"
 
     items[1]["callback"]()
+    assert state["panel_enabled"] == [("lfs.asset_manager", True)]
+
+
+def test_tools_menu_projects_selects_scope_when_available(monkeypatch):
+    state = _install_lichtfeld_stub(monkeypatch)
+    selected = []
+    state["panels"]["lfs.asset_manager"] = SimpleNamespace(
+        select_projects_scope=lambda: selected.append(True),
+    )
+    tools_mod = _import_tools_menu(monkeypatch)
+
+    items = tools_mod.ToolsMenu().menu_items()
+    items[0]["callback"]()
+    assert state["panel_enabled"] == [("lfs.asset_manager", True)]
+    assert selected == [True]
+
+
+def test_tools_menu_projects_skips_missing_select_projects_scope(monkeypatch):
+    state = _install_lichtfeld_stub(monkeypatch)
+    state["panels"]["lfs.asset_manager"] = SimpleNamespace()
+    tools_mod = _import_tools_menu(monkeypatch)
+
+    items = tools_mod.ToolsMenu().menu_items()
+    items[0]["callback"]()
     assert state["panel_enabled"] == [("lfs.asset_manager", True)]
 
 

@@ -681,20 +681,6 @@ namespace lfs::vis {
                 const float v = splitViewPixelCenterUv(y, rect_y, rect_h);
                 for (int x = rect_x; x < rect_x + rect_w; ++x) {
                     const float u = splitViewPixelCenterUv(x, rect_x, rect_w);
-                    const bool use_left = x < divider;
-                    const auto& panel = use_left ? left_panel : right_panel;
-                    float panel_u = u;
-                    if (panel.normalize_x_to_panel) {
-                        const float span = std::max(panel.end_position - panel.start_position, 1e-6f);
-                        panel_u = (u - panel.start_position) / span;
-                    }
-                    const float panel_v = panel.flip_y ? 1.0f - v : v;
-                    const glm::vec2 clamp_max = glm::clamp(panel.uv_clamp_max,
-                                                           glm::vec2(0.0f), glm::vec2(1.0f));
-                    const glm::vec2 texture_uv = glm::min(
-                        (glm::vec2(panel_u, panel_v) * panel.texcoord_scale + panel.texcoord_offset) *
-                            panel.uv_scale,
-                        clamp_max);
                     const std::size_t idx = static_cast<std::size_t>(y) * width + x;
                     glm::vec3 color;
                     if (params.loss_visualization) {
@@ -710,7 +696,7 @@ namespace lfs::vis {
 
                     const float dist_from_split = std::abs(static_cast<float>(x) + 0.5f - split_x);
                     if (!params.loss_visualization && dist_from_split < kMinBarWidthPx * 0.5f) {
-                        glm::vec3 color = kDividerColor;
+                        glm::vec3 divider_color = kDividerColor;
                         const float dist_from_center =
                             std::abs(static_cast<float>(y) + 0.5f - center_y);
                         const float handle_h = std::min(kHandleHeightPx, static_cast<float>(rect_h));
@@ -724,19 +710,19 @@ namespace lfs::vis {
                                 (glm::vec2(handle_w, handle_h) * 0.5f - glm::vec2(corner_radius));
                             if (corner_dist.x <= 0.0f || corner_dist.y <= 0.0f ||
                                 glm::length(corner_dist) <= corner_radius) {
-                                color = kDividerColor * 0.8f;
+                                divider_color = kDividerColor * 0.8f;
                                 const float local_y = static_cast<float>(y) + 0.5f - center_y;
                                 for (int i = -kGripLineCount; i <= kGripLineCount; ++i) {
                                     const float line_y = static_cast<float>(i) * kGripSpacingPx;
                                     if (std::abs(local_y - line_y) < kGripWidthPx &&
                                         dist_from_split < kGripLengthPx * 0.5f) {
-                                        color = glm::vec3(0.9f);
+                                        divider_color = glm::vec3(0.9f);
                                         break;
                                     }
                                 }
                             }
                         }
-                        write(idx, color);
+                        write(idx, divider_color);
                     }
                 }
             }
@@ -1331,7 +1317,8 @@ namespace lfs::vis {
                                 const auto scaled = lfs::core::scale_undistort_params(
                                     request.undistort_params,
                                     lfs::rendering::imageWidth(gt_tensor, gt_layout),
-                                    lfs::rendering::imageHeight(gt_tensor, gt_layout));
+                                    lfs::rendering::imageHeight(gt_tensor, gt_layout),
+                                    request.preview_max_dimension);
                                 gt_tensor = lfs::core::undistort_image(gt_tensor, scaled, worker_stream);
                             }
                             gt_tensor = lfs::rendering::flipImageVertical(gt_tensor, gt_layout);
@@ -1351,7 +1338,8 @@ namespace lfs::vis {
                                 const auto scaled = lfs::core::scale_undistort_params(
                                     request.undistort_params,
                                     static_cast<int>(depth.shape()[1]),
-                                    static_cast<int>(depth.shape()[0]));
+                                    static_cast<int>(depth.shape()[0]),
+                                    request.preview_max_dimension);
                                 depth = lfs::core::undistort_mask(depth, scaled, worker_stream);
                             }
                             image = makeDepthDisplayTensor(
@@ -1373,7 +1361,8 @@ namespace lfs::vis {
                                 const auto scaled = lfs::core::scale_undistort_params(
                                     request.undistort_params,
                                     lfs::rendering::imageWidth(normal, normal_layout),
-                                    lfs::rendering::imageHeight(normal, normal_layout));
+                                    lfs::rendering::imageHeight(normal, normal_layout),
+                                    request.preview_max_dimension);
                                 normal = lfs::core::undistort_image(normal, scaled, worker_stream);
                             }
                             image = makeNormalDisplayTensor(normal);
@@ -1529,6 +1518,38 @@ namespace lfs::vis {
             (dirty_mask_.load(std::memory_order_relaxed) & DirtyFlag::SPLATS) != 0;
         return vksplat_viewport_renderer_->buildSelectionMask(
             *last_vulkan_context_, *model, request, force_input_upload);
+    }
+
+    // Camera and edit changes retry on the next frame. A passive training refresh
+    // parks instead, so the idle preview draws only once its render can proceed.
+    void RenderingManager::queueSharedScratchRetry(const DirtyMask retry_dirty) {
+        if ((retry_dirty & ~DirtyFlag::SPLATS) == 0) {
+            parked_arena_retry_ |= retry_dirty;
+            return;
+        }
+        dirty_mask_.fetch_or(retry_dirty, std::memory_order_relaxed);
+    }
+
+    void RenderingManager::pollTrainingRefresh(const bool is_training) {
+        if (const DirtyMask training_dirty = frame_lifecycle_service_.handleTrainingRefresh(
+                is_training, framerate_controller_.getSettings().training_frame_refresh_time_sec);
+            training_dirty) {
+            training_refresh_dirty_.fetch_or(training_dirty, std::memory_order_relaxed);
+            markDirty(training_dirty);
+        }
+    }
+
+    double RenderingManager::secondsUntilTrainingRefresh() const {
+        return frame_lifecycle_service_.secondsUntilTrainingRefresh(
+            framerate_controller_.getSettings().training_frame_refresh_time_sec);
+    }
+
+    void RenderingManager::pollParkedArenaRetry() {
+        if (parked_arena_retry_ == 0 ||
+            (vksplat_viewport_renderer_ && !vksplat_viewport_renderer_->pollArenaHandoff())) {
+            return;
+        }
+        dirty_mask_.fetch_or(std::exchange(parked_arena_retry_, 0), std::memory_order_relaxed);
     }
 
     RenderingManager::VulkanFrameResult RenderingManager::renderVulkanFrame(const RenderContext& context) {
@@ -2018,12 +2039,9 @@ namespace lfs::vis {
         } // !render_lock_contended model-change tracking
 
         const bool synchronize_vksplat_input_upload = is_training;
-        // Keep this cadence dirty separate until the frame consumes the atomic
-        // dirty mask. Its provenance determines whether a temporal settle burst
-        // can produce useful history or would only race the next training tick.
-        const DirtyMask training_refresh_dirty = frame_lifecycle_service_.handleTrainingRefresh(
-            is_training,
-            framerate_controller_.getSettings().training_frame_refresh_time_sec);
+        // Training refresh marks the scene dirty from the main loop; its provenance decides whether a
+        // temporal settle burst can produce useful history or would only race the next training tick.
+        const DirtyMask training_refresh_dirty = training_refresh_dirty_.exchange(0, std::memory_order_relaxed);
 
         const bool has_cached_gpu_only_frame = [&]() {
             if (vulkan_viewport_image_size_.x <= 0 || vulkan_viewport_image_size_.y <= 0) {
@@ -2058,11 +2076,15 @@ namespace lfs::vis {
         }
 
         DirtyMask frame_dirty = dirty_mask_.exchange(0);
+        if (vksplat_viewport_renderer_) {
+            vksplat_viewport_renderer_->setCameraNavigating(
+                is_training && (frame_dirty & DirtyFlag::CAMERA) != 0);
+        }
         constexpr DirtyMask temporal_source_dirty =
             DirtyFlag::CAMERA | DirtyFlag::SPLATS | DirtyFlag::MESH |
             DirtyFlag::VIEWPORT | DirtyFlag::BACKGROUND | DirtyFlag::SPLIT_VIEW;
-        const DirtyMask independently_dirty_temporal_sources = frame_dirty & temporal_source_dirty;
-        frame_dirty |= training_refresh_dirty;
+        const DirtyMask independently_dirty_temporal_sources =
+            frame_dirty & ~training_refresh_dirty & temporal_source_dirty;
         const bool lod_results_ready = lod_controller_ && lod_controller_->hasReadyResults();
         const bool lod_transition_active = lod_controller_ && lod_controller_->transitionActive();
         if (lod_results_ready) {
@@ -4528,7 +4550,7 @@ namespace lfs::vis {
                         has_cached_viewport_output &&
                         shared_scratch_retryable) {
                         const DirtyMask retry_dirty = vksplatSharedScratchRetryDirty(frame_dirty);
-                        dirty_mask_.fetch_or(retry_dirty, std::memory_order_relaxed);
+                        queueSharedScratchRetry(retry_dirty);
                         const bool cached_size_matches = vulkan_viewport_image_size_ == render_size;
                         if (vksplat_viewport_resize || !cached_size_matches) {
                             LOG_DEBUG("{} ({}); skipping cached viewport image, retry_dirty=0x{:x}, vksplat_resize={}, cached_size={}x{}, render_size={}x{}",
@@ -4789,8 +4811,7 @@ namespace lfs::vis {
                 isRetryableSharedScratchUnavailable(render_error);
             if (shared_scratch_retryable) {
                 const DirtyMask retry_dirty = vksplatSharedScratchRetryDirty(frame_dirty);
-                dirty_mask_.fetch_or(retry_dirty,
-                                     std::memory_order_relaxed);
+                queueSharedScratchRetry(retry_dirty);
                 render_lock.reset();
                 const bool cached_size_matches = vulkan_viewport_image_size_ == render_size;
                 if (has_cached_viewport_output && !vksplat_viewport_resize && cached_size_matches) {

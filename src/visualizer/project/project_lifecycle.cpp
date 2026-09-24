@@ -4476,6 +4476,13 @@ namespace lfs::vis::project {
         if (!trainer) {
             return std::nullopt;
         }
+        // A finished trainer is a new run, not a resume. Iteration above
+        // zero still needs overwrite consent before Start is accepted.
+        if (auto* const manager = viewer_.getTrainerManager();
+            manager && manager->isFinished() &&
+            trainer->get_current_iteration() > 0) {
+            return trainer->get_current_iteration();
+        }
         if (trainer->get_current_iteration() > 0) {
             return std::nullopt;
         }
@@ -6313,7 +6320,10 @@ namespace lfs::vis::project {
             const bool splat_already_captured =
                 fourcc == "SPLT" &&
                 captured_splat != captured_splat_serials_.end() &&
-                captured_splat->second >= sync_scene_serial;
+                // A rename or selection change can advance the scene serial
+                // while a capture finishes. Its bytes are still current when
+                // geometry is clean, and its provenance must still be recorded.
+                (captured_splat->second >= sync_scene_serial || !capture_payloads);
             if (fourcc == "SPLT") {
                 live_splats.insert(node->uuid);
             } else if (fourcc == "PCLD") {
@@ -8466,6 +8476,22 @@ namespace lfs::vis::project {
         const std::lock_guard document_lock(document_access_mutex_);
         cached_project_info_.reset();
         return document_->set_license(license);
+    }
+
+    lfs::Result<void> ProjectLifecycle::adoptImportLicense(
+        const std::optional<std::vector<uint8_t>>& license_bytes) {
+        if (!document_) {
+            return fail<void>(
+                lfs::ErrorCode::FailedPrecondition,
+                "There is no active project document.",
+                "Project lifecycle has not created or opened a document",
+                "project.document");
+        }
+        const std::lock_guard document_lock(document_access_mutex_);
+        auto adopted = document_->adopt_import_license(license_bytes);
+        if (adopted)
+            cached_project_info_.reset();
+        return adopted;
     }
 
     lfs::Result<void> ProjectLifecycle::clearLicense() {

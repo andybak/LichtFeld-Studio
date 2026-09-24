@@ -49,7 +49,9 @@ body {
     font-size: 12dp;
     text-align: center;
     max-height: 400dp;
-    overflow: auto;
+    word-break: break-word;
+    overflow-x: hidden;
+    overflow-y: auto;
 }
 
 .modal-input-row {
@@ -143,6 +145,15 @@ body {
     min-height: 28dp;
     max-height: 28dp;
     margin: 0 0 8dp;
+}
+.modal-field--multiline { height: auto; min-height: 96dp; max-height: none; align-items: flex-start; }
+.form-modal .modal-field--multiline textarea {
+    flex: 1;
+    min-width: 0;
+    height: 88dp;
+    min-height: 88dp;
+    max-height: none;
+    overflow-y: auto;
 }
 .modal-field-label {
     display: block;

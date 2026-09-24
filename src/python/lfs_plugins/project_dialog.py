@@ -14,10 +14,11 @@ def form_content(kind: str, data: dict[str, Any], *, tr: Callable[[str], str],
     def label(key: str) -> str:
         return text(tr(key))
 
-    def form_row(key: str, control: str, name: str = "") -> str:
+    def form_row(key: str, control: str, name: str = "", *, multiline: bool = False) -> str:
         caption = (f'<label class="modal-field-label" for="{text(name)}">{label(key)}</label>'
                    if name else f'<span class="modal-field-label">{label(key)}</span>')
-        return f'<div class="modal-field">{caption}{control}</div>'
+        row_class = "modal-field modal-field--multiline" if multiline else "modal-field"
+        return f'<div class="{row_class}">{caption}{control}</div>'
 
     def fact(key: str, value: Any, *, id: str = "") -> str:
         return form_row(key, f'<span id="{id}" class="modal-field-value" title="{text(value)}">{text(value)}</span>')
@@ -34,7 +35,7 @@ def form_content(kind: str, data: dict[str, Any], *, tr: Callable[[str], str],
         return dict(label=tr(key), style=style, disabled=disabled)
 
     body = '<div class="project-form">'
-    if kind not in {"license", "remove_content", "compact_content"}:
+    if kind not in {"license", "remove_content", "compact_content", "gallery_details"}:
         body += fact("projects.property.path", data.get("path", ""))
     buttons = []
     if busy:
@@ -59,11 +60,16 @@ def form_content(kind: str, data: dict[str, Any], *, tr: Callable[[str], str],
         body += '<div class="modal-note">' + label("projects.license.meaning_" + meaning) + '</div>'
         if selected == "custom":
             body += field("license_name", "projects.license.name")
-            body += form_row("projects.license.text", f'<textarea id="license_text" name="license_text" rows="1">{text(data.get("license_text", ""))}</textarea>', "license_text")
+            body += form_row("projects.license.text", f'<textarea id="license_text" name="license_text" rows="1" value="{text(data.get("license_text", ""))}"></textarea>', "license_text")
         if selected not in {"CC0-1.0", "LicenseRef-Proprietary"}:
             body += field("attribution", "projects.license.attribution")
     elif kind == "rename":
         body += field("name", "projects.property.display_name")
+    elif kind == "gallery_details":
+        body += field("gallery_title", "projects.gallery.details.title")
+        body += form_row("projects.gallery.details.description",
+                         f'<textarea id="gallery_description" name="gallery_description" rows="4" value="{text(data.get("gallery_description", ""))}"></textarea>',
+                         "gallery_description", multiline=True)
     elif kind == "repair":
         body += field("destination", "projects.dialog.choose_destination")
         buttons = [button("projects.dialog.choose_destination")]

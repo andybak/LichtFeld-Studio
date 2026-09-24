@@ -17,6 +17,7 @@
 #include "rendering/cuda_vulkan_interop.hpp"
 #include "rendering/rasterizer/vulkan/src/gs_renderer.h"
 #include "rendering/rendering.hpp"
+#include "vksplat_shared_scratch_install.hpp"
 #include "window/vulkan_context.hpp"
 
 #include <array>
@@ -147,7 +148,8 @@ namespace lfs::vis {
             const lfs::rendering::ViewportRenderRequest& request,
             bool force_input_upload,
             OutputSlot output_slot = OutputSlot::Main,
-            bool synchronize_input_upload = false);
+            bool synchronize_input_upload = false,
+            bool deterministic_export = false);
         [[nodiscard]] std::expected<RenderResult, std::string> rerenderSelectionOverlay(
             VulkanContext& context,
             const lfs::core::SplatData& splat_data,
@@ -188,6 +190,12 @@ namespace lfs::vis {
         // training indefinitely.
         void requestArenaHandoff();
         void cancelArenaHandoff();
+        // Keeps a pending reservation alive and reports whether the next render
+        // could claim the arena without waiting.
+        [[nodiscard]] bool pollArenaHandoff();
+        // While the camera moves during training, the viewer and training take
+        // turns on the shared scratch (see NavigationArenaShare).
+        void setCameraNavigating(bool navigating);
 
         // Invoked with the completion value immediately after each live-model
         // submit, BEFORE the shared arena frame is released — the trainer's
@@ -762,6 +770,8 @@ namespace lfs::vis {
 
         cudaStream_t render_stream_ = nullptr;
         std::uint64_t arena_handoff_token_ = 0;
+        bool camera_navigating_ = false;
+        NavigationArenaShare navigation_share_;
 
         std::function<void(std::uint64_t)> live_submit_callback_;
 
