@@ -61,6 +61,20 @@ def test_live_project_publication_has_no_commit_conflict_or_followup_action(comm
     assert actions == []
 
 
+def test_new_gallery_subscriber_does_not_consume_existing_subscribers_update(gallery):
+    controller, state, _actions = gallery
+    first = []
+    second = []
+    controller.subscribe(lambda snapshot: first.append(snapshot["signed_in"]))
+    last_broadcast = copy.deepcopy(controller._last_snapshot)
+    state["signed_in"] = False
+    controller.subscribe(lambda snapshot: second.append(snapshot["signed_in"]))
+
+    assert first == [True]
+    assert second == [False]
+    assert controller._last_snapshot == last_broadcast
+
+
 def test_gallery_update_removes_only_groups_emptied_by_replaced_splats(gallery, monkeypatch, tmp_path):
     panel, _, actions = gallery
     module = import_module("lfs_plugins.gallery_controller")
@@ -628,6 +642,66 @@ def test_publish_review_save_choice_only_for_open_project(gallery, monkeypatch, 
     assert 'data-if="show_prepared_copy"' in rml
     assert 'data-if="show_cover"' in rml
     assert 'data-if="show_unlinked_hint">{{unlinked_copy}}' in rml
+
+
+def test_pull_review_folder_dropdown_browse_and_submit(gallery, monkeypatch, tmp_path):
+    from lfs_plugins.gallery_file_panel import GalleryFilePanel
+    module = import_module("lfs_plugins.gallery_file_panel")
+    controller, state, _ = gallery
+    default = tmp_path / "default"
+    watched = tmp_path / "watched"
+    browsed = tmp_path / "browsed"
+    for directory in (default, watched, browsed):
+        directory.mkdir()
+    monkeypatch.setattr(module.lf.ui, "get_panel_object", lambda _: None, raising=False)
+    monkeypatch.setattr(module.lf.ui, "set_panel_enabled", lambda *_: None, raising=False)
+    monkeypatch.setattr(module.lf.ui, "request_redraw", lambda: None, raising=False)
+    calls = []
+    monkeypatch.setattr(module.lf.ui, "open_folder_dialog", lambda title, start: calls.append((title, start)) or str(browsed), raising=False)
+    submitted = []
+    monkeypatch.setattr(controller, "pull_asset", lambda *args, **kwargs: submitted.append((args, kwargs)))
+    panel = GalleryFilePanel()
+    panel.show(controller=controller, asset={"id": "remote"}, scene=scene(), action="pull",
+               fields={"pull_folder": str(default), "pull_name": "copy.licht"},
+               pull_folders=[{"name": "default", "path": str(default)},
+                             {"name": "watched", "path": str(watched)}])
+    assert panel._pull_folders == [{"name": "default", "path": str(default)},
+                                   {"name": "watched", "path": str(watched)}]
+    panel._set("pull_folder", str(watched))
+    assert panel._fields["pull_folder"] == str(watched)
+    panel._browse_pull_folder()
+    assert calls[0][1] == str(watched)
+    assert panel._fields["pull_folder"] == str(browsed)
+    assert panel._pull_folders[-1]["path"] == str(browsed)
+    bindings, events = {}, {}
+
+    class Model:
+        def bind(self, name, getter, setter):
+            bindings[name] = getter, setter
+        def bind_func(self, *_args):
+            pass
+        def bind_record_list(self, *_args):
+            pass
+        def bind_event(self, name, callback):
+            events[name] = callback
+        def get_handle(self):
+            return None
+
+    panel.on_bind_model(SimpleNamespace(create_data_model=lambda _name: Model()))
+    bindings["pull_folder"][1](str(default))
+    assert panel._fields["pull_folder"] == str(browsed)
+    events["choose_pull_folder"](None, None, [str(watched)])
+    assert panel._fields["pull_folder"] == str(watched)
+    events["choose_pull_folder"](None, None, [str(browsed)])
+    panel._state = state
+    panel._submit()
+    assert submitted[0][0][2] == str(browsed / "copy.licht")
+    rml = (Path(__file__).resolve().parents[2] / "src/visualizer/gui/rmlui/resources/gallery_file_panel.rml").read_text()
+    assert 'data-for="folder : pull_folders"' in rml
+    assert 'data-event-change="choose_pull_folder(ev.value)"' in rml
+    assert 'data-value="pull_folder"' in rml
+    assert 'data-attrif-selected="folder.path == pull_folder"' not in rml
+    assert 'data-event-click="browse_pull_folder"' in rml
 
 
 def test_publish_without_save_rechecks_saved_commit(gallery, monkeypatch, tmp_path):
@@ -1209,7 +1283,8 @@ def test_catalog_projection_renders_before_account_snapshot_without_authorizing_
     # Once the account-scoped snapshot arrives it supersedes the projection.
     assert asset_sync_state({"id": "local", "exists": True})["relationship"] == "unlinked"
 
-def test_default_pull_registers_links_without_touching_open_document(gallery, monkeypatch, tmp_path):
+@pytest.mark.parametrize('folder_id, pinned', [('default', False), ('watched', False), (None, True)])
+def test_default_pull_registers_links_without_touching_open_document(gallery, monkeypatch, tmp_path, folder_id, pinned):
     panel, state, actions = gallery
     module = import_module('lfs_plugins.gallery_controller')
     path = str(tmp_path / 'pulled.licht')
@@ -1227,6 +1302,7 @@ def test_default_pull_registers_links_without_touching_open_document(gallery, mo
     registered = []
     project = SimpleNamespace(id='fresh-project', project_uuid='fresh-project', extra={})
     index = SimpleNamespace(load=lambda: True, update_asset=lambda *a, **kw: project, get_asset=lambda _: None,
+        folder_id_for_path=lambda _: folder_id,
         register_licht_asset=lambda p, **kw: registered.append((p, kw)) or (project, True))
     monkeypatch.setattr(import_module('lfs_plugins.asset_index'), 'AssetIndex', lambda: index)
     panel._register_download(job, state['identity'])
@@ -1234,6 +1310,7 @@ def test_default_pull_registers_links_without_touching_open_document(gallery, mo
                           'projectStamp': module.file_stamp(path)}
     panel._finish_import()
     assert registered[0][0] == path
+    assert registered[0][1].get('pin', False) is pinned
     assert actions == [('link', ('pull', 'fresh-project', 'fresh-commit'), {'project_path': path})]
     assert panel._download_open_steps.pulled_project is None
     job['linkOperation'] = {'id': 'link', 'state': 'ready'}
@@ -1418,10 +1495,14 @@ def test_gallery_action_table_uses_file_activity_and_account_precedence(gallery)
     from lfs_plugins.gallery_actions import gallery_actions, gallery_eligibility
     asset = {"id": "project", "exists": True, "status": "AVAILABLE"}
     facts = dict(state="local", relationship="linked", linked=True, sceneReady=True,
-                 signed_in=True, established=True, source_formats=["licht"])
+                 signed_in=True, connection_state="connected", established=True,
+                 source_formats=["licht"])
     assert gallery_actions(asset, facts)[0]["id"] == "update"
-    disabled = gallery_actions(asset, dict(facts, signed_in=False))[0]
-    assert not disabled["enabled"] and disabled["reason"].endswith("eligibility.connect")
+    assert gallery_actions(asset, dict(facts, signed_in=False))[0]["label"] == gallery_actions(asset, facts)[0]["label"]
+    disabled = gallery_actions(asset, dict(facts, signed_in=False, connection_state="not_connected"))[0]
+    assert disabled["enabled"] and not disabled["reason"]
+    assert disabled["label"].endswith("portal.status.connect")
+    assert gallery_actions(asset, dict(facts, signed_in=False, connection_state="switched_off"))[0]["label"].endswith("portal.status.turn_on")
     assert gallery_actions(dict(asset, status="UNREADABLE"), facts) == []
     cached = dict(facts, cachedUnverified=True)
     assert gallery_actions(dict(asset, status="UNREADABLE"), cached) == []
@@ -1433,7 +1514,7 @@ def test_gallery_action_table_uses_file_activity_and_account_precedence(gallery)
     assert gallery_actions(asset, dict(facts, activity="applying", active=True)) == []
     completed = dict(facts, job={"id": "done", "status": "completed"}, undoAvailable=True)
     assert [a["id"] for a in gallery_actions(asset, completed)] == ["undo"]
-    assert not gallery_actions(asset, dict(completed, signed_in=False))[0]["enabled"]
+    assert not gallery_actions(asset, dict(completed, signed_in=False, connection_state="not_connected"))[0]["enabled"]
     assert gallery_actions(asset, dict(facts, viewingCopy=True, state="equal"))[0]["id"] == "publish_new"
     assert gallery_actions(asset, dict(facts, viewingCopy=True, state="remote"))[0]["id"] == "publish_new"
     queued = dict(facts, activity="queued", active=True, job={"id": "j", "status": "queued"})
@@ -1445,6 +1526,21 @@ def test_gallery_action_table_uses_file_activity_and_account_precedence(gallery)
     assert gallery_eligibility(dict(asset, embedded_dataset_complete=False), facts)["status"] == "not_checked"
     reasons = gallery_eligibility(dict(asset, publication={"visibleSplats": 0, "externalPayloads": True}), facts)
     assert reasons["reasons"] == ["no_splats", "external_payloads"]
+
+
+def test_disconnected_unlinked_project_keeps_publish_intent_until_gallery_check(gallery):
+    from lfs_plugins.gallery_actions import gallery_actions
+
+    asset = {"id": "project", "exists": True, "status": "AVAILABLE"}
+    facts = {"state": "not_checked", "relationship": "unlinked", "signed_in": False,
+             "connection_state": "not_connected"}
+    action = gallery_actions(asset, facts)[0]
+    assert action["id"] == "publish"
+    assert action["enabled"]
+    assert action["label"].endswith("portal.status.connect")
+    assert gallery_actions(asset, dict(facts, connection_state="switched_off"))[0]["id"] == "publish"
+    assert gallery_actions(asset, dict(facts, connection_state="connected"))[0]["id"] == "check"
+    assert gallery_actions(asset, dict(facts, relationship="linked"))[0]["id"] == "check"
 
 
 def test_presentation_metadata_and_scene_content_have_separate_relationships(gallery):
