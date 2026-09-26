@@ -4,15 +4,18 @@
 
 #include "py_params.hpp"
 
-#include "control/command_api.hpp"
+#include "core/camera_metrics.hpp"
+#include "core/event_bridge/command_api.hpp"
 #include "core/event_bridge/command_center_bridge.hpp"
 #include "core/logger.hpp"
 #include "core/optimization_properties.hpp"
 #include "core/path_utils.hpp"
 #include "python/python_runtime.hpp"
+#if LFS_BUILD_TRAINER
 #include "training/trainer.hpp"
+#endif
 #include "visualizer/core/parameter_manager.hpp"
-#include "visualizer/training/training_manager.hpp"
+#include "visualizer/core/training_manager.hpp"
 
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
@@ -606,11 +609,13 @@ namespace lfs::python {
         if (can_edit()) {
             return tm->getEditableDatasetParams();
         }
+#if LFS_BUILD_TRAINER
         if (tm->hasTrainer()) {
             if (const auto* trainer = tm->getTrainer()) {
                 return trainer->getParams().dataset;
             }
         }
+#endif
         return tm->getEditableDatasetParams();
     }
 
@@ -850,6 +855,8 @@ namespace lfs::python {
 
         m.def("training_backends", [] {
             nb::list result;
+            if constexpr (!LFS_BUILD_TRAINER)
+                return result;
             for (const auto& backend : core::param::kTrainingBackends) {
                 nb::dict item;
                 item["id"] = std::string(backend.wire_name);
@@ -990,6 +997,11 @@ namespace lfs::python {
                 [](PyOptimizationParams& self) { return self.params().enable_eval; },
                 [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.enable_eval = v; }); },
                 "Enable evaluation during training")
+            .def_prop_rw(
+                "eval_all",
+                [](PyOptimizationParams& self) { return self.params().eval_all; },
+                [](PyOptimizationParams&, bool v) { modify_params([v](auto& p) { p.eval_all = v; }); },
+                "Train on every image and evaluate all of them; no image is held out")
             .def_prop_rw(
                 "background_improvements",
                 [](PyOptimizationParams& self) { return self.params().background_improvements; },

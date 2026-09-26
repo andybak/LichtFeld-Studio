@@ -5,7 +5,10 @@
 #include "strategy_utils.hpp"
 #include "core/assert.hpp"
 #include "core/cuda/sh_layout.cuh"
+#include "core/cuda_error.hpp"
 #include "core/logger.hpp"
+#include "core/tensor_completion.hpp"
+#include "core/tensor_cuda_interop.hpp"
 #include "core/training_churn_metrics.hpp"
 #include "kernels/pruning_kernels.hpp"
 #include "lfs/training/sh_value_storage.hpp"
@@ -88,12 +91,10 @@ namespace lfs::training {
             auto grown = lfs::core::Tensor::zeros_direct(
                 source.shape(), desired_capacity, device, source.dtype());
             if (source.numel() > 0) {
-                const auto stream = grown.stream();
-                source.sync_to_stream(stream);
-                LFS_CUDA_CHECK(cudaMemcpyAsync(
-                    grown.data_ptr(), source.data_ptr(), source.bytes(),
-                    cudaMemcpyDeviceToDevice, stream));
-                LFS_CUDA_CHECK(cudaStreamSynchronize(stream));
+                grown.flatten().slice(0, 0, source.numel()).copy_(source);
+                lfs::core::TensorCompletion completion;
+                completion.include(grown);
+                completion.wait();
             }
             scores = std::move(grown);
         }
@@ -604,8 +605,7 @@ namespace lfs::training {
                                      ? Tensor::zeros_direct(TensorShape({n}), desired_cap, device)
                                      : Tensor::zeros({n}, device);
                     if (cur > 0) {
-                        cudaMemcpy(fresh.ptr<float>(), scores.ptr<float>(),
-                                   cur * sizeof(float), cudaMemcpyDeviceToDevice);
+                        fresh.slice(0, 0, cur).copy_(scores);
                     }
                     scores = std::move(fresh);
                     return;
@@ -621,10 +621,6 @@ namespace lfs::training {
         } else {
             scores = Tensor::zeros({n}, device);
         }
-    }
-
-    int collect_adam_scale_ptrs(AdamOptimizer& /*optimizer*/, float* /*out_ptrs*/[12]) {
-        return 0;
     }
 
     void zero_adam_grads_at_indices(
@@ -649,9 +645,12 @@ namespace lfs::training {
                     auto idx_i32 = indices.dtype() == DataType::Int32
                                        ? indices
                                        : indices.to(DataType::Int32);
+                    const auto stream = lfs::core::getCurrentCUDAStream();
+                    idx_i32.sync_to_stream(stream);
+                    state->grad.set_stream(stream);
                     shN_swizzled_zero_at_indices(
                         state->grad.ptr<float>(), idx_i32.ptr<int>(),
-                        idx_i32.numel(), shN_layout_rest);
+                        idx_i32.numel(), shN_layout_rest, stream);
                 }
                 continue;
             }

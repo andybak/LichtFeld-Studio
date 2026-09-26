@@ -11,6 +11,9 @@
 #include "core/environment.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
+#include "core/tensor_cuda_interop.hpp"
+#include "core/tensor_upload.hpp"
+#include "cuda_backend_test.hpp"
 #include "lfs/training/sh_value_codec.hpp"
 #include "lfs/training/sh_value_storage.hpp"
 #include "optimizer/adam_optimizer.hpp"
@@ -38,6 +41,10 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace tensor_hardening {
+    cudaError_t launch_delay_kernel(cudaStream_t stream, uint64_t cycles);
+}
 
 using namespace lfs::training;
 using namespace lfs::core;
@@ -236,9 +243,10 @@ namespace {
 
 } // namespace
 
-class GsplatRasterizerTest : public ::testing::Test {
+class GsplatRasterizerTest : public lfs::test::CudaBackendTest {
 protected:
     void SetUp() override {
+        LFS_CUDA_BACKEND_OR_RETURN();
         // Create minimal test data
         const size_t N = 100; // Number of Gaussians
         const int sh_degree = 0;
@@ -291,6 +299,8 @@ protected:
     }
 
     void TearDown() override {
+        if (IsSkipped())
+            return;
 #if LFS_CUDA_FAILURE_INJECTION_ENABLED
         gsplat_lfs::set_cuda_allocation_failure_for_testing(false);
 #endif
@@ -305,7 +315,9 @@ protected:
     Tensor bg_color_;
 };
 
-TEST(VmmDeviceBufferTest, GrowsInPlace) {
+class VmmDeviceBufferTest : public lfs::test::CudaBackendTest {};
+
+TEST_F(VmmDeviceBufferTest, GrowsInPlace) {
     constexpr size_t kMiB = 1024u * 1024u;
     constexpr size_t kFirstCommit = 256u * kMiB;
     constexpr size_t kSecondCommit = 512u * kMiB;
@@ -375,7 +387,9 @@ TEST_F(GsplatRasterizerTest, CudaAllocationFailureAbortsAndRecovers) {
 }
 #endif
 
-TEST(GsplatRasterizerPPISP, NegativeShRadianceDoesNotCreateBrightPixels) {
+class GsplatRasterizerPPISP : public lfs::test::CudaBackendTest {};
+
+TEST_F(GsplatRasterizerPPISP, NegativeShRadianceDoesNotCreateBrightPixels) {
     constexpr int width = 32;
     constexpr int height = 32;
     auto camera = make_camera(width, height);
@@ -527,7 +541,9 @@ TEST_F(GsplatRasterizerTest, GutModeSteadyStateAllocs) {
 
 // gut/gsplat forward+backward with default quant ON + sh_degree>0.
 // Saves dequant temp in ctx so backward does not dtype-abort on q16 codes.
-TEST(GsplatRasterizerQuantTest, GutForwardBackwardWithDefaultQuantAndShDegree) {
+class GsplatRasterizerQuantTest : public lfs::test::CudaBackendTest {};
+
+TEST_F(GsplatRasterizerQuantTest, GutForwardBackwardWithDefaultQuantAndShDegree) {
     // Default flags: quant ON (no force-off).
     lfs::training::sh_value::set_sh_value_quant_enabled_for_testing(true);
 
@@ -588,7 +604,7 @@ TEST(GsplatRasterizerQuantTest, GutForwardBackwardWithDefaultQuantAndShDegree) {
     lfs::training::sh_value::set_sh_value_quant_enabled_for_testing(std::nullopt);
 }
 
-TEST(GsplatRasterizerQuantTest, RejectsFloat16ShRestWithoutQ16Bounds) {
+TEST_F(GsplatRasterizerQuantTest, RejectsFloat16ShRestWithoutQ16Bounds) {
     auto camera = make_camera(32, 32);
     constexpr size_t n = 4;
     constexpr size_t rest = 3;
@@ -625,11 +641,9 @@ TEST(GsplatRasterizerQuantTest, RejectsFloat16ShRestWithoutQ16Bounds) {
     }
 }
 
-TEST(GsplatRasterizerEdgeScores, GutFusedScoresRespectEdgeMapAndCameraModel) {
-    int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
-        GTEST_SKIP() << "CUDA device unavailable";
-    }
+class GsplatRasterizerEdgeScores : public lfs::test::CudaBackendTest {};
+
+TEST_F(GsplatRasterizerEdgeScores, GutFusedScoresRespectEdgeMapAndCameraModel) {
 
     auto run = [](Camera camera, const Tensor& edge_map) {
         auto splat = make_visible_splat(32);
@@ -687,11 +701,7 @@ TEST(GsplatRasterizerEdgeScores, GutFusedScoresRespectEdgeMapAndCameraModel) {
     EXPECT_TRUE(fisheye_has_positive);
 }
 
-TEST(GsplatRasterizerEdgeScores, GutAndFastGsHavePositiveScoreCorrelation) {
-    int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
-        GTEST_SKIP() << "CUDA device unavailable";
-    }
+TEST_F(GsplatRasterizerEdgeScores, GutAndFastGsHavePositiveScoreCorrelation) {
 
     constexpr int width = 64;
     constexpr int height = 64;
@@ -788,11 +798,9 @@ TEST(GsplatIntersectionCount, RoundedCapacityCannotOverflowSignedSortCount) {
     EXPECT_EQ(gsplat_lfs::intersection_sort_capacity(limit + 65536, limit + 65536), limit);
 }
 
-TEST(GsplatRasterizerTestPositive, AggregateIntersectionsRenderOnColdAndWarmCache) {
-    int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
-        GTEST_SKIP() << "CUDA device unavailable";
-    }
+class GsplatRasterizerTestPositive : public lfs::test::CudaBackendTest {};
+
+TEST_F(GsplatRasterizerTestPositive, AggregateIntersectionsRenderOnColdAndWarmCache) {
     struct CacheCleanup {
         ~CacheCleanup() { (void)gsplat_lfs::release_intersect_thread_local_cache(); }
     } cleanup;
@@ -884,11 +892,9 @@ TEST(GsplatRasterizerTestPositive, AggregateIntersectionsRenderOnColdAndWarmCach
     }
 }
 
-TEST(GsplatRasterizerErrors, GutArenaExhaustionPreservesTypedResourceError) {
-    int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
-        GTEST_SKIP() << "CUDA device unavailable";
-    }
+class GsplatRasterizerErrors : public lfs::test::CudaBackendTest {};
+
+TEST_F(GsplatRasterizerErrors, GutArenaExhaustionPreservesTypedResourceError) {
 
     lfs::core::RasterizerMemoryArena::Config config;
     config.virtual_size = 64ULL << 20;
@@ -1298,7 +1304,7 @@ TEST_F(GsplatRasterizerTest, TileBatchesPreserveShRestAlphaAndDensificationGradi
 
 // Regression for issue #2189. Run with and without the existing pair-budget
 // test override to cover both the single-list and tile replay dispatch paths.
-class GutScreenShare : public ::testing::TestWithParam<int> {};
+class GutScreenShare : public lfs::test::CudaBackendTest, public ::testing::WithParamInterface<int> {};
 
 TEST_P(GutScreenShare, PublishedOncePerFrameAndConstrainsOnlyWhenEnabled) {
     using Model = lfs::core::CameraModelType;
@@ -1526,7 +1532,9 @@ TEST_P(GutScreenShare, MrnfClipsAfterGrowthAndLeavesUnsetLimitUnchanged) {
     }
 }
 
-TEST(GutScreenShareGeometry, ClippingVisibilityWindowResetAndNonDefaultStream) {
+class GutScreenShareGeometry : public lfs::test::CudaBackendTest {};
+
+TEST_F(GutScreenShareGeometry, ClippingVisibilityWindowResetAndNonDefaultStream) {
     auto radii = Tensor::from_vector(std::vector<int32_t>{10, 10, 10, 10, 0, 10, 100, 100}, {4, 2}, Device::CUDA);
     auto centers = Tensor::from_vector({5.f, 5.f, 95.f, 45.f, 50.f, 25.f, 50.f, 25.f}, {4, 2}, Device::CUDA);
     auto shares = Tensor::from_vector({.1f, 0.f, .3f, 0.f}, {4}, Device::CUDA);
@@ -1561,7 +1569,9 @@ TEST(GutScreenShareGeometry, ClippingVisibilityWindowResetAndNonDefaultStream) {
     EXPECT_EQ(h.ptr<float>()[2], 0.f);
 }
 
-TEST(GutScreenShareStrategy, RendererSwitchStartsANewMeasurementWindow) {
+class GutScreenShareStrategy : public lfs::test::CudaBackendTest {};
+
+TEST_F(GutScreenShareStrategy, RendererSwitchStartsANewMeasurementWindow) {
     auto model = make_parity_splat(100, 42);
     MRNF strategy(*model);
     auto params = lfs::core::param::OptimizationParameters::mrnf_defaults();
@@ -1586,7 +1596,7 @@ TEST(GutScreenShareStrategy, RendererSwitchStartsANewMeasurementWindow) {
     EXPECT_FALSE(strategy.get_optimizer().collect_projected_screen_share());
 }
 
-TEST(GutScreenShareStrategy, MatureRefinementsReduceActualProjectedAreaBelowLimit) {
+TEST_F(GutScreenShareStrategy, MatureRefinementsReduceActualProjectedAreaBelowLimit) {
     auto camera = make_camera(96, 64);
     for (bool enabled : {false, true}) {
         auto model = make_visible_splat(1);
@@ -1644,4 +1654,217 @@ TEST(GutScreenShareStrategy, MatureRefinementsReduceActualProjectedAreaBelowLimi
         }
         ASSERT_EQ(model->size(), 1);
     }
+}
+
+TEST_F(GsplatRasterizerTest, BackwardUsesCurrentQueueAndJoinsForwardStorage) {
+    TensorWorkQueue producer(GpuBackend::CUDA);
+    TensorWorkQueue consumer(GpuBackend::CUDA);
+    TensorWorkQueue::Scope scope(producer);
+    auto camera = make_camera(32, 32);
+    auto splat = make_visible_splat(16);
+    auto bg = Tensor::zeros({3}, Device::GPU);
+    AdamConfig config;
+    config.initial_capacity = 32;
+    AdamOptimizer optimizer(*splat, config);
+    optimizer.allocate_gradients(32);
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        auto result = gsplat_rasterize_forward(camera, *splat, bg);
+        ASSERT_TRUE(result.has_value()) << result.error();
+        auto gradient = Tensor::ones_like(result->first.image);
+        auto alpha_gradient = Tensor::zeros_like(result->first.alpha);
+        {
+            TensorWorkQueue::Scope backward_scope(consumer);
+            gsplat_rasterize_backward(result->second, gradient, alpha_gradient,
+                                      *splat, optimizer, Tensor{});
+            EXPECT_EQ(optimizer.get_grad(ParamType::Means).stream(), consumer.native_handle());
+        }
+        optimizer.zero_grad(repeat);
+    }
+    consumer.wait();
+    producer.wait();
+    release_gsplat_rasterizer_thread_local_caches();
+}
+
+TEST_F(GsplatRasterizerTest, BackwardJoinsAuxiliaryProducersAndOutputs) {
+    TensorWorkQueue forward(GpuBackend::CUDA), producer(GpuBackend::CUDA), backward(GpuBackend::CUDA);
+    TensorWorkQueue::Scope scope(forward);
+    for (const bool use_error : {false, true}) {
+        for (int delayed = 0; delayed < 4; ++delayed) {
+            if (!use_error && delayed == 0)
+                continue;
+            SCOPED_TRACE(::testing::Message() << "error=" << use_error << " delayed=" << delayed);
+            auto camera = make_camera(64, 64);
+            auto splat = make_visible_splat(32);
+            splat->_densification_info = Tensor::zeros({2, 32}, Device::GPU);
+            AdamConfig config;
+            config.initial_capacity = 64;
+            AdamOptimizer optimizer(*splat, config);
+            optimizer.allocate_gradients(64);
+            auto bg = Tensor::zeros({3}, Device::GPU);
+            auto error = Tensor::ones({64, 64}, Device::GPU);
+            auto edge = Tensor::ones({64, 64}, Device::GPU);
+            auto scores = Tensor::zeros({32}, Device::GPU);
+            auto result = gsplat_rasterize_forward(camera, *splat, bg, 0, 0, 0, 0,
+                                                   1.f, false, GsplatRenderMode::RGB, true);
+            ASSERT_TRUE(result.has_value()) << result.error();
+            auto gradient = Tensor::ones_like(result->first.image);
+            auto alpha_gradient = Tensor::zeros_like(result->first.alpha);
+            Tensor* target = std::array<Tensor*, 4>{&error, &edge, &scores, &splat->_densification_info}[delayed];
+            target->fill_(delayed < 2 ? 0.f : -100.f);
+            auto produced = Tensor::full(target->shape(), delayed < 2 ? 1.f : 0.f, Device::GPU);
+            auto* destination = target->ptr<float>();
+            const auto* source = produced.ptr<float>();
+            forward.wait();
+            {
+                TensorWorkQueue::Scope producer_scope(producer);
+                target->set_stream(static_cast<cudaStream_t>(producer.native_handle()));
+                ASSERT_EQ(tensor_hardening::launch_delay_kernel(
+                              static_cast<cudaStream_t>(producer.native_handle()), 150000000),
+                          cudaSuccess);
+                ASSERT_EQ(cudaMemcpyAsync(destination, source, target->bytes(), cudaMemcpyDeviceToDevice,
+                                          static_cast<cudaStream_t>(producer.native_handle())),
+                          cudaSuccess);
+            }
+            {
+                TensorWorkQueue::Scope backward_scope(backward);
+                gsplat_rasterize_backward(result->second, gradient, alpha_gradient, *splat, optimizer,
+                                          use_error ? error : Tensor{}, edge, scores);
+                EXPECT_EQ(splat->_densification_info.stream(), backward.native_handle());
+                EXPECT_EQ(scores.stream(), backward.native_handle());
+                const auto score_cpu = scores.cpu();
+                const auto info_cpu = splat->_densification_info.cpu();
+                EXPECT_GT(*std::max_element(score_cpu.ptr<float>(), score_cpu.ptr<float>() + score_cpu.numel()), 0.f);
+                EXPECT_GT(*std::max_element(info_cpu.ptr<float>(), info_cpu.ptr<float>() + info_cpu.numel()), 0.f);
+                EXPECT_GE(*std::min_element(score_cpu.ptr<float>(), score_cpu.ptr<float>() + score_cpu.numel()), 0.f);
+                EXPECT_GE(*std::min_element(info_cpu.ptr<float>(), info_cpu.ptr<float>() + info_cpu.numel()), 0.f);
+            }
+            producer.wait();
+            backward.wait();
+        }
+    }
+    forward.wait();
+    release_gsplat_rasterizer_thread_local_caches();
+}
+
+TEST_F(GsplatRasterizerTest, ForwardJoinsCameraTransformAndRetainsItForBackward) {
+    TensorWorkQueue render(GpuBackend::CUDA), producer(GpuBackend::CUDA), backward(GpuBackend::CUDA);
+    TensorWorkQueue::Scope scope(render);
+    auto camera = std::make_unique<Camera>(make_camera(64, 64));
+    auto splat = make_visible_splat(32);
+    auto bg = Tensor::zeros({3}, Device::GPU);
+    AdamConfig config;
+    config.initial_capacity = 64;
+    AdamOptimizer optimizer(*splat, config);
+    optimizer.allocate_gradients(64);
+    auto reference = gsplat_rasterize_forward(*camera, *splat, bg);
+    ASSERT_TRUE(reference.has_value()) << reference.error();
+    auto expected = reference->first.image.cpu();
+    release_ctx_arena(reference->second);
+    auto transform = camera->world_view_transform();
+    auto saved = transform.clone();
+    auto* destination = transform.ptr<float>();
+    const auto* source = saved.ptr<float>();
+    ASSERT_EQ(cudaMemsetAsync(destination, 0, transform.bytes(),
+                              static_cast<cudaStream_t>(render.native_handle())),
+              cudaSuccess);
+    render.wait();
+    {
+        TensorWorkQueue::Scope producer_scope(producer);
+        transform.set_stream(static_cast<cudaStream_t>(producer.native_handle()));
+        ASSERT_EQ(tensor_hardening::launch_delay_kernel(
+                      static_cast<cudaStream_t>(producer.native_handle()), 150000000),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(destination, source, transform.bytes(), cudaMemcpyDeviceToDevice,
+                                  static_cast<cudaStream_t>(producer.native_handle())),
+                  cudaSuccess);
+    }
+    auto result = gsplat_rasterize_forward(*camera, *splat, bg);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    auto actual = result->first.image.cpu();
+    EXPECT_EQ(std::memcmp(expected.ptr<float>(), actual.ptr<float>(), expected.bytes()), 0);
+    camera.reset();
+    transform = {};
+    auto gradient = Tensor::ones_like(result->first.image);
+    auto alpha_gradient = Tensor::zeros_like(result->first.alpha);
+    {
+        TensorWorkQueue::Scope backward_scope(backward);
+        gsplat_rasterize_backward(result->second, gradient, alpha_gradient, *splat, optimizer);
+        EXPECT_TRUE(optimizer.get_grad(ParamType::Means).isfinite().all().item<bool>());
+    }
+    producer.wait();
+    backward.wait();
+    render.wait();
+    release_gsplat_rasterizer_thread_local_caches();
+}
+
+TEST_F(GsplatRasterizerTest, FastContextRetiresOutsideExecutionScopeWithoutDeviceWait) {
+    TensorWorkQueue render(GpuBackend::CUDA), unrelated(GpuBackend::CUDA);
+    std::optional<FastRasterizeContext> context;
+    {
+        TensorWorkQueue::Scope scope(render);
+        auto camera = make_camera(64, 64);
+        auto splat = make_visible_splat(32);
+        auto bg = Tensor::zeros({3}, Device::GPU);
+        auto result = fast_rasterize_forward(camera, *splat, bg);
+        ASSERT_TRUE(result.has_value());
+        context.emplace(std::move(result->second));
+        render.wait();
+    }
+    ASSERT_EQ(getCurrentCUDAStream(), nullptr);
+    TensorFence other_work(GpuBackend::CUDA);
+    ASSERT_EQ(tensor_hardening::launch_delay_kernel(
+                  static_cast<cudaStream_t>(unrelated.native_handle()), 600000000),
+              cudaSuccess);
+    unrelated.record(other_work);
+    context.reset();
+    // A streamless retirement also breaks the next frame's event chain.
+    auto& arena = GlobalArenaManager::instance().get_arena();
+    const auto frame = arena.begin_frame(static_cast<cudaStream_t>(render.native_handle()));
+    arena.end_frame(frame, static_cast<cudaStream_t>(render.native_handle()));
+    EXPECT_FALSE(other_work.ready()) << "Context retirement must not synchronize unrelated GPU work";
+    other_work.wait();
+    render.wait();
+    release_fast_rasterizer_thread_local_caches();
+}
+
+TEST_F(GsplatRasterizerTest, FastContextKeepsBackwardQueueAfterException) {
+    TensorWorkQueue forward(GpuBackend::CUDA), backward(GpuBackend::CUDA);
+    std::optional<FastRasterizeContext> context;
+    {
+        TensorWorkQueue::Scope scope(forward);
+        auto camera = make_camera(64, 64);
+        auto splat = make_visible_splat(32);
+        auto bg = Tensor::zeros({3}, Device::GPU);
+        AdamConfig config;
+        config.initial_capacity = 64;
+        AdamOptimizer optimizer(*splat, config);
+        optimizer.allocate_gradients(64);
+        auto result = fast_rasterize_forward(camera, *splat, bg);
+        ASSERT_TRUE(result.has_value());
+        context.emplace(std::move(result->second));
+        auto gradient = Tensor::ones_like(result->first.image);
+        auto invalid_alpha = Tensor::ones({2}, Device::GPU);
+        {
+            TensorWorkQueue::Scope backward_scope(backward);
+            EXPECT_THROW(fast_rasterize_backward(*context, gradient, *splat, optimizer, invalid_alpha), std::exception);
+            EXPECT_EQ(context->completion_stream, backward.native_handle());
+        }
+        forward.wait();
+    }
+    ASSERT_EQ(getCurrentCUDAStream(), nullptr);
+    TensorFence pending(GpuBackend::CUDA);
+    ASSERT_EQ(tensor_hardening::launch_delay_kernel(
+                  static_cast<cudaStream_t>(backward.native_handle()), 150000000),
+              cudaSuccess);
+    backward.record(pending);
+    context.reset();
+    // Reusing the frame must join the last backward reader, without a host wait.
+    auto& arena = GlobalArenaManager::instance().get_arena();
+    const auto frame = arena.begin_frame(static_cast<cudaStream_t>(forward.native_handle()));
+    EXPECT_FALSE(pending.ready());
+    forward.wait();
+    EXPECT_TRUE(pending.ready());
+    arena.end_frame(frame, static_cast<cudaStream_t>(forward.native_handle()));
+    backward.wait();
+    release_fast_rasterizer_thread_local_caches();
 }

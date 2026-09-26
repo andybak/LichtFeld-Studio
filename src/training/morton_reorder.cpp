@@ -5,11 +5,13 @@
 
 #include "core/cuda/sh_layout.cuh"
 #include "core/cuda_error.hpp"
+#include "core/gpu_device_runtime.hpp"
 #include "core/logger.hpp"
 #include "core/sh_value_quant.hpp"
 #include "core/sh_value_quant_kernels.hpp"
 #include "core/splat_exportable_storage.hpp"
 #include "core/tensor/backend/cuda/runtime/cuda_stream_context.hpp"
+#include "core/tensor_completion.hpp"
 #include "kernels/morton_reorder_kernels.hpp"
 #include "lfs/training/joint_adam_codec.hpp"
 #include "lfs/training/live_model_mutation_guard.hpp"
@@ -43,7 +45,7 @@ namespace lfs::training::morton {
             dims[0] = n;
             Tensor gathered = Tensor::zeros_direct(
                 TensorShape(dims), std::max(cap, n), tensor.device(), tensor.dtype());
-            gathered.set_stream(tensor.stream());
+            gathered.set_stream(core::getCurrentCUDAStream());
             if (old0 == n) {
                 tensor.index_select_into(gathered, 0, perm, BoundaryMode::Assert);
                 tensor = std::move(gathered);
@@ -57,7 +59,7 @@ namespace lfs::training::morton {
             dims[0] = old0;
             Tensor dest = Tensor::zeros_direct(
                 TensorShape(dims), cap, tensor.device(), tensor.dtype());
-            dest.set_stream(tensor.stream());
+            dest.set_stream(core::getCurrentCUDAStream());
             dest.slice(0, 0, n).copy_from(gathered);
             dest.slice(0, n, old0).copy_from(tensor.slice(0, n, old0));
             tensor = std::move(dest);
@@ -76,7 +78,7 @@ namespace lfs::training::morton {
                 return;
             }
             Tensor scratch = Tensor::zeros_direct(tensor.shape(), n, tensor.device(), tensor.dtype());
-            scratch.set_stream(tensor.stream());
+            scratch.set_stream(core::getCurrentCUDAStream());
             tensor.index_select_into(scratch, 0, perm, BoundaryMode::Assert);
             tensor.copy_from(scratch);
         }
@@ -134,20 +136,12 @@ namespace lfs::training::morton {
                 rest,
                 stream);
 
-            LFS_CUDA_CHECK(cudaMemcpyAsync(
-                lfs::core::resolve_exportable_device_ptr(live),
-                dest_codes,
-                n_cells * sizeof(std::uint16_t),
-                cudaMemcpyDeviceToDevice,
-                stream));
-            LFS_CUDA_CHECK(cudaMemcpyAsync(
-                lfs::core::resolve_exportable_device_ptr(bounds),
-                dest_mm,
-                n_bound_floats * sizeof(float),
-                cudaMemcpyDeviceToDevice,
-                stream));
-            LFS_CUDA_CHECK_MSG(
-                cudaStreamSynchronize(stream), "q16 morton permute copy-back");
+            live.flatten().slice(0, 0, n_cells).copy_(dest_u16);
+            bounds.flatten().slice(0, 0, n_bound_floats).copy_(dest_bounds);
+            lfs::core::TensorCompletion completion;
+            completion.include(live);
+            completion.include(bounds);
+            completion.wait();
         }
 
         void permute_shN_fp32(core::SplatData& splat, const Tensor& perm, cudaStream_t stream) {
@@ -355,7 +349,7 @@ namespace lfs::training::morton {
         const std::size_t n = perm.numel();
         if (tensor.ndim() == 2 && tensor.size(1) == n && tensor.size(0) != n) {
             Tensor dest = Tensor::zeros(tensor.shape(), tensor.device(), tensor.dtype());
-            dest.set_stream(tensor.stream());
+            dest.set_stream(core::getCurrentCUDAStream());
             tensor.index_select_into(dest, 1, perm, BoundaryMode::Assert);
             tensor = std::move(dest);
             return;
@@ -403,8 +397,7 @@ namespace lfs::training::morton {
             permute_row_tensor(splat._densification_info, result.permutation);
         }
         if (splat._max_screen_share.is_valid() && splat._max_screen_share.numel() > 0) {
-            LFS_CUDA_CHECK_MSG(cudaDeviceSynchronize(),
-                               "wait fused adam before screen-share morton permute");
+            core::gpu_device_barrier(core::GpuBackend::CUDA);
             permute_row_tensor(splat._max_screen_share, result.permutation);
             if (optimizer != nullptr) {
                 optimizer->refresh_screen_share_buffer();
@@ -421,7 +414,7 @@ namespace lfs::training::morton {
         }
 
         splat.note_param_layout_changed();
-        LFS_CUDA_CHECK_MSG(cudaDeviceSynchronize(), "morton reorder device barrier");
+        core::gpu_device_barrier(core::GpuBackend::CUDA);
         // Morton's temporary permutation buffers normally return to the CUDA
         // pool immediately. Keep the VRAM hygiene trim when that leaves a
         // substantial reserved/unused tail, but avoid paying a device-wide

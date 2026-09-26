@@ -24,6 +24,7 @@
 
 #include "core/cuda/memory_arena.hpp"
 #include "core/logger.hpp"
+#include "cuda_backend_test.hpp"
 #include "visualizer/rendering/stale_frame_guard.hpp"
 #include "visualizer/rendering/vksplat_shared_scratch_install.hpp"
 
@@ -129,9 +130,10 @@ namespace {
     };
 } // namespace
 
-class ArenaMetricsContentionTest : public ::testing::Test {
+class ArenaMetricsContentionTest : public lfs::test::CudaBackendTest {
 protected:
     void SetUp() override {
+        LFS_CUDA_BACKEND_OR_RETURN();
         ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     }
 };
@@ -434,7 +436,6 @@ TEST_F(ArenaMetricsContentionTest, NavigationTurnTakingUnderLoad) {
     const bool finished = completes_within(20s, [&] {
         TrainingLoop training(arena, tenants);
         EXPECT_EQ(cudaSetDevice(0), cudaSuccess);
-        lfs::vis::NavigationArenaShare share;
         RasterizerMemoryArena::RenderHandoffToken token = 0;
         std::uint64_t steps_at_last_frame = training.steps();
         auto last_release = Clock::now();
@@ -442,13 +443,11 @@ TEST_F(ArenaMetricsContentionTest, NavigationTurnTakingUnderLoad) {
         const auto navigation_end = Clock::now() + 1500ms;
         while (Clock::now() < navigation_end) {
             arena.set_rendering_active(true);
-            const auto frame = arena.try_begin_render_frame_for(lfs::vis::NavigationArenaShare::kRenderWaitMs, token);
+            const auto frame = arena.try_begin_render_frame_for(1, token);
             arena.set_rendering_active(false);
             if (!frame) {
                 token = arena.request_render_handoff(token);
-                share.noteDeclined(Clock::now());
             } else {
-                share.noteBegan(Clock::now());
                 token = 0;
                 tenants.enter();
                 const std::uint64_t steps = training.steps();
@@ -461,7 +460,7 @@ TEST_F(ArenaMetricsContentionTest, NavigationTurnTakingUnderLoad) {
                 std::this_thread::sleep_for(1ms);
                 tenants.leave();
                 lfs::vis::releaseViewerArenaFrame(arena, *frame, &token,
-                                                  std::optional(share.trainingFramesBeforeNextRender(Clock::now())));
+                                                  std::optional(lfs::vis::kTrainingFramesPerNavigationRender));
                 last_release = Clock::now();
             }
             std::this_thread::sleep_for(3ms);
@@ -479,6 +478,138 @@ TEST_F(ArenaMetricsContentionTest, NavigationTurnTakingUnderLoad) {
     EXPECT_GE(steps_while_navigating, 60u) << "training was starved while the camera moved";
     EXPECT_LE(most_steps_between_frames, 1u) << "training ran more than one step between two viewer frames";
     EXPECT_GE(steps_after_navigation, 10u) << "training stayed blocked after navigation stopped";
+}
+
+TEST_F(ArenaMetricsContentionTest, NavigationWaitReturnsWhenTheRunningStepEnds) {
+    using Clock = std::chrono::steady_clock;
+    using namespace std::chrono_literals;
+    RasterizerMemoryArena arena;
+    std::promise<void> step_began;
+    std::thread training([&] {
+        const auto frame = arena.begin_frame(nullptr, false);
+        step_began.set_value();
+        std::this_thread::sleep_for(40ms);
+        arena.end_frame(frame, nullptr, false);
+    });
+    step_began.get_future().wait();
+    RasterizerMemoryArena::RenderHandoffToken token = 0;
+    const auto start = Clock::now();
+    const bool ready = lfs::vis::waitForViewerArenaWindow(arena, token, 250ms, 20ms);
+    const auto waited = Clock::now() - start;
+    training.join();
+    ASSERT_TRUE(ready) << "the wait gave up on a step that ended within its timeout";
+    EXPECT_GE(waited, 30ms) << "the wait returned while the step still held the arena";
+    EXPECT_LT(waited, 200ms) << "the wait outlasted the step it waited for";
+    const auto frame = arena.try_begin_render_frame_for(1, token);
+    ASSERT_TRUE(frame.has_value()) << "a ready window still declined the render";
+    arena.end_frame(*frame, true);
+}
+
+TEST_F(ArenaMetricsContentionTest, NavigationWaitGivesUpAfterItsTimeout) {
+    using Clock = std::chrono::steady_clock;
+    using namespace std::chrono_literals;
+    RasterizerMemoryArena arena;
+    std::promise<void> step_began;
+    std::thread training([&] {
+        const auto frame = arena.begin_frame(nullptr, false);
+        step_began.set_value();
+        std::this_thread::sleep_for(300ms);
+        arena.end_frame(frame, nullptr, false);
+    });
+    step_began.get_future().wait();
+    RasterizerMemoryArena::RenderHandoffToken token = 0;
+    const auto start = Clock::now();
+    const bool ready = lfs::vis::waitForViewerArenaWindow(arena, token, 60ms, 20ms);
+    const auto waited = Clock::now() - start;
+    EXPECT_FALSE(ready) << "the wait reported a window while training held the arena";
+    EXPECT_GE(waited, 60ms);
+    EXPECT_LT(waited, 250ms) << "the wait ignored its timeout";
+    training.join();
+    arena.cancel_render_handoff(token);
+}
+
+TEST_F(ArenaMetricsContentionTest, NavigationWaitTakesTheOwedStepBackWhenTrainingIsIdle) {
+    using Clock = std::chrono::steady_clock;
+    using namespace std::chrono_literals;
+    RasterizerMemoryArena arena;
+    RasterizerMemoryArena::RenderHandoffToken token = 0;
+    auto frame = arena.try_begin_render_frame_for(1, token);
+    ASSERT_TRUE(frame.has_value());
+    lfs::vis::releaseViewerArenaFrame(arena, *frame, &token, std::optional<std::uint32_t>(1));
+    ASSERT_TRUE(arena.render_handoff_owes_training(token));
+
+    const auto start = Clock::now();
+    ASSERT_TRUE(lfs::vis::waitForViewerArenaWindow(arena, token, 250ms, 20ms));
+    const auto waited = Clock::now() - start;
+    EXPECT_GE(waited, 20ms) << "the viewer took the owed step before the grace period ended";
+    EXPECT_LT(waited, 150ms) << "an idle trainer held the viewer past the grace period";
+    EXPECT_FALSE(arena.try_begin_frame(nullptr, false)) << "training began after the viewer took the window back";
+    frame = arena.try_begin_render_frame_for(1, token);
+    ASSERT_TRUE(frame.has_value()) << "a ready window still declined the render";
+    arena.end_frame(*frame, true);
+}
+
+// Races a training loop against a navigating viewer that presents between frames
+// and waits for its window before every frame. Catches a ready report after
+// which the render still declines, overlapping tenants, more than one training
+// step between two viewer frames, and a starved trainer.
+TEST_F(ArenaMetricsContentionTest, NavigationWaitAlwaysYieldsAFrameUnderLoad) {
+    using Clock = std::chrono::steady_clock;
+    using namespace std::chrono_literals;
+    RasterizerMemoryArena arena;
+    TenantCounter tenants;
+    std::uint64_t viewer_frames = 0;
+    std::uint64_t declined_after_ready = 0;
+    std::uint64_t timed_out = 0;
+    std::uint64_t most_steps_between_frames = 0;
+    std::uint64_t steps_while_navigating = 0;
+
+    const bool finished = completes_within(20s, [&] {
+        TrainingLoop training(arena, tenants);
+        EXPECT_EQ(cudaSetDevice(0), cudaSuccess);
+        RasterizerMemoryArena::RenderHandoffToken token = 0;
+        const auto first_steps = training.steps();
+        std::optional<std::uint64_t> steps_at_last_frame;
+        const auto navigation_end = Clock::now() + 1500ms;
+        while (Clock::now() < navigation_end) {
+            if (!lfs::vis::waitForViewerArenaWindow(arena, token, lfs::vis::kNavigationArenaWait,
+                                                    lfs::vis::kNavigationTrainingGrace)) {
+                ++timed_out;
+                continue;
+            }
+            arena.set_rendering_active(true);
+            const auto frame = arena.try_begin_render_frame_for(1, token);
+            arena.set_rendering_active(false);
+            if (!frame) {
+                ++declined_after_ready;
+                continue;
+            }
+            token = 0;
+            tenants.enter();
+            const std::uint64_t steps = training.steps();
+            if (steps_at_last_frame) {
+                most_steps_between_frames = std::max(most_steps_between_frames, steps - *steps_at_last_frame);
+            }
+            steps_at_last_frame = steps;
+            ++viewer_frames;
+            std::this_thread::sleep_for(1ms);
+            tenants.leave();
+            lfs::vis::releaseViewerArenaFrame(arena, *frame, &token,
+                                              std::optional(lfs::vis::kTrainingFramesPerNavigationRender));
+            std::this_thread::sleep_for(3ms);
+        }
+        steps_while_navigating = training.steps() - first_steps;
+        arena.cancel_render_handoff(token);
+        training.stop();
+    });
+
+    ASSERT_TRUE(finished) << "viewer and training deadlocked on the arena";
+    EXPECT_EQ(tenants.most.load(), 1) << "viewer and training used the arena at the same time";
+    EXPECT_EQ(declined_after_ready, 0u) << "a render declined right after its window was reported ready";
+    EXPECT_EQ(timed_out, 0u) << "the viewer waited out its timeout on sub-millisecond steps";
+    EXPECT_GE(viewer_frames, 60u) << "the viewer was starved while navigating";
+    EXPECT_GE(steps_while_navigating, 60u) << "training was starved while the camera moved";
+    EXPECT_LE(most_steps_between_frames, 1u) << "training ran more than one step between two viewer frames";
 }
 
 // Races a training loop against a parked idle refresh that polls readiness.
@@ -527,44 +658,6 @@ TEST_F(ArenaMetricsContentionTest, ReadyParkedRefreshAlwaysBeginsUnderLoad) {
     EXPECT_EQ(tenants.most.load(), 1) << "refresh and training used the arena at the same time";
     EXPECT_EQ(declined_after_ready, 0u) << "a render declined right after the arena reported it ready";
     EXPECT_GE(renders, 20u) << "the idle refresh was starved";
-}
-
-// Catches turn-taking that starves training when the viewer never waited, keeps
-// the scratch longer than the viewer waited, or lets a later frame that did not
-// wait shrink the viewer's window.
-TEST(NavigationArenaShareTest, ViewerKeepsTheScratchForAsLongAsTrainingMadeItWait) {
-    using std::chrono::milliseconds;
-    lfs::vis::NavigationArenaShare share;
-    const auto t0 = lfs::vis::NavigationArenaShare::Clock::time_point{} + std::chrono::seconds(10);
-    share.noteBegan(t0);
-    EXPECT_EQ(share.trainingFramesBeforeNextRender(t0 + milliseconds(1)), 1u);
-
-    share.noteDeclined(t0 + milliseconds(17));
-    share.noteDeclined(t0 + milliseconds(33));
-    share.noteBegan(t0 + milliseconds(67));
-    EXPECT_EQ(share.trainingFramesBeforeNextRender(t0 + milliseconds(68)), 0u);
-    share.noteBegan(t0 + milliseconds(84));
-    EXPECT_EQ(share.trainingFramesBeforeNextRender(t0 + milliseconds(116)), 0u);
-    EXPECT_EQ(share.trainingFramesBeforeNextRender(t0 + milliseconds(117)), 1u);
-}
-
-// Catches an uncapped keep window: one long training step (a refinement) must
-// not make the viewer hold the scratch for just as long afterwards.
-TEST(NavigationArenaShareTest, LongTrainingStepsLeaveTheViewerOnlyACappedWindow) {
-    lfs::vis::NavigationArenaShare share;
-    const auto t0 = lfs::vis::NavigationArenaShare::Clock::time_point{} + std::chrono::seconds(10);
-    const auto began = t0 + std::chrono::milliseconds(400);
-    share.noteDeclined(t0);
-    share.noteBegan(began);
-    const auto keep = lfs::vis::NavigationArenaShare::kMaxViewerKeep;
-    EXPECT_EQ(share.trainingFramesBeforeNextRender(began + keep - std::chrono::milliseconds(1)), 0u);
-    EXPECT_EQ(share.trainingFramesBeforeNextRender(began + keep), 1u);
-
-    share.noteDeclined(began + keep);
-    share.reset();
-    share.noteBegan(began + keep + std::chrono::milliseconds(30));
-    EXPECT_EQ(share.trainingFramesBeforeNextRender(began + keep + std::chrono::milliseconds(31)), 1u)
-        << "a wait from before the reset still counted";
 }
 
 TEST_F(ArenaMetricsContentionTest, ArenaContentionNeverDropsValidCachedFrame) {

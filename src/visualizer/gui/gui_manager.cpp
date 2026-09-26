@@ -3,10 +3,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "gui/gui_manager.hpp"
-#include "control/command_api.hpp"
 #include "core/camera.hpp"
 #include "core/cuda_error.hpp"
 #include "core/environment.hpp"
+#include "core/event_bridge/command_api.hpp"
 #include "core/event_bridge/command_center_bridge.hpp"
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/image_io.hpp"
@@ -20,6 +20,7 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include "core/tensor.hpp"
+#include "core/tensor_backend.hpp"
 #include "core/user_paths.hpp"
 #include "gui/bounds_gizmo.hpp"
 #include "gui/camera_thumbnail_batch.hpp"
@@ -56,6 +57,7 @@
 #include "internal/resource_paths.hpp"
 #include "tools/align_tool.hpp"
 
+#include "core/camera_metrics.hpp"
 #include "core/events.hpp"
 #include "core/parameters.hpp"
 #include "core/scene.hpp"
@@ -74,8 +76,10 @@
 #include "scene/scene_render_state.hpp"
 #include "theme/theme.hpp"
 #include "tools/selection_tool.hpp"
+#if LFS_BUILD_TRAINER
 #include "training/trainer.hpp"
-#include "training/training_manager.hpp"
+#endif
+#include "core/training_manager.hpp"
 #include "visualizer/app_store.hpp"
 #include "visualizer/scene_coordinate_utils.hpp"
 #include "visualizer_impl.hpp"
@@ -2713,7 +2717,11 @@ namespace lfs::vis::gui {
             const auto* trainer = scene_manager.getTrainerManager()
                                       ? scene_manager.getTrainerManager()->getTrainer()
                                       : nullptr;
+#if LFS_BUILD_TRAINER
             const std::uint64_t loss_generation = trainer ? trainer->cameraLossColorGeneration() : 0;
+#else
+            constexpr std::uint64_t loss_generation = 0;
+#endif
 
             if (camera_data_changed) {
                 const auto& all_cameras = scene.getAllCamerasCached();
@@ -2809,8 +2817,10 @@ namespace lfs::vis::gui {
                 cache.loss_colors.size() != cache.cameras.size() ||
                 cache.training_loss_color_generation != loss_generation) {
                 std::vector<std::array<float, 3>> loss_colors;
+#if LFS_BUILD_TRAINER
                 if (trainer)
                     trainer->fillCameraLossColors(cache.cameras, loss_colors);
+#endif
                 cache.loss_colors.assign(
                     cache.cameras.size(), glm::vec3(std::numeric_limits<float>::quiet_NaN()));
                 for (size_t i = 0; i < loss_colors.size(); ++i)
@@ -3206,7 +3216,7 @@ namespace lfs::vis::gui {
             // KEEP IN SYNC: the screen-window formula lives in four places —
             // this overlay (rect only, no depth test),
             // vertex_shader.slang compute_splat_active_state,
-            // filterSelectionByScreenWindowKernel (selection_ops.cu), and the
+            // core::filter_points, and the
             // CPU reference in tests/test_selection_screen_window.cpp.
             // Contract: the window RECTANGLE is framebuffer-centred in all four
             // copies; the splat projection uses the displayed camera's real
@@ -4547,7 +4557,6 @@ namespace lfs::vis::gui {
     }
 
     void GuiManager::applyUiScale(float scale) {
-        scale = std::clamp(scale, 1.0f, 4.0f);
         const float previous_scale = current_ui_scale_;
 
         rmlui_manager_.setDpRatio(scale);
@@ -4615,8 +4624,10 @@ namespace lfs::vis::gui {
 
         float saved_scale = lfs::vis::loadUiScalePreference();
         if (saved_scale <= 0.0f)
-            saved_scale = SDL_GetWindowDisplayScale(viewer_->getWindow());
-        current_ui_scale_ = std::clamp(saved_scale, 1.0f, 4.0f);
+            saved_scale = std::clamp(SDL_GetWindowDisplayScale(viewer_->getWindow()), 1.0f, 4.0f);
+        else
+            saved_scale = std::clamp(saved_scale, 1.0f, 4.0f) * SDL_GetWindowPixelDensity(viewer_->getWindow());
+        current_ui_scale_ = saved_scale;
 
         lfs::python::set_shared_dpi_scale(current_ui_scale_);
         lfs::vis::setThemeDpiScale(current_ui_scale_);
@@ -6219,7 +6230,9 @@ namespace lfs::vis::gui {
                                                LFS_SOURCE_SITE_CURRENT());
         }
 
-        if (!cuda_unavailable_notified_ && lfs::core::cuda_is_unavailable()) {
+        if (!cuda_unavailable_notified_ &&
+            lfs::core::default_gpu_backend() == lfs::core::GpuBackend::CUDA &&
+            lfs::core::cuda_is_unavailable()) {
             cuda_unavailable_notified_ = true;
             lfs::core::events::state::CudaUnavailable{
                 .message = LOC("runtime.cuda_unavailable_message")}
@@ -6286,6 +6299,7 @@ namespace lfs::vis::gui {
         bool block_underlay_input = startup_overlay_blocking;
         {
             LOG_TIMER_THRESHOLD("gui_render.panel_setup.frame_state", 0.25);
+            rmlui_manager_.serviceEmojiFont();
             rmlui_manager_.beginFrameCursorTracking();
             modal_overlay_open = rml_modal_overlay_->isOpen();
             modal_overlay_pending = rml_modal_overlay_->hasPendingRequest();
@@ -6724,8 +6738,7 @@ namespace lfs::vis::gui {
             const float splitter_h = PanelLayoutManager::SPLITTER_H * current_ui_scale_;
             const float tab_bar_h = PanelLayoutManager::TAB_BAR_H * current_ui_scale_;
             const float avail_h = ph - 16.0f;
-            const float scene_h = std::max(80.0f * current_ui_scale_,
-                                           avail_h * panel_layout_.getScenePanelRatio() - splitter_h * 0.5f);
+            const float scene_h = panel_layout_.scenePanelHeight(avail_h, current_ui_scale_);
 
             RightPanelLayout rp_layout;
             rp_layout.pos = glm::vec2(screen.work_pos.x + screen.work_size.x - rpw, screen.work_pos.y);
@@ -8571,16 +8584,18 @@ namespace lfs::vis::gui {
         });
 
         internal::DisplayScaleChanged::when([this](const auto& e) {
-            if (lfs::vis::loadUiScalePreference() <= 0.0f) {
+            const float saved_scale = lfs::vis::loadUiScalePreference();
+            if (saved_scale <= 0.0f)
                 pending_ui_scale_ = std::clamp(e.scale, 1.0f, 4.0f);
-            }
+            else
+                pending_ui_scale_ = std::clamp(saved_scale, 1.0f, 4.0f) * SDL_GetWindowPixelDensity(viewer_->getWindow());
         });
 
         internal::UiScaleChangeRequested::when([this](const auto& e) {
             if (e.scale <= 0.0f) {
                 pending_ui_scale_ = std::clamp(SDL_GetWindowDisplayScale(viewer_->getWindow()), 1.0f, 4.0f);
             } else {
-                pending_ui_scale_ = std::clamp(e.scale, 1.0f, 4.0f);
+                pending_ui_scale_ = std::clamp(e.scale, 1.0f, 4.0f) * SDL_GetWindowPixelDensity(viewer_->getWindow());
             }
             lfs::python::request_redraw();
         });
@@ -8896,9 +8911,7 @@ namespace lfs::vis::gui {
         const float splitter_h = PanelLayoutManager::SPLITTER_H * dpi;
         const float tab_bar_h = PanelLayoutManager::TAB_BAR_H * dpi;
         const float avail_h = panel_h - 2.0f * kPanelPad;
-        const float scene_h =
-            std::max(80.0f * dpi,
-                     avail_h * panel_layout_.getScenePanelRatio() - splitter_h * 0.5f);
+        const float scene_h = panel_layout_.scenePanelHeight(avail_h, dpi);
         const float content_top = kPanelPad;
         const float tab_content_y = content_top + scene_h + splitter_h + tab_bar_h;
         const float tab_content_h =
@@ -8928,7 +8941,7 @@ namespace lfs::vis::gui {
                           draw_ctx);
     }
 
-    bool GuiManager::needsAnimationFrame() const {
+    bool GuiManager::needsAnimationFrame(const bool include_export_progress) const {
         const auto now = std::chrono::steady_clock::now();
         if (cameraThumbnailRefreshDue(now)) {
             if (auto* const rendering = viewer_ ? viewer_->getRenderingManager() : nullptr)
@@ -8943,7 +8956,7 @@ namespace lfs::vis::gui {
             now < interactive_transition_guard_until_) {
             return true;
         }
-        if (isViewportExportLocked())
+        if (include_export_progress && isViewportExportLocked())
             return true;
         if (rmlui_manager_.dragPayload())
             return true;

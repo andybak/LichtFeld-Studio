@@ -85,6 +85,7 @@ def preferences_panel_module(monkeypatch):
         set_viewport_toolbar_position_calls=[],
         zoom_speed=11.0,
         navigation_speed=8.0,
+        trackpad={"device": "mouse", "swipe_pans": False, "swipe_speed": 50.0, "zoom_speed": 50.0},
         project_location="",
         embed_dataset_by_default=False,
         project_manager_preferences={
@@ -95,8 +96,7 @@ def preferences_panel_module(monkeypatch):
     )
 
     tensor_defaults = dict(backend="cuda", vulkan_device="", vulkan_validation=0,
-                           force_fp32_half=False, force_no_atomic_float=False,
-                           viewer_vulkan_inputs=False)
+                           force_fp32_half=False, force_no_atomic_float=False)
     state.tensor_preferences = dict(tensor_defaults)
 
     def set_tensor_backend_preferences(**values):
@@ -145,6 +145,14 @@ def preferences_panel_module(monkeypatch):
 
     def set_speed(name, value):
         setattr(state, name, max(1.0, min(100.0, float(value))))
+
+    def set_trackpad(device, swipe_pans, swipe_speed, zoom_speed):
+        state.trackpad = {
+            "device": device,
+            "swipe_pans": swipe_pans,
+            "swipe_speed": max(1.0, min(100.0, swipe_speed)),
+            "zoom_speed": max(1.0, min(100.0, zoom_speed)),
+        }
 
     lf_stub = ModuleType("lichtfeld")
     lf_stub.ui = SimpleNamespace(
@@ -229,6 +237,8 @@ def preferences_panel_module(monkeypatch):
         set_zoom_speed_preference=lambda value: set_speed("zoom_speed", value),
         get_navigation_speed_preference=lambda: state.navigation_speed,
         set_navigation_speed_preference=lambda value: set_speed("navigation_speed", value),
+        get_trackpad_preferences=lambda: dict(state.trackpad),
+        set_trackpad_preferences=set_trackpad,
         remember_camera_navigation=lambda: False,
         set_remember_camera_navigation=lambda _enabled: None,
         remember_camera_view_snap=lambda: False,
@@ -564,6 +574,25 @@ def test_navigation_speed_preferences_reset_with_input_section(preferences_panel
 
     assert state.zoom_speed == 11
     assert state.navigation_speed == 8
+
+
+def test_trackpad_preferences_round_trip_and_reset_with_input_section(preferences_panel_module):
+    module, state = preferences_panel_module
+    panel = module.PreferencesPanel()
+    panel._section = "input"
+
+    panel._set_trackpad(device="automatic")
+    panel._set_trackpad(swipe_pans=True)
+    panel._set_scrub_value("trackpad_swipe_speed", 70)
+    panel._set_scrub_value("trackpad_zoom_speed", 120)
+    assert state.trackpad["device"] == "automatic"
+    assert state.trackpad["swipe_pans"] is True
+    assert panel._get_scrub_value("trackpad_swipe_speed") == 70
+    assert state.trackpad["zoom_speed"] == 100
+
+    panel._reset_section()
+
+    assert state.trackpad == {"device": "mouse", "swipe_pans": False, "swipe_speed": 50.0, "zoom_speed": 50.0}
 
 
 def test_project_location_is_saved_and_can_return_to_default(
@@ -1152,4 +1181,3 @@ def test_tensor_setting_preserves_other_pending_preferences(preferences_panel_mo
     assert state.tensor_preferences["backend"] == "vulkan"
     assert state.tensor_preferences["vulkan_validation"] == 2
     assert state.tensor_preferences["force_fp32_half"] is True
-    assert state.tensor_preferences["viewer_vulkan_inputs"] is False

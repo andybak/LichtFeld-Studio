@@ -7,6 +7,7 @@
 #include <random>
 #include <torch/torch.h>
 
+#include "cuda_backend_test.hpp"
 #include "lfs/kernels/ppisp.cuh"
 
 namespace {
@@ -201,9 +202,9 @@ const torch::Tensor COLOR_PINV_BLOCK_DIAG = torch::tensor({
     torch::Tensor runCudaForward(const TestParams& p, const torch::Tensor& rgb_in, const int height, const int width,
                                  const int camera_idx, const int frame_idx) {
         auto rgb_out = torch::empty_like(rgb_in);
-        lfs::training::kernels::launch_ppisp_forward_chw(
+        lfs::training::kernels::launch_ppisp_forward_chw_region(
             p.exposure.data_ptr<float>(), p.vignetting.data_ptr<float>(), p.color.data_ptr<float>(),
-            p.crf.data_ptr<float>(), rgb_in.data_ptr<float>(), rgb_out.data_ptr<float>(), height, width,
+            p.crf.data_ptr<float>(), rgb_in.data_ptr<float>(), rgb_out.data_ptr<float>(), height, width, 0, height,
             static_cast<int>(p.vignetting.size(0)), static_cast<int>(p.exposure.size(0)), camera_idx, frame_idx, nullptr);
         cudaDeviceSynchronize();
         return rgb_out;
@@ -237,7 +238,7 @@ const torch::Tensor COLOR_PINV_BLOCK_DIAG = torch::tensor({
         return g;
     }
 
-    class PPISPCudaVsTorchTest : public ::testing::Test {};
+    class PPISPCudaVsTorchTest : public lfs::test::CudaBackendTest {};
 
     TEST_F(PPISPCudaVsTorchTest, NegativeRadianceDoesNotBecomeBrightRedOrYellow) {
         auto params = createParams(1, 1, DEFAULT_SEED);

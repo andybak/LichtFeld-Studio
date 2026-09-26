@@ -34,12 +34,11 @@ find_package(GTest CONFIG REQUIRED)
 # =============================================================================
 # CPU-only visualizer tests (no LibTorch)
 # =============================================================================
-if(BUILD_VISUALIZER_TESTS)
+if(BUILD_VISUALIZER_TESTS OR BUILD_TESTS)
     # The focused menu-bar suite exercises no GPU code. Windows CI installs
     # the CUDA toolkit but has no display driver, so defer loading nvcuda.dll
-    # until a driver API is actually called. Normal application builds retain
-    # their existing eager driver dependency.
-    if(MSVC)
+    # until a driver API is actually called. Application builds load the driver eagerly.
+    if(MSVC AND BUILD_VISUALIZER_TESTS)
         target_link_options(lfs_core PRIVATE "/DELAYLOAD:nvcuda.dll")
         target_link_libraries(lfs_core PRIVATE delayimp)
         target_link_options(lfs_visualizer PRIVATE "/DELAYLOAD:nvcuda.dll")
@@ -51,6 +50,7 @@ if(BUILD_VISUALIZER_TESTS)
         test_panel_layout_render_demand.cpp
         test_preferences_migration.cpp
         test_startup_overlay_geometry.cpp
+        test_trackpad_navigation.cpp
     )
     add_executable(lichtfeld_visualizer_tests EXCLUDE_FROM_ALL
         ${LICHTFELD_VISUALIZER_TEST_SOURCES}
@@ -68,6 +68,19 @@ if(BUILD_VISUALIZER_TESTS)
         lfs_python_runtime
         GTest::gtest_main
     )
+    if(APPLE)
+        # On macOS the visualizer resolves CPython from the host process. The app
+        # pulls libpython in by embedding it; the test binary must load it whole.
+        find_package(Python REQUIRED COMPONENTS Development.Embed)
+        target_link_options(lichtfeld_visualizer_tests PRIVATE
+            "LINKER:-force_load,$<TARGET_LINKER_FILE:Python::Python>")
+        target_link_libraries(lichtfeld_visualizer_tests PRIVATE lfs_python_embed)
+    endif()
+    # The trackpad tests set SDL's modifier state. A static SDL is reached through
+    # lfs_visualizer; a shared one (Windows) must be linked so both see one state.
+    if(TARGET SDL3::SDL3-shared)
+        target_link_libraries(lichtfeld_visualizer_tests PRIVATE SDL3::SDL3-shared)
+    endif()
     add_test(
         NAME lichtfeld_visualizer_tests
         COMMAND lichtfeld_visualizer_tests
@@ -321,6 +334,7 @@ if(NOT WIN32)
     )
 endif()
 target_compile_definitions(lichtfeld_format_tests PRIVATE
+    LFS_TENSOR_PRIVATE_ACCESS
     PROJECT_ROOT_PATH="${CMAKE_SOURCE_DIR}"
 )
 if(WIN32)
@@ -351,7 +365,9 @@ else()
         -ffunction-sections -fdata-sections
     )
     target_link_options(lichtfeld_format_tests PRIVATE
-        -Wl,--no-export-dynamic -Wl,--gc-sections
+        $<$<PLATFORM_ID:Darwin>:-Wl,-dead_strip>
+        $<$<NOT:$<PLATFORM_ID:Darwin>>:-Wl,--no-export-dynamic>
+        $<$<NOT:$<PLATFORM_ID:Darwin>>:-Wl,--gc-sections>
     )
 endif()
 if(WIN32)
@@ -404,10 +420,95 @@ if(WIN32)
 else()
     set(Torch_DIR "${PROJ_ROOT_DIR}/external/libtorch/share/cmake/Torch")
 endif()
+# The native reference kernel must use the Release tensor-kernel flags it is compared against.
+set_source_files_properties(test_tensor_expression_cuda.cu PROPERTIES
+    COMPILE_OPTIONS "$<TARGET_PROPERTY:lfs_tensor_kernels,COMPILE_OPTIONS>")
+
+# The shared harness records tensor facade traces, and tensor-library tests may
+# include private tensor headers. Other tests do not get the definition, so a stray
+# private include fails to compile.
+function(lfs_tensor_private_access)
+    set(_prefixes
+        test_main test_tensor_ tensor_ bench_tensor_ test_allocator_ test_cuda_ test_stale_stream_
+        test_zero_stride_ test_strided_reduce_ expression_reference cuda_backend_test test_alloc_counter
+        test_zip_gather)
+    foreach(_src IN LISTS ARGN)
+        get_filename_component(_name "${_src}" NAME)
+        foreach(_prefix IN LISTS _prefixes)
+            if(_name MATCHES "^${_prefix}")
+                set_property(SOURCE "${_src}" APPEND PROPERTY COMPILE_DEFINITIONS LFS_TENSOR_PRIVATE_ACCESS)
+                break()
+            endif()
+        endforeach()
+    endforeach()
+endfunction()
+
+if(NOT LFS_HAS_CUDA)
+    set(TEST_SOURCES
+        test_main.cpp
+        test_tensor_queue_readback.cpp
+        test_tensor_vulkan_runtime.cpp
+        test_tensor_vulkan_allocation_padding.cpp
+        test_tensor_vulkan_adoption.cpp
+        test_tensor_vulkan_pointwise.cpp
+        test_tensor_vulkan_reduce.cpp
+        test_tensor_vulkan_index.cpp
+        test_tensor_vulkan_matrix_nn.cpp
+        test_tensor_vulkan_random.cpp
+        test_tensor_vulkan_buffer.cpp
+        test_tensor_metal.cpp
+        test_viewer_no_cuda.cpp
+    )
+    if(APPLE)
+        list(APPEND TEST_SOURCES test_video_videotoolbox.cpp)
+    endif()
+    add_executable(lichtfeld_tests ${TEST_SOURCES})
+    if(APPLE)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(VIDEO_TEST_FFMPEG REQUIRED IMPORTED_TARGET
+            libavcodec libavformat libavutil)
+        target_sources(lichtfeld_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/io/stb_image_impl.cpp)
+        target_include_directories(lichtfeld_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/external)
+        target_link_libraries(lichtfeld_tests PRIVATE
+            lfs_video PkgConfig::VIDEO_TEST_FFMPEG nlohmann_json::nlohmann_json)
+    endif()
+    target_compile_features(lichtfeld_tests PRIVATE cxx_std_23)
+    target_include_directories(lichtfeld_tests PRIVATE
+        ${LFS_CORE_ABI_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_BINARY_DIR}/include
+        ${CMAKE_SOURCE_DIR}/tests
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/app/include
+    )
+    lfs_tensor_private_access(${TEST_SOURCES})
+    target_link_libraries(lichtfeld_tests PRIVATE
+        lfs_rendering_tensor
+        lfs_core
+        GTest::gtest
+        Vulkan::Vulkan
+    )
+    add_test(NAME lichtfeld_tests COMMAND lichtfeld_tests --tensor-backend=vulkan)
+    set_tests_properties(lichtfeld_tests PROPERTIES TIMEOUT 300)
+
+    # Metal vs Vulkan tensor benchmark, built on demand and not registered with ctest.
+    if(APPLE)
+        add_executable(bench_tensor_metal_vulkan EXCLUDE_FROM_ALL bench_tensor_metal_vulkan.cpp)
+        target_compile_features(bench_tensor_metal_vulkan PRIVATE cxx_std_23)
+        target_include_directories(bench_tensor_metal_vulkan PRIVATE ${LFS_CORE_ABI_INCLUDE_DIR})
+        target_link_libraries(bench_tensor_metal_vulkan PRIVATE lfs_core)
+    endif()
+    return()
+elseif(NOT LFS_BUILD_TRAINER)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/ViewerTests.cmake)
+    return()
+endif()
+
 find_package(Torch REQUIRED)
 message(STATUS "Tests: LibTorch ${Torch_VERSION} found for tensor comparison tests")
 
 # Regular test sources (unit tests, integration tests)
+
 set(TEST_FILES
     licht_test_support.cpp
     test_assert_hardening.cpp
@@ -422,6 +523,13 @@ set(TEST_FILES
     test_device_fault.cpp
     device_fault_cuda_utils.cu
     test_selection_ops.cpp
+    test_tensor_point_ops.cpp
+    test_tensor_expression.cpp
+    test_tensor_expression_cuda.cu
+    test_splat_codec_edits.cpp
+    test_tensor_splat_affine.cpp
+    test_tensor_sh_codec.cpp
+    test_tensor_image_ops.cpp
     test_selection_cursor.cpp
     test_tensor_basic.cpp
     test_tensor_ops.cpp
@@ -440,6 +548,9 @@ set(TEST_FILES
     test_fused_reg_loss.cpp
     test_fused_bg_blend.cpp
     test_photometric_hygiene.cpp
+    test_photometric_ops.cpp
+    test_adam_ops.cpp
+    test_mcmc_ops.cpp
     test_persistent_masks.cpp
     test_fused_noise_injection.cpp
     test_densification_info_zero.cpp
@@ -462,8 +573,10 @@ set(TEST_FILES
     test_selection_screen_ops.cpp
     test_selection_tensor_projection.cpp
     test_export_band_pack.cpp
+    test_viewer_appearance.cpp
     test_point_cloud_merge.cpp
     test_display_tensors.cpp
+    test_viewer_gpu_memory.cpp
     test_tensor_views.cpp
     test_tensor_advanced.cpp
     test_tensor_async_consts.cpp
@@ -573,6 +686,7 @@ set(TEST_FILES
     test_panel_registry_animation_demand.cpp
     test_panel_registry_default_closed.cpp
     test_panel_layout_render_demand.cpp
+    test_number_format.cpp
     test_reactive_store.cpp
     test_video_color_convert.cpp
     test_python_integration.cpp
@@ -614,6 +728,8 @@ set(TEST_FILES
     test_training_scene_init_concurrency.cpp
     test_training_init_centering.cpp
     test_scene_consolidation.cpp
+    test_scene_combining_backends.cpp
+    test_scene_snapshot_backend.cpp
     test_scene_graph_fuzz.cpp
     test_uuid.cpp
     test_render_settings_defaults.cpp
@@ -637,6 +753,7 @@ set(TEST_FILES
     test_input_controller_dataset_load.cpp
     test_input_controller_panel_camera.cpp
     test_selection_service_interactions.cpp
+    test_selection_group_mask.cpp
     test_scene_graph_identity.cpp
     test_undo_history.cpp
     test_selection_command_dispatch.cpp
@@ -652,11 +769,13 @@ set(TEST_FILES
     test_nvcodec_sentinel_validation.cpp
     test_compressed_blob_tier.cpp
     test_pipelined_loader.cpp
+    test_pipelined_loader_backends.cpp
     test_pipelined_loader_ledger.cpp
     test_pipelined_loader_sidecar_jpeg2k.cpp
     test_operator_return_value.cpp
     test_sdl_rml_key_mapping.cpp
     test_rml_path_utils.cpp
+    test_rml_system_interface.cpp
     test_rml_drag_payload.cpp
     test_context_menu_placement.cpp
     test_rml_static_style_boundaries.cpp
@@ -675,13 +794,11 @@ set(TEST_FILES
     test_romav1.cpp
     test_sam2.cpp
     test_lpips.cpp
-    test_ppisp_controller.cpp
     test_ppisp_regularization.cpp
     test_ppisp_sidecar.cpp
     test_ppisp_checkpoint_roundtrip.cpp
     test_bilateral_grid_projection.cpp
     test_bilateral_grid_exposure_chroma.cpp
-    test_bilateral_grid_backward_tiled.cpp
     test_ppisp_projection.cpp
     test_ppisp_cuda_vs_torch.cpp
     test_ppisp_banded_region.cpp
@@ -718,6 +835,8 @@ set(TEST_FILES
     test_rotated_sh_correctness.cpp
     test_splat_raw_payload.cpp
     test_tensor_stream.cpp
+    test_tensor_queue_readback.cpp
+    test_tensor_completion.cpp
     test_tensor_d4_from_blob_stream.cpp
     tensor_hardening_cuda_utils.cu
     test_cuda_event_pool.cpp
@@ -754,6 +873,7 @@ if(LFS_TENSOR_VULKAN)
         test_tensor_backend_parity.cpp
         test_ply_vulkan_q16_bands.cpp
         test_viewer_vulkan_load.cpp
+        test_headless_vulkan_device_selection.cpp
         test_viewer_no_cuda.cpp
         test_selection_mask_ops.cpp
         test_sh_quant_tensor_program.cpp
@@ -788,8 +908,9 @@ list(APPEND TEST_FILES test_readback_ticket_ring.cpp)
 list(APPEND TEST_FILES test_gpu_resource_pool.cpp)
 list(APPEND TEST_FILES test_viewport_scratch_bucket.cpp)
 list(APPEND TEST_FILES test_lod_page_cache.cpp)
-list(APPEND TEST_FILES test_lod_page_dequant.cpp)
-list(APPEND TEST_FILES test_lod_upload_engine.cpp)
+list(APPEND TEST_FILES test_vulkan_lod_upload_engine.cpp)
+list(APPEND TEST_FILES test_splat_sh_tensor_layout.cpp)
+list(APPEND TEST_FILES test_tensor_device_runtime.cpp)
 list(APPEND TEST_FILES test_octree_lod.cpp)
 list(APPEND TEST_FILES test_ply_to_rad_lod.cpp)
 list(APPEND TEST_FILES test_rad_gpu_encode.cpp)
@@ -854,6 +975,9 @@ target_compile_definitions(lichtfeld_tests PRIVATE
     TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/data"
     PROJECT_ROOT_PATH="${CMAKE_SOURCE_DIR}"
 )
+if(LFS_TENSOR_VULKAN)
+    target_compile_definitions(lichtfeld_tests PRIVATE LFS_TEST_TENSOR_VULKAN=1)
+endif()
 
 # Large test assets are hosted in the public Cloudflare R2 bucket
 # 'lichtfeld-test-assets' and fetched at configure time. A failed download only
@@ -1062,12 +1186,10 @@ string(CONCAT LFS_SLOW_TEST_FILTER
     "TensorMultiStreamTest.TrainerViewerHandshake*:"
     "CheckpointAtomicReplaceFaultTest.*:"
     "MemoryPressureTest.InjectedFailure*:"
-    "PPISPControllerTest.TrainingLoopConverges:"
     "UndistortCameraTest.BicyclePinholeNoDist:"
     "VideoColorConvertTest.*FullHD*:"
     "PlyToRadLod.*:"
-    "LodPageDequant.*:"
-    "LodUploadEngine.*:"
+    "TensorBackends/LodUpload.*:"
     "RadMetaSidecar.*:"
     "OctreeLod.*:"
     "NurecUsdzFormatTest.*:"
@@ -1206,6 +1328,7 @@ set(LFS_PYTHON_FAST_TESTS
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_io_hygiene_regressions.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_keymap_bindings.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_verified_dead_code_cleanup.py
+    ${CMAKE_CURRENT_SOURCE_DIR}/python/test_viewer_spirv.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_layout_composition.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_manage_stubs.py
     ${CMAKE_CURRENT_SOURCE_DIR}/python/test_mesh.py
@@ -1555,7 +1678,7 @@ set_tests_properties(lichtfeld.decimate.perf PROPERTIES
     LABELS "nightly;gpu" ENVIRONMENT "LFS_DECIMATE_PERF=1" TIMEOUT 60)
 
 # Focused CUDA renderer contracts.
-add_executable(gsplat_tests test_main.cpp test_gsplat_rasterizer.cpp)
+add_executable(gsplat_tests test_main.cpp test_gsplat_rasterizer.cpp tensor_hardening_cuda_utils.cu)
 target_compile_features(gsplat_tests PRIVATE cxx_std_23)
 target_include_directories(gsplat_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/src/training ${CUDAToolkit_INCLUDE_DIRS})
@@ -1563,3 +1686,12 @@ target_link_libraries(gsplat_tests PRIVATE lfs_training lfs_core GTest::gtest CU
 if(COMMAND lfs_enable_fast_cxx_compile)
     lfs_enable_fast_cxx_compile(gsplat_tests)
 endif()
+
+lfs_tensor_private_access(${TEST_SOURCES})
+foreach(_lfs_tensor_test_target IN ITEMS
+        tensor_hardening_tests tensor_interface_freeze tensor_backend_corpus
+        bench_tensor_launch_overhead bench_tensor_gui)
+    if(TARGET ${_lfs_tensor_test_target})
+        target_compile_definitions(${_lfs_tensor_test_target} PRIVATE LFS_TENSOR_PRIVATE_ACCESS)
+    endif()
+endforeach()

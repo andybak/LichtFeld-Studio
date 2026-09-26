@@ -3,10 +3,10 @@
 
 #pragma once
 
-#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <thread>
 
 namespace lfs::vis {
 
@@ -26,43 +26,47 @@ namespace lfs::vis {
         return true;
     }
 
-    // Turn-taking on the shared training scratch while the camera moves during
-    // training. Training runs one step after every viewer frame. When a step made
-    // the viewer wait, the viewer keeps the scratch for as long as it waited
-    // (capped), so both get about half of the time and training never stops.
-    class NavigationArenaShare {
-    public:
-        using Clock = std::chrono::steady_clock;
-        static constexpr std::chrono::milliseconds kMaxViewerKeep{66};
-        // A navigation frame may wait this long for a training step that is about
-        // to finish instead of dropping the frame.
-        static constexpr std::uint32_t kRenderWaitMs = 5;
+    // While the camera moves during training, training runs one step after every
+    // viewer frame: frames keep a steady cadence and training keeps progressing.
+    inline constexpr std::uint32_t kTrainingFramesPerNavigationRender = 1;
 
-        void noteDeclined(const Clock::time_point now) {
-            if (!declined_since_) {
-                declined_since_ = now;
+    // A navigation frame waits this long for training's step to leave the shared
+    // scratch; presenting the previous splat image would put it under overlays
+    // that already follow the new camera.
+    inline constexpr std::chrono::milliseconds kNavigationArenaWait{250};
+    // How long a navigation frame lets training start the step it is owed. A
+    // trainer waiting for its next step starts within microseconds of the
+    // release; one still busy elsewhere must not hold the viewer back.
+    inline constexpr std::chrono::milliseconds kNavigationTrainingGrace{2};
+
+    // Reserves the arena for the viewer and waits until a render could claim it
+    // without waiting, or the timeout passes. Training first gets the frames the
+    // reservation owes it, unless it does not start them within the grace period.
+    // Takes no lock of its own.
+    template <typename Arena, typename Token>
+    [[nodiscard]] bool waitForViewerArenaWindow(Arena& arena, Token& token, const std::chrono::milliseconds timeout,
+                                                const std::chrono::milliseconds training_grace) {
+        const auto start = std::chrono::steady_clock::now();
+        const auto deadline = start + timeout;
+        const auto grace_end = start + training_grace;
+        while (true) {
+            token = arena.request_render_handoff(token);
+            if (token == 0) {
+                return false;
             }
-        }
-
-        void noteBegan(const Clock::time_point now) {
-            if (!declined_since_) {
-                return;
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= grace_end) {
+                arena.withdraw_render_handoff_training_frames(token);
             }
-            const Clock::duration waited = std::min<Clock::duration>(now - *declined_since_, kMaxViewerKeep);
-            keep_until_ = std::max(keep_until_, now + waited);
-            declined_since_.reset();
+            if (!arena.render_handoff_owes_training(token) && arena.render_frame_ready(token)) {
+                return true;
+            }
+            if (now >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-
-        [[nodiscard]] std::uint32_t trainingFramesBeforeNextRender(const Clock::time_point now) const {
-            return now < keep_until_ ? 0u : 1u;
-        }
-
-        void reset() { *this = {}; }
-
-    private:
-        std::optional<Clock::time_point> declined_since_;
-        Clock::time_point keep_until_{};
-    };
+    }
 
     // Releases a viewer arena frame. With a turn given, the next window is
     // reserved before the release and training gets that many frames first;

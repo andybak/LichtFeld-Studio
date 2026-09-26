@@ -87,7 +87,11 @@ set(TRAINING_NEW_SOURCES
     live_model_mutation_guard.cpp
     optimizer/scheduler.cpp
     losses/regularization.cpp
-    losses/photometric_loss.cpp
+    ops/registry.cpp
+    ops/requirements.cpp
+    ops/photometric_cuda.cpp
+    ops/adam_cuda.cpp
+    ops/mcmc_cuda.cpp
     losses/mask_loss.cpp
     strategies/strategy_utils.cpp
     strategies/mcmc.cpp
@@ -99,7 +103,6 @@ set(TRAINING_NEW_SOURCES
     components/config_serialization.cpp
     components/bilateral_grid.cpp
     components/ppisp.cpp
-    components/ppisp_controller.cu
     components/ppisp_controller_pool.cu
     components/ppisp_file.cpp
     components/sparsity_optimizer.cpp

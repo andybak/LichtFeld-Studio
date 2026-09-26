@@ -254,7 +254,7 @@ namespace lfs::vis {
         void saveValuesLocked() {
             if (!paths || !writable)
                 return;
-            values["schema_version"] = 1;
+            values["schema_version"] = 2;
             if (const auto result = paths->writePreferencesAtomically(values.dump(2) + '\n'); !result)
                 LOG_WARN("Unable to save user preferences: {}",
                          lfs::format_for_developer(result.error()));
@@ -297,6 +297,22 @@ namespace lfs::vis {
             }
             if (changed)
                 saveValuesLocked();
+        }
+
+        // Before schema 2 the panel saved its default back on every start, so on
+        // a Mac, where Vulkan was the only backend, "vulkan" was never chosen:
+        // it becomes automatic, which picks Metal where the GPU supports it.
+        void migrateTensorBackendLocked() {
+#ifdef __APPLE__
+            const auto tensor = values.find("tensor_backend");
+            if (tensor == values.end() || !tensor->is_object())
+                return;
+            const auto backend = tensor->find("backend");
+            if (backend != tensor->end() && *backend == "vulkan") {
+                *backend = "auto";
+                saveValuesLocked();
+            }
+#endif
         }
 
         void loadLocked() {
@@ -344,7 +360,13 @@ namespace lfs::vis {
                     throw std::runtime_error("root value is not an object");
                 values = std::move(parsed);
                 input.close();
+                // Migrations save the current schema, so read the loaded one first.
+                const auto schema = values.find("schema_version");
+                const bool before_schema_2 = schema == values.end() || !schema->is_number_integer() ||
+                                             schema->get<int>() < 2;
                 migrateProjectLocationLocked();
+                if (before_schema_2)
+                    migrateTensorBackendLocked();
             } catch (const std::exception& error) {
                 // Windows does not allow the malformed file to be moved while
                 // this reader still holds it open.
@@ -527,6 +549,35 @@ namespace lfs::vis {
         impl_->loadLocked();
         return impl_->values.value("scene_graph_selection_markers", false);
     }
+    void UserPreferences::setTrackpad(const TrackpadPreferenceState& state) {
+        const TrackpadPreferenceState defaults;
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        impl_->values["trackpad"] = {
+            {"device", navigationDeviceName(state.device)},
+            {"swipe_pans", state.swipe_pans},
+            {"swipe_speed", clampNavigationSpeed(state.swipe_speed, defaults.swipe_speed)},
+            {"zoom_speed", clampNavigationSpeed(state.zoom_speed, defaults.zoom_speed)},
+        };
+        impl_->saveLocked();
+    }
+    TrackpadPreferenceState UserPreferences::trackpad() {
+        std::scoped_lock lock(impl_->mutex);
+        impl_->loadLocked();
+        TrackpadPreferenceState result;
+        const auto it = impl_->values.find("trackpad");
+        if (it == impl_->values.end() || !it->is_object())
+            return result;
+        if (const auto device = it->find("device"); device != it->end() && device->is_string())
+            result.device = parseNavigationDevice(device->get<std::string>()).value_or(result.device);
+        if (const auto pans = it->find("swipe_pans"); pans != it->end() && pans->is_boolean())
+            result.swipe_pans = pans->get<bool>();
+        if (const auto speed = it->find("swipe_speed"); speed != it->end() && speed->is_number())
+            result.swipe_speed = clampNavigationSpeed(speed->get<float>(), result.swipe_speed);
+        if (const auto speed = it->find("zoom_speed"); speed != it->end() && speed->is_number())
+            result.zoom_speed = clampNavigationSpeed(speed->get<float>(), result.zoom_speed);
+        return result;
+    }
     void UserPreferences::setProgressBarStyle(const std::string_view value) {
         std::scoped_lock lock(impl_->mutex);
         impl_->loadLocked();
@@ -595,13 +646,21 @@ namespace lfs::vis {
     void UserPreferences::setTensorBackend(const TensorPreferenceState& state) {
         std::scoped_lock lock(impl_->mutex);
         impl_->loadLocked();
+        const char* backend = state.backend ? "vulkan" : "auto";
+#if LFS_HAS_CUDA
+        if (state.backend == core::GpuBackend::CUDA)
+            backend = "cuda";
+#endif
+#ifdef __APPLE__
+        if (state.backend == core::GpuBackend::Metal)
+            backend = "metal";
+#endif
         impl_->values["tensor_backend"] = {
-            {"backend", state.backend == core::GpuBackend::Vulkan ? "vulkan" : "cuda"},
+            {"backend", backend},
             {"vulkan_device", state.options.vulkan_device},
             {"vulkan_validation", std::clamp(state.options.vulkan_validation, 0, 2)},
             {"force_fp32_half", state.options.force_fp32_half},
             {"force_no_atomic_float", state.options.force_no_atomic_float},
-            {"viewer_vulkan_inputs", state.options.viewer_vulkan_inputs},
         };
         impl_->saveLocked();
     }
@@ -613,9 +672,18 @@ namespace lfs::vis {
         const auto it = impl_->values.find("tensor_backend");
         if (it == impl_->values.end() || !it->is_object())
             return result;
-        if (const auto backend = it->find("backend"); backend != it->end() &&
-                                                      backend->is_string() && *backend == "vulkan")
-            result.backend = core::GpuBackend::Vulkan;
+        if (const auto backend = it->find("backend"); backend != it->end() && backend->is_string()) {
+            if (*backend == "vulkan")
+                result.backend = core::GpuBackend::Vulkan;
+#if LFS_HAS_CUDA
+            else if (*backend == "cuda")
+                result.backend = core::GpuBackend::CUDA;
+#endif
+#ifdef __APPLE__
+            else if (*backend == "metal")
+                result.backend = core::GpuBackend::Metal;
+#endif
+        }
         if (const auto device = it->find("vulkan_device"); device != it->end() && device->is_string())
             result.options.vulkan_device = device->get<std::string>();
         if (const auto mode = it->find("vulkan_validation"); mode != it->end() && mode->is_number_integer()) {
@@ -630,7 +698,6 @@ namespace lfs::vis {
         };
         read_bool("force_fp32_half", result.options.force_fp32_half);
         read_bool("force_no_atomic_float", result.options.force_no_atomic_float);
-        read_bool("viewer_vulkan_inputs", result.options.viewer_vulkan_inputs);
         return result;
     }
 
@@ -844,6 +911,10 @@ namespace lfs::vis {
     bool loadSceneGraphSelectionMarkersPreference() {
         return UserPreferences::instance().sceneGraphSelectionMarkers();
     }
+    void saveTrackpadPreferences(const TrackpadPreferenceState& state) {
+        UserPreferences::instance().setTrackpad(state);
+    }
+    TrackpadPreferenceState loadTrackpadPreferences() { return UserPreferences::instance().trackpad(); }
     void saveProgressBarStylePreference(const std::string_view style) {
         UserPreferences::instance().setProgressBarStyle(style);
     }

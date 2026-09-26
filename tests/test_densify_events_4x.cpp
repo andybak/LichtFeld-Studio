@@ -6,6 +6,7 @@
  */
 
 #include "core/tensor.hpp"
+#include "cuda_backend_test.hpp"
 #include "lfs/training/refine_scratch.hpp"
 #include "training/kernels/densification_kernels.hpp"
 #include "training/kernels/mrnf_kernels.hpp"
@@ -19,6 +20,8 @@
 using namespace lfs::core;
 using namespace lfs::training;
 
+class DensifyEvents4x : public lfs::test::CudaBackendTest {};
+
 namespace {
 
     std::vector<float> to_host(const Tensor& t) {
@@ -27,7 +30,7 @@ namespace {
 
 } // namespace
 
-TEST(DensifyEvents4x, FillFreeSlotsFusedWritesAttrsAndZerosAdam) {
+TEST_F(DensifyEvents4x, FillFreeSlotsFusedWritesAttrsAndClearsFreeMask) {
     constexpr size_t N = 8;
     constexpr size_t K = 3;
 
@@ -68,17 +71,13 @@ TEST(DensifyEvents4x, FillFreeSlotsFusedWritesAttrsAndZerosAdam) {
                   cudaSuccess);
     }
 
-    auto adam0 = Tensor::ones({N}, Device::GPU);
-    auto adam1 = Tensor::ones({N}, Device::GPU);
-    float* adam_ptrs[2] = {adam0.ptr<float>(), adam1.ptr<float>()};
-
     kernels::launch_fill_free_slots_fused(
         targets.ptr<int64_t>(), K,
         src_means.ptr<float>(), src_rots.ptr<float>(), src_scales.ptr<float>(),
         src_sh0.ptr<float>(), src_opac.ptr<float>(),
         means.ptr<float>(), rots.ptr<float>(), scales.ptr<float>(),
         sh0.ptr<float>(), opac.ptr<float>(),
-        /*opacity_dim=*/0, adam_ptrs, 2, free_mask.ptr<bool>(), N);
+        /*opacity_dim=*/0, free_mask.ptr<bool>(), N);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
     auto mh = to_host(means);
@@ -87,13 +86,6 @@ TEST(DensifyEvents4x, FillFreeSlotsFusedWritesAttrsAndZerosAdam) {
     EXPECT_FLOAT_EQ(mh[5 * 3 + 2], 32.f);
     EXPECT_FLOAT_EQ(mh[0], 0.f); // untouched
 
-    auto ah0 = to_host(adam0);
-    auto ah1 = to_host(adam1);
-    EXPECT_FLOAT_EQ(ah0[1], 0.f);
-    EXPECT_FLOAT_EQ(ah0[3], 0.f);
-    EXPECT_FLOAT_EQ(ah0[0], 1.f);
-    EXPECT_FLOAT_EQ(ah1[5], 0.f);
-
     auto fm = free_mask.cpu();
     EXPECT_FALSE(fm.ptr<bool>()[1]);
     EXPECT_FALSE(fm.ptr<bool>()[3]);
@@ -101,7 +93,7 @@ TEST(DensifyEvents4x, FillFreeSlotsFusedWritesAttrsAndZerosAdam) {
     EXPECT_FALSE(fm.ptr<bool>()[0]);
 }
 
-TEST(DensifyEvents4x, PackedRefineCountsMatchHost) {
+TEST_F(DensifyEvents4x, PackedRefineCountsMatchHost) {
     constexpr size_t N = 16;
     std::vector<uint8_t> b0(N, 0), b1(N, 0);
     std::vector<float> f0(N, 0.f), f1(N, 0.f);
@@ -144,7 +136,7 @@ TEST(DensifyEvents4x, PackedRefineCountsMatchHost) {
     EXPECT_EQ(counts[3], 1);
 }
 
-TEST(DensifyEvents4x, PositiveMedianNormalizeMatchesSortReference) {
+TEST_F(DensifyEvents4x, PositiveMedianNormalizeMatchesSortReference) {
     // Values: positives 1,2,3,4,5 → median 3; zeros stay 0; result /3
     std::vector<float> data = {0.f, 1.f, 0.f, 5.f, 2.f, 4.f, 3.f, 0.f, -1.f};
     auto t = Tensor::from_vector(data, TensorShape({data.size()}), Device::GPU);
@@ -170,7 +162,7 @@ TEST(DensifyEvents4x, PositiveMedianNormalizeMatchesSortReference) {
     }
 }
 
-TEST(DensifyEvents4x, PositiveMedianWorkspaceMatchesAllocatingPath) {
+TEST_F(DensifyEvents4x, PositiveMedianWorkspaceMatchesAllocatingPath) {
     std::vector<float> data = {0.f, 1.f, 0.f, 5.f, 2.f, 4.f, 3.f, 0.f, -1.f};
     auto allocating = Tensor::from_vector(data, TensorShape({data.size()}), Device::GPU);
     auto persisted = Tensor::from_vector(data, TensorShape({data.size()}), Device::GPU);
@@ -190,7 +182,7 @@ TEST(DensifyEvents4x, PositiveMedianWorkspaceMatchesAllocatingPath) {
     }
 }
 
-TEST(DensifyEvents4x, PositiveMedianWorkspaceZerosWhenNoPositives) {
+TEST_F(DensifyEvents4x, PositiveMedianWorkspaceZerosWhenNoPositives) {
     std::vector<float> data = {0.f, -1.f, 0.f, -2.f};
     auto t = Tensor::from_vector(data, TensorShape({data.size()}), Device::GPU);
     PositiveMedianScratch scratch;
@@ -202,7 +194,7 @@ TEST(DensifyEvents4x, PositiveMedianWorkspaceZerosWhenNoPositives) {
     }
 }
 
-TEST(DensifyEvents4x, GumbelScratchMatchesAllocatingPath) {
+TEST_F(DensifyEvents4x, GumbelScratchMatchesAllocatingPath) {
     constexpr size_t n = 64;
     constexpr size_t k = 7;
     std::vector<float> weights(n, 0.f);
@@ -233,7 +225,7 @@ TEST(DensifyEvents4x, GumbelScratchMatchesAllocatingPath) {
     }
 }
 
-TEST(DensifyEvents4x, GumbelScratchDenseMatchesAllocatingPath) {
+TEST_F(DensifyEvents4x, GumbelScratchDenseMatchesAllocatingPath) {
     constexpr size_t n = 32;
     constexpr size_t k = 5;
     std::vector<float> weights(n);
@@ -261,7 +253,7 @@ TEST(DensifyEvents4x, GumbelScratchDenseMatchesAllocatingPath) {
     }
 }
 
-TEST(DensifyEvents4x, GumbelUInt32PayloadsAreBoundedAndUnique) {
+TEST_F(DensifyEvents4x, GumbelUInt32PayloadsAreBoundedAndUnique) {
     constexpr size_t n = 257;
     constexpr size_t k = 31;
     std::vector<float> weights(n, 1.0f);
@@ -288,7 +280,7 @@ TEST(DensifyEvents4x, GumbelUInt32PayloadsAreBoundedAndUnique) {
     }
 }
 
-TEST(DensifyEvents4x, TopologyScratchReleaseDropsAllResidentBytes) {
+TEST_F(DensifyEvents4x, TopologyScratchReleaseDropsAllResidentBytes) {
     GumbelTopKScratch gumbel;
     PositiveMedianScratch median;
     gumbel.ensure_n(128, Device::GPU);
@@ -303,7 +295,7 @@ TEST(DensifyEvents4x, TopologyScratchReleaseDropsAllResidentBytes) {
     EXPECT_FALSE(median.selected.is_valid());
 }
 
-TEST(DensifyEvents4x, DensifyChildWorkspaceGrowsOnly) {
+TEST_F(DensifyEvents4x, DensifyChildWorkspaceGrowsOnly) {
     DensifyChildWorkspace ws;
     ws.ensure(100, 0, false, false, Device::GPU);
     const size_t cap1 = ws.capacity;
@@ -318,7 +310,7 @@ TEST(DensifyEvents4x, DensifyChildWorkspaceGrowsOnly) {
     EXPECT_GT(ws.capacity, cap1);
 }
 
-TEST(DensifyEvents4x, ScoreBufferAppendZerosInPlace) {
+TEST_F(DensifyEvents4x, ScoreBufferAppendZerosInPlace) {
     Tensor scores = Tensor::zeros_direct(TensorShape({4}), /*capacity=*/16, Device::GPU);
     std::vector<float> init = {1.f, 2.f, 3.f, 4.f};
     ASSERT_EQ(cudaMemcpy(scores.ptr<float>(), init.data(), 4 * sizeof(float),
@@ -334,7 +326,7 @@ TEST(DensifyEvents4x, ScoreBufferAppendZerosInPlace) {
     EXPECT_FLOAT_EQ(v[9], 0.f);
 }
 
-TEST(DensifyEvents4x, DensificationInfoReusesMatchingShape) {
+TEST_F(DensifyEvents4x, DensificationInfoReusesMatchingShape) {
     Tensor info = Tensor::zeros({2, 32}, Device::GPU);
     float* p0 = info.ptr<float>();
     ensure_densification_info_shape_inplace(info, 32, Device::GPU);

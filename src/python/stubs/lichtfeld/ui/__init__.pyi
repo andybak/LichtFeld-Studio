@@ -414,7 +414,9 @@ def is_panel_enabled(panel_id: str) -> bool:
     """Check if a panel is enabled"""
 
 def get_left_dock_width() -> float:
-    """Get the current left dock width in logical pixels"""
+    """
+    Get the left dock width the user chose, in logical pixels. The dock is narrower while the window is too small to fit it.
+    """
 
 def set_left_dock_width(width: float) -> None:
     """Set the left dock width in logical pixels"""
@@ -2015,6 +2017,11 @@ def save_spz_file_dialog(default_name: str = 'export') -> str:
     Open a save file dialog for SPZ files. Returns empty string if cancelled.
     """
 
+def save_glb_file_dialog(default_name: str = 'export') -> str:
+    """
+    Open a save file dialog for GLB (SPZ glTF) files. Returns empty string if cancelled.
+    """
+
 def save_usd_file_dialog(default_name: str = 'export') -> str:
     """
     Open a save file dialog for USD files. Returns empty string if cancelled.
@@ -2734,6 +2741,14 @@ def set_navigation_speed_preference(speed: float) -> None:
 def get_navigation_speed_preference() -> float:
     """Get the default WASD navigation speed"""
 
+def get_trackpad_preferences() -> dict:
+    """Get trackpad navigation preferences"""
+
+def set_trackpad_preferences(device: str, swipe_pans: bool, swipe_speed: float, zoom_speed: float) -> None:
+    """
+    Persist and apply trackpad navigation preferences (device 'mouse', 'trackpad' or 'automatic'; speeds 1-100, 50 is the default)
+    """
+
 def get_project_manager_preferences() -> dict:
     """
     Get Project Manager preferences from the canonical user preferences store
@@ -2772,7 +2787,7 @@ def reset_scene_reconstruction_preferences() -> None:
 def get_tensor_backend_preferences() -> dict:
     """Get saved tensor backend preferences; changes apply after restart"""
 
-def set_tensor_backend_preferences(backend: str = 'cuda', vulkan_device: str = '', vulkan_validation: int = 0, force_fp32_half: bool = False, force_no_atomic_float: bool = False, viewer_vulkan_inputs: bool = False) -> None:
+def set_tensor_backend_preferences(backend: str = 'auto', vulkan_device: str = '', vulkan_validation: int = 0, force_fp32_half: bool = False, force_no_atomic_float: bool = False) -> None:
     """Save tensor backend preferences for the next application start"""
 
 def get_mcp_preferences() -> dict:

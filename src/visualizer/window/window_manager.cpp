@@ -13,7 +13,6 @@
 #include "input/input_controller.hpp"
 #include "input/sdl_coordinate_utils.hpp"
 #include "input/sdl_key_mapping.hpp"
-#include "rendering/cuda_vulkan_interop.hpp"
 #include "vulkan_context.hpp"
 #include "vulkan_loader_probe.hpp"
 #include "window_state_utils.hpp"
@@ -678,6 +677,9 @@ namespace lfs::vis {
             SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
             LOG_INFO("GNOME Wayland session detected; preferring X11/Xwayland for native window decorations");
         }
+        // Report macOS trackpad contacts as touch events so automatic navigation
+        // can tell trackpad swipes from mouse wheels.
+        SDL_SetHint(SDL_HINT_TRACKPAD_IS_TOUCH_ONLY, "1");
 
         if (!SDL_Init(SDL_INIT_VIDEO)) {
             reportSdlVideoInitFailure();
@@ -773,7 +775,6 @@ namespace lfs::vis {
             SDL_Quit();
             return false;
         }
-        lfs::rendering::setExpectedVulkanDeviceUuid(vulkan_context_->deviceUUID());
         adoptTensorBackendDevice();
         if (!vulkan_context_->presentBootstrapFrame(0.11f, 0.11f, 0.14f, 1.0f)) {
             std::cerr << "Failed to present Vulkan bootstrap frame: " << vulkan_context_->lastError() << std::endl;
@@ -1140,6 +1141,24 @@ namespace lfs::vis {
                 break;
             if (input_controller_) {
                 input_controller_->handleScroll(event.wheel.x, event.wheel.y);
+            }
+            break;
+
+        case SDL_EVENT_PINCH_UPDATE:
+            // macOS sends trackpad pinches without a window, so no window filter.
+            if (input_controller_) {
+                input_controller_->handlePinch(event.pinch.scale);
+            }
+            break;
+
+        case SDL_EVENT_FINGER_DOWN:
+        case SDL_EVENT_FINGER_UP:
+        case SDL_EVENT_FINGER_CANCELED:
+            // Trackpad touches are indirect and arrive without a window too.
+            if (input_controller_) {
+                const SDL_TouchDeviceType type = SDL_GetTouchDeviceType(event.tfinger.touchID);
+                if (type == SDL_TOUCH_DEVICE_INDIRECT_ABSOLUTE || type == SDL_TOUCH_DEVICE_INDIRECT_RELATIVE)
+                    input_controller_->handleTrackpadTouch(event.type == SDL_EVENT_FINGER_DOWN);
             }
             break;
 
@@ -1848,6 +1867,9 @@ namespace lfs::vis {
     }
 
     void WindowManager::adoptTensorBackendDevice() {
+        // Metal tensors reach the window device through their own interop.
+        if (lfs::core::default_gpu_backend() == lfs::core::GpuBackend::Metal)
+            return;
         const auto& device = vulkan_context_->tensorBackendDevice();
         if (!device.complete) {
             LOG_INFO("Tensor Vulkan backend keeps its own device: the window device has no spare compute queue or lacks a required feature");
@@ -1859,9 +1881,15 @@ namespace lfs::vis {
             .device = vulkan_context_->device(),
             .queue = device.queue,
             .queue_family = device.queue_family,
+            .sharing_queue_families = {vulkan_context_->graphicsQueueFamily(), vulkan_context_->computeQueueFamily(), device.queue_family},
+            .sharing_queue_family_count = 3,
             .shader_atomic_float = device.shader_atomic_float,
             .memory_budget = false,
+            .shader_float64 = device.shader_float64,
             .shader_float16 = device.shader_float16,
+            .vulkan_memory_model = device.vulkan_memory_model,
+            .vulkan_memory_model_device_scope = device.vulkan_memory_model_device_scope,
+            .cooperative_matrix = device.cooperative_matrix,
             .external_memory = vulkan_context_->externalMemoryInteropEnabled(),
             .external_semaphore = vulkan_context_->externalSemaphoreInteropEnabled(),
         };

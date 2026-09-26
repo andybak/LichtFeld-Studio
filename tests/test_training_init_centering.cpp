@@ -5,6 +5,7 @@
 #include "core/parameters.hpp"
 #include "core/scene.hpp"
 #include "core/uuid.hpp"
+#include "cuda_backend_test.hpp"
 #include "io/loader.hpp"
 #include "training/training_setup.hpp"
 
@@ -25,14 +26,13 @@ namespace {
     const std::array<glm::vec3, 4> dataset_points = {{{10, 20, 0}, {14, 20, 0}, {10, 24, 0}, {14, 24, 0}}};
     const std::array<glm::vec3, 4> init_points = {{{11, 21, 3}, {13, 21, 3}, {11, 23, 5}, {13, 23, 5}}};
 
-    class TrainingInitCentering : public ::testing::TestWithParam<std::tuple<int, bool, int>> {
+    class TrainingInitCentering : public lfs::test::CudaBackendTest,
+                                  public ::testing::WithParamInterface<std::tuple<int, bool, int>> {
     protected:
         fs::path root;
 
         void SetUp() override {
-            int devices = 0;
-            if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
-                GTEST_SKIP() << "CUDA device required for training initialization";
+            LFS_CUDA_BACKEND_OR_RETURN();
             root = fs::temp_directory_path() / ("lfs_init_centering_" + generate_uuid_v4().to_string());
             fs::create_directories(root / "images");
             fs::create_directories(root / "sparse" / "0");
@@ -202,6 +202,40 @@ namespace {
         ASSERT_TRUE(initialized) << initialized.error();
         ASSERT_TRUE(scene.getTrainingModel());
         check_positions(scene.getTrainingModel()->means(), source, glm::vec3{0}, scene);
+    }
+
+    TEST_F(TrainingInitCentering, EvalAllKeepsEveryCameraInTrainingOnBothLoadPaths) {
+        for (const bool async : {false, true}) {
+            for (const bool eval_all : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << "async=" << async << " eval_all=" << eval_all);
+                param::TrainingParameters params;
+                params.dataset.data_path = root;
+                params.dataset.test_every = 2;
+                params.optimization.enable_eval = true;
+                params.optimization.eval_all = eval_all;
+                Scene scene;
+                if (async) {
+                    auto loader = lfs::io::Loader::create();
+                    auto loaded = loader->load(root, {});
+                    ASSERT_TRUE(loaded) << loaded.error().format();
+                    const auto applied = lfs::training::applyLoadResultToScene(params, scene, std::move(*loaded));
+                    ASSERT_TRUE(applied) << applied.error();
+                } else {
+                    const auto loaded = lfs::training::loadTrainingDataIntoScene(params, scene);
+                    ASSERT_TRUE(loaded) << loaded.error();
+                }
+                const auto cameras = scene.getAllCameras();
+                ASSERT_EQ(cameras.size(), 2u);
+                size_t training = 0;
+                size_t evaluation = 0;
+                for (const auto& camera : cameras) {
+                    training += camera->split() == CameraSplit::Train;
+                    evaluation += camera->split() == CameraSplit::Eval;
+                }
+                EXPECT_EQ(training, eval_all ? 2u : 1u);
+                EXPECT_EQ(evaluation, eval_all ? 0u : 1u);
+            }
+        }
     }
 
     TEST_F(TrainingInitCentering, DeferredInitializationUsesCapturedOrigin) {

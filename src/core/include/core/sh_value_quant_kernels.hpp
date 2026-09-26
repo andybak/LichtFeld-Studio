@@ -3,9 +3,9 @@
 
 #pragma once
 
+#include "core/cuda_types.hpp"
 #include <cstddef>
 #include <cstdint>
-#include <cuda_runtime.h>
 
 namespace lfs::core::sh_value_quant {
 

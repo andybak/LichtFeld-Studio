@@ -3,9 +3,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "gui/rml_status_bar.hpp"
+#include "core/camera_metrics.hpp"
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/events.hpp"
 #include "core/logger.hpp"
+#include "core/number_format.hpp"
 #include "core/services.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "gui/gpu_memory_query.hpp"
@@ -18,13 +20,16 @@
 #include "gui/status_bar_mining.hpp"
 #include "gui/string_keys.hpp"
 #include "gui/ui_context.hpp"
+#include "input/input_controller.hpp"
 #include "internal/resource_paths.hpp"
 #include "preferences.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
 #include "theme/theme.hpp"
+#if LFS_BUILD_TRAINER
 #include "training/trainer.hpp"
-#include "training/training_manager.hpp"
+#endif
+#include "core/training_manager.hpp"
 #include "visualizer/app_store.hpp"
 #include "visualizer_impl.hpp"
 
@@ -132,8 +137,37 @@ namespace lfs::vis::gui {
             return s.substr(0, end + 1);
         }
 
+        // Automatic detection needs the trackpad touches only macOS reports.
+        NavigationDevice nextNavigationDevice(const NavigationDevice device) {
+            switch (device) {
+            case NavigationDevice::Mouse:
+                return NavigationDevice::Trackpad;
+            case NavigationDevice::Trackpad:
+#ifdef __APPLE__
+                return NavigationDevice::Automatic;
+#else
+                return NavigationDevice::Mouse;
+#endif
+            case NavigationDevice::Automatic:
+                break;
+            }
+            return NavigationDevice::Mouse;
+        }
+
+        const char* navigationDeviceTooltip(const NavigationDevice device) {
+            switch (device) {
+            case NavigationDevice::Trackpad:
+                return "ui.input_trackpad_tooltip";
+            case NavigationDevice::Automatic:
+                return "ui.input_automatic_tooltip";
+            case NavigationDevice::Mouse:
+                break;
+            }
+            return "ui.input_mouse_tooltip";
+        }
+
         std::string formatStepLabel(const size_t step) {
-            return std::format("{} {}", stripColon(LOC(lichtfeld::Strings::Status::STEP)), step);
+            return std::format("{} {}", stripColon(LOC(lichtfeld::Strings::Status::STEP)), lfs::core::format_count(step));
         }
 
         // Width the element's content box would need to show everything on one line.
@@ -437,8 +471,11 @@ namespace lfs::vis::gui {
         ctor.Bind("zoom_sep_color", &model_.zoom_sep_color);
         ctor.Bind("lfs_mem_text", &model_.lfs_mem_text);
         ctor.Bind("lfs_mem_color", &model_.lfs_mem_color);
+        ctor.Bind("show_lfs_memory", &model_.show_lfs_memory);
         ctor.Bind("show_gpu_model", &model_.show_gpu_model);
         ctor.Bind("gpu_panel_active", &model_.gpu_panel_active);
+        ctor.Bind("input_device", &model_.input_device);
+        ctor.Bind("input_device_tooltip", &model_.input_device_tooltip);
         ctor.Bind("gpu_model_text", &model_.gpu_model_text);
         ctor.Bind("gpu_mem_text", &model_.gpu_mem_text);
         ctor.Bind("gpu_mem_color", &model_.gpu_mem_color);
@@ -530,6 +567,8 @@ namespace lfs::vis::gui {
         mcp_power_listener_ = nullptr;
         delete mcp_preferences_listener_;
         mcp_preferences_listener_ = nullptr;
+        delete input_device_listener_;
+        input_device_listener_ = nullptr;
     }
 
     void RmlStatusBar::reloadResources() {
@@ -810,6 +849,19 @@ namespace lfs::vis::gui {
         }
         if (auto* el = document_->GetElementById("mcp-toggle"))
             el->AddEventListener(Rml::EventId::Click, mcp_power_listener_);
+
+        if (!input_device_listener_) {
+            input_device_listener_ = new CallbackListener([this] {
+                auto trackpad = lfs::vis::loadTrackpadPreferences();
+                trackpad.device = nextNavigationDevice(trackpad.device);
+                if (auto* const ic = lfs::vis::InputController::instance())
+                    ic->setTrackpadPreferences(trackpad);
+                lfs::vis::saveTrackpadPreferences(trackpad);
+                markModelDirty();
+            });
+        }
+        if (auto* el = document_->GetElementById("input-device-toggle"))
+            el->AddEventListener(Rml::EventId::Click, input_device_listener_);
     }
 
     void RmlStatusBar::setModelString(const char* name, std::string& field, std::string value) {
@@ -1143,6 +1195,11 @@ namespace lfs::vis::gui {
         const auto& p = lfs::vis::theme().palette;
 
         setModelString("safe_mode_text", model_.safe_mode_text, LOC("status_bar.safe_mode"));
+        const auto* const input_controller = lfs::vis::InputController::instance();
+        const auto device = input_controller ? input_controller->trackpadPreferences().device
+                                             : NavigationDevice::Mouse;
+        setModelString("input_device", model_.input_device, std::string(navigationDeviceName(device)));
+        setModelString("input_device_tooltip", model_.input_device_tooltip, LOC(navigationDeviceTooltip(device)));
         setModelString("mcp_preferences_label", model_.mcp_preferences_label,
                        LOC("status_bar.mcp_preferences"));
         if (mcp_status_provider_) {
@@ -1210,13 +1267,13 @@ namespace lfs::vis::gui {
                                               : "status_bar.mcp_turn_on"));
             setModelBool("mcp_server_enabled", model_.mcp_server_enabled, status.enabled);
             setModelString("mcp_total_text", model_.mcp_total_text,
-                           std::format("{} {}", status.request_count,
+                           std::format("{} {}", lfs::core::format_count(status.request_count),
                                        LOC("status_bar.mcp_requests")));
             setModelString("mcp_success_text", model_.mcp_success_text,
-                           std::format("{} {}", status.success_count,
+                           std::format("{} {}", lfs::core::format_count(status.success_count),
                                        LOC("status_bar.mcp_successes")));
             setModelString("mcp_error_text", model_.mcp_error_text,
-                           std::format("{} {}", status.error_count,
+                           std::format("{} {}", lfs::core::format_count(status.error_count),
                                        LOC("status_bar.mcp_errors")));
         }
 
@@ -1257,8 +1314,12 @@ namespace lfs::vis::gui {
                                             : "default";
             const auto* trainer = tm ? tm->getTrainer() : nullptr;
             const auto method = trainingBackendStatusLabel(
+#if LFS_BUILD_TRAINER
                 trainer ? std::optional{trainer->getParams().optimization.raster_backend()}
                         : std::nullopt,
+#else
+                std::nullopt,
+#endif
                 stored_backend);
             std::string strat_name;
             const std::string_view strategy = strategy_raw ? std::string_view(strategy_raw) : std::string_view{};
@@ -1402,7 +1463,7 @@ namespace lfs::vis::gui {
             };
             setProgressMarkersRml(buildProgressMarkersRml(tm->getSaveSteps(), total, cur, marker_state,
                                                           progress_miner_pref_));
-            setModelString("step_value", model_.step_value, std::format("{}/{}", cur, total));
+            setModelString("step_value", model_.step_value, std::format("{}/{}", lfs::core::format_count(cur), lfs::core::format_count(total)));
             setModelString("loss_value", model_.loss_value, std::format("{:.4f}", loss));
             setModelString("gaussians_value", model_.gaussians_value,
                            std::format("{}/{}", fmtCount(num_splats), fmtCount(max_g)));
@@ -1556,8 +1617,8 @@ namespace lfs::vis::gui {
         const auto mem = cached_gpu_mem_;
         constexpr float gib = 1024.0f * 1024.0f * 1024.0f;
         float app_gib = mem.process_used / gib;
-        float used_gib = mem.total_used / gib;
-        float total_gib = mem.total / gib;
+        float used_gib = (mem.uses_process_budget ? mem.process_budget_used : mem.total_used) / gib;
+        float total_gib = (mem.uses_process_budget ? mem.process_budget : mem.total) / gib;
         float pct = total_gib > 0.0f ? (used_gib / total_gib) * 100.0f : 0.0f;
 
         ThemeColor mem_color = pct < 50.0f ? p.success : (pct < 75.0f ? p.warning : p.error);
@@ -1565,21 +1626,26 @@ namespace lfs::vis::gui {
                      lfs::vis::app_store().perf_hud.get().visible);
         setModelString("lfs_mem_text", model_.lfs_mem_text, std::format("LFS {:.2f} GiB", app_gib));
         setModelString("lfs_mem_color", model_.lfs_mem_color, colorToRml(p.info));
+        setModelBool("show_lfs_memory", model_.show_lfs_memory, !mem.uses_process_budget);
         setModelBool("show_gpu_model", model_.show_gpu_model, !mem.device_name.empty());
         setModelString("gpu_model_text", model_.gpu_model_text, mem.device_name);
         setModelString("gpu_mem_text", model_.gpu_mem_text,
-                       std::format("{} {:.2f}/{:.2f} GiB", LOC("status_bar.gpu"), used_gib, total_gib));
+                       total_gib > 0.0f
+                           ? std::format("{} {:.2f}/{:.2f} GiB",
+                                         mem.uses_process_budget ? LOC("status_bar.gpu_budget") : LOC("status_bar.gpu"),
+                                         used_gib, total_gib)
+                           : std::format("{} —", LOC("status_bar.gpu")));
         setModelString("gpu_mem_color", model_.gpu_mem_color, colorToRml(mem_color));
 
         // FPS: prefer scene-render rate when scene frames are in the measurement
         // window; when only GUI frames are presented, show that rate as ui-fps
-        // so a GUI-only spin is not invisible. True idle (no samples) stays 0.
+        // so a GUI-only spin is not invisible. True idle (no samples) stays a dim 0.
         const float scene_fps = reactive_fps_available_ ? reactive_fps_value_
                                                         : (rm ? rm->getAverageFPS() : 0.0f);
         const float presented_fps = rm ? rm->getPresentedAverageFPS() : 0.0f;
         const bool ui_only_fps = scene_fps <= 0.0f && presented_fps > 0.0f;
-        const float fps = ui_only_fps ? presented_fps : scene_fps;
-        ThemeColor fps_col = ui_only_fps
+        const float fps = std::round(ui_only_fps ? presented_fps : scene_fps);
+        ThemeColor fps_col = ui_only_fps || fps <= 0.0f
                                  ? p.text_dim
                                  : (fps >= 30.0f ? p.success : (fps >= 15.0f ? p.warning : p.error));
         setModelString("fps_value", model_.fps_value, std::format("{:.0f}", fps));

@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "py_ui.hpp"
-#include "control/command_api.hpp"
 #include "core/environment.hpp"
+#include "core/event_bridge/command_api.hpp"
 #include "core/event_bridge/command_center_bridge.hpp"
 #include "core/event_bridge/event_bridge.hpp"
 #include "core/event_bridge/localization_manager.hpp"
@@ -48,6 +48,7 @@
 #include "visualizer/app_store.hpp"
 #include "visualizer/core/editor_context.hpp"
 #include "visualizer/core/services.hpp"
+#include "visualizer/core/training_manager.hpp"
 #include "visualizer/gui/gui_manager.hpp"
 #include "visualizer/gui/panel_registry.hpp"
 #include "visualizer/gui/sequencer_ui_state.hpp"
@@ -62,7 +63,6 @@
 #include "visualizer/scene/scene_manager.hpp"
 #include "visualizer/theme/theme.hpp"
 #include "visualizer/tools/unified_tool_registry.hpp"
-#include "visualizer/training/training_manager.hpp"
 #include "visualizer/visualizer.hpp"
 #include <RmlUi/Core/Core.h>
 #include <typeinfo>
@@ -5342,6 +5342,40 @@ namespace lfs::python {
             "Get the default WASD navigation speed");
 
         m.def(
+            "get_trackpad_preferences",
+            [] {
+                const auto state = vis::loadTrackpadPreferences();
+                nb::dict result;
+                result["device"] = std::string(vis::navigationDeviceName(state.device));
+                result["swipe_pans"] = state.swipe_pans;
+                result["swipe_speed"] = state.swipe_speed;
+                result["zoom_speed"] = state.zoom_speed;
+                return result;
+            },
+            "Get trackpad navigation preferences");
+
+        m.def(
+            "set_trackpad_preferences",
+            [](const std::string& device, const bool swipe_pans, const float swipe_speed, const float zoom_speed) {
+                const auto parsed = vis::parseNavigationDevice(device);
+                if (!parsed)
+                    throw nb::value_error("device must be 'mouse', 'trackpad' or 'automatic'");
+                vis::saveTrackpadPreferences({
+                    .device = *parsed,
+                    .swipe_pans = swipe_pans,
+                    .swipe_speed = swipe_speed,
+                    .zoom_speed = zoom_speed,
+                });
+                const auto state = vis::loadTrackpadPreferences();
+                invoke_on_viewer([state] {
+                    if (auto* const controller = vis::InputController::instance())
+                        controller->setTrackpadPreferences(state);
+                });
+            },
+            nb::arg("device"), nb::arg("swipe_pans"), nb::arg("swipe_speed"), nb::arg("zoom_speed"),
+            "Persist and apply trackpad navigation preferences (device 'mouse', 'trackpad' or 'automatic'; speeds 1-100, 50 is the default)");
+
+        m.def(
             "get_project_manager_preferences",
             [] {
                 auto& preferences = vis::UserPreferences::instance();
@@ -5456,26 +5490,38 @@ namespace lfs::python {
         m.def("get_tensor_backend_preferences", [] {
             const auto state = vis::UserPreferences::instance().tensorBackend();
             nb::dict result;
-            result["backend"] = state.backend == core::GpuBackend::Vulkan ? "vulkan" : "cuda";
+            std::string backend = state.backend ? core::gpu_backend_name(*state.backend) : "auto";
+            std::transform(backend.begin(), backend.end(), backend.begin(),
+                           [](const unsigned char c) { return std::tolower(c); });
+            result["backend"] = backend;
             result["vulkan_device"] = state.options.vulkan_device;
             result["vulkan_validation"] = state.options.vulkan_validation;
             result["force_fp32_half"] = state.options.force_fp32_half;
             result["force_no_atomic_float"] = state.options.force_no_atomic_float;
-            result["viewer_vulkan_inputs"] = state.options.viewer_vulkan_inputs;
+            result["cuda_available"] = static_cast<bool>(LFS_HAS_CUDA);
+            result["metal_available"] = core::gpu_backend_available(core::GpuBackend::Metal);
             return result; }, "Get saved tensor backend preferences; changes apply after restart");
 
-        m.def("set_tensor_backend_preferences", [](const std::string& backend, const std::string& device, int validation, bool fp32_half, bool no_atomic_float, bool viewer_inputs) {
-                  if (backend != "cuda" && backend != "vulkan")
-                      throw nb::value_error("Backend must be cuda or vulkan");
+        m.def("set_tensor_backend_preferences", [](const std::string& backend, const std::string& device, int validation, bool fp32_half, bool no_atomic_float) {
+                  if (backend != "auto" && backend != "cuda" && backend != "vulkan" && backend != "metal")
+                      throw nb::value_error("Backend must be auto, cuda, vulkan or metal");
+                  if constexpr (!LFS_HAS_CUDA) {
+                    if (backend == "cuda")
+                      throw nb::value_error("CUDA is not compiled into this build");
+                  }
+                  if (backend == "metal" && !core::gpu_backend_available(core::GpuBackend::Metal))
+                      throw nb::value_error("Metal needs macOS 26 and a Metal 4 GPU");
                   if (validation < 0 || validation > 2)
                       throw nb::value_error("Validation must be 0, 1, or 2");
                   const vis::TensorPreferenceState state{
-                      .backend = backend == "vulkan" ? core::GpuBackend::Vulkan : core::GpuBackend::CUDA,
+                      .backend = backend == "auto"     ? std::nullopt
+                                 : backend == "vulkan" ? std::optional(core::GpuBackend::Vulkan)
+                                 : backend == "metal"  ? std::optional(core::GpuBackend::Metal)
+                                                       : std::optional(core::GpuBackend::CUDA),
                       .options = {.vulkan_device = device, .vulkan_validation = validation,
-                                  .force_fp32_half = fp32_half, .force_no_atomic_float = no_atomic_float,
-                                  .viewer_vulkan_inputs = viewer_inputs},
+                                  .force_fp32_half = fp32_half, .force_no_atomic_float = no_atomic_float},
                   };
-                  vis::UserPreferences::instance().setTensorBackend(state); }, nb::arg("backend") = "cuda", nb::arg("vulkan_device") = "", nb::arg("vulkan_validation") = 0, nb::arg("force_fp32_half") = false, nb::arg("force_no_atomic_float") = false, nb::arg("viewer_vulkan_inputs") = false, "Save tensor backend preferences for the next application start");
+                  vis::UserPreferences::instance().setTensorBackend(state); }, nb::arg("backend") = "auto", nb::arg("vulkan_device") = "", nb::arg("vulkan_validation") = 0, nb::arg("force_fp32_half") = false, nb::arg("force_no_atomic_float") = false, "Save tensor backend preferences for the next application start");
 
         m.def(
             "get_mcp_preferences",
