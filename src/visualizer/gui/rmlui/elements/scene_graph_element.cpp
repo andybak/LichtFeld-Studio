@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "gui/rmlui/elements/scene_graph_element.hpp"
-#include "gui/camera_thumbnail_policy.hpp"
 #include "gui/rmlui/elements/scene_graph_drop_target.hpp"
+#include "gui/scene_graph_context_actions.hpp"
 #include "gui/scene_tree_session.hpp"
 
 #include "core/event_bridge/localization_manager.hpp"
@@ -488,29 +488,6 @@ namespace lfs::vis::gui {
         panel_screen_y_ = y;
     }
 
-    std::unordered_set<int> SceneGraphElement::visibleCameraUids() const {
-        std::unordered_set<int> result;
-        if (last_visible_start_ == kUnsetVisibleRange ||
-            last_visible_end_ == kUnsetVisibleRange) {
-            return result;
-        }
-        const auto visible_range = cameraThumbnailVisibleRowRange(
-            last_visible_start_, last_visible_end_, flat_rows_.size());
-        if (!visible_range)
-            return result;
-        const auto [start, end] = *visible_range;
-        result.reserve(end - start);
-        for (size_t i = start; i < end; ++i) {
-            const auto snapshot_it = node_snapshots_.find(flat_rows_[i].id);
-            if (snapshot_it != node_snapshots_.end() &&
-                snapshot_it->second.type == core::NodeType::CAMERA &&
-                snapshot_it->second.camera_uid >= 0) {
-                result.insert(snapshot_it->second.camera_uid);
-            }
-        }
-        return result;
-    }
-
     void SceneGraphElement::setModelsCollapsed(const bool /*collapsed*/) {
         // The redundant Models header was removed. Keep accepting legacy session
         // state, but never let an old collapsed flag hide the root rows.
@@ -755,6 +732,10 @@ namespace lfs::vis::gui {
             node_name->SetClass("node-name", true);
             slot.node_name = slot.content->AppendChild(std::move(node_name));
 
+            auto streamed_badge = doc->CreateElement("span");
+            streamed_badge->SetClass("streamed-badge", true);
+            slot.streamed_badge = slot.content->AppendChild(std::move(streamed_badge));
+
             auto actions = doc->CreateElement("span");
             actions->SetClass("row-actions", true);
             auto* actions_el = slot.content->AppendChild(std::move(actions));
@@ -820,7 +801,6 @@ namespace lfs::vis::gui {
         drop_valid_ = false;
         pending_reveal_node_id_ = core::NULL_NODE;
         scene_has_nodes_ = false;
-        root_count_ = 0;
         model_count_ = 0;
         last_training_model_node_name_.clear();
         last_training_model_gaussian_count_ = std::numeric_limits<size_t>::max();
@@ -916,10 +896,10 @@ namespace lfs::vis::gui {
             snapshot.locked = static_cast<bool>(node->locked);
             snapshot.has_children = !node->children.empty();
             snapshot.training_enabled = node->training_enabled;
-            snapshot.camera_uid = node->camera_uid;
             snapshot.has_mask = node->type == core::NodeType::CAMERA &&
                                 (!node->mask_path.empty() ||
                                  (node->camera && node->camera->has_in_memory_mask()));
+            snapshot.streamed = node->type == core::NodeType::SPLAT && node->model_streamed;
 
             switch (node->type) {
             case core::NodeType::SPLAT:
@@ -1081,6 +1061,7 @@ namespace lfs::vis::gui {
             .encoded_label = encode(snapshot.label),
             .padding_left_dp = formatDp((selection_markers_visible_ ? 17 : 4) + depth * 16),
             .has_mask = snapshot.has_mask,
+            .streamed = snapshot.streamed,
             .can_delete = snapshot.can_delete,
             .delete_enabled = snapshot.delete_enabled,
             .can_rename = snapshot.can_rename,
@@ -1105,7 +1086,6 @@ namespace lfs::vis::gui {
 
         node_snapshots_ = std::move(snapshots);
         root_ids_ = std::move(root_ids);
-        root_count_ = root_ids_.size();
         model_count_ = std::ranges::count_if(node_snapshots_, [](const auto& item) {
             const auto type = item.second.type;
             return type == core::NodeType::SPLAT || type == core::NodeType::POINTCLOUD ||
@@ -1510,6 +1490,11 @@ namespace lfs::vis::gui {
         setCachedClass(slot.node_name, "training-disabled",
                        row.type == core::NodeType::CAMERA && !row.training_enabled);
         setCachedInnerRml(slot.node_name, row.encoded_label);
+        setCachedProperty(slot.streamed_badge, "display", row.streamed && !renaming ? "block" : "none");
+        if (row.streamed) {
+            setCachedInnerRml(slot.streamed_badge, LOC("scene.streamed_badge"));
+            setCachedAttribute(slot.streamed_badge, "title", LOC("scene.streamed_badge_tooltip"));
+        }
         if (renaming) {
             if (rename_buffer_.empty())
                 rename_buffer_ = snapshot.name;
@@ -2751,17 +2736,6 @@ namespace lfs::vis::gui {
         gui->enqueueModal(std::move(request));
     }
 
-    void SceneGraphElement::deleteSelectedNodes() {
-        auto* scene_manager = services().sceneOrNull();
-        if (!scene_manager)
-            return;
-
-        if (selected_ids_.empty())
-            return;
-        const std::vector<core::NodeId> ids(selected_ids_.begin(), selected_ids_.end());
-        requestDeleteNodes(ids);
-    }
-
     void SceneGraphElement::toggleChildrenTraining(const core::NodeId group_id, const bool enabled) {
         auto* scene_manager = services().sceneOrNull();
         auto* scene = scene_manager ? &scene_manager->getScene() : nullptr;
@@ -2812,6 +2786,16 @@ namespace lfs::vis::gui {
         if (!node)
             return;
 
+        const auto has_camera_target = [scene](const core::SceneNode& target) {
+            if (target.type == core::NodeType::CAMERA)
+                return true;
+            return target.type == core::NodeType::CAMERA_GROUP &&
+                   std::ranges::any_of(target.children, [scene](const core::NodeId id) {
+                       const auto* child = scene->getNodeById(id);
+                       return child && child->type == core::NodeType::CAMERA;
+                   });
+        };
+
         if (selected_ids_.size() > 1) {
             items.push_back(makeAction(tr("scene.select_hierarchy"),
                                        prefixedAction("select_hierarchy")));
@@ -2827,17 +2811,19 @@ namespace lfs::vis::gui {
                     prefixedAction(std::format("ungroup:{}", node_id)), true));
             }
             bool all_camera_like = true;
+            bool has_training_targets = false;
             for (const core::NodeId id : selected_ids_) {
                 const auto* selected = scene->getNodeById(id);
                 if (!selected)
                     continue;
+                has_training_targets |= has_camera_target(*selected);
                 if (selected->type != core::NodeType::CAMERA &&
                     selected->type != core::NodeType::CAMERA_GROUP) {
                     all_camera_like = false;
                     break;
                 }
             }
-            if (all_camera_like) {
+            if (all_camera_like && has_training_targets) {
                 items.push_back(makeAction(tr(string_keys::Scene::ENABLE_ALL_TRAINING),
                                            prefixedAction("enable_all_selected_train")));
                 items.push_back(makeAction(tr(string_keys::Scene::DISABLE_ALL_TRAINING),
@@ -2861,9 +2847,11 @@ namespace lfs::vis::gui {
                 items.push_back(makeAction(
                     tr(string_keys::Scene::GO_TO_CAMERA_VIEW),
                     prefixedAction(std::format("go_to_camera:{}", node->camera_uid))));
-                items.push_back(makeAction(
-                    tr(string_keys::Scene::GO_TO_IMAGE),
-                    prefixedAction(std::format("go_to_image:{}", node->camera_uid))));
+                if (!node->image_path.empty()) {
+                    items.push_back(makeAction(
+                        tr(string_keys::Scene::GO_TO_IMAGE),
+                        prefixedAction(std::format("go_to_image:{}", node->camera_uid))));
+                }
                 items.push_back(makeAction(
                     tr(string_keys::Scene::OPEN_IN_GT_COMPARE),
                     prefixedAction(std::format("open_in_gt_compare:{}", node->camera_uid))));
@@ -2916,12 +2904,14 @@ namespace lfs::vis::gui {
                     prefixedAction("add_kf")));
                 break;
             case core::NodeType::CAMERA_GROUP:
-                items.push_back(makeAction(
-                    tr(string_keys::Scene::ENABLE_ALL_TRAINING),
-                    prefixedAction(std::format("enable_all_train:{}", node_id))));
-                items.push_back(makeAction(
-                    tr(string_keys::Scene::DISABLE_ALL_TRAINING),
-                    prefixedAction(std::format("disable_all_train:{}", node_id))));
+                if (has_camera_target(*node)) {
+                    items.push_back(makeAction(
+                        tr(string_keys::Scene::ENABLE_ALL_TRAINING),
+                        prefixedAction(std::format("enable_all_train:{}", node_id))));
+                    items.push_back(makeAction(
+                        tr(string_keys::Scene::DISABLE_ALL_TRAINING),
+                        prefixedAction(std::format("disable_all_train:{}", node_id))));
+                }
                 break;
             case core::NodeType::DATASET:
                 if (colmapSparseSourcePath(*scene_manager)) {
@@ -2939,9 +2929,11 @@ namespace lfs::vis::gui {
                     tr("scene.add_group_ellipsis"),
                     prefixedAction(std::format("add_group:{}", node_id)),
                     !items.empty()));
-                items.push_back(makeAction(
-                    tr("scene.merge_to_single_ply"),
-                    prefixedAction(std::format("merge_group:{}", node_id))));
+                if (showGroupMergeAction(*scene, node_id)) {
+                    items.push_back(makeAction(
+                        tr("scene.merge_to_single_ply"),
+                        prefixedAction(std::format("merge_group:{}", node_id))));
+                }
                 items.push_back(makeAction(
                     tr("scene.ungroup"),
                     prefixedAction(std::format("ungroup:{}", node_id)), true));
@@ -2962,6 +2954,7 @@ namespace lfs::vis::gui {
             }
 
             if (node->type != core::NodeType::CAMERA &&
+                node->type != core::NodeType::CAMERA_GROUP &&
                 node->type != core::NodeType::CROPBOX &&
                 node->type != core::NodeType::ELLIPSOID &&
                 !node_snapshots_.at(node_id).locked) {

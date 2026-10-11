@@ -57,7 +57,7 @@ namespace lfs::vis::tools {
         if (!settings.show_grid) {
             settings.show_grid = true;
             rm->updateSettings(settings);
-            rm->markDirty(DirtyFlag::OVERLAY);
+            rm->markDirty(DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
         }
         grid_override_active_ = true;
     }
@@ -78,15 +78,20 @@ namespace lfs::vis::tools {
         if (settings.show_grid != saved_show_grid_) {
             settings.show_grid = saved_show_grid_;
             rm->updateSettings(settings);
-            rm->markDirty(DirtyFlag::OVERLAY);
+            rm->markDirty(DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
         }
     }
 
     void AlignTool::update(const ToolContext& ctx) {
+        if (isEnabled() && op::operators().activeModalId() == op::to_string(op::BuiltinOp::AlignPickPoint)) {
+            op::ModalEvent event{};
+            event.type = op::ModalEvent::Type::NONE;
+            op::operators().dispatchModalEvent(event);
+        }
         auto* const rm = ctx.getRenderingManager();
         const bool has_status = services().getAlignStatusMessage() != nullptr;
         if (had_align_status_ && !has_status && rm) {
-            rm->markDirty(DirtyFlag::OVERLAY);
+            rm->markDirty(DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
         }
         had_align_status_ = has_status;
 
@@ -171,11 +176,11 @@ namespace lfs::vis::tools {
             const auto& bounds = ctx.getViewportBounds();
             const glm::vec2 viewport_pos(bounds.x, bounds.y);
             const glm::vec2 viewport_size(bounds.width, bounds.height);
-            const auto panel_info = rm->resolveViewerPanel(
-                ctx.getViewport(),
-                viewport_pos,
-                viewport_size,
-                screen_point);
+            const auto panel_info = rm->resolveViewerPanel(rm->activeViewId(),
+                                                           ctx.getViewport(),
+                                                           viewport_pos,
+                                                           viewport_size,
+                                                           screen_point);
             if (!panel_info || !panel_info->valid()) {
                 return std::nullopt;
             }
@@ -188,7 +193,7 @@ namespace lfs::vis::tools {
                 proj.focal_length_mm = fallback_focal_length_mm;
             }
             proj.orthographic = settings.orthographic;
-            proj.ortho_scale = settings.ortho_scale;
+            proj.ortho_scale = op::alignPanelOrthoScale(*rm, rm->activeViewId());
 
             proj.viewport = *panel_info->viewport;
             proj.viewport.windowSize = {panel_info->render_width, panel_info->render_height};
@@ -436,7 +441,7 @@ namespace lfs::vis::tools {
             const auto settings = rendering_manager->getSettings();
             panel_proj_fallback.focal_length_mm = settings.focal_length_mm;
             panel_proj_fallback.orthographic = settings.orthographic;
-            panel_proj_fallback.ortho_scale = settings.ortho_scale;
+            panel_proj_fallback.ortho_scale = op::alignPanelOrthoScale(*rendering_manager, rendering_manager->activeViewId());
         }
         panel_proj_fallback.viewport = tool_context_->getViewport();
         panel_proj_fallback.viewport.windowSize = {fallback_render_width, fallback_render_height};
@@ -546,10 +551,10 @@ namespace lfs::vis::tools {
             const glm::vec2 render_point = screenToRender(panel_proj, mouse_pos);
             const int depth_x = static_cast<int>(render_point.x);
             const int depth_y = static_cast<int>(render_point.y);
-            const float depth = rendering_manager->getDepthAtPixel(
-                depth_x,
-                depth_y,
-                panel_proj_opt ? std::optional<SplitViewPanelId>(panel_proj.info.panel) : std::nullopt);
+            const float depth = rendering_manager->getDepthAtPixel(rendering_manager->activeViewId(),
+                                                                   depth_x,
+                                                                   depth_y,
+                                                                   panel_proj_opt ? std::optional<SplitViewPanelId>(panel_proj.info.panel) : std::nullopt, true);
             if (depth > 0.0f && depth < 1e9f) {
                 hover_depth = depth;
             }

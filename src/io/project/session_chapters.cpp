@@ -141,7 +141,7 @@ namespace lfs::io::project {
                 {"centre_speed", 0.002},
                 {"roll_speed", 0.01},
                 {"translate_speed", 0.0005},
-                {"wasd_speed", 8.0},
+                {"wasd_speed", 10.0},
                 {"max_wasd_speed", 100.0},
                 {"ortho_scale", nullptr},
             };
@@ -353,10 +353,7 @@ namespace lfs::io::project {
                  }},
                 {"split",
                  {
-                     {"focused_panel", "left"},
                      {"gt_camera_id", nullptr},
-                     {"panel_grid_planes",
-                      Json::array({1, 1})},
                  }},
                 {"camera_bookmarks", Json::array()},
                 {"tools",
@@ -413,6 +410,26 @@ namespace lfs::io::project {
                       }},
                  }},
             };
+        }
+
+        Json default_nodes() {
+            return Json{
+                {"schema_version", 1},
+                {"trees", Json::array()},
+                {"stacks", Json::object()},
+            };
+        }
+
+        lfs::Result<void> validate_nodes(const Json& root) {
+            if (!root.is_object() || root.value("schema_version", 0) != 1 ||
+                !root.contains("trees") || !root["trees"].is_array() ||
+                !root.contains("stacks") || !root["stacks"].is_object()) {
+                return fail<void>(
+                    lfs::ErrorCode::DataLoss,
+                    "NODE must contain schema_version 1, a trees array, and a stacks object",
+                    "NODE");
+            }
+            return {};
         }
 
         lfs::Result<Json> root_copy(
@@ -551,6 +568,7 @@ namespace lfs::io::project {
             const auto& payload =
                 space["opaque_payload"];
             if (type != "fixed_arrangement" &&
+                type != "screen" &&
                 type != "panel_registry" &&
                 type != "python_console") {
                 return {};
@@ -560,6 +578,17 @@ namespace lfs::io::project {
                     lfs::ErrorCode::Unsupported,
                     "Known GUIL spaces require version 1 object payloads",
                     "GUIL.layouts.areas.spaces");
+            }
+            if (type == "screen") {
+                if (!payload.contains("layout") ||
+                    !payload.contains("areas") ||
+                    !payload["areas"].is_array()) {
+                    return fail<void>(
+                        lfs::ErrorCode::DataLoss,
+                        "The GUIL screen payload is invalid",
+                        "GUIL.layouts.areas.spaces.screen");
+                }
+                return {};
             }
             if (type == "fixed_arrangement") {
                 if (payload.contains("window")) {
@@ -880,9 +909,6 @@ namespace lfs::io::project {
             if (!root.contains(
                     "render_settings") ||
                 !root["render_settings"].is_object() ||
-                !root.contains("panel_cameras") ||
-                !root["panel_cameras"].is_array() ||
-                root["panel_cameras"].size() != 2 ||
                 !root.contains("navigation") ||
                 !root["navigation"].is_object() ||
                 !root.contains("split") ||
@@ -897,6 +923,15 @@ namespace lfs::io::project {
                     "VIEW is missing one of its required state groups",
                     "VIEW");
             }
+            if (root.contains("panel_cameras") &&
+                (!root["panel_cameras"].is_array() ||
+                 root["panel_cameras"].empty() ||
+                 root["panel_cameras"].size() > 2)) {
+                return fail<void>(
+                    lfs::ErrorCode::DataLoss,
+                    "VIEW legacy panel cameras are malformed",
+                    "VIEW.panel_cameras");
+            }
             const auto& settings =
                 root["render_settings"];
             if (!settings.contains(
@@ -909,6 +944,8 @@ namespace lfs::io::project {
                     "VIEW must store canonical raster_backend and must not serialize the gut mirror",
                     "VIEW.render_settings.raster_backend");
             }
+            if (!root.contains("panel_cameras"))
+                return {};
             std::set<std::string> panels;
             for (const auto& camera :
                  root["panel_cameras"]) {
@@ -938,14 +975,6 @@ namespace lfs::io::project {
                 }
                 panels.insert(
                     camera["panel"].get<std::string>());
-            }
-            if (panels !=
-                std::set<std::string>{
-                    "primary", "secondary"}) {
-                return fail<void>(
-                    lfs::ErrorCode::DataLoss,
-                    "VIEW needs exactly primary and secondary camera state",
-                    "VIEW.panel_cameras.panel");
             }
             return {};
         }
@@ -1171,6 +1200,9 @@ namespace lfs::io::project {
         case SessionJsonChapterKind::Sequencer:
             root = default_sequencer();
             break;
+        case SessionJsonChapterKind::Nodes:
+            root = default_nodes();
+            break;
         }
         const auto text = root.dump(2);
         auto dom = JsonChapterDom::parse(text);
@@ -1222,6 +1254,8 @@ namespace lfs::io::project {
             return validate_view(*root);
         case SessionJsonChapterKind::Sequencer:
             return validate_sequencer(*root);
+        case SessionJsonChapterKind::Nodes:
+            return validate_nodes(*root);
         }
         return fail<void>(
             lfs::ErrorCode::ContractViolation,

@@ -3,18 +3,17 @@
 
 #include "lfs/training/morton_reorder.hpp"
 
-#include "core/cuda/sh_layout.cuh"
-#include "core/cuda_error.hpp"
 #include "core/gpu_device_runtime.hpp"
 #include "core/logger.hpp"
+#include "core/sh_layout.hpp"
 #include "core/sh_value_quant.hpp"
-#include "core/sh_value_quant_kernels.hpp"
 #include "core/splat_exportable_storage.hpp"
-#include "core/tensor/backend/cuda/runtime/cuda_stream_context.hpp"
 #include "core/tensor_completion.hpp"
-#include "kernels/morton_reorder_kernels.hpp"
+#include "core/tensor_execution.hpp"
+#include "lfs/training/idle_arena_scratch.hpp"
 #include "lfs/training/joint_adam_codec.hpp"
 #include "lfs/training/live_model_mutation_guard.hpp"
+#include "lfs/training/ops/registry.hpp"
 #include "lfs/training/sh_value_codec.hpp"
 #include "lfs/training/sh_value_storage.hpp"
 #include "optimizer/adam_optimizer.hpp"
@@ -31,6 +30,35 @@ namespace lfs::training::morton {
         using core::Tensor;
         using core::TensorShape;
 
+        // Morton runs between training frames, so its SH destinations borrow the
+        // idle rasterizer arena: whole when they fit, otherwise in groups sized to
+        // what is committed. The borrow ends after the reorder's device barrier.
+        constexpr std::size_t MIN_MORTON_ARENA_BYTES = 16ull << 20;
+
+        // Buffer for a grouped permutation whose unit is one cell (or slot)
+        // across every tile: the arena block when it holds at least one unit,
+        // otherwise a private allocation bounded by GROUP_BUDGET_BYTES.
+        struct GroupScratch {
+            void* ptr = nullptr;
+            std::size_t bytes = 0;
+            Tensor owner;
+        };
+
+        [[nodiscard]] GroupScratch group_scratch(const IdleArenaScratch& scratch,
+                                                 const std::size_t unit_bytes,
+                                                 const std::size_t units,
+                                                 lfs::core::TensorExecutionTarget stream) {
+            constexpr std::size_t GROUP_BUDGET_BYTES = 64ull << 20;
+            if (scratch.capacity() >= unit_bytes) {
+                return {scratch.data(), scratch.capacity(), {}};
+            }
+            const std::size_t budget_units = std::max<std::size_t>(1, GROUP_BUDGET_BYTES / unit_bytes);
+            const std::size_t bytes = std::min(units, budget_units) * unit_bytes;
+            Tensor owner = Tensor::empty_exact({bytes}, DataType::UInt8);
+            owner.set_stream(stream);
+            return {owner.data_ptr(), bytes, std::move(owner)};
+        }
+
         void permute_dim0_prefix(Tensor& tensor, const Tensor& perm) {
             const std::size_t n = perm.numel();
             if (!tensor.is_valid() || tensor.numel() == 0 || n == 0) {
@@ -45,7 +73,7 @@ namespace lfs::training::morton {
             dims[0] = n;
             Tensor gathered = Tensor::zeros_direct(
                 TensorShape(dims), std::max(cap, n), tensor.device(), tensor.dtype());
-            gathered.set_stream(core::getCurrentCUDAStream());
+            gathered.set_stream(core::TensorExecutionTarget::current());
             if (old0 == n) {
                 tensor.index_select_into(gathered, 0, perm, BoundaryMode::Assert);
                 tensor = std::move(gathered);
@@ -59,7 +87,7 @@ namespace lfs::training::morton {
             dims[0] = old0;
             Tensor dest = Tensor::zeros_direct(
                 TensorShape(dims), cap, tensor.device(), tensor.dtype());
-            dest.set_stream(core::getCurrentCUDAStream());
+            dest.set_stream(core::TensorExecutionTarget::current());
             dest.slice(0, 0, n).copy_from(gathered);
             dest.slice(0, n, old0).copy_from(tensor.slice(0, n, old0));
             tensor = std::move(dest);
@@ -78,135 +106,40 @@ namespace lfs::training::morton {
                 return;
             }
             Tensor scratch = Tensor::zeros_direct(tensor.shape(), n, tensor.device(), tensor.dtype());
-            scratch.set_stream(core::getCurrentCUDAStream());
+            scratch.set_stream(core::TensorExecutionTarget::current());
             tensor.index_select_into(scratch, 0, perm, BoundaryMode::Assert);
             tensor.copy_from(scratch);
         }
 
-        void permute_shN_q16(core::SplatData& splat, const Tensor& perm, cudaStream_t stream) {
-            auto& live = splat.shN();
-            auto& bounds = splat.shN_value_bounds();
+        void permute_shN_impl(core::SplatData& splat, const Tensor& perm, lfs::core::TensorExecutionTarget stream,
+                              const IdleArenaScratch& scratch) {
+            auto& shN = splat.shN();
             const auto rest = static_cast<std::uint32_t>(splat.max_sh_coeffs_rest());
             const std::size_t n = static_cast<std::size_t>(splat.size());
-            const std::size_t n_cells = core::sh_value_quant::sh_value_u16_count(n, rest);
-            const std::size_t n_bound_floats = core::sh_value_quant::n_bounds_for_prims(n) * 2;
-            if (live.numel() < n_cells) {
-                throw std::runtime_error("Morton reorder: q16 shN storage smaller than its logical size");
-            }
-            if (!bounds.is_valid() || bounds.numel() < n_bound_floats) {
-                throw std::runtime_error(
-                    "Morton reorder: shN_value_bounds short/missing — refusing silent SH wipe");
-            }
-
-            if (live.stream() != stream) {
-                live.set_stream(stream);
-            }
-            if (bounds.stream() != stream) {
-                bounds.set_stream(stream);
-            }
-            lfs::core::waitForCUDAStream(stream, live.stream());
-            lfs::core::waitForCUDAStream(stream, bounds.stream());
-            lfs::core::waitForCUDAStream(stream, perm.stream());
-
-            const auto* src_u16 = reinterpret_cast<const std::uint16_t*>(
-                lfs::core::resolve_exportable_device_ptr(live));
-            const auto* src_bounds = static_cast<const float*>(
-                lfs::core::resolve_exportable_device_ptr(bounds));
-            const auto* perm_ptr = perm.ptr<std::int64_t>();
-
-            Tensor dest_u16 = Tensor::zeros_direct(
-                TensorShape({n_cells}), n_cells, Device::GPU, DataType::Float16);
-            dest_u16.set_stream(stream);
-            Tensor dest_bounds = Tensor::zeros(
-                TensorShape({n_bound_floats}), Device::GPU, DataType::Float32);
-            dest_bounds.set_stream(stream);
-
-            auto* dest_codes = reinterpret_cast<std::uint16_t*>(
-                lfs::core::resolve_exportable_device_ptr(dest_u16));
-            auto* dest_mm = static_cast<float*>(
-                lfs::core::resolve_exportable_device_ptr(dest_bounds));
-            core::sh_value_quant::encode_shN_u16_gathered(
-                src_u16,
-                src_bounds,
-                perm_ptr,
-                dest_codes,
-                dest_mm,
-                n,
-                n,
-                rest,
-                stream);
-
-            live.flatten().slice(0, 0, n_cells).copy_(dest_u16);
-            bounds.flatten().slice(0, 0, n_bound_floats).copy_(dest_bounds);
-            lfs::core::TensorCompletion completion;
-            completion.include(live);
-            completion.include(bounds);
-            completion.wait();
-        }
-
-        void permute_shN_fp32(core::SplatData& splat, const Tensor& perm, cudaStream_t stream) {
-            const bool expanded = sh_value::ensure_shN_fp32_for_mutation(splat);
-            auto& live = splat.shN();
-            const auto rest = static_cast<std::uint32_t>(splat.max_sh_coeffs_rest());
-            const std::size_t n = static_cast<std::size_t>(splat.size());
-            if (!live.is_valid() || live.dtype() != DataType::Float32) {
-                if (expanded) {
-                    (void)sh_value::commit_shN_after_mutation(splat);
-                }
+            if (!shN.is_valid() || shN.numel() == 0 || rest == 0 || n == 0 ||
+                !perm.is_valid() || perm.numel() != n) {
                 return;
             }
-
-            const std::size_t logical = core::sh_swizzled_float_count(n, rest);
-            if (live.numel() < logical) {
-                throw std::runtime_error("Morton reorder: shN storage smaller than its logical size");
+            LiveModelMutationGuard mutation_guard("permute_shN");
+            if (splat.shN_value_quantized() && shN.dtype() == lfs::core::DataType::Float16) {
+                training_morton_ops().permute_sh_q16(splat, perm, stream, scratch);
+                return;
             }
-            Tensor scratch = Tensor::zeros_direct(
-                TensorShape({logical}), logical, Device::GPU, DataType::Float32);
-            scratch.set_stream(stream);
-            if (live.stream() != stream) {
-                live.set_stream(stream);
-            }
-            core::shN_swizzled_gather_self_i64(
-                live.ptr<float>(),
-                scratch.ptr<float>(),
-                perm.ptr<std::int64_t>(),
-                n,
-                0,
-                rest,
-                stream);
-            if (live.numel() == logical) {
-                live.copy_from(scratch);
-            } else {
-                live.slice(0, 0, logical).copy_from(scratch);
-            }
-            if (expanded) {
-                (void)sh_value::commit_shN_after_mutation(splat);
-            }
+            training_morton_ops().permute_sh_fp32(splat, perm, stream, scratch);
         }
     } // namespace
 
-    void permute_shN(core::SplatData& splat, const lfs::core::Tensor& perm, cudaStream_t stream) {
-        auto& shN = splat.shN();
-        const auto rest = static_cast<std::uint32_t>(splat.max_sh_coeffs_rest());
-        const std::size_t n = static_cast<std::size_t>(splat.size());
-        if (!shN.is_valid() || shN.numel() == 0 || rest == 0 || n == 0 ||
-            !perm.is_valid() || perm.numel() != n) {
-            return;
+    void permute_shN(core::SplatData& splat, const lfs::core::Tensor& perm, lfs::core::TensorExecutionTarget stream) {
+        if (stream.is_default_queue()) {
+            stream = core::TensorExecutionTarget::current();
         }
-        if (stream == nullptr) {
-            stream = core::getCurrentCUDAStream();
-        }
-        LiveModelMutationGuard mutation_guard("permute_shN");
-        if (splat.shN_value_quantized() && shN.dtype() == lfs::core::DataType::Float16) {
-            permute_shN_q16(splat, perm, stream);
-            return;
-        }
-        permute_shN_fp32(splat, perm, stream);
+        permute_shN_impl(splat, perm, stream, IdleArenaScratch(0, 0, stream));
     }
 
     namespace {
 
-        void permute_optimizer(AdamOptimizer& optimizer, const Tensor& perm, cudaStream_t stream) {
+        void permute_optimizer(AdamOptimizer& optimizer, const Tensor& perm, lfs::core::TensorExecutionTarget stream,
+                               const ops::MortonOps& morton_ops) {
             const std::size_t n = perm.numel();
             if (n == 0) {
                 return;
@@ -240,9 +173,9 @@ namespace lfs::training::morton {
                     !state->joint_bounds.is_valid()) {
                     continue;
                 }
-                lfs::core::waitForCUDAStream(stream, state->exp_avg.stream());
-                lfs::core::waitForCUDAStream(stream, state->joint_bounds.stream());
-                lfs::core::waitForCUDAStream(stream, perm.stream());
+                stream.wait_for(state->exp_avg.execution_target());
+                stream.wait_for(state->joint_bounds.execution_target());
+                stream.wait_for(perm.execution_target());
 
                 const int bpc = joint_adam::bytes_per_cell(state->joint_bits);
                 if (bpc <= 0 || state->exp_avg.ndim() != 2) {
@@ -252,29 +185,20 @@ namespace lfs::training::morton {
                 if (n_attr <= 0 || state->exp_avg.size(0) != n) {
                     continue;
                 }
-                const std::size_t packed_cap =
-                    std::max(state->exp_avg.capacity() > 0 ? state->exp_avg.capacity() : n, n);
-                Tensor dest_packed = Tensor::zeros_direct(
-                    state->exp_avg.shape(), packed_cap, Device::GPU, DataType::UInt8);
+                Tensor dest_packed = Tensor::empty_exact(state->exp_avg.shape(), DataType::UInt8);
                 dest_packed.set_stream(stream);
+                dest_packed.zero_();
                 const std::size_t nb = joint_adam::n_bounds_for_prims(n);
-                const std::size_t nb_cap = std::max(
-                    state->joint_bounds.capacity() > 0 ? state->joint_bounds.capacity() : nb, nb);
-                Tensor dest_bounds = Tensor::zeros_direct(
-                    TensorShape({nb, std::size_t{4}}), nb_cap, Device::GPU, DataType::Float32);
+                Tensor dest_bounds = Tensor::empty_exact({nb, std::size_t{4}}, DataType::Float32);
                 dest_bounds.set_stream(stream);
-                kernels::launch_joint_permute_contiguous(
-                    state->exp_avg.ptr<std::uint8_t>(),
-                    state->joint_bounds.ptr<float>(),
-                    dest_packed.ptr<std::uint8_t>(),
-                    dest_bounds.ptr<float>(),
-                    perm.ptr<std::int64_t>(),
-                    static_cast<int>(n),
-                    n_attr,
-                    state->joint_bits,
-                    stream);
-                state->exp_avg = std::move(dest_packed);
-                state->joint_bounds = std::move(dest_bounds);
+                dest_bounds.zero_();
+                {
+                    const core::TensorExecutionTarget::Scope stream_guard(stream);
+                    morton_ops.permute_joint(state->exp_avg, state->joint_bounds, perm, dest_packed, dest_bounds,
+                                             {ops::JointLayout::Rows, static_cast<int>(n), n_attr, state->joint_bits});
+                }
+                state->exp_avg.copy_from(dest_packed);
+                state->joint_bounds.copy_from(dest_bounds);
             }
         }
 
@@ -282,7 +206,9 @@ namespace lfs::training::morton {
             AdamOptimizer& optimizer,
             const core::SplatData& splat,
             const Tensor& perm,
-            cudaStream_t stream) {
+            lfs::core::TensorExecutionTarget stream,
+            const IdleArenaScratch& scratch,
+            const ops::MortonOps& morton_ops) {
             auto* state = optimizer.get_state_mutable(ParamType::ShN);
             if (state == nullptr || !state->is_joint() || !state->exp_avg.is_valid() ||
                 !state->joint_bounds.is_valid()) {
@@ -302,43 +228,67 @@ namespace lfs::training::morton {
                 Tensor dest = Tensor::zeros_direct(
                     TensorShape({logical}), cap, Device::GPU, DataType::Float32);
                 dest.set_stream(stream);
-                core::shN_swizzled_gather_self_i64(
-                    state->grad.ptr<float>(),
-                    dest.ptr<float>(),
-                    perm.ptr<std::int64_t>(),
-                    n,
-                    0,
-                    rest,
-                    stream);
+                morton_ops.gather_gradient(state->grad, perm, dest, rest, stream);
                 state->grad = std::move(dest);
             }
 
-            lfs::core::waitForCUDAStream(stream, state->exp_avg.stream());
-            lfs::core::waitForCUDAStream(stream, state->joint_bounds.stream());
-            const std::size_t packed_n = state->exp_avg.size(0);
-            const std::size_t packed_cap = std::max(
-                state->exp_avg.capacity() > 0 ? state->exp_avg.capacity() : packed_n, packed_n);
-            Tensor dest_packed = Tensor::zeros_direct(
-                state->exp_avg.shape(), packed_cap, Device::GPU, DataType::UInt8);
-            dest_packed.set_stream(stream);
+            stream.wait_for(state->exp_avg.execution_target());
+            stream.wait_for(state->joint_bounds.execution_target());
+            const std::size_t packed_bytes = state->exp_avg.bytes();
             const std::size_t nb = joint_adam::n_bounds_for_prims(n);
-            const std::size_t nb_cap = std::max(
-                state->joint_bounds.capacity() > 0 ? state->joint_bounds.capacity() : nb, nb);
-            Tensor dest_bounds = Tensor::zeros_direct(
-                TensorShape({nb, std::size_t{4}}), nb_cap, Device::GPU, DataType::Float32);
+            Tensor dest_bounds = Tensor::empty_exact({nb, std::size_t{4}}, DataType::Float32);
             dest_bounds.set_stream(stream);
-            kernels::launch_joint_permute_shN(
-                state->exp_avg.ptr<std::uint8_t>(),
-                state->joint_bounds.ptr<float>(),
-                dest_packed.ptr<std::uint8_t>(),
-                dest_bounds.ptr<float>(),
-                perm.ptr<std::int64_t>(),
-                static_cast<int>(n),
-                slots,
-                state->joint_bits,
-                stream);
-            state->exp_avg = std::move(dest_packed);
-            state->joint_bounds = std::move(dest_bounds);
+            dest_bounds.zero_();
+            if (auto* packed = static_cast<std::uint8_t*>(scratch.zeroed(packed_bytes))) {
+                auto dest_packed = Tensor::from_blob(packed, {packed_bytes}, Device::GPU, DataType::UInt8, stream);
+                {
+                    const core::TensorExecutionTarget::Scope stream_guard(stream);
+                    morton_ops.permute_joint(state->exp_avg, state->joint_bounds, perm, dest_packed, dest_bounds,
+                                             {ops::JointLayout::SwizzledSH, static_cast<int>(n), slots, state->joint_bits});
+                }
+                morton_ops.copy_back(state->exp_avg, packed, packed_bytes, stream);
+            } else {
+                constexpr std::size_t R = core::kShReorderSize;
+                const std::size_t tiles = (n + R - 1) / R;
+                const std::size_t slot_bytes =
+                    tiles * R * 4 * static_cast<std::size_t>(joint_adam::bytes_per_cell(state->joint_bits));
+                const auto group = group_scratch(scratch, slot_bytes, static_cast<std::size_t>(slots), stream);
+                // Only a borrowed arena block needs a raw view; backends without an
+                // arena cannot view raw device memory.
+                auto group_view = group.owner.is_valid()
+                                      ? group.owner
+                                      : Tensor::from_blob(group.ptr, {group.bytes}, Device::GPU, DataType::UInt8, stream);
+                {
+                    const core::TensorExecutionTarget::Scope stream_guard(stream);
+                    morton_ops.permute_joint_grouped(state->exp_avg, state->joint_bounds, perm, dest_bounds, group_view,
+                                                     {ops::JointLayout::SwizzledSH, static_cast<int>(n), slots, state->joint_bits});
+                }
+                if (state->exp_avg.execution_target() != stream) {
+                    state->exp_avg.execution_target().wait_for(stream);
+                }
+            }
+            state->joint_bounds.copy_from(dest_bounds);
+        }
+    } // namespace
+
+    namespace {
+        [[nodiscard]] std::size_t morton_scratch_bytes(const core::SplatData& splat,
+                                                       const AdamOptimizer* optimizer) {
+            const auto n = static_cast<std::size_t>(splat.size());
+            const auto rest = static_cast<std::uint32_t>(splat.max_sh_coeffs_rest());
+            std::size_t bytes = 0;
+            if (rest > 0 && splat.shN().is_valid()) {
+                bytes = splat.shN_value_quantized()
+                            ? core::sh_value_quant::sh_value_u16_count(n, rest) * sizeof(std::uint16_t)
+                            : core::sh_swizzled_float_count(n, rest) * sizeof(float);
+            }
+            if (optimizer != nullptr) {
+                const auto* state = optimizer->get_state(ParamType::ShN);
+                if (state != nullptr && state->is_joint() && state->exp_avg.is_valid()) {
+                    bytes = std::max(bytes, state->exp_avg.bytes());
+                }
+            }
+            return bytes;
         }
     } // namespace
 
@@ -349,7 +299,7 @@ namespace lfs::training::morton {
         const std::size_t n = perm.numel();
         if (tensor.ndim() == 2 && tensor.size(1) == n && tensor.size(0) != n) {
             Tensor dest = Tensor::zeros(tensor.shape(), tensor.device(), tensor.dtype());
-            dest.set_stream(core::getCurrentCUDAStream());
+            dest.set_stream(core::TensorExecutionTarget::current());
             tensor.index_select_into(dest, 1, perm, BoundaryMode::Assert);
             tensor = std::move(dest);
             return;
@@ -360,7 +310,7 @@ namespace lfs::training::morton {
     ReorderResult apply_morton_reorder(
         core::SplatData& splat,
         AdamOptimizer* optimizer,
-        cudaStream_t stream) {
+        lfs::core::TensorExecutionTarget stream) {
         ReorderResult result;
         if (splat.has_frozen_ranges()) {
             LOG_DEBUG("Skipping Morton reorder: {} frozen-range span(s) are active",
@@ -372,32 +322,44 @@ namespace lfs::training::morton {
             return result;
         }
 
-        LiveModelMutationGuard mutation_guard("morton_reorder");
-        if (stream == nullptr) {
-            stream = core::getCurrentCUDAStream();
+        const auto backend = core::default_gpu_backend();
+        const auto* morton_ops = training_ops(backend).morton;
+        if (morton_ops == nullptr) [[unlikely]] {
+            throw std::runtime_error(unavailable_training_family(backend, Family::Morton)
+                                         .value_or("Morton training ops are unavailable"));
         }
-        if (splat.means().stream() != stream) {
+        LiveModelMutationGuard mutation_guard("morton_reorder");
+        if (stream.is_default_queue()) {
+            stream = core::TensorExecutionTarget::current();
+        }
+        if (splat.means().execution_target() != stream) {
             splat.means().set_stream(stream);
         }
 
-        result.permutation = kernels::launch_morton_permutation(splat.means(), stream);
+        {
+            const core::TensorExecutionTarget::Scope stream_guard(stream);
+            result.permutation = morton_ops->permutation(splat.means());
+        }
         if (!result.permutation.is_valid() || result.permutation.numel() != n) {
             LOG_ERROR("Morton reorder failed to produce a permutation of length {}", n);
             return result;
         }
+
+        const std::size_t scratch_bytes = morton_scratch_bytes(splat, optimizer);
+        const IdleArenaScratch scratch(scratch_bytes, std::min(scratch_bytes, MIN_MORTON_ARENA_BYTES), stream);
 
         permute_named_param(splat.means(), result.permutation);
         permute_named_param(splat.sh0(), result.permutation);
         permute_named_param(splat.scaling_raw(), result.permutation);
         permute_named_param(splat.rotation_raw(), result.permutation);
         permute_named_param(splat.opacity_raw(), result.permutation);
-        permute_shN(splat, result.permutation, stream);
+        permute_shN_impl(splat, result.permutation, stream, scratch);
 
         if (splat._densification_info.is_valid() && splat._densification_info.numel() > 0) {
             permute_row_tensor(splat._densification_info, result.permutation);
         }
         if (splat._max_screen_share.is_valid() && splat._max_screen_share.numel() > 0) {
-            core::gpu_device_barrier(core::GpuBackend::CUDA);
+            core::gpu_device_barrier(stream.backend());
             permute_row_tensor(splat._max_screen_share, result.permutation);
             if (optimizer != nullptr) {
                 optimizer->refresh_screen_share_buffer();
@@ -409,12 +371,12 @@ namespace lfs::training::morton {
         }
 
         if (optimizer != nullptr) {
-            permute_optimizer(*optimizer, result.permutation, stream);
-            permute_optimizer_shN(*optimizer, splat, result.permutation, stream);
+            permute_optimizer(*optimizer, result.permutation, stream, *morton_ops);
+            permute_optimizer_shN(*optimizer, splat, result.permutation, stream, scratch, *morton_ops);
         }
 
         splat.note_param_layout_changed();
-        core::gpu_device_barrier(core::GpuBackend::CUDA);
+        core::gpu_device_barrier(stream.backend());
         // Morton's temporary permutation buffers normally return to the CUDA
         // pool immediately. Keep the VRAM hygiene trim when that leaves a
         // substantial reserved/unused tail, but avoid paying a device-wide
@@ -423,7 +385,6 @@ namespace lfs::training::morton {
         lfs::core::Tensor::trim_memory_pool_if_reserved_unused_exceeds(
             MORTON_TRIM_UNUSED_THRESHOLD);
         result.applied = true;
-        LOG_INFO("Morton reordered {} Gaussians", n);
         return result;
     }
 

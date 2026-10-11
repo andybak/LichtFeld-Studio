@@ -7,10 +7,10 @@
 #include "core/splat_data.hpp"
 #include "core/tensor_upload.hpp"
 #include "lfs/training/ops/adam.hpp"
+#include "lfs/training/ops/raster.hpp"
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <cuda_runtime_api.h>
 #include <string>
 #include <unordered_map>
 
@@ -76,76 +76,30 @@ namespace lfs::training {
         Opacity
     };
 
-    struct FastGSFusedAdamParam {
-        float* param = nullptr;
-        uint8_t* joint_packed = nullptr;
-        float* joint_bounds = nullptr;
-        int joint_bits = 0;
-        // SH value quant (shN only)
-        float* sh_value_bounds = nullptr;
-        int sh_value_bits = 0;
-        int sh_value_n_cells = 0;
-        int n_primitives = 0;
-        const bool* frozen_mask = nullptr;
-        int frozen_mask_size = 0;
-        float frozen_lr_scale = 0.0f;
-        const bool* crop_damping_mask = nullptr;
-        int crop_damping_mask_size = 0;
-        float cropbox_lr_scale = 1.0f;
-        int n_elements = 0;
-        int n_attributes = 0;
-        float step_size = 0.0f;
-        float bias_correction2_sqrt_rcp = 1.0f;
-        bool enabled = false;
-        const float* screen_share_max = nullptr;
-        int screen_share_n = 0;
-        float screen_share_limit = 0.0f;
-        float screen_share_penalty = 0.0f;
-    };
-
-    struct FastGSFusedAdamState {
-        bool enabled = false;
-        float beta1 = 0.9f;
-        float beta2 = 0.999f;
-        float eps = 1e-15f;
-        float scale_reg_weight = 0.0f;
-        float opacity_reg_weight = 0.0f;
-        const float* sparsity_opa_sigmoid = nullptr;
-        const float* sparsity_z = nullptr;
-        const float* sparsity_u = nullptr;
-        int sparsity_n = 0;
-        float sparsity_rho = 0.0f;
-        float sparsity_grad_loss = 0.0f;
-        bool per_splat_mean_step = false;
-        float mean_step_median_extent = 0.0f;
-        float mean_step_r_min = 1.0f;
-        float mean_step_r_max = 300.0f;
-        FastGSFusedAdamParam means;
-        FastGSFusedAdamParam sh0;
-        FastGSFusedAdamParam shN;
-        FastGSFusedAdamParam scaling;
-        FastGSFusedAdamParam rotation;
-        FastGSFusedAdamParam opacity;
-        const bool* mean_step_far_mask = nullptr;
-        int mean_step_far_mask_n = 0;
-    };
+    [[nodiscard]] inline bool fastgs_adam_enabled(const lfs::gpu_ops::BackwardAdam& adam) noexcept {
+        for (const auto& group : adam.groups) {
+            if (group.enabled) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     class AdamOptimizer {
     public:
         explicit AdamOptimizer(lfs::core::SplatData& splat_data, const AdamConfig& config);
 
         void step(int iteration);
-        FastGSFusedAdamState prepare_fastgs_fused_adam(int iteration, cudaStream_t execution_stream = nullptr);
+        // Groups and optimizer scalars. Loss and sparsity tensors stay unbound (absent_);
+        // the caller overlays those when it builds the backward hand-off.
+        lfs::gpu_ops::BackwardAdam prepare_fastgs_fused_adam(int iteration, lfs::core::TensorExecutionTarget execution_stream = lfs::core::TensorExecutionTarget::default_queue(lfs::core::default_gpu_backend()));
         void commit_fastgs_fused_adam(int iteration);
         void set_frozen_mask(lfs::core::Tensor mask);
         [[nodiscard]] const lfs::core::Tensor& frozen_mask() const { return frozen_mask_; }
         void set_frozen_lr_scale(float scale);
         void set_crop_damping_mask(lfs::core::Tensor mask);
         void set_cropbox_lr_scale(float scale);
-        void set_per_splat_mean_step(bool enabled,
-                                     float median_extent,
-                                     float r_min,
-                                     float r_max);
+        void set_per_splat_mean_step(bool enabled, float median_extent);
         // Retain the allocation for both explicit and fused Adam; CPU inputs are uploaded.
         void set_mean_step_far_mask(lfs::core::Tensor mask);
         void set_screen_share_cap(const float* max_share, int n, float limit, float penalty);
@@ -218,6 +172,7 @@ namespace lfs::training {
 
         // Control notifications for external mutations
         void reset_state(ParamType type);
+        void reset_all_states();
 
         /// Telemetry: times the capacity=0 / no-headroom slow grow path has fired
         /// (process-wide). Loud LOG_WARN is emitted at each site; tests assert this counter.
@@ -241,8 +196,6 @@ namespace lfs::training {
         float cropbox_lr_scale_ = 1.0f;
         bool per_splat_mean_step_ = false;
         float mean_step_median_extent_ = 0.0f;
-        float mean_step_r_min_ = 1.0f;
-        float mean_step_r_max_ = 300.0f;
         lfs::core::Tensor mean_step_far_mask_storage_;
         const bool* mean_step_far_mask_ = nullptr;
         int mean_step_far_mask_n_ = 0;
@@ -273,10 +226,6 @@ namespace lfs::training {
         void alloc_quantized_state(ParamType type, AdamParamState& state, const lfs::core::Tensor& param,
                                    size_t moment_capacity, size_t prim_capacity);
         size_t scale_row_count(ParamType type) const;
-        const bool* frozen_mask_ptr() const;
-        int frozen_mask_size() const;
-        const bool* crop_damping_mask_ptr() const;
-        int crop_damping_mask_size() const;
 
         // Translate a primitive-row delta into the actual tensor growth along dim 0.
         // shN (1D swizzled): delta = swizzled_float_count(N + n_new) - swizzled_float_count(N).

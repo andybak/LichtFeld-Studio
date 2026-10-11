@@ -155,9 +155,10 @@ TEST_F(DualRepOptimizer, CheckpointRoundtripAfterFusedPrepareWithQuantOn) {
     // Fused preparation past SH warmup must advance state.size to the float layout.
     constexpr int past_warmup = 1001;
     auto fused = opt.prepare_fastgs_fused_adam(past_warmup);
-    EXPECT_TRUE(fused.enabled);
-    if (fused.shN.enabled) {
-        EXPECT_EQ(fused.shN.sh_value_bits, 16)
+    EXPECT_TRUE(fastgs_adam_enabled(fused));
+    const auto& shn = fused.groups[static_cast<std::size_t>(lfs::gpu_ops::AdamSlot::ShN)];
+    if (shn.enabled) {
+        EXPECT_EQ(shn.value_bits, 16)
             << "joint+q16 must keep value quant on the fused path";
     }
     opt.commit_fastgs_fused_adam(past_warmup);
@@ -398,9 +399,11 @@ TEST_F(DualRepOptimizer, FusedPrepareSetsNPrimitivesForOverhangGuard) {
     AdamOptimizer opt(splat, make_cfg(512));
     opt.allocate_gradients(512);
     auto fused = opt.prepare_fastgs_fused_adam(1001);
-    EXPECT_EQ(fused.shN.n_primitives, static_cast<int>(n))
+    EXPECT_EQ(fused.groups[static_cast<std::size_t>(lfs::gpu_ops::AdamSlot::ShN)].primitives,
+              static_cast<int>(n))
         << "kernel overhang guard needs live primitive count";
-    EXPECT_EQ(fused.means.n_primitives, static_cast<int>(n));
+    EXPECT_EQ(fused.groups[static_cast<std::size_t>(lfs::gpu_ops::AdamSlot::Means)].primitives,
+              static_cast<int>(n));
 }
 
 TEST_F(DualRepOptimizer, JointBoundsLoadAcceptsOversizedTable) {
@@ -492,9 +495,6 @@ TEST_F(DualRepOptimizer, MRNF_PerSplatMeanStepWithQuantizedAdamIsFinite) {
     opt_params.iterations = 200;
     opt_params.max_cap = 32;
     opt_params.sh_degree_interval = 10000;
-    // The per-splat mean step ships behind the opt-in Background Improvements
-    // switch; the test exercises that path, so it must opt in.
-    opt_params.background_improvements = true;
     ASSERT_NO_THROW(strategy.initialize(opt_params));
 
     std::vector<float> log_s(8 * 3);
@@ -574,7 +574,7 @@ TEST_F(DualRepOptimizer, MCMC_QuantOn_MidRunSaveLoadResume) {
     // shN step_count advances only after SH warmup.
     for (int it = 1; it <= mid_iter; ++it) {
         auto fused = opt.prepare_fastgs_fused_adam(it);
-        EXPECT_TRUE(fused.enabled);
+        EXPECT_TRUE(fastgs_adam_enabled(fused));
         opt.commit_fastgs_fused_adam(it);
     }
 
@@ -610,9 +610,10 @@ TEST_F(DualRepOptimizer, MCMC_QuantOn_MidRunSaveLoadResume) {
     auto& ropt = target.get_optimizer();
     for (int it = mid_iter + 1; it <= resume_to; ++it) {
         auto fused = ropt.prepare_fastgs_fused_adam(it);
-        EXPECT_TRUE(fused.enabled);
-        if (fused.shN.enabled) {
-            EXPECT_EQ(fused.shN.sh_value_bits, 16)
+        EXPECT_TRUE(fastgs_adam_enabled(fused));
+        const auto& shn = fused.groups[static_cast<std::size_t>(lfs::gpu_ops::AdamSlot::ShN)];
+        if (shn.enabled) {
+            EXPECT_EQ(shn.value_bits, 16)
                 << "joint+q16 must stay on after mid-run resume";
         }
         ropt.commit_fastgs_fused_adam(it);
@@ -732,8 +733,8 @@ TEST_F(DualRepOptimizer, FusedStepBindingsJoinExecutionQueue) {
     {
         TensorWorkQueue::Scope consumer_scope(consumer);
         const auto bindings = optimizer.prepare_fastgs_fused_adam(
-            1001, static_cast<cudaStream_t>(consumer.native_handle()));
-        ASSERT_TRUE(bindings.enabled);
+            1001, consumer);
+        ASSERT_TRUE(fastgs_adam_enabled(bindings));
         EXPECT_EQ(model.means().stream(), consumer.native_handle());
         EXPECT_EQ(model.shN().stream(), consumer.native_handle());
         for (auto type : {ParamType::Means, ParamType::Sh0, ParamType::ShN,

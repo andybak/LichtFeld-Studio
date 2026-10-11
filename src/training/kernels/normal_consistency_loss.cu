@@ -2,9 +2,9 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "core/cuda_error.hpp"
-#include "lfs/core/warp_reduce.cuh"
 #include "normal_consistency_loss.hpp"
 #include "normal_loss.hpp"
+#include "training/kernels/warp_reduce.cuh"
 
 #include <algorithm>
 
@@ -14,17 +14,16 @@ namespace lfs::training::kernels {
     namespace {
         namespace slots = normal_consistency_slots;
 
-        constexpr int kThreadsPerBlock = 256;
-        constexpr size_t kMaxBlocks = 1024;
+        constexpr int kThreadsPerBlock = kGeometryLossThreads;
 
-        constexpr int kStatCount = 3;
+        constexpr int kStatCount = kNormalStatCount;
         constexpr int kLossStatCount = 1;
 
         constexpr float kMinExpectedDepth = 1.0e-6f;
         constexpr float kMinCrossNormSq = 1.0e-24f;
 
         [[nodiscard]] size_t consistency_block_count(const size_t num_pixels) {
-            return std::min((num_pixels + kThreadsPerBlock - 1) / kThreadsPerBlock, kMaxBlocks);
+            return geometry_loss_block_count(num_pixels);
         }
 
         template <bool Weighted>
@@ -44,9 +43,17 @@ namespace lfs::training::kernels {
             float fy;
             float cx;
             float cy;
+            const float* rays;
+            int width;
+            bool wrap;
         };
 
         __device__ __forceinline__ float3 pixel_ray(const Intrinsics k, const int x, const int y) {
+            if (k.rays) {
+                const int px = k.wrap ? (x + k.width) % k.width : x;
+                const float* r = k.rays + 3 * (y * k.width + px);
+                return make_float3(r[0], r[1], r[2]);
+            }
             return make_float3(
                 (static_cast<float>(x) + 0.5f - k.cx) / k.fx,
                 (static_cast<float>(y) + 0.5f - k.cy) / k.fy,
@@ -97,7 +104,7 @@ namespace lfs::training::kernels {
             const size_t num_pixels) {
             DepthNormalSample s = {};
 
-            if (x <= 0 || y <= 0 || x >= width - 1 || y >= height - 1) {
+            if ((!k.wrap && (x <= 0 || x >= width - 1)) || y <= 0 || y >= height - 1) {
                 return s;
             }
             const size_t idx = static_cast<size_t>(y) * width + x;
@@ -107,7 +114,9 @@ namespace lfs::training::kernels {
                 return s;
             }
 
-            const size_t neighbor_idx[4] = {idx + 1, idx - 1, idx + width, idx - width};
+            const size_t neighbor_idx[4] = {static_cast<size_t>(y) * width + (x + 1) % width,
+                                            static_cast<size_t>(y) * width + (x + width - 1) % width,
+                                            idx + width, idx - width};
             const float jump_limit = kNormalConsistencyMaxRelDepthJump * e_c;
             for (int i = 0; i < 4; ++i) {
                 if (!expected_depth_at(depth_accum, alpha_map, neighbor_idx[i],
@@ -137,7 +146,7 @@ namespace lfs::training::kernels {
                 tx.z * ty.x - tx.x * ty.z,
                 tx.x * ty.y - tx.y * ty.x);
             const float nraw_norm_sq = n_raw.x * n_raw.x + n_raw.y * n_raw.y + n_raw.z * n_raw.z;
-            if (nraw_norm_sq < kMinCrossNormSq) {
+            if (!isfinite(nraw_norm_sq) || nraw_norm_sq < kMinCrossNormSq) {
                 return s;
             }
 
@@ -261,7 +270,9 @@ namespace lfs::training::kernels {
                 -(g_ty.x * ray_ym.x + g_ty.y * ray_ym.y + g_ty.z * ray_ym.z)};
 
             const size_t idx = static_cast<size_t>(y) * width + x;
-            const size_t neighbor_idx[4] = {idx + 1, idx - 1, idx + width, idx - width};
+            const size_t neighbor_idx[4] = {static_cast<size_t>(y) * width + (x + 1) % width,
+                                            static_cast<size_t>(y) * width + (x + width - 1) % width,
+                                            idx + width, idx - width};
             for (int i = 0; i < 4; ++i) {
                 // E = max(accum, 0)/alpha: dE/daccum = 1/alpha, dE/dalpha = -E/alpha
                 const float inv_a = 1.0f / s.neighbor_alpha[i];
@@ -559,12 +570,6 @@ namespace lfs::training::kernels {
         }
     } // namespace
 
-    size_t normal_consistency_partial_count(const size_t num_pixels) {
-        const size_t num_blocks = consistency_block_count(num_pixels);
-        return static_cast<size_t>(slots::kSlotCount) +
-               2 * static_cast<size_t>(kStatCount) * num_blocks;
-    }
-
     namespace {
         template <bool Weighted>
         void launch_normal_consistency_loss_impl(
@@ -584,12 +589,13 @@ namespace lfs::training::kernels {
             const float cy,
             const float weight,
             const float* pixel_weight,
-            const cudaStream_t stream) {
+            const cudaStream_t stream,
+            const float* camera_rays, bool wrap_horizontal) {
             const size_t num_pixels = static_cast<size_t>(width) * height;
             const int num_blocks = static_cast<int>(consistency_block_count(num_pixels));
             float* finals = partial_sums;
             double* block_partials = reinterpret_cast<double*>(partial_sums + slots::kSlotCount);
-            const Intrinsics k{fx, fy, cx, cy};
+            const Intrinsics k{fx, fy, cx, cy, camera_rays, width, wrap_horizontal};
 
             consistency_stats_kernel<Weighted><<<num_blocks, kThreadsPerBlock, 0, stream>>>(
                 rendered_normal,
@@ -648,12 +654,13 @@ namespace lfs::training::kernels {
             const float cy,
             const float weight,
             const float* pixel_weight,
-            const cudaStream_t stream) {
+            const cudaStream_t stream,
+            const float* camera_rays, bool wrap_horizontal) {
             const size_t num_pixels = static_cast<size_t>(width) * height;
             const int num_blocks = static_cast<int>(consistency_block_count(num_pixels));
             float* finals = partial_sums;
             double* block_partials = reinterpret_cast<double*>(partial_sums + slots::kSlotCount);
-            const Intrinsics k{fx, fy, cx, cy};
+            const Intrinsics k{fx, fy, cx, cy, camera_rays, width, wrap_horizontal};
 
             prior_depth_stats_kernel<Weighted><<<num_blocks, kThreadsPerBlock, 0, stream>>>(
                 prior_normal,
@@ -712,18 +719,19 @@ namespace lfs::training::kernels {
         const float cy,
         const float weight,
         cudaStream_t stream,
-        const float* pixel_weight) {
+        const float* pixel_weight,
+        const float* camera_rays, bool wrap_horizontal) {
         stream = resolve_stream(stream);
         if (pixel_weight) {
             launch_normal_consistency_loss_impl<true>(
                 rendered_normal, rendered_depth_accum, rendered_alpha,
                 grad_normal, grad_depth_accum, grad_alpha, loss_out, partial_sums,
-                width, height, fx, fy, cx, cy, weight, pixel_weight, stream);
+                width, height, fx, fy, cx, cy, weight, pixel_weight, stream, camera_rays, wrap_horizontal);
         } else {
             launch_normal_consistency_loss_impl<false>(
                 rendered_normal, rendered_depth_accum, rendered_alpha,
                 grad_normal, grad_depth_accum, grad_alpha, loss_out, partial_sums,
-                width, height, fx, fy, cx, cy, weight, nullptr, stream);
+                width, height, fx, fy, cx, cy, weight, nullptr, stream, camera_rays, wrap_horizontal);
         }
     }
 
@@ -743,18 +751,19 @@ namespace lfs::training::kernels {
         const float cy,
         const float weight,
         cudaStream_t stream,
-        const float* pixel_weight) {
+        const float* pixel_weight,
+        const float* camera_rays, bool wrap_horizontal) {
         stream = resolve_stream(stream);
         if (pixel_weight) {
             launch_normal_prior_depth_loss_impl<true>(
                 prior_normal, rendered_depth_accum, rendered_alpha,
                 grad_depth_accum, grad_alpha, loss_out, partial_sums,
-                width, height, fx, fy, cx, cy, weight, pixel_weight, stream);
+                width, height, fx, fy, cx, cy, weight, pixel_weight, stream, camera_rays, wrap_horizontal);
         } else {
             launch_normal_prior_depth_loss_impl<false>(
                 prior_normal, rendered_depth_accum, rendered_alpha,
                 grad_depth_accum, grad_alpha, loss_out, partial_sums,
-                width, height, fx, fy, cx, cy, weight, nullptr, stream);
+                width, height, fx, fy, cx, cy, weight, nullptr, stream, camera_rays, wrap_horizontal);
         }
     }
 

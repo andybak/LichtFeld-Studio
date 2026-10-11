@@ -3,9 +3,11 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "gui/panel_registry.hpp"
+#include "core/event_bridge/localization_manager.hpp"
 #include "core/logger.hpp"
 #include "gui/gui_focus_state.hpp"
-#include "gui/panel_layout.hpp"
+#include "gui/gui_input.hpp"
+#include "gui/resize_geometry.hpp"
 #include "gui/ui_context.hpp"
 #include "gui/ui_widgets.hpp"
 #include "python/python_runtime.hpp"
@@ -24,6 +26,11 @@
 namespace lfs::vis::gui {
 
     namespace {
+        std::string localized_label(const std::string& source) {
+            const auto& localization = lfs::event::LocalizationManager::getInstance();
+            return localization.hasKey(source) ? std::string(localization.get(source)) : source;
+        }
+
         float floatingUiScale() {
             return std::max(1.0f, getThemeDpiScale());
         }
@@ -75,8 +82,8 @@ namespace lfs::vis::gui {
             case PanelSpace::ViewportOverlay: return "viewport_overlay";
             case PanelSpace::MainPanelTab: return "main_panel_tab";
             case PanelSpace::SceneHeader: return "scene_header";
-            case PanelSpace::BottomDock: return "bottom_dock";
-            case PanelSpace::LeftDock: return "left_dock";
+            case PanelSpace::BottomArea: return "bottom_dock";
+            case PanelSpace::LeftArea: return "left_dock";
             case PanelSpace::StatusBar: return "status_bar";
             }
             return "unknown";
@@ -334,6 +341,8 @@ namespace lfs::vis::gui {
             assert(!info.id.empty());
 
             info.id_storage = std::make_shared<const std::string>(info.id);
+            info.label_source = info.label;
+            info.label = localized_label(info.label_source);
             info.label_storage = std::make_shared<const std::string>(info.label);
 
             if (!validatePanelContract(info, info.space))
@@ -1064,6 +1073,7 @@ apply_registered_chrome:
                             masked_resize_input.mouse_button_events.clear();
                             masked_resize_input.mouse_wheel = 0.0f;
                             masked_resize_input.mouse_wheel_x = 0.0f;
+                            masked_resize_input.pinch_scale = 1.0f;
                             panel_input = &masked_resize_input;
                         }
                         const auto result = snap.panel->renderDirect({
@@ -1104,8 +1114,8 @@ apply_registered_chrome:
                                              },
                                              ctx);
                     break;
-                case PanelSpace::BottomDock:
-                case PanelSpace::LeftDock:
+                case PanelSpace::BottomArea:
+                case PanelSpace::LeftArea:
                     break;
                 case PanelSpace::StatusBar:
                     snap.panel->renderDirect({
@@ -1410,30 +1420,34 @@ apply_registered_chrome:
         return result;
     }
 
-    std::vector<PanelSummary> PanelRegistry::get_panel_summaries_for_space(
-        const PanelSpace space, const PanelDrawContext& ctx, const bool apply_poll) {
-        std::vector<PanelSnapshot> snapshots;
-        {
-            std::lock_guard lock(mutex_);
-            snapshots = collect_snapshots_locked(PanelRenderTarget::for_space(space), ctx);
-        }
-
-        std::vector<PanelSummary> result;
-        result.reserve(snapshots.size());
-        for (const auto& snap : snapshots) {
-            if (apply_poll) {
-                try {
-                    if (!PanelRegistry::check_poll(snap, ctx))
-                        continue;
-                } catch (const std::exception& e) {
-                    LOG_ERROR("Panel '{}' poll error: {}", snap.label, e.what());
-                    continue;
-                }
+    std::vector<PanelDetails> PanelRegistry::get_all_panels() {
+        std::lock_guard lock(mutex_);
+        std::vector<PanelDetails> result;
+        result.reserve(panels_.size());
+        for (const auto& panel : panels_) {
+            uint64_t stack_order = 0;
+            if (const auto interaction = floating_interactions_.find(panel.id);
+                interaction != floating_interactions_.end()) {
+                stack_order = interaction->second.stack_order;
             }
-            result.push_back({std::string(snap.label), std::string(snap.id), snap.space,
-                              snap.order, true, false});
+            result.push_back(PanelDetails{
+                panel.label,
+                panel.id,
+                panel.parent_id,
+                panel.space,
+                panel.order,
+                panel.enabled,
+                panel.options,
+                panel.poll_dependencies,
+                panel.is_native,
+                panel.initial_width,
+                panel.initial_height,
+                stack_order,
+            });
         }
-        std::stable_sort(result.begin(), result.end(), [](const PanelSummary& a, const PanelSummary& b) {
+        std::stable_sort(result.begin(), result.end(), [](const PanelDetails& a, const PanelDetails& b) {
+            if (a.space != b.space)
+                return a.space < b.space;
             if (a.order != b.order)
                 return a.order < b.order;
             return a.label < b.label;
@@ -1902,17 +1916,6 @@ apply_registered_chrome:
         }
     }
 
-    bool PanelRegistry::needsAnimationFrame() const {
-        std::lock_guard lock(mutex_);
-        for (const auto& p : panels_) {
-            if (!p.enabled || p.error_disabled || !p.panel)
-                continue;
-            if (p.panel->needsAnimationFrame())
-                return true;
-        }
-        return false;
-    }
-
     namespace {
         // Shared visibility predicate for animation demand and scheduled delays.
         // Must stay in lockstep: a mismatch causes either pinned frames or stalled wakes.
@@ -1922,7 +1925,7 @@ apply_registered_chrome:
                 return false;
 
             if (!p.parent_id.empty()) {
-                return visibility.right_panel_visible &&
+                return visibility.properties_or_scene_visible &&
                        std::string_view(p.parent_id) == visibility.active_main_tab;
             }
 
@@ -1936,14 +1939,14 @@ apply_registered_chrome:
             case PanelSpace::ViewportOverlay:
                 return true;
             case PanelSpace::SceneHeader:
-                return visibility.right_panel_visible;
+                return visibility.properties_or_scene_visible;
             case PanelSpace::MainPanelTab:
-                return visibility.right_panel_visible &&
+                return visibility.properties_or_scene_visible &&
                        std::string_view(p.id) == visibility.active_main_tab;
-            case PanelSpace::BottomDock:
-                return visibility.ui_visible && visibility.bottom_dock_visible;
-            case PanelSpace::LeftDock:
-                return visibility.ui_visible && visibility.left_dock_visible;
+            case PanelSpace::BottomArea:
+                return visibility.ui_visible && visibility.bottom_editor_visible;
+            case PanelSpace::LeftArea:
+                return visibility.ui_visible && visibility.left_editor_visible;
             }
             return false;
         }
@@ -1977,11 +1980,11 @@ apply_registered_chrome:
             case PanelSpace::MainPanelTab:
                 demand.main_panel_tab = true;
                 return;
-            case PanelSpace::BottomDock:
-                demand.bottom_dock = true;
+            case PanelSpace::BottomArea:
+                demand.bottom_editor = true;
                 return;
-            case PanelSpace::LeftDock:
-                demand.left_dock = true;
+            case PanelSpace::LeftArea:
+                demand.left_editor = true;
                 return;
             }
         }
@@ -2014,39 +2017,6 @@ apply_registered_chrome:
         return animationDemandForVisiblePanels(visibility).any();
     }
 
-    std::string PanelRegistry::describeAnimationDemand(
-        const PanelAnimationVisibility visibility) const {
-        std::string result;
-        std::lock_guard lock(mutex_);
-        for (const auto& p : panels_) {
-            if (!p.enabled || p.error_disabled || !p.panel ||
-                !isPanelVisibleForAnimation(p, visibility) ||
-                !p.panel->needsAnimationFrame())
-                continue;
-
-            if (!result.empty())
-                result += ',';
-            result += p.id;
-            const auto detail = p.panel->animationDemandDescription();
-            if (!detail.empty()) {
-                result += '(';
-                result += detail;
-                result += ')';
-            }
-        }
-        return result;
-    }
-
-    bool PanelRegistry::needsImmediateAnimationFrameForVisiblePanels(
-        const PanelAnimationVisibility visibility) const {
-        std::lock_guard lock(mutex_);
-        return std::any_of(panels_.begin(), panels_.end(), [&](const auto& p) {
-            return p.enabled && !p.error_disabled && p.panel &&
-                   isPanelVisibleForAnimation(p, visibility) &&
-                   p.panel->needsImmediateAnimationFrame();
-        });
-    }
-
     std::optional<double> PanelRegistry::nextScheduledAnimationDelayForVisiblePanels(
         const PanelAnimationVisibility visibility) const {
         std::optional<double> min_delay;
@@ -2065,12 +2035,28 @@ apply_registered_chrome:
         std::lock_guard lock(mutex_);
         for (auto& p : panels_) {
             if (p.id == id) {
-                p.label = new_label;
+                p.label_source = new_label;
+                p.label = localized_label(new_label);
                 p.label_storage = std::make_shared<const std::string>(p.label);
                 return true;
             }
         }
         return false;
+    }
+
+    void PanelRegistry::refresh_localized_labels() {
+        const auto generation = lfs::event::LocalizationManager::getInstance().getCurrentLanguageGeneration();
+        std::lock_guard lock(mutex_);
+        if (generation == localized_label_generation_)
+            return;
+        localized_label_generation_ = generation;
+        for (auto& p : panels_) {
+            auto label = localized_label(p.label_source);
+            if (label != p.label) {
+                p.label = std::move(label);
+                p.label_storage = std::make_shared<const std::string>(p.label);
+            }
+        }
     }
 
     bool PanelRegistry::set_panel_order(const std::string& id, int new_order) {

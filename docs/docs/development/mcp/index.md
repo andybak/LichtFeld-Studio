@@ -31,6 +31,7 @@ Read these first in most sessions:
 
 Then narrow further:
 
+- `lichtfeld://ui/screen` for editor areas, the active 3D view, and layout
 - `lichtfeld://ui/tools` for tool ids, active state, and availability
 - `lichtfeld://ui/menus` for menu trees and invokable actions
 - `lichtfeld://ui/panels` for panel ids and registry state
@@ -47,13 +48,31 @@ Then narrow further:
 | `training_*` | Training state, loss, and training control |
 | `runtime_*` | Normalized job and event tracking |
 | `ui_tool_*`, `ui_menu_*`, `ui_panel_*`, `ui_operator_*`, `ui_modal_*` | Drive the registered GUI surface, including confirm dialogs |
+| `screen_*`, `view_*` | Editor areas and 3D views: `screen.get`/`split`/`join`/`close`/`swap`/`set_editor`/`maximize`/`reset`, `view.command`/`get_camera`/`set_camera`/`get_settings`/`set_settings`. Resource: `lichtfeld://ui/screen`. `camera.get`/`set_view`/`reset` take optional `view`. |
 | `operator_*` | Introspect and invoke registered GUI operators, including modal flows |
 | `selection_*` | Screen-space Gaussian selection |
 | `transform_*` | Node transform inspection and edits |
 | `gaussians_*` | Raw Gaussian tensor reads and writes |
 | `history_*` | Shared undo/redo inspection, playback, and grouped transactions |
 | `editor_*` | Integrated Python console execution |
+| `nodes_*` | [Node graphs, modifier stacks, evaluation and Node Editor](node-editor.md), without Python execution |
 | `camera_*`, `render_*`, `sequencer_*` | View state, captures, and timeline workflows |
+
+## Pointer Injection
+
+`ui.pointer` drives the same SDL event and polled-pointer path as the physical mouse. Coordinates are window pixels, matching `render_capture_window`. Supported actions are `move`, `hover`, `down`, `up`, `wheel`, `pinch`, and `drag`; `drag` accepts `from`, `to`, `button`, `steps`, and optional Ctrl, Shift, Alt, or Meta modifiers. During an injected gesture the physical cursor is ignored, and normal input resumes after the injected button is released.
+
+`hover` accepts `x`, `y` and optional `duration_ms` (1–10000, default 1000). It returns immediately and retains the pointer for delayed tooltips; capture after the 500 ms tooltip delay. Normal input resumes when the duration expires or another pointer action starts.
+
+Use this tool for end-to-end GUI automation instead of pushing SDL events directly. A direct push does not update SDL's polled mouse state, which causes event-driven and per-frame GUI input to disagree.
+
+`wheel` also accepts optional `x`, `y` to position the cursor for that event,
+and `modifiers: ["ctrl"]` (or `["super"]`) for cursor-centered canvas zoom in trackpad mode. Unmodified wheel events zoom in mouse mode and pan in trackpad mode, using the same navigation preferences as the viewport.
+For example, `{"action":"wheel","x":800,"y":600,"dy":-1,"modifiers":["ctrl"]}`.
+Modifier names for all pointer actions are `ctrl`, `shift`, `alt`, and `super`.
+`pinch` accepts a positive `scale` (1 means unchanged), plus optional `x`, `y`.
+It injects `SDL_EVENT_PINCH_UPDATE` through the normal input path; for example
+`{"action":"pinch","scale":1.1,"x":800,"y":600}`.
 
 ## Runtime Model
 
@@ -65,6 +84,7 @@ Then narrow further:
 - `export.scene`
 - `export.video`
 - `operator.modal`
+- `nodes.evaluate`
 
 When a tool can block or keep running, use the runtime APIs instead of sleeping:
 
@@ -79,6 +99,7 @@ When a tool can block or keep running, use the runtime APIs instead of sleeping:
 - [Connecting MCP Clients](connecting-clients.md) for client setup (Claude Desktop, Claude Code, in-repo agents)
 - [Bootstrap](bootstrap.md) for the discovery-first workflow
 - [Recipes](recipes/) for concrete task sequences
+- [Frame demand and idle verification](recipes/render-on-demand.md) for the runtime frame ledger and GPU idle test
 
 ## What Not To Do
 

@@ -1,8 +1,8 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
-#include "io/hdr_tonemap.hpp"
-#include "io/video_frame_extractor.hpp"
+#include "media/hdr_tonemap.hpp"
+#include "media/video_frame_extractor.hpp"
 
 extern "C" {
 #include <libavutil/pixfmt.h>
@@ -182,4 +182,14 @@ TEST(VideoFrameExtractorParams, RejectsInvalidRangesAndDimensions) {
     params.custom_height = 1;
     EXPECT_FALSE(VideoFrameExtractor::validateParams(
         params, 1920, 1080, 1.0 / 90000.0, layout, error));
+}
+
+TEST(VideoTrimRange, EndAtThePlayerDurationExtractsToTheEnd) {
+    constexpr double player_duration = 61.0 / 29.97;
+    EXPECT_EQ(lfs::io::extractionEndTime(static_cast<float>(player_duration), player_duration), -1.0);
+    EXPECT_EQ(lfs::io::extractionEndTime(-1.0f, player_duration), -1.0);
+    EXPECT_DOUBLE_EQ(lfs::io::extractionEndTime(1.5f, player_duration), 1.5);
+    const float end = static_cast<float>(player_duration);
+    EXPECT_DOUBLE_EQ(lfs::io::extractionEndTime(end, player_duration, false), static_cast<double>(end));
+    EXPECT_DOUBLE_EQ(lfs::io::extractionEndTime(1.5f, player_duration, false), 1.5);
 }

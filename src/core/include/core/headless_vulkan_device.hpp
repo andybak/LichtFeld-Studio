@@ -3,9 +3,10 @@
 #pragma once
 #include "core/environment.hpp"
 #include "core/gpu_device_info.hpp"
-#include "core/tensor_backend.hpp"
+#include "core/tensor_backend_vulkan.hpp"
 #include "core/vulkan_device_selection.hpp"
 #include "core/vulkan_helpers.hpp"
+#include "core/vulkan_queue_sync.hpp"
 #include <cstdio>
 #include <cstring>
 #include <optional>
@@ -124,8 +125,8 @@ namespace lfs::core {
                 extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
             if (external_interop) {
 #ifdef _WIN32
-                extensions.push_back(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
-                extensions.push_back(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+                extensions.push_back("VK_KHR_external_memory_win32");
+                extensions.push_back("VK_KHR_external_semaphore_win32");
 #elif defined(__linux__)
                 extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
                 extensions.push_back(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
@@ -243,7 +244,7 @@ namespace lfs::core {
                                      nullptr, &device.device_) != VK_SUCCESS) {
                 return std::nullopt;
             }
-            vkGetDeviceQueue(device.device_, queue_family, 0, &device.queue_);
+            lfs::rendering::vk_get_device_queue_synced(device.device_, queue_family, 0, &device.queue_);
             device.physical_device_ = physical;
             device.queue_family_ = queue_family;
             device.shader_atomic_float_ = shader_atomic_float;
@@ -273,8 +274,8 @@ namespace lfs::core {
 
         ~HeadlessAdoptedDevice() {
             if (device_ != VK_NULL_HANDLE) {
-                vkDeviceWaitIdle(device_);
-                vkDestroyDevice(device_, nullptr);
+                lfs::rendering::vk_device_wait_idle_synced(device_);
+                lfs::rendering::vk_destroy_device_synced(device_, nullptr);
             }
             if (instance_ != VK_NULL_HANDLE) {
                 vkDestroyInstance(instance_, nullptr);

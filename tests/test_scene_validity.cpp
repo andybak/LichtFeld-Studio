@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -29,6 +30,7 @@
 #include "core/pinned_memory_allocator.hpp"
 #include "core/point_cloud.hpp"
 #include "core/scene.hpp"
+#include "core/sh_value_quant.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "cuda_backend_test.hpp"
@@ -250,6 +252,7 @@ namespace lfs::python {
         params.optimization.max_cap = 16;
         params.optimization.headless = true;
         params.optimization.enable_eval = false;
+        params.optimization.use_exposure_correction = false;
         params.optimization.use_ppisp = use_ppisp;
         return params;
     }
@@ -374,13 +377,13 @@ namespace lfs::python {
         const auto original = trainer.getParams();
         auto invalid = original;
         invalid.optimization.gut = true;
-        invalid.optimization.use_depth_loss = true;
+        invalid.optimization.mip_filter = true;
 
         const auto updated = trainer.setParams(invalid);
 
         ASSERT_FALSE(updated.has_value());
         EXPECT_NE(
-            updated.error().user_message().find("Depth Loss"),
+            updated.error().user_message().find("Mip Filter"),
             std::string::npos);
         EXPECT_EQ(
             trainer.getParams().optimization.to_json(),
@@ -805,7 +808,7 @@ namespace lfs::python {
         parameter_manager.setActiveStrategy("mcmc");
         parameter_manager.modifyActiveParams([](auto& pending) {
             pending.gut = true;
-            pending.use_depth_loss = true;
+            pending.mip_filter = true;
         });
         lfs::vis::services().set(&parameter_manager);
         lfs::vis::TrainerManager manager;
@@ -814,7 +817,7 @@ namespace lfs::python {
 
         EXPECT_FALSE(manager.startTraining());
         EXPECT_EQ(manager.getState(), lfs::vis::TrainingState::Ready);
-        EXPECT_NE(manager.getLastError().find("Depth Loss"),
+        EXPECT_NE(manager.getLastError().find("Mip Filter"),
                   std::string::npos);
         // No run was accepted: a command rejection is not an initialization result.
         EXPECT_TRUE(manager.waitForInitialization());
@@ -1149,6 +1152,48 @@ namespace lfs::python {
             core::SelectionTopologyError);
 
         first->gaussian_count.store(2, std::memory_order_release);
+        second->gaussian_count.store(2, std::memory_order_release);
+    }
+
+    // A removed node leaves a tombstone in the consolidated slot table until the
+    // background compaction lands. Removals inside that window must complete and
+    // keep the selection of the remaining nodes.
+    TEST_F(SceneValidityTest, RemovalsBeforeConsolidatedCompactionKeepSelection) {
+        const auto first_id = dummy_scene_.addSplat("First", make_test_splat(2));
+        const auto second_id = dummy_scene_.addSplat("Second", make_test_splat(2));
+        const auto third_id = dummy_scene_.addSplat("Third", make_test_splat(2));
+        ASSERT_NE(third_id, core::NULL_NODE);
+        dummy_scene_.setSelectionMask(std::make_shared<core::Tensor>(
+            make_test_selection_mask({1, 0, 2, 0, 3, 3})));
+        ASSERT_EQ(dummy_scene_.consolidateNodeModels(), 3u);
+
+        dummy_scene_.removeNodeById(first_id);
+        ASSERT_EQ(dummy_scene_.getNodeById(first_id), nullptr);
+        ASSERT_TRUE(dummy_scene_.isConsolidated());
+        EXPECT_EQ(dummy_scene_.capturePerNodeSelectionSlices().size(), 2u);
+        EXPECT_EQ(selection_mask_values(dummy_scene_), (std::vector<uint8_t>{2, 0, 3, 3}));
+
+        dummy_scene_.removeNodeById(second_id);
+        EXPECT_EQ(dummy_scene_.getNodeById(second_id), nullptr);
+        EXPECT_EQ(selection_mask_values(dummy_scene_), (std::vector<uint8_t>{3, 3}));
+    }
+
+    // Once a removal starts it must finish; a selection it cannot map is cleared.
+    TEST_F(SceneValidityTest, RemovalCompletesWhenSelectionCannotBeMapped) {
+        const auto first_id = dummy_scene_.addSplat("First", make_test_splat(2));
+        const auto second_id = dummy_scene_.addSplat("Second", make_test_splat(2));
+        dummy_scene_.setSelectionMask(std::make_shared<core::Tensor>(
+            make_test_selection_mask({1, 0, 0, 2})));
+        ASSERT_EQ(dummy_scene_.consolidateNodeModels(), 2u);
+        auto* second = dummy_scene_.getNodeById(second_id);
+        ASSERT_NE(second, nullptr);
+        second->gaussian_count.store(3, std::memory_order_release);
+
+        EXPECT_NO_THROW(dummy_scene_.removeNodeById(first_id));
+        EXPECT_EQ(dummy_scene_.getNodeById(first_id), nullptr);
+        for (const auto value : selection_mask_values(dummy_scene_)) {
+            EXPECT_EQ(value, 0);
+        }
         second->gaussian_count.store(2, std::memory_order_release);
     }
 
@@ -1487,9 +1532,11 @@ namespace lfs::python {
                     const size_t requested_capacity,
                     const core::DataType dtype,
                     const std::string_view name) {
-                EXPECT_EQ(dtype, core::DataType::Float32);
+                EXPECT_EQ(dtype, name == "SplatData.shN" ? core::DataType::Float16 : core::DataType::Float32)
+                    << name;
                 calls->push_back({std::string{name}, requested_capacity});
-                auto tensor = core::Tensor::zeros_direct(std::move(shape), requested_capacity, core::Device::GPU);
+                auto tensor =
+                    core::Tensor::zeros_direct(std::move(shape), requested_capacity, core::Device::GPU, dtype);
                 tensor.set_name(std::string{name});
                 return tensor;
             };
@@ -1523,8 +1570,8 @@ namespace lfs::python {
         EXPECT_LE(model->scaling_raw().capacity(), capacity);
         EXPECT_LE(model->rotation_raw().capacity(), capacity);
         EXPECT_LE(model->opacity_raw().capacity(), capacity);
-        EXPECT_LE(model->shN_raw().capacity(),
-                  core::sh_swizzled_float_count(capacity, core::sh_rest_coefficients_for_degree(1)));
+        const auto rest = static_cast<std::uint32_t>(core::sh_rest_coefficients_for_degree(1));
+        EXPECT_LE(model->shN_raw().capacity(), core::sh_value_quant::sh_value_u16_count(capacity, rest));
 
         const auto max_capacity_for = [&](const std::string_view name) -> size_t {
             size_t max_capacity = 0;
@@ -1540,8 +1587,9 @@ namespace lfs::python {
         EXPECT_EQ(max_capacity_for("SplatData.scaling"), capacity);
         EXPECT_EQ(max_capacity_for("SplatData.rotation"), capacity);
         EXPECT_EQ(max_capacity_for("SplatData.opacity"), capacity);
-        EXPECT_EQ(max_capacity_for("SplatData.shN"),
-                  core::sh_swizzled_float_count(capacity, core::sh_rest_coefficients_for_degree(1)));
+        EXPECT_EQ(max_capacity_for("SplatData.shN"), core::sh_value_quant::sh_value_u16_count(capacity, rest));
+        EXPECT_EQ(max_capacity_for("SplatData.shN_value_bounds"),
+                  core::sh_value_quant::n_bounds_for_prims(capacity) * 2);
     }
 
     TEST_F(SceneValidityTest, MigrateTrainingModelAcceptsCudaOnlyExportableStorage) {
@@ -2070,6 +2118,119 @@ namespace lfs::python {
         for (int col = 0; col < 4; ++col)
             for (int row = 0; row < 4; ++row)
                 EXPECT_NEAR(world_before[col][row], world_after[col][row], 1e-4f);
+    }
+
+    TEST_F(SceneValidityTest, ReparentRejectsUnrepresentableParentInverseWithoutMutation) {
+        const auto group = dummy_scene_.addGroup("TinyGroup");
+        const auto splat = dummy_scene_.addSplat("Child", make_test_splat(1));
+        const glm::mat4 local_before = dummy_scene_.getNodeById(splat)->local_transform.get();
+        const glm::mat4 tiny_scale = glm::scale(glm::mat4(1.0f), glm::vec3(1e-18f));
+        dummy_scene_.setNodeTransform(group, tiny_scale);
+
+        EXPECT_FALSE(dummy_scene_.reparent(splat, group));
+        EXPECT_EQ(dummy_scene_.getNodeById(splat)->parent_id, core::NULL_NODE);
+        EXPECT_TRUE(dummy_scene_.getNodeById(group)->children.empty());
+        EXPECT_EQ(dummy_scene_.getNodeById(splat)->local_transform.get(), local_before);
+    }
+
+    TEST_F(SceneValidityTest, MoveRejectsUnrepresentableParentInverseWithoutMutation) {
+        const auto group = dummy_scene_.addGroup("TinyGroup");
+        const auto splat = dummy_scene_.addSplat("Child", make_test_splat(1));
+        const glm::mat4 local_before = dummy_scene_.getNodeById(splat)->local_transform.get();
+        const glm::mat4 tiny_scale = glm::scale(glm::mat4(1.0f), glm::vec3(1e-18f));
+        dummy_scene_.setNodeTransform(group, tiny_scale);
+
+        EXPECT_FALSE(dummy_scene_.moveNode(splat, group, -1));
+        EXPECT_EQ(dummy_scene_.getNodeById(splat)->parent_id, core::NULL_NODE);
+        EXPECT_TRUE(dummy_scene_.getNodeById(group)->children.empty());
+        EXPECT_EQ(dummy_scene_.getNodeById(splat)->local_transform.get(), local_before);
+    }
+
+    TEST_F(SceneValidityTest, ReparentAndMoveAcceptFiniteAnisotropicParentsAndPreserveWorldTransform) {
+        const std::array<glm::vec3, 2> scales = {
+            glm::vec3(1.0f, 1.0f, 1.0e-7f), glm::vec3(1.0e3f, 1.0e-3f, 1.0f)};
+        for (size_t index = 0; index < scales.size(); ++index) {
+            const auto group = dummy_scene_.addGroup("AnisotropicGroup" + std::to_string(index));
+            const auto splat = dummy_scene_.addSplat("AnisotropicChild" + std::to_string(index),
+                                                     make_test_splat(1));
+            const auto moved = dummy_scene_.addSplat("AnisotropicMoved" + std::to_string(index),
+                                                     make_test_splat(1));
+            ASSERT_NE(group, core::NULL_NODE);
+            ASSERT_NE(splat, core::NULL_NODE);
+            ASSERT_NE(moved, core::NULL_NODE);
+
+            dummy_scene_.setNodeTransform(group, glm::scale(glm::mat4(1.0f), scales[index]));
+            glm::mat4 child_transform = glm::translate(glm::mat4(1.0f), glm::vec3(0.5f, -2.0f, 3.0f));
+            child_transform = glm::rotate(child_transform, 0.17f, glm::vec3(0.0f, 0.0f, 1.0f));
+            dummy_scene_.setNodeTransform(splat, child_transform);
+            child_transform[3][0] += 2.0f;
+            dummy_scene_.setNodeTransform(moved, child_transform);
+            const glm::mat4 world_before = dummy_scene_.getWorldTransform(splat);
+            const glm::mat4 moved_world_before = dummy_scene_.getWorldTransform(moved);
+
+            ASSERT_TRUE(dummy_scene_.reparent(splat, group));
+            ASSERT_TRUE(dummy_scene_.moveNode(moved, group, -1));
+            const glm::mat4 world_after = dummy_scene_.getWorldTransform(splat);
+            const glm::mat4 moved_world_after = dummy_scene_.getWorldTransform(moved);
+            for (int column = 0; column < 4; ++column) {
+                for (int row = 0; row < 3; ++row) {
+                    const float tolerance = 1.0e-4f * std::max(1.0f, std::abs(world_before[column][row]));
+                    EXPECT_NEAR(world_after[column][row], world_before[column][row], tolerance);
+                    const float moved_tolerance =
+                        1.0e-4f * std::max(1.0f, std::abs(moved_world_before[column][row]));
+                    EXPECT_NEAR(moved_world_after[column][row], moved_world_before[column][row], moved_tolerance);
+                }
+            }
+        }
+    }
+
+    TEST_F(SceneValidityTest, ReparentRejectsZeroAndTinyNestedParentsWithoutMutation) {
+        const auto outer = dummy_scene_.addGroup("OuterGroup");
+        const auto inner = dummy_scene_.addGroup("InnerGroup", outer);
+        const auto splat = dummy_scene_.addSplat("Child", make_test_splat(1));
+        ASSERT_NE(outer, core::NULL_NODE);
+        ASSERT_NE(inner, core::NULL_NODE);
+        ASSERT_NE(splat, core::NULL_NODE);
+        const glm::mat4 local_before = dummy_scene_.getNodeById(splat)->local_transform.get();
+
+        for (const float scale : {0.0f, 1.0e-30f}) {
+            dummy_scene_.setNodeTransform(outer, glm::scale(glm::mat4(1.0f), glm::vec3(scale)));
+            EXPECT_FALSE(dummy_scene_.reparent(splat, inner));
+            EXPECT_EQ(dummy_scene_.getNodeById(splat)->parent_id, core::NULL_NODE);
+            EXPECT_TRUE(dummy_scene_.getNodeById(inner)->children.empty());
+            EXPECT_EQ(dummy_scene_.getNodeById(splat)->local_transform.get(), local_before);
+        }
+    }
+
+    TEST_F(SceneValidityTest, ReparentAndMoveMatchLegacyInverseForFiniteParents) {
+        const auto group = dummy_scene_.addGroup("TransformedGroup");
+        const auto reparented = dummy_scene_.addSplat("Reparented", make_test_splat(1));
+        const auto moved = dummy_scene_.addSplat("Moved", make_test_splat(1));
+
+        glm::mat4 group_transform = glm::translate(glm::mat4(1.0f), glm::vec3(2.0f, -3.0f, 4.0f));
+        group_transform = glm::rotate(group_transform, 0.37f, glm::vec3(0.0f, 1.0f, 0.0f));
+        group_transform = glm::scale(group_transform, glm::vec3(1.25f, 0.75f, 1.5f));
+        dummy_scene_.setNodeTransform(group, group_transform);
+
+        glm::mat4 reparented_transform = glm::translate(glm::mat4(1.0f), glm::vec3(-1.0f, 0.5f, 2.0f));
+        reparented_transform = glm::rotate(reparented_transform, -0.23f, glm::vec3(1.0f, 0.0f, 0.0f));
+        dummy_scene_.setNodeTransform(reparented, reparented_transform);
+        const glm::mat4 reparented_world = dummy_scene_.getWorldTransform(reparented);
+        const glm::mat4 expected_reparented_local =
+            glm::inverse(dummy_scene_.getWorldTransform(group)) * reparented_world;
+
+        ASSERT_TRUE(dummy_scene_.reparent(reparented, group));
+        EXPECT_EQ(dummy_scene_.getNodeById(reparented)->local_transform.get(), expected_reparented_local);
+
+        glm::mat4 moved_transform = glm::translate(glm::mat4(1.0f), glm::vec3(0.25f, 1.5f, -2.0f));
+        moved_transform = glm::rotate(moved_transform, 0.19f, glm::vec3(0.0f, 0.0f, 1.0f));
+        dummy_scene_.setNodeTransform(moved, moved_transform);
+        const glm::mat4 moved_world = dummy_scene_.getWorldTransform(moved);
+        const glm::mat4 expected_moved_local =
+            glm::inverse(dummy_scene_.getWorldTransform(group)) * moved_world;
+
+        ASSERT_TRUE(dummy_scene_.moveNode(moved, group, -1));
+        EXPECT_EQ(dummy_scene_.getNodeById(moved)->local_transform.get(), expected_moved_local);
     }
 
     TEST_F(SceneValidityTest, SceneManagerMoveNodeReparentsIntoGroup) {

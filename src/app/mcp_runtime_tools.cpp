@@ -4,6 +4,8 @@
 #include "app/mcp_runtime_tools.hpp"
 #include "app/mcp_app_utils.hpp"
 #include "app/mcp_event_handlers.hpp"
+#include "app/mcp_media_tools.hpp"
+#include "app/mcp_node_tools.hpp"
 
 #include "core/event_bridge/scoped_handler.hpp"
 #include "core/events.hpp"
@@ -40,11 +42,47 @@ namespace lfs::app {
         using json = nlohmann::json;
         using mcp::McpResourceContent;
 
-        constexpr std::array<std::string_view, 7> kRuntimeJobIds = {
+        json frame_snapshot_json(const vis::FrameLedgerSnapshot& snapshot) {
+            json presents_by_reason = json::object();
+            json view_renders_by_reason = json::object();
+            json holders = json::array();
+            json last_frame_reasons = json::array();
+            for (std::size_t i = 0; i < static_cast<std::size_t>(vis::FrameReason::Count); ++i) {
+                const auto reason = static_cast<vis::FrameReason>(i);
+                presents_by_reason[vis::frameReasonName(reason)] = snapshot.presents_by_reason[i];
+                view_renders_by_reason[vis::frameReasonName(reason)] = snapshot.view_renders_by_reason[i];
+                if (snapshot.last_frame_reasons.test(i))
+                    last_frame_reasons.push_back(vis::frameReasonName(reason));
+            }
+            for (const auto& holder : snapshot.live_holders) {
+                holders.push_back(json{{"reason", vis::frameReasonName(holder.reason)},
+                                       {"scope", holder.scope == vis::FrameScope::Gui ? "gui" : "view"},
+                                       {"detail", holder.detail},
+                                       {"age_ms", std::chrono::duration<double, std::milli>(holder.age).count()}});
+            }
+            return json{{"frames_presented", snapshot.frames_presented},
+                        {"views_rendered", snapshot.views_rendered[0]},
+                        {"views_rendered_by_view", snapshot.views_rendered},
+                        {"presents_by_reason", std::move(presents_by_reason)},
+                        {"view_renders_by_reason", std::move(view_renders_by_reason)},
+                        {"frames_without_reason", snapshot.frames_without_reason},
+                        {"wakes_without_frame", snapshot.wakes_without_frame},
+                        {"holders_expired", snapshot.holders_expired},
+                        {"preview_skipped_no_step", snapshot.preview_skipped_no_step},
+                        {"stale_detections", snapshot.stale_detections},
+                        {"requests_dropped", snapshot.requests_dropped},
+                        {"last_frame_reasons", std::move(last_frame_reasons)},
+                        {"last_frame_details", snapshot.last_frame_details},
+                        {"live_holders", std::move(holders)}};
+        }
+
+        constexpr std::array<std::string_view, 9> kRuntimeJobIds = {
+            "nodes.evaluate",
             "editor.python",
             "training.main",
             "export.scene",
             "import.dataset",
+            "media.extract",
             "export.video",
             "mesh2splat",
             "operator.modal",
@@ -75,6 +113,10 @@ namespace lfs::app {
         }
 
         std::string_view runtime_job_label(const std::string_view job_id) {
+            if (job_id == "media.extract")
+                return "Media Extraction";
+            if (job_id == "nodes.evaluate")
+                return "Node evaluation";
             if (job_id == "editor.python") {
                 return "Python Editor";
             }
@@ -100,6 +142,10 @@ namespace lfs::app {
         }
 
         json runtime_job_event_types_json(const std::string_view job_id) {
+            if (job_id == "media.extract")
+                return json::array({"media.extract.started", "media.extract.progress", "media.extract.completed", "media.extract.failed", "media.extract.cancelled"});
+            if (job_id == "nodes.evaluate")
+                return json::array({"nodes.evaluation.started", "nodes.evaluation.progress", "nodes.evaluation.completed", "nodes.evaluation.failed"});
             if (job_id == "editor.python") {
                 return json::array({"editor.started", "editor.completed"});
             }
@@ -171,6 +217,11 @@ namespace lfs::app {
                 });
             }
 
+            json node_tools = json::array();
+            for (const auto& tool : mcp::ToolRegistry::instance().list_tools())
+                if (tool.metadata.category == "nodes")
+                    node_tools.push_back(mcp::tool_to_json(tool).at("name"));
+
             return json{
                 {"catalog_uri", "lichtfeld://runtime/catalog"},
                 {"state_uri", "lichtfeld://runtime/state"},
@@ -180,7 +231,15 @@ namespace lfs::app {
                 {"supported_event_types", supported_runtime_event_types_json()},
                 {"jobs", std::move(jobs)},
                 {"events", std::move(events)},
+                {"nodes", {{"tools", std::move(node_tools)}, {"resources", json::array({"lichtfeld://nodes/types", "lichtfeld://nodes/trees", "lichtfeld://nodes/trees/<uuid>", "lichtfeld://nodes/stacks", "lichtfeld://nodes/stacks/<node uuid>", "lichtfeld://nodes/editor"})}, {"job_id", "nodes.evaluate"}}},
             };
+        }
+
+        template <typename F>
+        auto dispatch_job_work(vis::Visualizer* viewer, const std::string_view job_id, F&& work) {
+            if (job_id == "media.extract")
+                return std::invoke(std::forward<F>(work));
+            return post_and_wait(viewer, std::forward<F>(work));
         }
 
         vis::VisualizerImpl* as_visualizer_impl(vis::Visualizer* viewer) {
@@ -217,6 +276,8 @@ namespace lfs::app {
                 return "ssog";
             case core::ExportFormat::SPZ:
                 return "spz";
+            case core::ExportFormat::GLB:
+                return "glb";
             case core::ExportFormat::HTML_VIEWER:
                 return "html_viewer";
             case core::ExportFormat::USD:
@@ -370,14 +431,15 @@ namespace lfs::app {
                     "Trainer manager is not initialized");
             }
 
-            const auto state = trainer->getState();
+            const bool preparing = viewer.isTrainingStartPending();
+            const auto state = preparing ? vis::TrainingState::Starting : trainer->getState();
             const int total_iterations = trainer->getTotalIterations();
             const int current_iteration = trainer->getCurrentIteration();
             json payload{
                 {"id", "training.main"},
                 {"label", "Training"},
                 {"kind", "training"},
-                {"active", trainer->isTrainingActive()},
+                {"active", preparing || trainer->isTrainingActive()},
                 {"status",
                  state == vis::TrainingState::Finished && !trainer->getLastError().empty()
                      ? "failed"
@@ -478,7 +540,7 @@ namespace lfs::app {
             const std::string stage = tasks.getImportStage();
             const std::string outcome = tasks.getImportOutcome();
             const bool success = tasks.getImportSuccess();
-            const bool cancellable = tasks.canCancelGalleryImport();
+            const bool cancellable = tasks.canCancelImport();
 
             std::string status = "idle";
             if (active) {
@@ -656,12 +718,23 @@ namespace lfs::app {
             const bool include_output,
             const size_t output_max_chars,
             const bool output_tail) {
+            if (job_id == "media.extract") {
+                auto result = media_extract_job_snapshot();
+                add_runtime_job_links(result);
+                return result;
+            }
             auto* const viewer_impl = as_visualizer_impl(viewer);
             if (!viewer_impl) {
                 return std::unexpected("Visualizer implementation is unavailable");
             }
 
             auto* const gui = viewer_impl->getGuiManager();
+
+            if (job_id == "nodes.evaluate") {
+                auto result = node_evaluation_job(*viewer_impl);
+                add_runtime_job_links(result);
+                return result;
+            }
 
             if (job_id == "editor.python") {
                 return editor_job_json(include_output, output_max_chars, output_tail);
@@ -738,6 +811,18 @@ namespace lfs::app {
                 }
             }
 
+            json frames = json::object();
+            if (viewer) {
+                if (auto* const rendering = viewer->getRenderingManager()) {
+                    const auto snapshot = rendering->frameDemandLedger().snapshot();
+                    frames = frame_snapshot_json(snapshot);
+                    frames["view_ids"] = rendering->ledgerViews();
+                    const auto rates = rendering->getFrameRates();
+                    frames["ui_fps"] = rates.ui;
+                    frames["viewport_fps"] = rates.view;
+                }
+            }
+
             return json{
                 {"catalog_uri", "lichtfeld://runtime/catalog"},
                 {"state_uri", "lichtfeld://runtime/state"},
@@ -749,6 +834,7 @@ namespace lfs::app {
                 {"active_job_count", active_jobs},
                 {"cancellable_job_count", cancellable_jobs},
                 {"jobs", std::move(jobs)},
+                {"frames", std::move(frames)},
             };
         }
 
@@ -918,6 +1004,10 @@ namespace lfs::app {
                 if (details.contains("current_frame")) {
                     fingerprint["current_frame"] = details["current_frame"];
                 }
+                if (job.value("id", "") == "media.extract") {
+                    fingerprint["processed"] = details.value("processed", 0);
+                    fingerprint["generation"] = details.value("generation", std::uint64_t{0});
+                }
             }
             return fingerprint;
         }
@@ -941,6 +1031,13 @@ namespace lfs::app {
             vis::Visualizer* viewer,
             const std::string& job_id,
             const std::string& action) {
+            if (job_id == "media.extract") {
+                if (action != "cancel")
+                    return std::unexpected("Action '" + action + "' is not supported for media.extract");
+                if (const auto result = cancel_media_extract_job(); !result)
+                    return std::unexpected(std::string(result.error().user_message()));
+                return {};
+            }
             auto* const viewer_impl = as_visualizer_impl(viewer);
             if (!viewer_impl) {
                 return std::unexpected("Visualizer implementation is unavailable");
@@ -1009,7 +1106,7 @@ namespace lfs::app {
             }
 
             if (job_id == "import.dataset") {
-                if (action == "cancel" && gui && gui->asyncTasks().requestGalleryImportCancel())
+                if (action == "cancel" && gui && gui->asyncTasks().requestImportCancel())
                     return {};
                 if (action != "dismiss") {
                     return std::unexpected("Action '" + action + "' is not supported for import.dataset");
@@ -1092,6 +1189,38 @@ namespace lfs::app {
 
         registry.register_tool(
             mcp::McpTool{
+                .name = "runtime.frame_ledger",
+                .description = "Read frame-demand counters, current holders, and the latest frame reasons",
+                .input_schema = {
+                    .type = "object",
+                    .properties = json{
+                        {"reset", json{{"type", "boolean"}, {"description", "Reset counters before taking the snapshot (default: false)"}}}},
+                    .required = {}},
+                .metadata = mcp::McpToolMetadata{
+                    .category = "runtime",
+                    .kind = "query",
+                    .runtime = "any",
+                    .thread_affinity = "any_thread",
+                }},
+            [viewer](const json& args) -> json {
+                const bool reset = args.value("reset", false);
+                auto* const rendering = viewer ? viewer->getRenderingManager() : nullptr;
+                if (!rendering)
+                    return json{{"success", false}, {"error", "Rendering manager is unavailable"}};
+                auto& ledger = rendering->frameDemandLedger();
+                if (reset)
+                    ledger.resetCounters();
+                const auto snapshot = ledger.snapshot();
+                auto frames = frame_snapshot_json(snapshot);
+                frames["view_ids"] = rendering->ledgerViews();
+                const auto rates = rendering->getFrameRates();
+                frames["ui_fps"] = rates.ui;
+                frames["viewport_fps"] = rates.view;
+                return json{{"success", true}, {"frames", std::move(frames)}};
+            });
+
+        registry.register_tool(
+            mcp::McpTool{
                 .name = "runtime.job.describe",
                 .description = "Describe one normalized runtime job, including output snapshots when available",
                 .input_schema = {
@@ -1115,7 +1244,7 @@ namespace lfs::app {
                     static_cast<size_t>(std::max(0, args.value("output_max_chars", 20000)));
                 const bool output_tail = args.value("output_tail", true);
 
-                return post_and_wait(viewer, [viewer, job_id, include_output, output_max_chars, output_tail]() -> json {
+                return dispatch_job_work(viewer, job_id, [viewer, job_id, include_output, output_max_chars, output_tail]() -> json {
                     auto payload = describe_job_payload_on_gui(
                         viewer,
                         job_id,
@@ -1167,7 +1296,7 @@ namespace lfs::app {
                 const bool output_tail = args.value("output_tail", true);
 
                 auto describe = [&]() -> std::expected<json, std::string> {
-                    return post_and_wait(viewer, [viewer, &job_id, include_output, output_max_chars, output_tail]() {
+                    return dispatch_job_work(viewer, job_id, [viewer, &job_id, include_output, output_max_chars, output_tail]() {
                         return describe_job_payload_on_gui(
                             viewer,
                             job_id,
@@ -1241,7 +1370,7 @@ namespace lfs::app {
                     static_cast<size_t>(std::max(0, args.value("output_max_chars", 20000)));
                 const bool output_tail = args.value("output_tail", true);
 
-                return post_and_wait(viewer, [viewer, job_id, action, include_output, output_max_chars, output_tail]() -> json {
+                return dispatch_job_work(viewer, job_id, [viewer, job_id, action, include_output, output_max_chars, output_tail]() -> json {
                     if (auto result = control_job_on_gui(viewer, job_id, action); !result) {
                         return json{{"error", result.error()}};
                     }
@@ -1366,7 +1495,7 @@ namespace lfs::app {
                     return std::unexpected("Runtime job URI must include an id");
                 }
 
-                return post_and_wait(viewer, [viewer, uri, job_id]() -> std::expected<std::vector<McpResourceContent>, std::string> {
+                return dispatch_job_work(viewer, job_id, [viewer, uri, job_id]() -> std::expected<std::vector<McpResourceContent>, std::string> {
                     auto payload = describe_job_payload_on_gui(viewer, job_id, true, 20000, true);
                     if (!payload) {
                         return std::unexpected(payload.error());

@@ -7,22 +7,26 @@
 
 #include "checkpoint.hpp"
 #include "core/gpu_elapsed.hpp"
+#include "core/host_metrics.hpp"
 #include "core/logger.hpp"
 #include "core/resource_messages.hpp"
 #include "core/sh_layout.hpp"
 #include "core/sh_value_quant.hpp"
-#include "core/sh_value_quant_kernels.hpp"
 #include "core/splat_exportable_storage.hpp"
 #include "core/tensor.hpp"
+#include "core/tensor_execution.hpp"
+#include "core/tensor_label.hpp"
 #include "core/tensor_readback.hpp"
 #include "core/tensor_serialization_sink.hpp"
 #include "core/tensor_upload.hpp"
-
+#include "diagnostics/vram_profiler.hpp"
+#include "lfs/training/ops/registry.hpp"
 #include "lfs/training/sh_value_codec.hpp"
 #include "strategies/istrategy.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -46,8 +50,15 @@
 #include <thread>
 #include <utility>
 
+#if defined(__APPLE__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 #if defined(_WIN32)
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -56,6 +67,150 @@
 #endif
 
 namespace lfs::training {
+
+    namespace {
+#if defined(__APPLE__)
+        constexpr std::size_t FILE_BACKED_SNAPSHOT_THRESHOLD =
+            64ull * 1024 * 1024;
+#endif
+    } // namespace
+
+    struct TrainingSnapshotBytes::Impl {
+        std::unique_ptr<std::byte[]> bytes;
+        std::FILE* file = nullptr;
+        mutable void* mapping = nullptr;
+        std::size_t size = 0;
+    };
+
+    TrainingSnapshotBytes::TrainingSnapshotBytes(
+        const std::size_t size,
+        const bool overwrite)
+        : impl_(std::make_unique<Impl>()) {
+        impl_->size = size;
+#if defined(__APPLE__)
+        if (size >= FILE_BACKED_SNAPSHOT_THRESHOLD) {
+            // An unlinked spool keeps the capture out of anonymous memory; the
+            // kernel can evict its clean pages under pressure. Without a usable
+            // temporary file the capture falls back to heap staging.
+            impl_->file = std::tmpfile();
+            if (impl_->file &&
+                ::ftruncate(::fileno(impl_->file), static_cast<off_t>(size)) == 0) {
+                return;
+            }
+            LOG_WARN("Checkpoint spool unavailable ({}); staging {} bytes in memory",
+                     std::strerror(errno), size);
+            if (impl_->file) {
+                std::fclose(impl_->file);
+                impl_->file = nullptr;
+            }
+        }
+#endif
+        impl_->bytes = overwrite
+                           ? std::make_unique_for_overwrite<std::byte[]>(size)
+                           : std::make_unique<std::byte[]>(size);
+    }
+
+    TrainingSnapshotBytes::~TrainingSnapshotBytes() {
+#if defined(__APPLE__)
+        if (impl_ && impl_->mapping) {
+            ::munmap(impl_->mapping, impl_->size);
+        }
+#endif
+        if (impl_ && impl_->file) {
+            std::fclose(impl_->file);
+        }
+    }
+
+    std::size_t TrainingSnapshotBytes::size() const noexcept {
+        return impl_->size;
+    }
+
+    std::byte* TrainingSnapshotBytes::data() noexcept {
+        return impl_->bytes.get();
+    }
+
+    const std::byte* TrainingSnapshotBytes::data() const noexcept {
+        return impl_->bytes.get();
+    }
+
+    bool TrainingSnapshotBytes::file_backed() const noexcept {
+        return impl_->file != nullptr;
+    }
+
+    lfs::Result<std::span<const std::byte>>
+    TrainingSnapshotBytes::mapped_data() const {
+        if (impl_->bytes) {
+            return std::span<const std::byte>(impl_->bytes.get(), impl_->size);
+        }
+#if defined(__APPLE__)
+        if (!impl_->mapping) {
+            impl_->mapping = ::mmap(
+                nullptr, impl_->size, PROT_READ, MAP_SHARED,
+                ::fileno(impl_->file), 0);
+            if (impl_->mapping == MAP_FAILED) {
+                impl_->mapping = nullptr;
+                return lfs::make_error(lfs::ErrorInit{
+                    .code = lfs::ErrorCode::Unavailable,
+                    .domain = lfs::ErrorDomain::Training,
+                    .user_message =
+                        "The training snapshot could not be mapped.",
+                    .detail = std::format(
+                        "Checkpoint spool mapping failed: {}",
+                        std::strerror(errno)),
+                    .detection = LFS_SOURCE_SITE_CURRENT(),
+                });
+            }
+        }
+        return std::span<const std::byte>(
+            static_cast<const std::byte*>(impl_->mapping), impl_->size);
+#else
+        return lfs::make_error(lfs::ErrorInit{
+            .code = lfs::ErrorCode::Unavailable,
+            .domain = lfs::ErrorDomain::Training,
+            .user_message = "The training snapshot could not be mapped.",
+            .detail = "Checkpoint spool mapping is unavailable",
+            .detection = LFS_SOURCE_SITE_CURRENT(),
+        });
+#endif
+    }
+
+    void TrainingSnapshotBytes::write_at(
+        const std::uint64_t offset,
+        std::span<const std::byte> source) {
+        if (offset > impl_->size ||
+            source.size() > impl_->size - offset) {
+            throw std::out_of_range(
+                "Checkpoint spool write is out of bounds");
+        }
+        if (source.empty()) {
+            return;
+        }
+        if (impl_->bytes) {
+            std::memcpy(impl_->bytes.get() + offset,
+                        source.data(), source.size());
+            return;
+        }
+#if defined(__APPLE__)
+        std::size_t completed = 0;
+        while (completed < source.size()) {
+            const auto written = ::pwrite(
+                ::fileno(impl_->file), source.data() + completed,
+                source.size() - completed,
+                static_cast<off_t>(offset + completed));
+            if (written < 0 && errno == EINTR) {
+                continue;
+            }
+            if (written <= 0) {
+                throw std::runtime_error(std::format(
+                    "Checkpoint spool write failed: {}",
+                    std::strerror(errno)));
+            }
+            completed += static_cast<std::size_t>(written);
+        }
+#else
+        throw std::runtime_error("Checkpoint spool is unavailable");
+#endif
+    }
 
     namespace {
 
@@ -147,6 +302,10 @@ namespace lfs::training {
                 }
                 break;
             }
+#elif defined(__APPLE__)
+            // /proc is unavailable on macOS. Reuse core's Mach resident-size
+            // query instead of reporting a zero delta for every capture.
+            return core::host_metrics::sample().process_rss_bytes;
 #endif
             return 0;
         }
@@ -165,6 +324,13 @@ namespace lfs::training {
                 result = {
                     .total_bytes = status.ullTotalPhys,
                     .available_bytes = status.ullAvailPhys,
+                };
+            }
+#elif defined(__APPLE__)
+            if (const auto memory = core::host_metrics::memory()) {
+                result = {
+                    .total_bytes = memory->total_bytes,
+                    .available_bytes = memory->available_bytes,
                 };
             }
 #elif defined(__linux__)
@@ -273,7 +439,7 @@ namespace lfs::training {
                 lfs::core::DataType::Float32;
             lfs::core::Device source_device =
                 lfs::core::Device::CPU;
-            void* source_stream = nullptr;
+            std::optional<lfs::core::TensorExecutionTarget> source_stream;
             std::uint64_t source_bytes = 0;
             const void* auxiliary_source_pointer = nullptr;
             lfs::core::TensorShape auxiliary_source_shape;
@@ -281,7 +447,7 @@ namespace lfs::training {
                 lfs::core::DataType::Float32;
             lfs::core::Device auxiliary_source_device =
                 lfs::core::Device::CPU;
-            void* auxiliary_source_stream = nullptr;
+            std::optional<lfs::core::TensorExecutionTarget> auxiliary_source_stream;
             lfs::core::TensorSerializationDescriptor descriptor;
             std::uint64_t payload_offset = 0;
             std::uint64_t payload_bytes = 0;
@@ -394,7 +560,7 @@ namespace lfs::training {
                     .source_shape = source.shape(),
                     .source_dtype = source.dtype(),
                     .source_device = source.device(),
-                    .source_stream = source.stream(),
+                    .source_stream = source.execution_target(),
                     .source_bytes = source.bytes(),
                     .auxiliary_source_pointer =
                         auxiliary_source
@@ -415,8 +581,8 @@ namespace lfs::training {
                             : lfs::core::Device::CPU,
                     .auxiliary_source_stream =
                         auxiliary_source
-                            ? auxiliary_source->stream()
-                            : nullptr,
+                            ? std::make_optional(auxiliary_source->execution_target())
+                            : std::nullopt,
                     .descriptor = descriptor,
                     .payload_offset =
                         static_cast<std::uint64_t>(
@@ -702,14 +868,15 @@ namespace lfs::training {
         std::uint64_t checkpoint_bytes = 0;
         std::uint64_t device_snapshot_bytes = 0;
         std::vector<TensorLayoutWitness> layout;
-        std::shared_ptr<std::vector<std::byte>> staging;
+        std::shared_ptr<TrainingSnapshotBytes> staging;
         TrainingSnapshotPauseMetrics metrics;
     };
 
     struct PendingTrainingSnapshot::Impl {
         mutable std::mutex mutex;
         std::condition_variable drained_condition;
-        std::shared_ptr<std::vector<std::byte>> staging;
+        std::shared_ptr<TrainingSnapshotBytes> staging;
+        std::uint64_t baseline_rss_bytes = 0;
         TrainingSnapshotPauseMetrics metrics;
         std::vector<PieceStamp> stamps;
         std::size_t outstanding_drains = 0;
@@ -740,6 +907,54 @@ namespace lfs::training {
             std::optional<DrainTask> task;
         };
 
+        // Recycle at most one Metal checkpoint allocation, only after its
+        // last immutable owner has released it. A new shared_ptr control block
+        // prevents old weak owners from acquiring a buffer being overwritten.
+        struct StagingPool {
+            explicit StagingPool(const std::size_t max_retired_bytes)
+                : max_retired_bytes(max_retired_bytes) {}
+
+            std::mutex mutex;
+            std::unique_ptr<TrainingSnapshotBytes> retired;
+            const std::size_t max_retired_bytes;
+
+            std::unique_ptr<TrainingSnapshotBytes> take(const std::size_t bytes) {
+                std::scoped_lock lock(mutex);
+                if (retired && retired->size() == bytes)
+                    return std::move(retired);
+                retired.reset();
+                return {};
+            }
+
+            void release(std::unique_ptr<TrainingSnapshotBytes> bytes) {
+                std::scoped_lock lock(mutex);
+                if (!retired && !bytes->file_backed() &&
+                    bytes->size() <= max_retired_bytes)
+                    retired = std::move(bytes);
+            }
+
+            bool trim() {
+                std::scoped_lock lock(mutex);
+                const bool released = bool(retired);
+                retired.reset();
+                return released;
+            }
+        };
+
+        std::shared_ptr<TrainingSnapshotBytes> acquire_staging(const std::size_t bytes) {
+            if (!ring->prefers_recycled_host_staging())
+                return std::make_shared<TrainingSnapshotBytes>(bytes);
+            auto allocation = staging_pool->take(bytes);
+            if (!allocation)
+                allocation = std::make_unique<TrainingSnapshotBytes>(bytes, true);
+            const std::weak_ptr<StagingPool> retired_pool = staging_pool;
+            return std::shared_ptr<TrainingSnapshotBytes>(allocation.release(), [retired_pool](TrainingSnapshotBytes* value) {
+                std::unique_ptr<TrainingSnapshotBytes> retired(value);
+                if (const auto pool = retired_pool.lock())
+                    pool->release(std::move(retired));
+            });
+        }
+
         explicit Impl(TrainingSnapshotServiceConfig value)
             : config(std::move(value)) {
             if (config.ring_slots == 0 ||
@@ -754,6 +969,8 @@ namespace lfs::training {
                 throw std::invalid_argument(
                     "Snapshot ring must be non-zero and no larger than 512 MiB");
             }
+            staging_pool = std::make_shared<StagingPool>(
+                config.ring_slots * config.band_bytes);
         }
 
         ~Impl() {
@@ -762,22 +979,30 @@ namespace lfs::training {
 
         void initialize_resources(
             const std::vector<TensorLayoutWitness>& layout,
-            const std::span<void* const>
-                mutating_streams) {
+            const std::span<const lfs::core::TensorExecutionTarget>
+                mutating_queues) {
             if (!d2h_queue)
-                d2h_queue = std::make_unique<lfs::core::TensorWorkQueue>(lfs::core::GpuBackend::CUDA);
+                d2h_queue = std::make_unique<lfs::core::TensorWorkQueue>(lfs::core::default_gpu_backend());
             ensure_device_scratch();
-            calibrate_once(layout, mutating_streams);
+            calibrate_once(layout, mutating_queues);
+            device_scratch = {};
             if (slots.empty()) {
-                ring = std::make_unique<lfs::core::TensorReadbackRing>(lfs::core::GpuBackend::CUDA,
+                ring = std::make_unique<lfs::core::TensorReadbackRing>(d2h_queue->backend(),
                                                                        config.ring_slots, config.band_bytes, *d2h_queue, &device_scratch);
                 slots.resize(config.ring_slots);
                 for (size_t i = 0; i < slots.size(); ++i)
                     slots[i].pinned = ring->slot_bytes(i).data();
-                drain_thread = std::jthread(
-                    [this](std::stop_token stop) {
+                // Slots own disjoint staging ranges. A single CPU copy worker
+                // can hold every slot busy while the GPU is already finished,
+                // extending the optimizer pause to pageable-copy throughput.
+                // Keep the workers persistent and bounded with the ring.
+                const auto worker_count = std::min<std::size_t>(slots.size(), 4);
+                drain_threads.reserve(worker_count);
+                for (std::size_t i = 0; i < worker_count; ++i) {
+                    drain_threads.emplace_back([this](std::stop_token stop) {
                         drain_loop(stop);
                     });
+                }
             }
         }
 
@@ -785,41 +1010,43 @@ namespace lfs::training {
             if (device_scratch.is_valid())
                 return;
             lfs::core::TensorWorkQueue::Scope scope(*d2h_queue);
+            lfs::core::TensorLabelScope label("training.snapshot.device_scratch");
             device_scratch = lfs::core::Tensor::empty({config.band_bytes}, lfs::core::Device::GPU,
                                                       lfs::core::DataType::UInt8);
+            device_scratch.set_name("training.snapshot.device_scratch");
         }
 
         void calibrate_once(
             const std::vector<TensorLayoutWitness>& layout,
-            const std::span<void* const>
-                mutating_streams) {
+            const std::span<const lfs::core::TensorExecutionTarget>
+                mutating_queues) {
             std::scoped_lock lock(calibration_mutex);
             if (process_pinned_d2h_bytes_per_second > 0.0) {
                 measured_bandwidth =
                     process_pinned_d2h_bytes_per_second;
                 return;
             }
-            std::set<void*> streams;
-            for (const auto stream : mutating_streams) {
-                if (stream) {
+            std::set<lfs::core::TensorExecutionTarget> streams;
+            for (const auto stream : mutating_queues) {
+                if (!stream.is_default_queue()) {
                     streams.insert(stream);
                 }
             }
             for (const auto& witness : layout) {
                 if (witness.source_device ==
                         lfs::core::Device::GPU &&
-                    witness.source_stream) {
-                    streams.insert(witness.source_stream);
+                    witness.source_stream && !witness.source_stream->is_default_queue()) {
+                    streams.insert(*witness.source_stream);
                 }
                 if (witness.auxiliary_source_device ==
                         lfs::core::Device::GPU &&
-                    witness.auxiliary_source_stream) {
+                    witness.auxiliary_source_stream && !witness.auxiliary_source_stream->is_default_queue()) {
                     streams.insert(
-                        witness.auxiliary_source_stream);
+                        *witness.auxiliary_source_stream);
                 }
             }
             for (const auto stream : streams) {
-                lfs::core::TensorWorkQueue(lfs::core::GpuBackend::CUDA, stream).wait();
+                stream.wait();
             }
             const auto source = std::ranges::max_element(
                 layout, std::less{},
@@ -858,19 +1085,19 @@ namespace lfs::training {
                     "Snapshot calibration requires device scratch");
             }
 
-            lfs::core::TensorReadbackRing calibration(lfs::core::GpuBackend::CUDA, 1, bytes, *d2h_queue, &device_scratch);
+            lfs::core::TensorReadbackRing calibration(d2h_queue->backend(), 1, bytes, *d2h_queue, &device_scratch);
             calibration.enqueue(source->source, 0, bytes, 0, 0, true);
             calibration.seal(0);
             calibration.wait(0);
             calibration.release(0);
-            lfs::core::GpuElapsed elapsed(lfs::core::GpuBackend::CUDA, 2);
-            if (!elapsed.mark(0, d2h_queue->native_handle()))
+            lfs::core::GpuElapsed elapsed(d2h_queue->backend(), 2);
+            if (!elapsed.mark(0, *d2h_queue))
                 throw std::runtime_error("Cannot start readback calibration timer");
             // Every iteration appends to the same slot; one seal covers the batch.
             for (int i = 0; i < config.calibration_iterations; ++i)
                 calibration.enqueue(source->source, 0, bytes, 0, 0, true);
             calibration.seal(0);
-            if (!elapsed.mark(1, d2h_queue->native_handle()) || !elapsed.wait_event(1))
+            if (!elapsed.mark(1, *d2h_queue) || !elapsed.wait_event(1))
                 throw std::runtime_error("Cannot finish readback calibration timer");
             const auto elapsed_ms = elapsed.milliseconds(0, 1);
             if (!elapsed_ms || !(*elapsed_ms > 0.0f))
@@ -910,13 +1137,19 @@ namespace lfs::training {
         void issue_native_to_slot(size_t slot_index, size_t pinned_offset,
                                   const lfs::core::Tensor& source, size_t source_offset, size_t bytes) {
             validate_slot_range(slot_index, pinned_offset, bytes);
-            ring->enqueue(source, source_offset, bytes, slot_index, pinned_offset, true);
+            // Capture waits for the last ring fence before training resumes.
+            // A direct copy already makes the host slot immutable; an extra
+            // source-to-device-scratch copy adds traffic without extending
+            // the snapshot lifetime. Encoded SH still uses device_scratch.
+            ring->enqueue(source, source_offset, bytes, slot_index, pinned_offset);
         }
 
         void issue_sh_to_slot(
             const std::size_t slot_index,
             const std::size_t pinned_offset,
             const TensorLayoutWitness& witness,
+            const lfs::core::Tensor& source,
+            const lfs::core::Tensor* auxiliary,
             const std::uint64_t tensor_byte_offset,
             const std::size_t bytes) {
             validate_slot_range(
@@ -929,66 +1162,38 @@ namespace lfs::training {
             }
             const auto encoding =
                 witness.descriptor.encoding;
+            lfs::gpu_ops::ShStorage storage = lfs::gpu_ops::ShStorage::Float32;
             if (encoding ==
                 lfs::core::TensorPayloadEncoding::
                     QuantizedShToCanonical) {
-                lfs::core::sh_value_quant::
-                    decode_shN_u16_range_to_canonical(
-                        static_cast<const std::uint16_t*>(
-                            witness.source_pointer),
-                        static_cast<const float*>(
-                            witness
-                                .auxiliary_source_pointer),
-                        static_cast<float*>(device_scratch.data_ptr()),
-                        tensor_byte_offset /
-                            sizeof(float),
-                        bytes / sizeof(float),
-                        witness.descriptor.sh_primitives,
-                        witness.descriptor
-                            .sh_coefficients_rest,
-                        witness.descriptor
-                            .sh_layout_coefficients_rest,
-                        static_cast<cudaStream_t>(d2h_queue->native_handle()));
+                storage = lfs::gpu_ops::ShStorage::Q16;
             } else if (encoding ==
                            lfs::core::
                                TensorPayloadEncoding::
                                    SwizzledShToCanonical &&
                        witness.source_dtype ==
                            lfs::core::DataType::Float16) {
-                lfs::core::sh_value_quant::
-                    decode_shN_f16_range_to_canonical(
-                        static_cast<const std::uint16_t*>(
-                            witness.source_pointer),
-                        static_cast<float*>(device_scratch.data_ptr()),
-                        tensor_byte_offset /
-                            sizeof(float),
-                        bytes / sizeof(float),
-                        witness.descriptor.sh_primitives,
-                        witness.descriptor
-                            .sh_coefficients_rest,
-                        witness.descriptor
-                            .sh_layout_coefficients_rest,
-                        static_cast<cudaStream_t>(d2h_queue->native_handle()));
-            } else if (encoding ==
+                storage = lfs::gpu_ops::ShStorage::IeeeFloat16;
+            } else if (encoding !=
                        lfs::core::TensorPayloadEncoding::
                            SwizzledShToCanonical) {
-                lfs::core::
-                    undo_reorder_sh_range_from_swizzled(
-                        static_cast<const float*>(
-                            witness.source_pointer),
-                        static_cast<float*>(device_scratch.data_ptr()),
-                        tensor_byte_offset /
-                            sizeof(float),
-                        bytes / sizeof(float),
-                        witness.descriptor.sh_primitives,
-                        witness.descriptor
-                            .sh_coefficients_rest,
-                        witness.descriptor
-                            .sh_layout_coefficients_rest,
-                        static_cast<cudaStream_t>(d2h_queue->native_handle()));
-            } else {
                 throw std::runtime_error(
                     "Unsupported SH snapshot encoding");
+            }
+            const lfs::core::Tensor absent;
+            {
+                const lfs::core::TensorExecutionTarget::Scope execution_scope(
+                    *d2h_queue);
+                training_sh_ops().decode_range(
+                    source,
+                    auxiliary != nullptr ? *auxiliary : absent,
+                    device_scratch,
+                    {.canonical_float_offset = tensor_byte_offset / sizeof(float),
+                     .float_count = bytes / sizeof(float),
+                     .primitives = witness.descriptor.sh_primitives,
+                     .destination_rest = witness.descriptor.sh_coefficients_rest,
+                     .layout_rest = witness.descriptor.sh_layout_coefficients_rest,
+                     .storage = storage});
             }
             ring->enqueue(device_scratch, 0, bytes, slot_index, pinned_offset);
         }
@@ -1103,16 +1308,19 @@ namespace lfs::training {
                     ring->wait(slot_index);
                     for (const auto& segment :
                          task.segments) {
-                        non_temporal_copy(
-                            task.capture
-                                    ->staging->data() +
-                                segment
-                                    .destination_offset,
-                            static_cast<
-                                const std::byte*>(
-                                slot.pinned) +
+                        const auto source = std::span<const std::byte>(
+                            static_cast<const std::byte*>(slot.pinned) +
                                 segment.pinned_offset,
                             segment.bytes);
+                        if (auto* destination =
+                                task.capture->staging->data()) {
+                            non_temporal_copy(
+                                destination + segment.destination_offset,
+                                source.data(), source.size());
+                        } else {
+                            task.capture->staging->write_at(
+                                segment.destination_offset, source);
+                        }
                     }
                     ring->release(slot_index);
                 } catch (const std::exception& e) {
@@ -1173,6 +1381,9 @@ namespace lfs::training {
             const std::shared_ptr<
                 PendingTrainingSnapshot::Impl>& capture) {
             TrainingSnapshotPauseMetrics completed;
+            // Overwrite storage faults pages during drains, so sample the
+            // completed buffer as well as the earlier pause-end observation.
+            const auto rss_after_drain = read_rss_bytes();
             bool record = false;
             {
                 std::scoped_lock lock(capture->mutex);
@@ -1180,11 +1391,13 @@ namespace lfs::training {
                     return;
                 }
                 capture->completion_recorded = true;
-                capture->metrics.final_drain_ms =
-                    Milliseconds(
-                        Clock::now() -
-                        capture->pause_end)
-                        .count();
+                if (rss_after_drain >= capture->baseline_rss_bytes)
+                    capture->metrics.host_rss_delta_bytes = std::max(
+                        capture->metrics.host_rss_delta_bytes, rss_after_drain - capture->baseline_rss_bytes);
+                capture->metrics.host_ram_within_gate =
+                    capture->metrics.host_rss_delta_bytes <=
+                    capture->metrics.host_staging_bytes +
+                        HOST_MEMORY_GATE_HEADROOM_BYTES;
                 bool consistent =
                     capture->error.empty() &&
                     !capture->stamps.empty();
@@ -1205,6 +1418,26 @@ namespace lfs::training {
                     tensor_count += stamp.tensor ? 1 : 0;
                     cpu_count += stamp.tensor ? 0 : 1;
                 }
+                // Never expose an unwritten byte from overwrite storage.
+                // Header rewrites and CPU tensor stamps may overlap; their
+                // union with fully drained device payloads must cover CKPT.
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+                ranges.reserve(capture->stamps.size());
+                for (const auto& stamp : capture->stamps) {
+                    if (stamp.bytes > 0 && stamp.offset <= capture->staging->size() &&
+                        stamp.bytes <= capture->staging->size() - stamp.offset)
+                        ranges.emplace_back(stamp.offset, stamp.offset + stamp.bytes);
+                }
+                std::ranges::sort(ranges);
+                std::uint64_t covered = 0;
+                for (const auto& [begin, end] : ranges) {
+                    if (begin > covered) {
+                        consistent = false;
+                        break;
+                    }
+                    covered = std::max(covered, end);
+                }
+                consistent = consistent && covered == capture->staging->size();
                 capture->metrics.tensor_piece_count =
                     tensor_count;
                 capture->metrics.cpu_piece_count =
@@ -1216,47 +1449,42 @@ namespace lfs::training {
                          .consistency_proven &&
                     capture->error.empty()) {
                     capture->error =
-                        "Snapshot UUID consistency proof failed";
+                        "Snapshot byte coverage or UUID consistency proof failed";
                 }
+                capture->metrics.final_drain_ms =
+                    Milliseconds(
+                        Clock::now() -
+                        capture->pause_end)
+                        .count();
                 capture->drained = true;
                 completed = capture->metrics;
                 record = capture->error.empty();
             }
             capture->drained_condition.notify_all();
-            double pause_p95_ms = 0.0;
-            std::size_t p95_n = 0;
-            {
-                std::scoped_lock lock(metrics_mutex);
-                active_capture = false;
-                if (record) {
-                    ++aggregate.completed_snapshots;
-                    aggregate.last = completed;
-                    pause_samples.push_back(
-                        completed.pause_ms);
-                    aggregate.pause_p95_ms =
-                        percentile_95(
-                            pause_samples);
-                    aggregate.p95_n =
-                        pause_samples.size();
-                    pause_p95_ms =
-                        aggregate.pause_p95_ms;
-                    p95_n = aggregate.p95_n;
-                }
-            }
+            std::scoped_lock lock(metrics_mutex);
+            active_capture = false;
             if (record) {
-                LOG_INFO(
-                    "Training snapshot pause metric: "
-                    "p95={:.3f}ms p95_n={}",
-                    pause_p95_ms, p95_n);
+                ++aggregate.completed_snapshots;
+                aggregate.last = completed;
+                pause_samples.push_back(
+                    completed.pause_ms);
+                aggregate.pause_p95_ms =
+                    percentile_95(
+                        pause_samples);
+                aggregate.p95_n =
+                    pause_samples.size();
             }
         }
 
         void shutdown() {
-            if (drain_thread.joinable()) {
-                drain_thread.request_stop();
-                ring_condition.notify_all();
-                drain_thread.join();
+            for (auto& worker : drain_threads)
+                worker.request_stop();
+            ring_condition.notify_all();
+            for (auto& worker : drain_threads) {
+                if (worker.joinable())
+                    worker.join();
             }
+            drain_threads.clear();
             if (d2h_queue) {
                 try {
                     d2h_queue->wait();
@@ -1279,7 +1507,8 @@ namespace lfs::training {
         std::mutex ring_mutex;
         std::condition_variable ring_condition;
         std::deque<std::size_t> drain_queue;
-        std::jthread drain_thread;
+        std::vector<std::jthread> drain_threads;
+        std::shared_ptr<StagingPool> staging_pool;
         double measured_bandwidth = 0.0;
 
         mutable std::mutex metrics_mutex;
@@ -1312,11 +1541,11 @@ namespace lfs::training {
                     return 0;
                 }
                 if (count > 0) {
-                    std::memcpy(
-                        capture_->staging->data() +
-                            cursor_,
-                        source,
-                        static_cast<std::size_t>(count));
+                    capture_->staging->write_at(
+                        cursor_,
+                        std::span<const std::byte>(
+                            reinterpret_cast<const std::byte*>(source),
+                            static_cast<std::size_t>(count)));
                     add_stamp(
                         cursor_,
                         static_cast<std::uint64_t>(
@@ -1515,7 +1744,7 @@ namespace lfs::training {
                 } else {
                     append_device_tensor(
                         descriptor, expected, source,
-                        offset, bytes);
+                        auxiliary_source, offset, bytes);
                     destination.seekp(
                         static_cast<std::streamoff>(
                             bytes),
@@ -1552,6 +1781,7 @@ namespace lfs::training {
                         descriptor,
                 const TensorLayoutWitness& witness,
                 const lfs::core::Tensor& source,
+                const lfs::core::Tensor* auxiliary,
                 const std::uint64_t destination_offset,
                 const std::uint64_t bytes) {
                 std::uint64_t tensor_offset = 0;
@@ -1620,8 +1850,8 @@ namespace lfs::training {
                         service_.issue_sh_to_slot(
                             *active_slot_,
                             active_slot_bytes_,
-                            witness, tensor_offset,
-                            count);
+                            witness, source, auxiliary,
+                            tensor_offset, count);
                     }
                     active_segments_.push_back(
                         TrainingSnapshotService::Impl::
@@ -1713,11 +1943,6 @@ namespace lfs::training {
     PendingTrainingSnapshot::~PendingTrainingSnapshot() =
         default;
 
-    bool PendingTrainingSnapshot::ready() const {
-        std::scoped_lock lock(impl_->mutex);
-        return impl_->drained;
-    }
-
     lfs::Result<CapturedTrainingSnapshot>
     PendingTrainingSnapshot::wait() {
         std::unique_lock lock(impl_->mutex);
@@ -1792,7 +2017,7 @@ namespace lfs::training {
                 }
             }
             impl_->initialize_resources(
-                layout, request.mutating_streams);
+                layout, request.mutating_queues);
             impl_->initialization_ms =
                 Milliseconds(Clock::now() - begin)
                     .count();
@@ -1811,17 +2036,6 @@ namespace lfs::training {
                     impl_->config.ring_slots *
                     impl_->config.band_bytes;
             }
-            LOG_INFO(
-                "Training snapshot service initialized off the save path: "
-                "init={:.3f}ms pinned={} bytes raw_pinned_D2H={:.3f}GiB/s "
-                "mutating_streams={}",
-                impl_->initialization_ms,
-                impl_->config.ring_slots *
-                    impl_->config.band_bytes,
-                impl_->measured_bandwidth /
-                    static_cast<double>(
-                        1024ull * 1024 * 1024),
-                request.mutating_streams.size());
             return {};
         } catch (const std::exception& error) {
             // LFS-CENSUS-OK(empty-catch): normalize the exception into a typed snapshot error.
@@ -1891,8 +2105,6 @@ namespace lfs::training {
 
             prepared->baseline_rss_bytes =
                 read_rss_bytes();
-            impl_->ensure_device_scratch();
-
             if (prepared->checkpoint_bytes >
                 std::numeric_limits<std::size_t>::max()) {
                 return snapshot_error(
@@ -1900,7 +2112,7 @@ namespace lfs::training {
                     "Checkpoint staging exceeds address space",
                     LFS_SOURCE_SITE_CURRENT());
             }
-            const auto host_memory =
+            auto host_memory =
                 read_host_memory_info();
             const auto reserve_bytes =
                 request.relaxed_host_memory_gate
@@ -1916,8 +2128,33 @@ namespace lfs::training {
                     "Snapshot host-memory requirement overflows",
                     LFS_SOURCE_SITE_CURRENT());
             }
+            const bool file_backed_staging =
+#if defined(__APPLE__)
+                prepared->checkpoint_bytes >=
+                FILE_BACKED_SNAPSHOT_THRESHOLD;
+#else
+                false;
+#endif
+            const auto resident_staging_bytes =
+                file_backed_staging ? std::uint64_t{0}
+                                    : prepared->checkpoint_bytes;
             const auto required_host_memory =
-                prepared->checkpoint_bytes + reserve_bytes;
+                resident_staging_bytes + reserve_bytes;
+            // An idle recycled buffer must never turn a previously viable
+            // save into a memory-pressure rejection. Live readers retain
+            // their own buffers; the pool can only release retired storage.
+            if (host_memory.available_bytes < required_host_memory &&
+                impl_->staging_pool->trim())
+                host_memory = read_host_memory_info();
+            if (request.release_host_memory &&
+                host_memory.available_bytes > 0 &&
+                host_memory.available_bytes <
+                    required_host_memory &&
+                request.release_host_memory(
+                    required_host_memory -
+                    host_memory.available_bytes) > 0) {
+                host_memory = read_host_memory_info();
+            }
             if (host_memory.available_bytes == 0 ||
                 host_memory.available_bytes <
                     required_host_memory) {
@@ -1926,22 +2163,22 @@ namespace lfs::training {
                     host_memory.available_bytes,
                     std::format(
                         "Training snapshot {}: {} bytes available, "
-                        "{} required ({} snapshot + {} reserve)",
+                        "{} required ({} resident staging + {} reserve; "
+                        "{} disk spool)",
                         request.relaxed_host_memory_gate
                             ? "rejected"
                             : "deferred",
                         host_memory.available_bytes,
                         required_host_memory,
-                        prepared->checkpoint_bytes,
-                        reserve_bytes),
+                        resident_staging_bytes,
+                        reserve_bytes,
+                        file_backed_staging
+                            ? prepared->checkpoint_bytes
+                            : 0),
                     LFS_SOURCE_SITE_CURRENT());
             }
-            prepared->staging =
-                std::make_shared<
-                    std::vector<std::byte>>();
-            prepared->staging->resize(
-                static_cast<std::size_t>(
-                    prepared->checkpoint_bytes));
+            prepared->staging = impl_->acquire_staging(
+                static_cast<std::size_t>(prepared->checkpoint_bytes));
             const auto rss_after = read_rss_bytes();
 
             prepared->metrics.snapshot_uuid =
@@ -1956,7 +2193,13 @@ namespace lfs::training {
                 impl_->config.ring_slots *
                 impl_->config.band_bytes;
             prepared->metrics.host_staging_bytes =
-                prepared->checkpoint_bytes;
+                prepared->staging->file_backed()
+                    ? 0
+                    : prepared->checkpoint_bytes;
+            prepared->metrics.disk_staging_bytes =
+                prepared->staging->file_backed()
+                    ? prepared->checkpoint_bytes
+                    : 0;
             prepared->metrics.host_rss_delta_bytes =
                 rss_after >=
                         prepared->baseline_rss_bytes
@@ -1971,7 +2214,7 @@ namespace lfs::training {
                 true;
             prepared->metrics.host_ram_within_gate =
                 prepared->metrics.host_rss_delta_bytes <=
-                prepared->checkpoint_bytes +
+                prepared->metrics.host_staging_bytes +
                     HOST_MEMORY_GATE_HEADROOM_BYTES;
             prepared->metrics.service_initialization_ms =
                 impl_->initialization_ms;
@@ -2048,6 +2291,7 @@ namespace lfs::training {
                 PendingTrainingSnapshot::Impl>();
         pending->staging =
             std::move(prepared.impl_->staging);
+        pending->baseline_rss_bytes = prepared.impl_->baseline_rss_bytes;
         pending->metrics =
             prepared.impl_->metrics;
         pending->metrics.iteration =
@@ -2064,11 +2308,11 @@ namespace lfs::training {
                 throw std::invalid_argument(
                     "Snapshot safe-point clock origin is in the future");
             }
-            std::set<void*> streams;
-            streams.insert(impl_->d2h_queue->native_handle());
+            std::set<lfs::core::TensorExecutionTarget> streams;
+            streams.insert(*impl_->d2h_queue);
             for (const auto stream :
-                 request.mutating_streams) {
-                if (stream) {
+                 request.mutating_queues) {
+                if (!stream.is_default_queue()) {
                     streams.insert(stream);
                 }
             }
@@ -2076,21 +2320,22 @@ namespace lfs::training {
                  prepared.impl_->layout) {
                 if (witness.source_device ==
                         lfs::core::Device::GPU &&
-                    witness.source_stream) {
+                    witness.source_stream && !witness.source_stream->is_default_queue()) {
                     streams.insert(
-                        witness.source_stream);
+                        *witness.source_stream);
                 }
                 if (witness.auxiliary_source_device ==
                         lfs::core::Device::GPU &&
-                    witness.auxiliary_source_stream) {
+                    witness.auxiliary_source_stream && !witness.auxiliary_source_stream->is_default_queue()) {
                     streams.insert(
-                        witness.auxiliary_source_stream);
+                        *witness.auxiliary_source_stream);
                 }
             }
             for (const auto stream : streams) {
-                lfs::core::TensorWorkQueue(lfs::core::GpuBackend::CUDA, stream).wait();
+                stream.wait();
             }
             const auto sync_end = Clock::now();
+            impl_->ensure_device_scratch();
 
             if (request.capture_additional_cpu_state) {
                 auto captured =
@@ -2174,6 +2419,7 @@ namespace lfs::training {
                     sink.last_event()) {
                 last_event->wait();
             }
+            impl_->device_scratch = {};
             const auto pause_end = Clock::now();
             const auto capture_rss = read_rss_bytes();
             if (capture_rss >=
@@ -2188,7 +2434,7 @@ namespace lfs::training {
             }
             pending->metrics.host_ram_within_gate =
                 pending->metrics.host_rss_delta_bytes <=
-                pending->metrics.checkpoint_bytes +
+                pending->metrics.host_staging_bytes +
                     HOST_MEMORY_GATE_HEADROOM_BYTES;
 
             pending->metrics.safe_point_entry_ms =
@@ -2217,6 +2463,7 @@ namespace lfs::training {
                 Milliseconds(
                     pause_end - pause_begin)
                     .count();
+            lfs::diagnostics::VramProfiler::instance().mark("training_snapshot", {}, pending->metrics.device_snapshot_bytes, pending->metrics.pause_ms);
             pending->metrics.cold_path_ms =
                 pending->metrics.pause_ms +
                 (pending->metrics.cold_first_snapshot
@@ -2234,63 +2481,6 @@ namespace lfs::training {
             pending->pause_end = pause_end;
             lfs::core::Tensor::trim_memory_pool();
 
-            LOG_INFO(
-                "Training snapshot {} iter {}: "
-                "bytes={} device_bytes={} pause={:.3f}ms "
-                "prepare_stall={:.3f}ms cold_path={:.3f}ms "
-                "cold_first={} "
-                "(safe_entry={:.3f} sync={:.3f} cpu_state={:.3f} "
-                "serialize+issue={:.3f} "
-                "last_d2h_wait={:.3f}) gate={:.3f}ms "
-                "raw_pinned_D2H={:.3f}GiB/s pause={} cold_path={} "
-                "host_delta={} host_gate={}",
-                pending->metrics.snapshot_uuid
-                    .to_string(),
-                request.iteration,
-                pending->metrics.checkpoint_bytes,
-                pending->metrics
-                    .device_snapshot_bytes,
-                pending->metrics.pause_ms,
-                pending->metrics.prepare_stall_ms,
-                pending->metrics.cold_path_ms,
-                pending->metrics.cold_first_snapshot,
-                pending->metrics
-                    .safe_point_entry_ms,
-                pending->metrics.stream_sync_ms,
-                pending->metrics
-                    .additional_cpu_state_ms,
-                pending->metrics
-                    .serialize_and_issue_ms,
-                pending->metrics
-                    .last_d2h_wait_ms,
-                pending->metrics.rig_gate_ms,
-                pending->metrics
-                        .measured_pinned_d2h_bytes_per_second /
-                    static_cast<double>(
-                        1024ull * 1024 * 1024),
-                pending->metrics
-                        .pause_within_rig_gate
-                    ? "PASS"
-                    : "FAIL",
-                pending->metrics
-                        .cold_path_within_rig_gate
-                    ? "PASS"
-                    : "FAIL",
-                pending->metrics.host_rss_delta_bytes,
-                pending->metrics.host_ram_within_gate
-                    ? "PASS"
-                    : "FAIL");
-            LOG_INFO(
-                "Training snapshot {} CPU value capture in safe point: "
-                "SCNG={:.3f}ms SELM={:.3f}ms PRMS={:.3f}ms total={:.3f}ms",
-                pending->metrics.snapshot_uuid
-                    .to_string(),
-                pending->metrics.scng_ms,
-                pending->metrics.selm_ms,
-                pending->metrics.prms_ms,
-                pending->metrics
-                    .additional_cpu_state_ms);
-
             impl_->mark_issuing_complete(pending);
             prepared.impl_.reset();
             return PendingTrainingSnapshot(
@@ -2299,6 +2489,7 @@ namespace lfs::training {
             try {
                 impl_->d2h_queue->wait();
             } catch (const std::exception& e) { LOG_WARN("Failed snapshot drain: {}", e.what()); }
+            impl_->device_scratch = {};
             pending->pause_end = Clock::now();
             {
                 std::scoped_lock lock(pending->mutex);

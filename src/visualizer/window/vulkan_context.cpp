@@ -4,9 +4,10 @@
 
 #include "vulkan_context.hpp"
 #include "core/vulkan_helpers.hpp"
+#include "core/vulkan_queue_sync.hpp"
 
 #include "core/crash_handler.hpp"
-#include "rendering/nvidia_dlss_plugin.hpp"
+#include "rendering/scene_upscaler_plugin.hpp"
 
 #include "core/cuda_error.hpp"
 #include "core/cuda_vulkan_interop.hpp"
@@ -17,7 +18,7 @@
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "core/shareable_allocation_limit.hpp"
-#include "core/tensor_backend.hpp"
+#include "core/tensor_backend_vulkan.hpp"
 #include "core/user_paths.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "rendering/vulkan_wait.hpp"
@@ -534,7 +535,7 @@ namespace lfs::vis {
     }
 
     bool VulkanContext::initHeadless() {
-        const bool interop = lfs::core::default_gpu_backend() == lfs::core::GpuBackend::CUDA;
+        const bool interop = lfs::core::tensor_backend_needs_vulkan_interop();
         const auto cuda_device = interop ? interopCudaDevice() : std::nullopt;
         if (interop && !cuda_device)
             return fail("Cannot identify CUDA device 0 for off-screen Vulkan interop");
@@ -570,7 +571,7 @@ namespace lfs::vis {
         compute_queue_ = graphics_queue_;
         transfer_queue_ = graphics_queue_;
         graphics_queue_family_ = present_queue_family_ = compute_queue_family_ = transfer_queue_family_ = handles.queue_family;
-        if (lfs::core::default_gpu_backend() == lfs::core::GpuBackend::Vulkan) {
+        if (!interop && lfs::core::tensor_backend_shares_vulkan_device()) {
             if (auto result = lfs::core::adopt_vulkan_device(handles); !result)
                 return fail(std::string(result.error().user_message()));
         }
@@ -599,10 +600,6 @@ namespace lfs::vis {
             timed("vulkan_init.createCommandPool", [&] { return createCommandPool(); }) &&
             timed("vulkan_init.createCommandBuffers", [&] { return createCommandBuffers(); }) &&
             timed("vulkan_init.createSyncObjects", [&] { return createSyncObjects(); });
-        LOG_INFO("Vulkan diagnostics: validation_layers={}, debug_utils={}, validation_errors_fatal={}",
-                 validation_enabled_ ? "active" : "inactive",
-                 debugObjectNamingEnabled() ? "active" : "inactive",
-                 validation_errors_fatal_ ? "active" : "inactive");
         return initialized;
     }
 
@@ -630,11 +627,10 @@ namespace lfs::vis {
     void VulkanContext::shutdown() {
         // AMB-B3: latch before any device wait so concurrent UI waits observe Shutdown.
         context_shutdown_started_.store(true, std::memory_order_release);
-        lfs::rendering::set_graphics_queue_external_sync(nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE);
         if (device_ != VK_NULL_HANDLE) {
             // Shutdown is the one place where a whole-device wait is intentional:
             // all swapchain, UI, and external interop resources are about to be destroyed.
-            const VkResult idle_result = vkDeviceWaitIdle(device_);
+            const VkResult idle_result = lfs::rendering::vk_device_wait_idle_synced(device_);
             if (idle_result != VK_SUCCESS) {
                 LOG_ERROR("Vulkan shutdown could not retire device work before destruction (device={:#x}, pending_immediate_submits={}, frame_active={}, frame_slot={}, result={}({}))",
                           vkHandleValue(device_),
@@ -648,7 +644,8 @@ namespace lfs::vis {
         // Optional vendor runtimes retain the Vulkan device passed at lazy
         // initialization. Shut them down after all GPU work is retired and
         // before the allocator/device they reference are destroyed.
-        NvidiaDlssPlugin::instance().shutdownRuntime();
+        for (auto* const plugin : sceneUpscalerPlugins())
+            plugin->shutdownRuntime();
 
         // #1488: surface leaked External* counts after idle, before device destroy.
         {
@@ -724,7 +721,7 @@ namespace lfs::vis {
         if (device_ != VK_NULL_HANDLE) {
             debug_name_writer_.reset();
             tensor_interop_.reset();
-            vkDestroyDevice(device_, nullptr);
+            lfs::rendering::vk_destroy_device_synced(device_, nullptr);
             device_ = VK_NULL_HANDLE;
         }
         if (surface_ != VK_NULL_HANDLE && instance_ != VK_NULL_HANDLE) {
@@ -1980,16 +1977,6 @@ namespace lfs::vis {
         return retired;
     }
 
-    bool VulkanContext::getTimelineSemaphoreCounterValue(const VkSemaphore semaphore,
-                                                         std::uint64_t& out_value) const {
-        out_value = 0;
-        if (device_ == VK_NULL_HANDLE || semaphore == VK_NULL_HANDLE) {
-            return false;
-        }
-        const VkResult result = vkGetSemaphoreCounterValue(device_, semaphore, &out_value);
-        return result == VK_SUCCESS;
-    }
-
     bool VulkanContext::waitForRetiredFrameSubmitSerial(const std::uint64_t serial) {
         if (serial == 0 || device_ == VK_NULL_HANDLE) {
             return true;
@@ -2079,7 +2066,7 @@ namespace lfs::vis {
         if (device_ == VK_NULL_HANDLE) {
             return true;
         }
-        const VkResult result = vkDeviceWaitIdle(device_);
+        const VkResult result = lfs::rendering::vk_device_wait_idle_synced(device_);
         if (result != VK_SUCCESS) {
             return setVkFailure(std::format("vkDeviceWaitIdle failed: {}", vkResultToString(result)), result);
         }
@@ -2140,19 +2127,19 @@ namespace lfs::vis {
                 available_extension_count);
             available_extensions.resize(available_extension_count);
         }
-        const auto dlss_instance_extensions =
-            NvidiaDlssPlugin::instance().requiredInstanceExtensions();
-        const auto missing_dlss_instance_extension = std::ranges::find_if(
-            dlss_instance_extensions,
-            [&available_extensions](const std::string& name) {
-                return !extensionAvailable(available_extensions, name.c_str());
-            });
-        if (missing_dlss_instance_extension != dlss_instance_extensions.end()) {
-            NvidiaDlssPlugin::instance().markBootstrapFailed(std::format(
-                "required Vulkan instance extension '{}' is unavailable",
-                *missing_dlss_instance_extension));
-        } else {
-            for (const auto& name : dlss_instance_extensions)
+        for (auto* const plugin : sceneUpscalerPlugins()) {
+            const auto plugin_extensions = plugin->requiredInstanceExtensions();
+            const auto missing = std::ranges::find_if(
+                plugin_extensions,
+                [&available_extensions](const std::string& name) {
+                    return !extensionAvailable(available_extensions, name.c_str());
+                });
+            if (missing != plugin_extensions.end()) {
+                plugin->markBootstrapFailed(std::format(
+                    "required Vulkan instance extension '{}' is unavailable", *missing));
+                continue;
+            }
+            for (const auto& name : plugin_extensions)
                 appendUniqueExtension(extensions, name.c_str());
         }
 #if LFS_HAS_CUDA && (defined(_WIN32) || defined(__linux__))
@@ -2585,8 +2572,8 @@ namespace lfs::vis {
             transfer_queue_family_ = 0;
             has_dedicated_transfer_queue_ = false;
         }
-        // The tensor backend gets its own queue: the second queue of the compute
-        // family when it has one, else the second queue of the graphics family.
+        // Tensor programs need graphics and compute on the same timeline. Keep
+        // a separate queue, preferring a graphics-capable family for raster.
         std::optional<uint32_t> tensor_queue_family;
         uint32_t tensor_queue_index = 1;
         {
@@ -2594,7 +2581,7 @@ namespace lfs::vis {
             vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &family_count, nullptr);
             std::vector<VkQueueFamilyProperties> family_props(family_count);
             vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &family_count, family_props.data());
-            for (const uint32_t candidate : {compute_queue_family_, graphics_queue_family_}) {
+            for (const uint32_t candidate : {graphics_queue_family_, compute_queue_family_}) {
                 if (candidate < family_count && family_props[candidate].queueCount >= 2 &&
                     (family_props[candidate].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
                     tensor_queue_family = candidate;
@@ -2646,19 +2633,19 @@ namespace lfs::vis {
         }
 
         std::vector<const char*> extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-        const auto dlss_device_extensions =
-            NvidiaDlssPlugin::instance().requiredDeviceExtensions(instance_, physical_device_);
-        const auto missing_dlss_device_extension = std::ranges::find_if(
-            dlss_device_extensions,
-            [&available_extensions](const std::string& name) {
-                return !extensionAvailable(available_extensions, name.c_str());
-            });
-        if (missing_dlss_device_extension != dlss_device_extensions.end()) {
-            NvidiaDlssPlugin::instance().markBootstrapFailed(std::format(
-                "required Vulkan device extension '{}' is unavailable",
-                *missing_dlss_device_extension));
-        } else {
-            for (const auto& name : dlss_device_extensions)
+        for (auto* const plugin : sceneUpscalerPlugins()) {
+            const auto plugin_extensions = plugin->requiredDeviceExtensions(instance_, physical_device_);
+            const auto missing = std::ranges::find_if(
+                plugin_extensions,
+                [&available_extensions](const std::string& name) {
+                    return !extensionAvailable(available_extensions, name.c_str());
+                });
+            if (missing != plugin_extensions.end()) {
+                plugin->markBootstrapFailed(std::format(
+                    "required Vulkan device extension '{}' is unavailable", *missing));
+                continue;
+            }
+            for (const auto& name : plugin_extensions)
                 appendUniqueExtension(extensions, name.c_str());
         }
 #if LFS_HAS_CUDA && (defined(_WIN32) || defined(__linux__))
@@ -2719,6 +2706,9 @@ namespace lfs::vis {
             extensionAvailable(available_extensions, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
         if (enable_shader_atomic_float) {
             appendUniqueExtension(extensions, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+        }
+        if (extensionAvailable(available_extensions, VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME)) {
+            appendUniqueExtension(extensions, VK_NV_SHADER_SUBGROUP_PARTITIONED_EXTENSION_NAME);
         }
 #ifdef __APPLE__
         // Metal tensors import into the device without copies.
@@ -2923,8 +2913,7 @@ namespace lfs::vis {
         features11.storageBuffer16BitAccess = supported_features11.storageBuffer16BitAccess;
         features11.uniformAndStorageBuffer16BitAccess =
             supported_features11.uniformAndStorageBuffer16BitAccess;
-        features11.pNext = enabled_chain_head;
-        features12.pNext = &features11;
+        features12.pNext = enabled_chain_head;
 
         uint32_t queue_family_count = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &queue_family_count, nullptr);
@@ -2978,12 +2967,12 @@ namespace lfs::vis {
             }
         }
 
-        vkGetDeviceQueue(device_, graphics_queue_family_, 0, &graphics_queue_);
-        vkGetDeviceQueue(device_, present_queue_family_, 0, &present_queue_);
+        lfs::rendering::vk_get_device_queue_synced(device_, graphics_queue_family_, 0, &graphics_queue_);
+        lfs::rendering::vk_get_device_queue_synced(device_, present_queue_family_, 0, &present_queue_);
         tensor_backend_device_ = {};
         if (tensor_queue_family.has_value()) {
             tensor_backend_device_.queue_family = *tensor_queue_family;
-            vkGetDeviceQueue(device_, *tensor_queue_family, tensor_queue_index, &tensor_backend_device_.queue);
+            lfs::rendering::vk_get_device_queue_synced(device_, *tensor_queue_family, tensor_queue_index, &tensor_backend_device_.queue);
             tensor_backend_device_.shader_atomic_float =
                 atomic_float_features.shaderBufferFloat32AtomicAdd == VK_TRUE;
             tensor_backend_device_.shader_float64 = features2.features.shaderFloat64 == VK_TRUE;
@@ -2996,16 +2985,14 @@ namespace lfs::vis {
                 tensor_backend_device_.queue != VK_NULL_HANDLE &&
                 features2.features.shaderInt64 == VK_TRUE && features2.features.shaderInt16 == VK_TRUE &&
                 features11.storageBuffer16BitAccess == VK_TRUE && features12.storageBuffer8BitAccess == VK_TRUE &&
-                features12.timelineSemaphore == VK_TRUE && features12.bufferDeviceAddress == VK_TRUE &&
+                features12.shaderInt8 == VK_TRUE && features12.timelineSemaphore == VK_TRUE && features12.bufferDeviceAddress == VK_TRUE &&
                 features13.synchronization2 == VK_TRUE;
         }
         LOG_INFO("Vulkan: tensor backend queue {} (family {})",
                  tensor_backend_device_.complete ? "available" : "unavailable",
                  tensor_backend_device_.queue_family);
         if (has_dedicated_compute_queue_) {
-            vkGetDeviceQueue(device_, compute_queue_family_, 0, &compute_queue_);
-            LOG_INFO("Vulkan: dedicated async-compute queue family {} (graphics family {})",
-                     compute_queue_family_, graphics_queue_family_);
+            lfs::rendering::vk_get_device_queue_synced(device_, compute_queue_family_, 0, &compute_queue_);
         } else {
             // Alias graphics so callers can submit unconditionally on computeQueue().
             compute_queue_ = graphics_queue_;
@@ -3013,10 +3000,7 @@ namespace lfs::vis {
                      graphics_queue_family_);
         }
         if (has_dedicated_transfer_queue_) {
-            vkGetDeviceQueue(device_, transfer_queue_family_, 0, &transfer_queue_);
-            LOG_INFO("Vulkan: dedicated transfer queue family {} (graphics family {})",
-                     transfer_queue_family_,
-                     graphics_queue_family_);
+            lfs::rendering::vk_get_device_queue_synced(device_, transfer_queue_family_, 0, &transfer_queue_);
         } else {
             transfer_queue_ = VK_NULL_HANDLE;
             LOG_INFO("Vulkan: no dedicated transfer family; image readbacks use graphics family {}",
@@ -3037,8 +3021,6 @@ namespace lfs::vis {
         external_memory_dedicated_allocation_enabled_ = enable_dedicated_allocation;
         sparse_binding_enabled_ = features2.features.sparseBinding == VK_TRUE;
         buffer_device_address_enabled_ = features12.bufferDeviceAddress == VK_TRUE;
-        lfs::rendering::set_graphics_queue_external_sync(
-            &graphics_queue_mutex_, graphics_queue_, present_queue_, compute_queue_);
 
         VkPhysicalDeviceMaintenance3Properties maint3{};
         maint3.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES;
@@ -3050,13 +3032,6 @@ namespace lfs::vis {
             lfs::core::set_shareable_device_allocation_limit(
                 static_cast<std::size_t>(maint3.maxMemoryAllocationSize));
         }
-        LOG_INFO("Vulkan sparseBinding: feature={} graphics_queue_sparse={} enabled={} "
-                 "bufferDeviceAddress={} maxMemoryAllocationSize={:#x}",
-                 sparse_binding_supported,
-                 graphics_queue_sparse,
-                 sparse_binding_enabled_,
-                 buffer_device_address_enabled_,
-                 static_cast<unsigned long long>(maint3.maxMemoryAllocationSize));
         swapchain_maintenance1_enabled_ = enable_swapchain_maintenance1;
         has_push_descriptor_ = enable_push_descriptor;
         has_conditional_rendering_ = enable_conditional_rendering;
@@ -3078,24 +3053,6 @@ namespace lfs::vis {
         if (require_external_interop && !external_semaphore_interop_enabled_) {
             return fail("Vulkan external timeline-semaphore interop is required (KHR_external_semaphore + platform variant); device is missing the extension(s)");
         }
-        if (external_memory_interop_enabled_) {
-            LOG_INFO("Vulkan external memory interop enabled{}",
-                     external_memory_dedicated_allocation_enabled_ ? " with dedicated allocations" : "");
-            if (lfs::core::shareable_allocation_limited()) {
-                LOG_INFO("Vulkan external memory interop shareable ceiling: {} bytes ({})",
-                         lfs::core::max_shareable_allocation_bytes(),
-                         lfs::core::shareable_allocation_limit_from_env() ? "env override"
-                                                                          : "platform default");
-            }
-        }
-        if (external_semaphore_interop_enabled_)
-            LOG_INFO("Vulkan external timeline semaphore interop enabled");
-        LOG_INFO("Vulkan optional features: push_descriptor={} host_image_copy={} swapchain_maintenance1={} fill_mode_non_solid={} wide_lines={}",
-                 has_push_descriptor_,
-                 has_host_image_copy_,
-                 swapchain_maintenance1_enabled_,
-                 has_fill_mode_non_solid_,
-                 has_wide_lines_);
         return true;
     }
 
@@ -3106,15 +3063,17 @@ namespace lfs::vis {
 
         VmaAllocatorCreateInfo create_info{};
         create_info.flags = surface_ == VK_NULL_HANDLE ? 0 : VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+        if (buffer_device_address_enabled_)
+            create_info.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
         create_info.physicalDevice = physical_device_;
         create_info.device = device_;
         create_info.instance = instance_;
         create_info.vulkanApiVersion = VK_API_VERSION_1_3;
         // Default large-heap block size is 256 MiB, which left ~130-200 MiB of
         // device memory parked in partially-filled blocks (block_bytes vs
-        // allocation_bytes). 64 MiB caps trailing-block waste; large buffers still
+        // allocation_bytes). 8 MiB caps trailing-block waste; large buffers still
         // get dedicated allocations and bypass blocks entirely.
-        create_info.preferredLargeHeapBlockSize = VkDeviceSize{64} << 20;
+        create_info.preferredLargeHeapBlockSize = VkDeviceSize{8} << 20;
 
         const VkResult result = vmaCreateAllocator(&create_info, &allocator_);
         if (result != VK_SUCCESS) {
@@ -3195,6 +3154,9 @@ namespace lfs::vis {
     }
 
     VkPresentModeKHR VulkanContext::choosePresentMode(const std::vector<VkPresentModeKHR>& modes) const {
+        // MAILBOX keeps navigation low-latency and avoids blocking the GUI tenant
+        // inside vkQueuePresent while it participates in shared-arena turn-taking.
+        // With no continuous frame demand, the ledger paces active animations.
         for (const auto mode : modes) {
             if (mode == VK_PRESENT_MODE_MAILBOX_KHR) {
                 return mode;
@@ -3993,9 +3955,6 @@ namespace lfs::vis {
             imported.device_address = vkGetBufferDeviceAddress(device_, &address_info);
         }
 
-        LOG_INFO("Exportable Vulkan chunks bound: bound={} committed={} MiB (no re-import)",
-                 imported.bound_chunks,
-                 block.committed_bytes >> 20);
         return true;
 #endif
     }
@@ -4648,25 +4607,14 @@ namespace lfs::vis {
         swapchain_extent_fixed_to_surface_ = extent_fixed_to_surface;
         swapchain_present_scaling_enabled_ = use_present_scaling;
         has_hdr_ = surface_format.colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-        if (old_swapchain == VK_NULL_HANDLE) {
-            LOG_INFO("Vulkan swapchain: {} images, extent {}x{}, format {}, color space {}{}{}",
-                     image_count,
-                     extent.width,
-                     extent.height,
-                     vkFormatToString(surface_format.format),
-                     vkColorSpaceToString(surface_format.colorSpace),
-                     has_hdr_ ? " (HDR-capable)" : "",
-                     use_present_scaling ? " (one-to-one present scaling)" : "");
-        } else {
-            LOG_DEBUG("Vulkan swapchain: {} images, extent {}x{}, format {}, color space {}{}{}",
-                      image_count,
-                      extent.width,
-                      extent.height,
-                      vkFormatToString(surface_format.format),
-                      vkColorSpaceToString(surface_format.colorSpace),
-                      has_hdr_ ? " (HDR-capable)" : "",
-                      use_present_scaling ? " (one-to-one present scaling)" : "");
-        }
+        LOG_DEBUG("Vulkan swapchain: {} images, extent {}x{}, format {}, color space {}{}{}",
+                  image_count,
+                  extent.width,
+                  extent.height,
+                  vkFormatToString(surface_format.format),
+                  vkColorSpaceToString(surface_format.colorSpace),
+                  has_hdr_ ? " (HDR-capable)" : "",
+                  use_present_scaling ? " (one-to-one present scaling)" : "");
 
         // One image-available semaphore per swapchain image (NOT per frame slot). The
         // active index is captured in beginFrame and held until endFrame's submit waits
@@ -5053,11 +5001,6 @@ namespace lfs::vis {
         setDebugObjectName(VK_OBJECT_TYPE_PIPELINE_CACHE,
                            pipeline_cache_,
                            "lichtfeld.pipeline_cache");
-        if (!cache_data.empty()) {
-            LOG_INFO("Loaded Vulkan pipeline cache: {} ({} bytes)",
-                     lfs::core::path_to_utf8(*path),
-                     cache_data.size());
-        }
         return true;
     }
 
@@ -5074,6 +5017,11 @@ namespace lfs::vis {
             result = vkGetPipelineCacheData(device_, pipeline_cache_, &cache_size, cache_data.data());
             if (result == VK_SUCCESS && cache_size > 0) {
                 cache_data.resize(cache_size);
+                const std::size_t cache_hash =
+                    std::hash<std::string_view>{}(std::string_view(cache_data.data(), cache_data.size()));
+                if (cache_hash == saved_pipeline_cache_hash_) {
+                    return;
+                }
                 std::error_code ec;
                 if (path) {
                     std::filesystem::create_directories(path->parent_path(), ec);
@@ -5100,9 +5048,7 @@ namespace lfs::vis {
                                 std::filesystem::rename(temporary_path, *path, rename_ec);
                             }
                             if (!rename_ec) {
-                                LOG_INFO("Saved Vulkan pipeline cache: {} ({} bytes)",
-                                         lfs::core::path_to_utf8(*path),
-                                         cache_data.size());
+                                saved_pipeline_cache_hash_ = cache_hash;
                             }
                         }
                     }
@@ -5295,7 +5241,7 @@ namespace lfs::vis {
         {
             LOG_TIMER_THRESHOLD("frame_pacing.vulkan_recreateSwapchain.device_wait_idle", 1.0);
             const auto wait_start = std::chrono::steady_clock::now();
-            const VkResult idle_result = vkDeviceWaitIdle(device_);
+            const VkResult idle_result = lfs::rendering::vk_device_wait_idle_synced(device_);
             LOG_DEBUG("Vulkan recreateSwapchain deviceWaitIdle result={} elapsed_ms={:.1f}",
                       vkResultToString(idle_result),
                       elapsedMs(wait_start));

@@ -10,6 +10,8 @@
 #include "core/detail/tensor_cpu_apply.hpp"
 #include "core/detail/tensor_dtype_dispatch.hpp"
 
+#include <format>
+
 namespace lfs::core {
 
     LazyExprState::~LazyExprState() noexcept {
@@ -99,6 +101,7 @@ namespace lfs::core {
             // Element-wise operation without broadcasting
             if (device_ == Device::GPU) {
                 pin_operands({this, &other});
+                prepare_inputs_for_stream({this, &other}, result.stream());
                 internal::backend_ops_for(*this).binary(
                     internal::pointwise_program(dtype_, out_dtype, op),
                     internal::storage_ref(*this), internal::storage_ref(other),
@@ -115,6 +118,7 @@ namespace lfs::core {
             pin_operands({this, &other});
 
             if (device_ == Device::GPU) {
+                prepare_inputs_for_stream({this, &other}, result.stream());
                 internal::backend_ops_for(*this).broadcast_binary(
                     internal::pointwise_program(dtype_, out_dtype, op),
                     internal::storage_ref(*this), internal::strided_layout(*this),
@@ -770,34 +774,11 @@ namespace lfs::core {
              dtype_ == DataType::UInt8 || dtype_ == DataType::Bool) &&
             (other.dtype_ == DataType::Int32 || other.dtype_ == DataType::Int64 ||
              other.dtype_ == DataType::UInt8 || other.dtype_ == DataType::Bool)) {
-            const Tensor divisor = other.cpu().contiguous();
-            bool contains_zero = false;
-            switch (divisor.dtype_) {
-            case DataType::Int32:
-                contains_zero = std::find(divisor.ptr<int32_t>(),
-                                          divisor.ptr<int32_t>() + divisor.numel(), 0) !=
-                                divisor.ptr<int32_t>() + divisor.numel();
-                break;
-            case DataType::Int64:
-                contains_zero = std::find(divisor.ptr<int64_t>(),
-                                          divisor.ptr<int64_t>() + divisor.numel(), 0) !=
-                                divisor.ptr<int64_t>() + divisor.numel();
-                break;
-            case DataType::UInt8:
-                contains_zero = std::find(divisor.ptr<uint8_t>(),
-                                          divisor.ptr<uint8_t>() + divisor.numel(), 0) !=
-                                divisor.ptr<uint8_t>() + divisor.numel();
-                break;
-            case DataType::Bool:
-                contains_zero = std::find(divisor.ptr<bool>(),
-                                          divisor.ptr<bool>() + divisor.numel(), false) !=
-                                divisor.ptr<bool>() + divisor.numel();
-                break;
-            default:
-                break;
-            }
-            LFS_ASSERT_MSG(!contains_zero,
-                           "integer modulo divisor must not contain zero");
+            // Counted where the divisor lives; only the count comes back.
+            const size_t nonzero = other.count_nonzero();
+            LFS_ASSERT_MSG(nonzero == other.numel(),
+                           std::format("integer modulo divisor has {} zero elements out of {}",
+                                       other.numel() - nonzero, other.numel()));
         }
         return binary_op_with_promotion(other, ops::mod_op{});
     }
@@ -870,7 +851,8 @@ namespace lfs::core {
     }
 
     float Tensor::mean_scalar() const {
-        if (device_ == Device::GPU && dtype_ == DataType::Float32 && is_contiguous_) {
+        // Empty inputs take the generic path, which defines their result.
+        if (device_ == Device::GPU && dtype_ == DataType::Float32 && is_contiguous_ && numel() > 0) {
             return internal::backend_ops_for(*this).mean_scalar(
                 internal::storage_ref(*this), numel(), internal::ExecContext{stream()});
         }
@@ -878,7 +860,8 @@ namespace lfs::core {
     }
 
     float Tensor::min_scalar() const {
-        if (device_ == Device::GPU && dtype_ == DataType::Float32 && is_contiguous_) {
+        // Empty inputs take the generic path, which defines their result.
+        if (device_ == Device::GPU && dtype_ == DataType::Float32 && is_contiguous_ && numel() > 0) {
             return internal::backend_ops_for(*this).min_scalar(
                 internal::storage_ref(*this), numel(), internal::ExecContext{stream()});
         }
@@ -886,7 +869,8 @@ namespace lfs::core {
     }
 
     float Tensor::max_scalar() const {
-        if (device_ == Device::GPU && dtype_ == DataType::Float32 && is_contiguous_) {
+        // Empty inputs take the generic path, which defines their result.
+        if (device_ == Device::GPU && dtype_ == DataType::Float32 && is_contiguous_ && numel() > 0) {
             return internal::backend_ops_for(*this).max_scalar(
                 internal::storage_ref(*this), numel(), internal::ExecContext{stream()});
         }

@@ -161,6 +161,11 @@ namespace lfs::core {
             return dev;
         }
 
+        // Development: test binaries one level below the build dir (build/tests/)
+        if (const auto dev = exe_dir.parent_path() / "src" / "python"; module_exists(dev)) {
+            return dev;
+        }
+
         // Fallback: module in same directory as exe (Windows dev builds)
         if (module_exists(exe_dir)) {
             return exe_dir;
@@ -303,10 +308,12 @@ namespace lfs::core {
             return exe_dir.parent_path();
         }
 
+#ifndef LFS_MACOS_PORTABLE_APP
         // Linux Development (vcpkg)
         if (const auto prefix = findVcpkgPrefix(exe_dir); !prefix.empty()) {
             return prefix;
         }
+#endif
 #endif
 
         return {};
@@ -346,21 +353,25 @@ namespace lfs::core {
         if (const auto p = exe_dir / "python.exe"; std::filesystem::exists(p))
             return p;
 
+#ifndef LFS_MACOS_PORTABLE_APP
         if (const auto prefix = findVcpkgPrefix(exe_dir); !prefix.empty()) {
             if (const auto p = prefix / "tools" / "python3" / "python.exe"; std::filesystem::exists(p))
                 return p;
         }
+#endif
 #else
         if (const auto p = exe_dir / "python3"; std::filesystem::exists(p))
             return p;
 
+#ifndef LFS_MACOS_PORTABLE_APP
         if (const auto prefix = findVcpkgPrefix(exe_dir); !prefix.empty()) {
             if (const auto p = prefix / "tools" / "python3" / "python3.12"; std::filesystem::exists(p))
                 return p;
         }
 #endif
+#endif
 
-#ifdef LFS_PYTHON_EXECUTABLE
+#if defined(LFS_PYTHON_EXECUTABLE) && !defined(LFS_MACOS_PORTABLE_APP)
         if (const auto p = std::filesystem::path(LFS_PYTHON_EXECUTABLE); std::filesystem::exists(p))
             return p;
 #endif

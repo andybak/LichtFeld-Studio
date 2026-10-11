@@ -9,21 +9,19 @@
 #include "visualizer/app_store.hpp"
 #include "visualizer/gui_capabilities.hpp"
 
+#include <algorithm>
 #include <string_view>
 
 namespace lfs::vis {
 
     namespace {
-        [[nodiscard]] std::string formatTransformSelectionError(const bool has_editable,
-                                                                const bool found_locked,
-                                                                const bool found_untransformable) {
-            if (found_locked && found_untransformable)
-                return "selection contains locked or unsupported nodes";
-            if (found_locked)
-                return has_editable ? "selection contains locked nodes" : "selection is locked";
-            if (found_untransformable)
-                return has_editable ? "selection contains unsupported nodes" : "select parent node";
-            return "No transform targets provided";
+
+        // Switching tools leaves the crop tool and selects the volume's parent,
+        // so a selected crop volume makes its parent the tool target.
+        [[nodiscard]] const core::SceneNode* toolTargetNode(const core::Scene& scene, const core::SceneNode& node) {
+            if (node.type == core::NodeType::CROPBOX || node.type == core::NodeType::ELLIPSOID)
+                return scene.getNodeById(node.parent_id);
+            return &node;
         }
 
         [[nodiscard]] std::string_view activeToolId(const ToolType tool) noexcept {
@@ -49,7 +47,13 @@ namespace lfs::vis {
         const bool trainer_paused = trainer_manager && trainer_manager->isPaused();
         const bool trainer_finished = trainer_manager && trainer_manager->isFinished();
         const std::size_t scene_node_count = scene_manager ? scene_manager->getScene().getNodeCount() : 0;
+        // Streaming attaches and detaches without a scene mutation, so this is polled.
+        const bool streamed_visible =
+            scene_manager && std::ranges::any_of(scene_manager->getScene().getNodes(), [&](const core::SceneNode* node) {
+                return node && node->model_streamed && scene_manager->getScene().isNodeEffectivelyVisible(node->id);
+            });
         if (state_initialized_ &&
+            streamed_visible == has_visible_streamed_model_ &&
             scene_generation == last_scene_generation_ &&
             selection_generation == last_selection_generation_ &&
             has_scene_manager == last_has_scene_manager_ &&
@@ -68,6 +72,7 @@ namespace lfs::vis {
         last_trainer_paused_ = trainer_paused;
         last_trainer_finished_ = trainer_finished;
         last_scene_node_count_ = scene_node_count;
+        has_visible_streamed_model_ = streamed_visible;
         state_initialized_ = true;
 
         if (!scene_manager) {
@@ -75,11 +80,8 @@ namespace lfs::vis {
             has_selection_ = false;
             has_gaussians_ = false;
             has_editable_transform_selection_ = false;
-            has_splat_selection_ = false;
             has_editable_splat_selection_ = false;
             has_editable_align_selection_ = false;
-            has_locked_align_selection_ = false;
-            transform_selection_error_.clear();
             selected_node_type_ = core::NodeType::SPLAT;
             return;
         }
@@ -115,11 +117,8 @@ namespace lfs::vis {
         const auto selected_node_ids = scene_manager->getSelectedNodeIds();
         has_selection_ = !selected_node_ids.empty();
         has_editable_transform_selection_ = false;
-        has_splat_selection_ = false;
         has_editable_splat_selection_ = false;
         has_editable_align_selection_ = false;
-        has_locked_align_selection_ = false;
-        transform_selection_error_.clear();
         selected_node_type_ = core::NodeType::SPLAT;
 
         if (has_selection_) {
@@ -139,8 +138,12 @@ namespace lfs::vis {
                     selected_type_initialized = true;
                 }
 
-                const bool locked = static_cast<bool>(node->locked);
-                const bool transformable = cap::isTransformableNodeType(node->type);
+                const auto* const target = toolTargetNode(scene, *node);
+                if (!target)
+                    continue;
+
+                const bool locked = scene.isNodeEffectivelyLocked(target->id);
+                const bool transformable = cap::isTransformableNodeType(target->type);
                 if (!transformable) {
                     found_untransformable = true;
                 } else if (locked) {
@@ -149,16 +152,22 @@ namespace lfs::vis {
                     has_editable_transform_target = true;
                 }
 
-                if (node->type == core::NodeType::SPLAT) {
-                    has_splat_selection_ = true;
-                    if (!locked)
-                        has_editable_splat_selection_ = true;
-                }
-
-                if (cap::isAlignTransformTargetType(node->type)) {
-                    if (locked) {
-                        has_locked_align_selection_ = true;
+                const auto inspect_splats = [&](const core::SceneNode& current, const bool ancestor_locked,
+                                                const auto& self) -> void {
+                    const bool current_locked = ancestor_locked || static_cast<bool>(current.locked);
+                    if (current.type == core::NodeType::SPLAT) {
+                        if (!current_locked && current.model)
+                            has_editable_splat_selection_ = true;
                     } else {
+                        for (const auto child_id : current.children)
+                            if (const auto* child = scene.getNodeById(child_id))
+                                self(*child, current_locked, self);
+                    }
+                };
+                inspect_splats(*target, locked, inspect_splats);
+
+                if (cap::isAlignTransformTargetType(target->type)) {
+                    if (!locked) {
                         has_editable_align_selection_ = true;
                     }
                 }
@@ -166,12 +175,6 @@ namespace lfs::vis {
 
             has_editable_transform_selection_ =
                 has_editable_transform_target && !found_locked && !found_untransformable;
-            if (!has_editable_transform_selection_) {
-                transform_selection_error_ =
-                    formatTransformSelectionError(has_editable_transform_target,
-                                                  found_locked,
-                                                  found_untransformable);
-            }
         }
 
         has_gaussians_ = (mode_ == EditorMode::VIEWING_SPLATS ||
@@ -185,7 +188,7 @@ namespace lfs::vis {
     }
 
     bool EditorContext::canSelectGaussians() const {
-        return has_gaussians_ && !isToolsDisabled();
+        return has_gaussians_ && !isToolsDisabled() && !has_visible_streamed_model_;
     }
 
     bool EditorContext::isToolAvailable(const ToolType tool) const {
@@ -198,9 +201,9 @@ namespace lfs::vis {
         case ToolType::None:
             return true;
         case ToolType::Selection:
-            return has_gaussians_;
+            return has_gaussians_ && !has_visible_streamed_model_;
         case ToolType::Mirror:
-            return has_gaussians_ && has_editable_splat_selection_;
+            return has_gaussians_ && has_editable_splat_selection_ && !has_visible_streamed_model_;
         case ToolType::Translate:
         case ToolType::Rotate:
         case ToolType::Scale:
@@ -209,41 +212,6 @@ namespace lfs::vis {
             return has_editable_align_selection_;
         }
         return false;
-    }
-
-    const char* EditorContext::getToolUnavailableReason(const ToolType tool) const {
-        if (isToolsDisabled())
-            return "switch to edit mode first";
-        if (!has_selection_ && tool != ToolType::None)
-            return "no node selected";
-
-        switch (tool) {
-        case ToolType::None:
-            return nullptr;
-        case ToolType::Selection:
-            return has_gaussians_ ? nullptr : "no gaussians";
-        case ToolType::Mirror:
-            if (!has_gaussians_)
-                return "no gaussians";
-            if (has_editable_splat_selection_)
-                return nullptr;
-            if (has_splat_selection_)
-                return "selection is locked";
-            return "select PLY node";
-        case ToolType::Translate:
-        case ToolType::Rotate:
-        case ToolType::Scale:
-            if (canTransformSelectedNode())
-                return nullptr;
-            return transform_selection_error_.empty() ? "select parent node" : transform_selection_error_.c_str();
-        case ToolType::Align:
-            if (has_editable_align_selection_)
-                return nullptr;
-            if (has_locked_align_selection_)
-                return "selection is locked";
-            return "select transformable node";
-        }
-        return nullptr;
     }
 
     void EditorContext::setActiveTool(const ToolType tool) {

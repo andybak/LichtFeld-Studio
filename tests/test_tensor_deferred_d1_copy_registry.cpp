@@ -26,7 +26,6 @@ namespace {
             internal::clear_lazy_ir_for_testing();
             internal::lazy_executor_clear_registry_for_testing();
             internal::lazy_executor_reset_diagnostics_for_testing();
-            internal::lazy_executor_set_debug_dump_override_for_testing(std::nullopt);
             internal::lazy_executor_set_pointwise_fusion_override_for_testing(std::nullopt);
             internal::lazy_executor_set_size_heuristic_override_for_testing(false);
             internal::lazy_executor_set_size_threshold_override_for_testing(std::nullopt);
@@ -38,7 +37,6 @@ namespace {
             internal::clear_lazy_ir_for_testing();
             internal::lazy_executor_clear_registry_for_testing();
             internal::lazy_executor_reset_diagnostics_for_testing();
-            internal::lazy_executor_set_debug_dump_override_for_testing(std::nullopt);
             internal::lazy_executor_set_pointwise_fusion_override_for_testing(std::nullopt);
             internal::lazy_executor_set_size_heuristic_override_for_testing(std::nullopt);
             internal::lazy_executor_set_size_threshold_override_for_testing(std::nullopt);
@@ -310,4 +308,14 @@ TEST(DeferredD1CopyRegistryTest, ConcurrentSiblingMaterialize) {
     EXPECT_EQ(b_values, a_values);
     EXPECT_EQ(data_pointer(a), data_pointer(b));
     EXPECT_EQ(after.executed_nodes - before.executed_nodes, 1u);
+}
+
+TEST(DeferredD1CopyRegistryTest, SteppedSliceRetainsMaterializedStorageAndStrides) {
+    LazyTestGuard guard;
+    auto expression = Tensor::arange(0.0f, 24.0f, 1.0f, Device::CPU).reshape({2, 3, 4}).add(1.0f);
+    ASSERT_TRUE(expression.is_deferred());
+    const auto view = expression.slice(1, 0, 3, 2).slice(2, 1, 4, 2);
+    expression = Tensor{};
+    EXPECT_EQ(view.shape(), TensorShape({2, 2, 2}));
+    EXPECT_EQ(view.to_vector(), (std::vector<float>{2, 4, 10, 12, 14, 16, 22, 24}));
 }

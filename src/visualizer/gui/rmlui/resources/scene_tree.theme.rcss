@@ -1,7 +1,7 @@
 /* Scene tree, history, and logging theme overrides. */
 
 body {
-    border-color: @{right_panel.border};
+    border-color: @{panel.border};
 }
 
 #search-container {
@@ -73,6 +73,12 @@ body {
 
 .row-icon {
     image-color: @{text};
+}
+
+.streamed-badge {
+    color: @{warning};
+    background-color: @{alpha(warning,0.14)};
+    border-color: @{alpha(warning,0.55)};
 }
 
 .row-icon.type-icon.splat        { image-color: @{alpha(info,0.90)}; }

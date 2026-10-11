@@ -6,19 +6,18 @@
 #include "core/alloc_counter.hpp"
 #include "core/assert.hpp"
 #include "core/camera.hpp"
-#include "core/cuda/sh_layout.cuh"
-#include "core/cuda_error.hpp"
 #include "core/gpu_device_runtime.hpp"
 #include "core/logger.hpp"
 #include "core/sh_value_quant.hpp"
+#include "core/tensor_backend.hpp"
 #include "core/tensor_completion.hpp"
-#include "core/tensor_cuda_interop.hpp"
+#include "core/tensor_execution.hpp"
 #include "core/tensor_serialization.hpp"
+#include "core/tensor_upload.hpp"
 #include "diagnostics/vram_profiler.hpp"
-#include "kernels/densification_kernels.hpp"
-#include "kernels/mrnf_kernels.hpp"
 #include "lfs/training/mean_step_scale.cuh"
 #include "lfs/training/morton_reorder.hpp"
+#include "lfs/training/ops/registry.hpp"
 #include "lfs/training/perf_bench.hpp"
 #include "lfs/training/sh_value_storage.hpp"
 #include "strategy_utils.hpp"
@@ -28,10 +27,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cuda_runtime.h>
 #include <limits>
 #include <numeric>
-#include <random>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
@@ -42,16 +39,28 @@ namespace lfs::training {
 
     namespace {
 
-        constexpr int MRNF_RATIO_RANK_LOG_INTERVAL = 25;
-
         constexpr float MRNF_EDGE_SCORE_WEIGHT = 0.25f;
-        constexpr int MRNF_EXPLORE_MIN_VIEW_SAMPLES = 10;
         constexpr int MRNF_BOUNDS_RECOMPUTE_INTERVAL_REFINES = 5;
         constexpr float MRNF_RAW_OPACITY_PRUNE_THRESHOLD = -5.54126358f; // logit(1 / 255)
         constexpr float MRNF_LOG_MIN_SCALE_THRESHOLD = -23.0258509f;     // log(1e-10)
         constexpr float MRNF_SH_C0 = 0.28209479177387814f;
-        constexpr float MRNF_EXPLORE_SCORE_FLOOR = 0.05f;
-        constexpr float MRNF_PROJECT_NEAR = 0.01f;
+
+        [[nodiscard]] lfs::core::Tensor compact_bool_indices(
+            const lfs::core::Tensor& mask, size_t count) {
+            using namespace lfs::core;
+            LFS_ASSERT_MSG(mask.ndim() == 1 && mask.is_contiguous() &&
+                               mask.device() == Device::GPU && mask.dtype() == DataType::Bool,
+                           "MRNF index compaction requires a contiguous CUDA bool vector");
+            LFS_ASSERT_MSG(count <= mask.numel(), "MRNF index count exceeds mask length");
+            auto indices = Tensor::empty({count}, Device::GPU, DataType::Int64);
+            indices.set_stream(mask.execution_target());
+            if (count != 0) {
+                const size_t actual = training_ops(default_gpu_backend()).mrnf->compact_bool_indices(mask, indices, count);
+                if (actual != count)
+                    throw std::runtime_error("MRNF index compaction count mismatch");
+            }
+            return indices;
+        }
 
         [[nodiscard]] lfs::core::Tensor squeeze_leading_ones(lfs::core::Tensor tensor) {
             while (tensor.is_valid() && tensor.ndim() > 1 && tensor.shape()[0] == 1) {
@@ -60,96 +69,20 @@ namespace lfs::training {
             return tensor;
         }
 
-        [[nodiscard]] bool is_cuda_image(const lfs::core::Tensor& tensor) {
+        [[nodiscard]] bool is_gpu_image(const lfs::core::Tensor& tensor) {
             return tensor.is_valid() &&
                    tensor.device() == lfs::core::Device::GPU &&
                    (tensor.dtype() == lfs::core::DataType::Float32 ||
                     tensor.dtype() == lfs::core::DataType::UInt8);
         }
 
-        [[nodiscard]] lfs::core::Tensor to_float01_cuda(const lfs::core::Tensor& tensor) {
-            auto value = squeeze_leading_ones(tensor);
-            if (value.dtype() == lfs::core::DataType::UInt8) {
-                value = value.to(lfs::core::DataType::Float32) / 255.0f;
+        [[nodiscard]] lfs::core::Tensor zero_splat_vector(const size_t n, const lfs::core::Device device) {
+            if (device != lfs::core::Device::GPU) {
+                return lfs::core::Tensor::zeros({n}, device);
             }
-            return value;
-        }
-
-        [[nodiscard]] bool same_spatial(const lfs::core::Tensor& a, const lfs::core::Tensor& b) {
-            if (!a.is_valid() || !b.is_valid() || a.ndim() < 2 || b.ndim() < 2) {
-                return false;
-            }
-            return a.shape()[a.ndim() - 2] == b.shape()[b.ndim() - 2] &&
-                   a.shape()[a.ndim() - 1] == b.shape()[b.ndim() - 1];
-        }
-
-        void ensure_cuda_float(lfs::core::Tensor& tensor, const lfs::core::TensorShape& shape) {
-            if (tensor.is_valid() &&
-                tensor.device() == lfs::core::Device::GPU &&
-                tensor.dtype() == lfs::core::DataType::Float32 &&
-                tensor.shape() == shape) {
-                return;
-            }
-            tensor = lfs::core::Tensor::empty(shape, lfs::core::Device::GPU, lfs::core::DataType::Float32);
-        }
-
-        void copy_into_cached(lfs::core::Tensor& dst, const lfs::core::Tensor& src) {
-            auto value = to_float01_cuda(src).contiguous();
-            ensure_cuda_float(dst, value.shape());
-            if (dst.data_ptr() != value.data_ptr() && value.bytes() > 0) {
-                dst.copy_(value);
-            }
-        }
-
-        [[nodiscard]] bool fill_mean_abs_error_hw(
-            const lfs::core::Tensor& image,
-            const lfs::core::Tensor& target,
-            lfs::core::Tensor& out_hw) {
-            auto pred = to_float01_cuda(image).contiguous();
-            auto gt = to_float01_cuda(target).contiguous();
-            if (pred.ndim() != 3 || gt.ndim() != 3) {
-                return false;
-            }
-            const size_t channels = std::min(pred.shape()[0], gt.shape()[0]);
-            const size_t height = pred.shape()[1];
-            const size_t width = pred.shape()[2];
-            if (channels == 0 || height == 0 || width == 0 ||
-                gt.shape()[1] != height || gt.shape()[2] != width) {
-                return false;
-            }
-            if (pred.shape()[0] != channels) {
-                pred = pred.slice(0, 0, channels).contiguous();
-            }
-            if (gt.shape()[0] != channels) {
-                gt = gt.slice(0, 0, channels).contiguous();
-            }
-            ensure_cuda_float(out_hw, lfs::core::TensorShape({height, width}));
-            const int channels_i = static_cast<int>(channels);
-            const int height_i = static_cast<int>(height);
-            const int width_i = static_cast<int>(width);
-            mrnf_strategy::launch_mean_abs_error_hw(
-                pred.ptr<float>(),
-                gt.ptr<float>(),
-                channels_i,
-                height_i,
-                width_i,
-                out_hw.ptr<float>());
-            return true;
-        }
-
-        [[nodiscard]] lfs::core::Tensor flatten_hw(const lfs::core::Tensor& tensor) {
-            auto value = squeeze_leading_ones(tensor);
-            while (value.is_valid() && value.ndim() > 2 && value.shape()[value.ndim() - 1] == 1) {
-                value = value.squeeze(-1);
-            }
-            if (value.ndim() == 3 && value.shape()[0] == 1) {
-                value = value.squeeze(0);
-            }
-            if (value.ndim() != 2) {
-                return {};
-            }
-            const size_t numel = value.numel();
-            return value.reshape(lfs::core::TensorShape({numel}));
+            auto tensor = lfs::core::Tensor::empty_exact({n}, lfs::core::DataType::Float32);
+            tensor.zero_();
+            return tensor;
         }
 
         [[nodiscard]] float logit_clamped(const float p) {
@@ -256,7 +189,7 @@ namespace lfs::training {
                 if (desired_capacity > size) {
                     tensor = lfs::core::Tensor::zeros_direct(lfs::core::TensorShape({size}), desired_capacity, device);
                 } else {
-                    tensor = lfs::core::Tensor::zeros({size}, device);
+                    tensor = zero_splat_vector(size, device);
                 }
             };
 
@@ -334,12 +267,10 @@ namespace lfs::training {
                         auto idx_i32 = indices.dtype() == lfs::core::DataType::Int32
                                            ? indices
                                            : indices.to(lfs::core::DataType::Int32);
-                        const auto stream = lfs::core::getCurrentCUDAStream();
+                        const auto stream = lfs::core::TensorExecutionTarget::current();
                         idx_i32.sync_to_stream(stream);
                         state->grad.set_stream(stream);
-                        lfs::core::shN_swizzled_zero_at_indices(
-                            state->grad.ptr<float>(), idx_i32.ptr<int>(),
-                            idx_i32.numel(), layout_rest, stream);
+                        training_sh_ops().zero_rows(state->grad, idx_i32, layout_rest);
                     }
                     return;
                 }
@@ -532,17 +463,11 @@ namespace lfs::training {
             splat_data.reconcile_deleted_mask();
         }
 
-        void normalize_by_positive_median_inplace(
-            lfs::core::Tensor& tensor,
-            PositiveMedianScratch* scratch = nullptr) {
+        void normalize_by_positive_median_inplace(lfs::core::Tensor& tensor) {
             if (tensor.device() == lfs::core::Device::GPU &&
                 tensor.dtype() == lfs::core::DataType::Float32 &&
                 tensor.is_valid() && tensor.numel() > 0) {
-                if (scratch) {
-                    scratch->ensure_n(tensor.numel(), tensor.device());
-                }
-                kernels::launch_normalize_by_positive_median(
-                    tensor.ptr<float>(), tensor.numel(), nullptr, scratch);
+                training_ops(lfs::core::default_gpu_backend()).refine->normalize_positive_median(tensor);
                 return;
             }
             // CPU fallback (tests / rare).
@@ -557,16 +482,25 @@ namespace lfs::training {
             tensor.div_(std::max(median, 1e-9f));
         }
 
-        [[nodiscard]] lfs::core::Tensor normalized_by_positive_median(
-            const lfs::core::Tensor& tensor,
-            PositiveMedianScratch* scratch = nullptr) {
+        [[nodiscard]] lfs::core::Tensor normalized_by_positive_median(const lfs::core::Tensor& tensor) {
             auto normalized = tensor.clone();
-            normalize_by_positive_median_inplace(normalized, scratch);
+            normalize_by_positive_median_inplace(normalized);
             return normalized;
         }
     } // namespace
 
-    MRNF::MRNF(lfs::core::SplatData& splat_data) : _splat_data(&splat_data) {}
+    MRNF::MRNF(lfs::core::SplatData& splat_data) : _splat_data(&splat_data) {
+        mrnf_ops_ = training_ops(lfs::core::default_gpu_backend()).mrnf;
+    }
+
+    const lfs::gpu_ops::MrnfOps& MRNF::mrnf_ops() const {
+        if (mrnf_ops_ == nullptr) [[unlikely]] {
+            throw std::runtime_error(
+                unavailable_training_family(lfs::core::default_gpu_backend(), Family::Mrnf)
+                    .value_or("Mrnf training ops are unavailable"));
+        }
+        return *mrnf_ops_;
+    }
 
     void MRNF::initialize(const lfs::core::param::OptimizationParameters& optimParams) {
         using namespace lfs::core;
@@ -578,7 +512,12 @@ namespace lfs::training {
         _densify_n_allocated_peak_bytes = 0;
         _densify_child_required_peak_bytes = 0;
         _densify_child_allocated_peak_bytes = 0;
-        _params = std::make_unique<const lfs::core::param::OptimizationParameters>(optimParams);
+        if (optimParams.gut && optimParams.opacity_decay_rendered_only)
+            LOG_INFO("opacity_decay_rendered_only has no effect with GUT");
+        auto resolved_params = optimParams;
+        resolved_params.resolve_mrnf_capacity_defaults();
+        _params = std::make_unique<const lfs::core::param::OptimizationParameters>(
+            std::move(resolved_params));
 
         if (_params->max_cap > 0) {
             const size_t capacity = static_cast<size_t>(_params->max_cap);
@@ -671,43 +610,27 @@ namespace lfs::training {
             TensorShape({capacity}), capacity, _splat_data->means().device(), DataType::Bool);
         sync_deleted_mask_from_free_mask(*_splat_data, _free_mask);
 
-        // Pre-size densification scratch to the parameter reservation so
-        // increasing live N within the allocator's headroom does not allocate
-        // from the driver during refinement.
-        if (capacity > 0) {
-            const auto device = _splat_data->means().device();
-            _densify_n_scratch.ensure_n(capacity, device);
-            _gumbel_scratch.ensure_n(capacity, device);
-            _median_scratch.ensure_n(capacity, device);
-            if (lfs::training::PerfBenchCollector::enabled()) {
-                lfs::training::PerfBenchCollector::instance().set_densify_workspace_bytes(
-                    _densify_n_scratch.resident_bytes());
-            }
-        }
-
         const size_t n = static_cast<size_t>(_splat_data->size());
-        _initial_sfm_point_count = n;
         const size_t tracking_capacity = splat_reserved_capacity(*_splat_data);
         reset_vector_buffer(_refine_weight_max, n, _splat_data->means().device(), tracking_capacity);
-        if (cfg_ratio_rank_on()) {
-            reset_vector_buffer(_vis_count, n, _splat_data->means().device(), tracking_capacity);
-            reset_vector_buffer(_refine_ratio_max, n, _splat_data->means().device(), tracking_capacity);
-        }
+        if (_params->opacity_decay_rendered_only && !_params->gut)
+            reset_vector_buffer(_rendered_count, n, _splat_data->means().device(), tracking_capacity);
+        else
+            _rendered_count = lfs::core::Tensor();
 
         publish_vram_attribution();
         compute_bounds();
         refresh_camera_hull();
-        ensure_mean_step_far_mask();
 
-        LOG_INFO("MRNF strategy initialized with {} Gaussians", n);
+        cancel_blob_seeding();
+        // A point cloud that already fills the capacity leaves no room for seeds, so skip capturing views for them.
+        if (n > 0 && (_params->max_cap <= 0 || static_cast<int64_t>(n) < int64_t{_params->max_cap}))
+            _blob_seeder = std::make_unique<BlobSeeder>(_splat_data->means());
     }
 
     void MRNF::set_training_dataset(std::shared_ptr<CameraDataset> views) {
         _views = std::move(views);
         refresh_camera_hull();
-        if (_optimizer) {
-            ensure_mean_step_far_mask();
-        }
     }
 
     lfs::core::Tensor MRNF::edge_score_scratch(const int iter) {
@@ -722,12 +645,12 @@ namespace lfs::training {
         const size_t n = static_cast<size_t>(_splat_data->size());
         if (!_edge_score_sum.is_valid() || _edge_score_sum.ndim() != 1 ||
             _edge_score_sum.numel() != n) {
-            _edge_score_sum = Tensor::zeros({n}, _splat_data->means().device());
+            _edge_score_sum = zero_splat_vector(n, _splat_data->means().device());
             _edge_sample_count = 0;
         }
         if (!_edge_view_scores.is_valid() || _edge_view_scores.ndim() != 1 ||
             _edge_view_scores.numel() != n) {
-            _edge_view_scores = Tensor::zeros({n}, _splat_data->means().device());
+            _edge_view_scores = zero_splat_vector(n, _splat_data->means().device());
         } else {
             _edge_view_scores.zero_();
         }
@@ -746,7 +669,7 @@ namespace lfs::training {
         // Match the old per-view estimator boundary: normalize each view's
         // splat vector independently, then apply the frozen mask in effect for
         // that sample before adding it to the persistent refine window.
-        normalize_by_positive_median_inplace(_edge_view_scores, &_median_scratch);
+        normalize_by_positive_median_inplace(_edge_view_scores);
         zero_frozen_scores_inplace(*_splat_data, _edge_view_scores);
         _edge_score_sum.add_(_edge_view_scores);
         ++_edge_sample_count;
@@ -813,54 +736,10 @@ namespace lfs::training {
         }
     }
 
-    int MRNF::view_target_samples_per_refine_window() const {
-        const int refine_window = _params ? static_cast<int>(_params->refine_every) : 1;
-        if (!_views || _views->size() == 0) {
-            return std::max(1, std::min(refine_window, MRNF_EXPLORE_MIN_VIEW_SAMPLES));
-        }
-
-        const int num_cam_dataset = static_cast<int>(_views->size());
-        const int requested_samples = num_cam_dataset < MRNF_EXPLORE_MIN_VIEW_SAMPLES
-                                          ? num_cam_dataset
-                                          : std::max(
-                                                MRNF_EXPLORE_MIN_VIEW_SAMPLES,
-                                                static_cast<int>(0.08f * static_cast<float>(num_cam_dataset)));
-        return std::max(1, std::min(refine_window, requested_samples));
-    }
-
-    bool MRNF::should_accumulate_view_sample(int iter) const {
-        if (!_params ||
-            iter <= static_cast<int>(_params->start_refine) ||
-            iter >= static_cast<int>(_params->stop_refine) ||
-            _splat_data->size() == 0) {
-            return false;
-        }
-
-        if (is_refining(iter)) {
-            return true;
-        }
-
-        const int target_samples = view_target_samples_per_refine_window();
-        const int refine_every = std::max(1, static_cast<int>(_params->refine_every));
-        const int stride = std::max(1, refine_every / target_samples);
-        return (iter % stride) == 0;
-    }
-
-    bool MRNF::should_accumulate_explore_sample(int iter) const {
-        return background_improvements_enabled() && far_operators_active() &&
-               should_accumulate_view_sample(iter);
-    }
-
     void MRNF::reset_edge_accumulator() {
         _edge_score_sum = lfs::core::Tensor();
         _edge_view_scores = lfs::core::Tensor();
         _edge_sample_count = 0;
-    }
-
-    void MRNF::reset_explore_accumulator() {
-        _explore_score_sum = lfs::core::Tensor();
-        _explore_sample_count = 0;
-        _explore_last_sample_iter = -1;
     }
 
     void MRNF::publish_vram_attribution() noexcept {
@@ -886,25 +765,12 @@ namespace lfs::training {
             };
 
             account_tensor("refine_weight_max", _refine_weight_max);
-            account_tensor("refine_ratio_max", _refine_ratio_max);
-            if (has_separate_visibility_buffer()) {
-                account_tensor("vis_count", _vis_count);
-            }
             account_tensor("free_mask", _free_mask);
             account_tensor("refine_counts_device", _refine_counts_dev);
             account_tensor("edge.precomputed_scores", _precomputed_edge_scores);
             account_tensor("edge.score_sum", _edge_score_sum);
             account_tensor("edge.view_scores", _edge_view_scores);
-            account_tensor("explore.score_sum", _explore_score_sum);
-            account_tensor("explore.error_hw", _explore_error_hw);
-            account_tensor("explore.view_scores", _explore_view_scores);
-            account_tensor("explore.means2d", _explore_means2d);
-            account_tensor("explore.radii", _explore_radii);
-            account_tensor("explore.far_field_mask", _far_field_mask);
-            account_tensor("explore.cached_image", _cached_seed_image);
-            account_tensor("explore.cached_target", _cached_seed_target);
-            account_tensor("explore.cached_alpha", _cached_seed_alpha);
-            account_tensor("explore.cached_depth", _cached_seed_depth);
+            account_tensor("far_field_mask", _far_field_mask);
 
             _strategy_required_peak_bytes =
                 std::max(_strategy_required_peak_bytes, strategy_required);
@@ -941,170 +807,16 @@ namespace lfs::training {
         }
     }
 
-    bool MRNF::should_cache_seed_view(int iter) const {
-        if (!background_improvements_enabled()) {
-            return false;
-        }
-        const int next_iter = iter + 1;
-        return is_refining(next_iter) &&
-               next_iter < effective_grow_until_iter();
-    }
-
-    void MRNF::cache_seed_view(int iter, const RenderOutput& render_output) {
-        using namespace lfs::core;
-        if (!should_cache_seed_view(iter) || !render_output.camera) {
-            return;
-        }
-        LOG_TIMER("MRNF::cache_seed_view");
-        if (!is_cuda_image(render_output.image) ||
-            !is_cuda_image(render_output.target_image) ||
-            !render_output.alpha.is_valid() ||
-            render_output.alpha.device() != Device::GPU ||
-            !same_spatial(render_output.image, render_output.target_image)) {
-            return;
-        }
-
-        copy_into_cached(_cached_seed_image, render_output.image);
-        copy_into_cached(_cached_seed_target, render_output.target_image);
-        copy_into_cached(_cached_seed_alpha, render_output.alpha);
-        if (render_output.depth.is_valid() && render_output.depth.device() == Device::GPU) {
-            copy_into_cached(_cached_seed_depth, render_output.depth);
-        } else {
-            _cached_seed_depth = Tensor();
-        }
-        _cached_seed_camera = render_output.camera;
-        _cached_seed_width = render_output.width > 0
-                                 ? render_output.width
-                                 : static_cast<int>(_cached_seed_image.shape()[_cached_seed_image.ndim() - 1]);
-        _cached_seed_height = render_output.height > 0
-                                  ? render_output.height
-                                  : static_cast<int>(_cached_seed_image.shape()[_cached_seed_image.ndim() - 2]);
-        _cached_seed_valid = true;
-    }
-
-    void MRNF::accumulate_explore_sample(int iter, const RenderOutput& render_output) {
-        using namespace lfs::core;
-
-        if (_explore_last_sample_iter == iter) {
-            return;
-        }
-        if (!should_accumulate_explore_sample(iter)) {
-            return;
-        }
-        LOG_TIMER("MRNF::accumulate_explore_sample");
-        if (!is_cuda_image(render_output.image) ||
-            !is_cuda_image(render_output.target_image) ||
-            render_output.image.ndim() < 3 ||
-            render_output.target_image.ndim() < 3 ||
-            !same_spatial(render_output.image, render_output.target_image)) {
-            return;
-        }
-
-        if (!fill_mean_abs_error_hw(render_output.image, render_output.target_image, _explore_error_hw) ||
-            !_explore_error_hw.is_valid() || _explore_error_hw.ndim() != 2 ||
-            _explore_error_hw.device() != Device::GPU ||
-            _explore_error_hw.dtype() != DataType::Float32) {
-            return;
-        }
-
-        const int height = static_cast<int>(_explore_error_hw.shape()[0]);
-        const int width = static_cast<int>(_explore_error_hw.shape()[1]);
-        if (height <= 0 || width <= 0) {
-            return;
-        }
-
-        const size_t n = static_cast<size_t>(_splat_data->size());
-        if (n == 0) {
-            return;
-        }
-
-        Tensor means2d;
-        Tensor radii;
-        bool used_render_buffers = false;
-        if (render_output.means2d.is_valid() && render_output.radii.is_valid() &&
-            render_output.means2d.device() == Device::GPU &&
-            render_output.radii.device() == Device::GPU &&
-            render_output.means2d.numel() > 0 &&
-            render_output.radii.numel() > 0) {
-            means2d = squeeze_leading_ones(render_output.means2d);
-            radii = squeeze_leading_ones(render_output.radii);
-            if (means2d.ndim() == 3 && means2d.shape()[0] == 1) {
-                means2d = means2d.squeeze(0);
-            }
-            if (radii.ndim() == 2 && radii.shape()[0] == 1) {
-                radii = radii.squeeze(0);
-            }
-            if (means2d.ndim() == 2 && means2d.shape()[0] == n && means2d.shape()[1] == 2 &&
-                radii.ndim() == 1 && radii.numel() == n) {
-                used_render_buffers = true;
-            }
-        }
-
-        if (!used_render_buffers) {
-            if (!render_output.camera) {
-                return;
-            }
-            const auto [fx, fy, cx, cy] = render_output.camera->get_intrinsics();
-            const float* w2c = render_output.camera->world_view_transform_ptr();
-            if (w2c == nullptr || !(fx > 0.0f) || !(fy > 0.0f)) {
-                return;
-            }
-            ensure_cuda_float(_explore_means2d, TensorShape({n, 2}));
-            ensure_cuda_float(_explore_radii, TensorShape({n}));
-            means2d = _explore_means2d;
-            radii = _explore_radii;
-            mrnf_strategy::launch_project_visible_centers(
-                _splat_data->means().ptr<float>(),
-                w2c,
-                fx,
-                fy,
-                cx,
-                cy,
-                width,
-                height,
-                MRNF_PROJECT_NEAR,
-                means2d.ptr<float>(),
-                radii.ptr<float>(),
-                n);
-        }
-
-        if (!_explore_score_sum.is_valid() ||
-            _explore_score_sum.ndim() != 1 ||
-            _explore_score_sum.numel() != n) {
-            _explore_score_sum = Tensor::zeros({n}, _splat_data->means().device());
-            _explore_sample_count = 0;
-        }
-
-        ensure_cuda_float(_explore_view_scores, TensorShape({n}));
-        assert(means2d.is_valid());
-        assert(means2d.ndim() == 2);
-        assert(means2d.shape()[0] == n);
-        assert(means2d.shape()[1] == 2);
-        assert(radii.is_valid());
-        assert(radii.ndim() == 1);
-        assert(radii.numel() == n);
-        mrnf_strategy::launch_gather_center_error(
-            means2d.ptr<float>(),
-            radii.ptr<float>(),
-            _explore_error_hw.ptr<float>(),
-            width,
-            height,
-            _explore_view_scores.ptr<float>(),
-            n);
-        normalize_by_positive_median_inplace(_explore_view_scores, &_median_scratch);
-        zero_frozen_scores_inplace(*_splat_data, _explore_view_scores);
-        _explore_score_sum.add_(_explore_view_scores);
-        ++_explore_sample_count;
-        _explore_last_sample_iter = iter;
-        publish_vram_attribution();
-    }
-
     void MRNF::post_render(int iter, RenderOutput& render_output) {
-        accumulate_explore_sample(iter, render_output);
-        cache_seed_view(iter, render_output);
+        const auto& seed_image = render_output.stable_target_image.is_valid() ? render_output.stable_target_image
+                                                                              : render_output.target_image;
+        if (_blob_seeder && render_output.camera && iter < static_cast<int>(_params->grow_until_iter) &&
+            is_gpu_image(seed_image)) {
+            _blob_seeder->capture(*render_output.camera, squeeze_leading_ones(seed_image));
+        }
     }
 
-    void MRNF::post_backward(int iter, RenderOutput& render_output) {
+    void MRNF::post_backward(int iter, RenderOutput& /*render_output*/) {
         LOG_TIMER("MRNF::post_backward");
         using namespace lfs::core;
 
@@ -1123,8 +835,6 @@ namespace lfs::training {
             _precomputed_edge_scores = Tensor();
             _edge_precompute_valid = false;
             reset_edge_accumulator();
-            reset_explore_accumulator();
-            _cached_seed_valid = false;
             // Topology freeze safety net: re-encode if the stop_refine step still
             // holds float SH (every regular refine already commits). is_refining()
             // classifies this boundary as an exclusive mutation step even when it
@@ -1136,12 +846,10 @@ namespace lfs::training {
             }
             _refine_weight_max = Tensor();
             _gumbel_scratch.release();
-            _median_scratch.release();
             _densify_n_scratch.release();
             _topology_frozen = true;
             assert(!_refine_weight_max.is_valid());
             assert(_gumbel_scratch.resident_bytes() == 0);
-            assert(_median_scratch.resident_bytes() == 0);
             assert(_densify_n_scratch.resident_bytes() == 0);
             Tensor::trim_memory_pool();
             publish_vram_attribution();
@@ -1168,36 +876,10 @@ namespace lfs::training {
         assert(info.shape()[1] == n);
 
         if (_refine_weight_max.numel() == n) {
-            float* ratio_max_ptr = nullptr;
-            if (cfg_ratio_rank_on() && _refine_ratio_max.numel() == n) {
-                ratio_max_ptr = _refine_ratio_max.ptr<float>();
-            }
-            if (has_separate_visibility_buffer()) {
-                mrnf_strategy::launch_fold_densification_and_zero(
-                    _vis_count.ptr<float>(),
-                    _refine_weight_max.ptr<float>(),
-                    _splat_data->_densification_info.ptr<float>(),
-                    n,
-                    nullptr,
-                    densification_row_count(),
-                    ratio_max_ptr,
-                    cfg_ratio_pow());
-            } else {
-                mrnf_strategy::launch_fold_densification_error_and_zero(
-                    _refine_weight_max.ptr<float>(),
-                    _splat_data->_densification_info.ptr<float>(),
-                    n);
-            }
+            mrnf_ops().fold_error(_refine_weight_max, _splat_data->_densification_info);
             zero_frozen_scores_inplace(*_splat_data, _refine_weight_max);
-            if (ratio_max_ptr != nullptr) {
-                zero_frozen_scores_inplace(*_splat_data, _refine_ratio_max);
-            }
-            if (has_separate_visibility_buffer()) {
-                zero_frozen_scores_inplace(*_splat_data, _vis_count);
-            } else {
-                auto vis = _splat_data->_densification_info.slice(0, 0, 1).squeeze(0);
-                zero_frozen_scores_inplace(*_splat_data, vis);
-            }
+            auto vis = _splat_data->_densification_info.slice(0, 0, 1).squeeze(0);
+            zero_frozen_scores_inplace(*_splat_data, vis);
         } else if (info.is_valid() && info.numel() > 0) {
             _splat_data->_densification_info.zero_();
         }
@@ -1206,11 +888,8 @@ namespace lfs::training {
             inject_noise(iter);
         }
 
-        accumulate_explore_sample(iter, render_output);
-        cache_seed_view(iter, render_output);
-
         if (refining_this_iter) {
-            refine(iter, render_output);
+            refine(iter);
             _precomputed_edge_scores = Tensor();
             _edge_precompute_valid = false;
         }
@@ -1222,18 +901,12 @@ namespace lfs::training {
 
     void MRNF::permute_gaussian_rows(const lfs::core::Tensor& perm) {
         morton::permute_row_tensor(_refine_weight_max, perm);
-        morton::permute_row_tensor(_refine_ratio_max, perm);
-        if (has_separate_visibility_buffer()) {
-            morton::permute_row_tensor(_vis_count, perm);
-        }
+        if (_rendered_count.is_valid())
+            morton::permute_row_tensor(_rendered_count, perm);
         morton::permute_row_tensor(_precomputed_edge_scores, perm);
         morton::permute_row_tensor(_edge_score_sum, perm);
-        morton::permute_row_tensor(_explore_score_sum, perm);
         morton::permute_row_tensor(_free_mask, perm);
         morton::permute_row_tensor(_far_field_mask, perm);
-        if (_far_growth.outside_mask.is_valid()) {
-            _far_growth.outside_mask = _far_field_mask;
-        }
         publish_mean_step_far_mask();
     }
 
@@ -1247,16 +920,7 @@ namespace lfs::training {
                 iter % _params->refine_every == 0);
     }
 
-    int MRNF::effective_grow_until_iter() const {
-        int value = static_cast<int>(_params->grow_until_iter);
-        const int fill_iter = cfg_fill_target_iter();
-        if (fill_iter > 0) {
-            value = std::max(value, fill_iter);
-        }
-        return value;
-    }
-
-    void MRNF::refine(int iter, RenderOutput& render_output) {
+    void MRNF::refine(int iter) {
         lfs::core::alloc_counter::ScopedSite densify_site("densify");
         LOG_TIMER("MRNF::refine");
         LFS_VRAM_SCOPE("MRNF::refine");
@@ -1273,31 +937,8 @@ namespace lfs::training {
 
         if (_splat_data->_max_screen_share.is_valid() &&
             _splat_data->_max_screen_share.numel() > 0) {
-            core::gpu_device_barrier(core::GpuBackend::CUDA);
-        }
-
-        if (_params && screen_share_shrink_active(iter) &&
-            screen_share_cap_active(_params->max_screen_share) &&
-            _splat_data->_max_screen_share.is_valid() &&
-            _splat_data->_max_screen_share.numel() == n) {
-            auto& log_scales_clip = _splat_data->scaling_raw();
-            assert(log_scales_clip.shape()[0] == n && log_scales_clip.shape()[1] == 3);
-            const bool* frozen = nullptr;
-            size_t frozen_n = 0;
-            if (_optimizer) {
-                const auto& mask = _optimizer->frozen_mask();
-                if (mask.is_valid()) {
-                    frozen = mask.ptr<bool>();
-                    frozen_n = mask.numel();
-                }
-            }
-            kernels::launch_clip_log_scale_by_screen_share(
-                log_scales_clip.ptr<float>(),
-                _splat_data->_max_screen_share.ptr<float>(),
-                frozen,
-                frozen_n,
-                _params->max_screen_share,
-                n);
+            core::gpu_device_barrier(core::gpu_backend_of(_splat_data->_max_screen_share)
+                                         .value_or(core::default_gpu_backend()));
         }
 
         auto raw_opacities = _splat_data->opacity_raw();
@@ -1317,24 +958,6 @@ namespace lfs::training {
                           compute_near_zero_rotation_mask(_splat_data->rotation_raw()) |
                           (scale_max < MRNF_LOG_MIN_SCALE_THRESHOLD);
 
-        // Bounds-dependent pruning is unsafe for one-point or colocated models:
-        // log(0) would classify every finite scale as oversized. Keep the
-        // bounds-independent safety checks active until a real scene extent exists.
-        if (_bounds_valid) {
-            const float max_allowed =
-                _bounds.max_extent <= std::numeric_limits<float>::max() / 100.0f
-                    ? _bounds.max_extent * 100.0f
-                    : std::numeric_limits<float>::max();
-            const float log_max_allowed = std::log(max_allowed);
-            auto center = Tensor::from_vector(
-                {_bounds.center[0], _bounds.center[1], _bounds.center[2]},
-                TensorShape({1, 3}), Device::GPU);
-            auto dist_from_center = (means - center).abs().max(1);
-            prune_mask = prune_mask |
-                         (scale_max > log_max_allowed) |
-                         (dist_from_center > max_allowed);
-        }
-
         if (_free_mask.is_valid() && n > 0) {
             auto active_mask = _free_mask.slice(0, 0, n).logical_not();
             prune_mask = prune_mask.logical_and(active_mask);
@@ -1344,17 +967,12 @@ namespace lfs::training {
         if (!_refine_counts_dev.is_valid() || _refine_counts_dev.numel() < 4) {
             _refine_counts_dev = Tensor::zeros({4}, Device::GPU, DataType::Int64);
         }
-        kernels::launch_packed_refine_counts(
-            prune_mask.ptr<bool>(), n,
-            nullptr, 0,
-            nullptr, 0,
-            nullptr, 0,
-            _refine_counts_dev.ptr<int64_t>());
+        training_ops(lfs::core::default_gpu_backend()).refine->counts(prune_mask, {}, {}, {}, _refine_counts_dev);
         const auto host_counts = _refine_counts_dev.to_vector_int64();
         const int pruned_count = static_cast<int>(host_counts[0]);
 
         if (pruned_count > 0) {
-            auto prune_indices = prune_mask.nonzero().squeeze(-1);
+            auto prune_indices = compact_bool_indices(prune_mask, static_cast<size_t>(pruned_count));
             mark_as_free(prune_indices);
             set_deleted_mask_rows(*_splat_data, _free_mask, prune_indices, true);
 
@@ -1375,31 +993,18 @@ namespace lfs::training {
             LFS_COUNTER_ADD("strategy.mrnf.pruned", pruned_count);
         }
 
-        const bool growing = iter < effective_grow_until_iter();
-        const bool seed_far = growing && background_improvements_enabled();
-        int reserved_seeds = seed_far ? starved_cadence_count(kExploreSeeds) : 0;
-        if (seed_far && cfg_seed_dose() > 0)
-            reserved_seeds = std::max(reserved_seeds, cfg_seed_dose());
-        begin_far_growth_window(n, reserved_seeds);
-
         grow_and_split(iter, pruned_count);
-        if (seed_far) {
-            seed_from_view(iter, render_output);
-        }
-        reset_explore_accumulator();
-
-        int live_far = 0;
-        const size_t live_n = static_cast<size_t>(_splat_data->size());
-        refresh_far_field_mask(live_n);
-        if (_camera_hull_valid && _far_field_mask.is_valid() &&
-            _far_field_mask.numel() == live_n) {
-            auto live_mask = _far_field_mask;
-            if (_free_mask.is_valid() && _free_mask.numel() >= live_mask.numel()) {
-                live_mask = live_mask.logical_and(_free_mask.slice(0, 0, live_mask.numel()).logical_not());
+        if (iter >= static_cast<int>(_params->grow_until_iter)) {
+            cancel_blob_seeding();
+        } else if (_blob_seeds.valid()) {
+            if (_blob_seeds.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                _blob_seed_worker.join();
+                append_blob_seeds(_blob_seeds.get());
             }
-            live_far = static_cast<int>(live_mask.to(DataType::Int32).sum().item<int>());
+        } else if (_blob_seeder && (_blob_seeder->budget_exhausted() ||
+                                    iter > static_cast<int>(_views ? _views->size() : 0))) {
+            start_blob_seeding();
         }
-        LFS_GAUGE("model.gaussians.live_far_field", live_far);
 
         enforce_max_cap();
         apply_decay(iter);
@@ -1408,12 +1013,8 @@ namespace lfs::training {
         const size_t new_n = static_cast<size_t>(_splat_data->size());
         const size_t tracking_capacity = splat_reserved_capacity(*_splat_data);
         reset_vector_buffer(_refine_weight_max, new_n, _splat_data->means().device(), tracking_capacity);
-        if (has_separate_visibility_buffer()) {
-            reset_vector_buffer(_vis_count, new_n, _splat_data->means().device(), tracking_capacity);
-        }
-        if (cfg_ratio_rank_on()) {
-            reset_vector_buffer(_refine_ratio_max, new_n, _splat_data->means().device(), tracking_capacity);
-        }
+        if (_params->opacity_decay_rendered_only && !_params->gut)
+            reset_vector_buffer(_rendered_count, new_n, _splat_data->means().device(), tracking_capacity);
         ensure_densification_info_shape();
         _splat_data->_densification_info.zero_();
         if (_splat_data->_max_screen_share.is_valid() &&
@@ -1429,32 +1030,24 @@ namespace lfs::training {
             lfs::training::sh_value::commit_shN_after_mutation(*_splat_data);
         }
 
+        _gumbel_scratch.release();
+        _densify_n_scratch.release();
         publish_vram_attribution();
 
         // MRNF trim_memory_pool parity with MCMC/IGS+ after refine.
         // Epoch-pinned release: trim runs under the same render_mutex_ exclusive
         // that bars Scene rebuild / preview from holding the float workspace
         // (trainer acquires exclusive for refining steps around post_backward).
-        lfs::core::Tensor::trim_memory_pool();
-    }
-
-    bool MRNF::cfg_ratio_rank_on() const {
-        return background_improvements_enabled() && _params->growth_ratio_rank;
-    }
-
-    float MRNF::cfg_ratio_pow() const {
-        return cfg_ratio_rank_on() ? _params->growth_ratio_pow : 0.0f;
-    }
-
-    bool MRNF::has_separate_visibility_buffer() const {
-        return cfg_ratio_rank_on() ||
-               (_vis_count.is_valid() && !_vis_count.is_view());
+        const auto reorder_interval = _params ? _params->morton_reorder_interval : 0;
+        const bool morton_next = reorder_interval > 0 &&
+                                 static_cast<size_t>(iter) % reorder_interval == 0 &&
+                                 !_splat_data->has_frozen_ranges();
+        if (!morton_next) {
+            lfs::core::Tensor::trim_memory_pool();
+        }
     }
 
     lfs::core::Tensor MRNF::visibility_accumulator() const {
-        if (has_separate_visibility_buffer()) {
-            return _vis_count;
-        }
         if (!_splat_data || !_splat_data->_densification_info.is_valid() ||
             _splat_data->_densification_info.ndim() != 2 ||
             _splat_data->_densification_info.shape()[0] < densification_row_count()) {
@@ -1463,54 +1056,17 @@ namespace lfs::training {
         return _splat_data->_densification_info.slice(0, 0, 1).squeeze(0);
     }
 
-    int MRNF::cfg_fill_target_iter() const {
-        return (background_improvements_enabled() && _params->fill_pacing_iter > 0)
-                   ? static_cast<int>(_params->fill_pacing_iter)
-                   : 0;
-    }
-
-    int MRNF::cfg_seed_dose() const {
-        return background_improvements_enabled() ? static_cast<int>(_params->far_seed_dose) : 0;
-    }
-
-    bool MRNF::background_improvements_enabled() const {
-        return _params && _params->background_improvements;
-    }
-
-    bool MRNF::far_operators_active() const {
-        return _scene_has_far_field || explore_starvation_weighting_enabled();
-    }
-
-    bool MRNF::explore_starvation_weighting_enabled() const {
-        return background_improvements_enabled() && _params->explore_starvation_weighting;
-    }
-
     void MRNF::refresh_camera_hull() {
         _camera_hull_valid = false;
-        // Invalidate the borrowed pointer before any census allocation or early return.
+        _far_field_mask = {};
+        // Invalidate the borrowed pointer before any early return.
         publish_mean_step_far_mask();
         _cam_centroid[0] = 0.0f;
         _cam_centroid[1] = 0.0f;
         _cam_centroid[2] = 0.0f;
         _orbit_radius = 0.0f;
 
-        if (!background_improvements_enabled()) {
-            _scene_has_far_field = false;
-            _far_field_mask = {};
-            update_far_starvation();
-            return;
-        }
-
         const size_t n_cam = _views ? _views->size() : 0;
-        if (n_cam < 2) {
-            update_far_starvation();
-            if (!_logged_degenerate_hull && background_improvements_enabled()) {
-                LOG_INFO("MRNF: camera hull unavailable (need >= 2 training cameras); far-field guard is inert");
-                _logged_degenerate_hull = true;
-            }
-            return;
-        }
-
         float sum_x = 0.0f;
         float sum_y = 0.0f;
         float sum_z = 0.0f;
@@ -1538,13 +1094,7 @@ namespace lfs::training {
             positions.push_back(p[2]);
             ++counted;
         }
-
         if (counted < 2) {
-            update_far_starvation();
-            if (!_logged_degenerate_hull && background_improvements_enabled()) {
-                LOG_INFO("MRNF: camera hull unavailable (need >= 2 valid cameras); far-field guard is inert");
-                _logged_degenerate_hull = true;
-            }
             return;
         }
 
@@ -1564,12 +1114,6 @@ namespace lfs::training {
         const float radius_eps =
             32.0f * std::numeric_limits<float>::epsilon() * std::max(centroid_norm, 1.0f);
         if (!std::isfinite(radius) || radius <= radius_eps) {
-            update_far_starvation();
-            if (!_logged_degenerate_hull && background_improvements_enabled()) {
-                LOG_INFO("MRNF: camera hull degenerate (orbit radius {:.6g}); far-field guard is inert",
-                         radius);
-                _logged_degenerate_hull = true;
-            }
             return;
         }
 
@@ -1578,139 +1122,9 @@ namespace lfs::training {
         _cam_centroid[2] = cz;
         _orbit_radius = radius;
         _camera_hull_valid = true;
-        _logged_degenerate_hull = false;
-
-        constexpr float kDeepFarRadiusOrbits = 8.0f;
-        const float far_scene_min_fraction = _params->far_scene_min_fraction;
-        const size_t n_now = _splat_data ? static_cast<size_t>(_splat_data->size()) : 0;
-        _scene_has_far_field = false;
-        if (n_now > 0) {
-            if (far_scene_min_fraction <= 0.0f) {
-                _scene_has_far_field = (n_now > 0);
-                LOG_INFO("MRNF: deep-far census unconditional at threshold 0 (n={}, far features {})",
-                         n_now, _scene_has_far_field ? "active" : "inert");
-            } else {
-                if (!_far_field_mask.is_valid() || _far_field_mask.numel() != n_now) {
-                    _far_field_mask = lfs::core::Tensor::zeros_bool({n_now}, lfs::core::Device::GPU);
-                }
-                mrnf_strategy::launch_far_field_mask(
-                    _splat_data->means().ptr<float>(),
-                    _cam_centroid[0], _cam_centroid[1], _cam_centroid[2],
-                    kDeepFarRadiusOrbits * _orbit_radius,
-                    _far_field_mask.ptr<bool>(), n_now);
-                const float far_frac =
-                    static_cast<float>(_far_field_mask.to(lfs::core::DataType::Int32).sum().item<int>()) /
-                    static_cast<float>(n_now);
-                _scene_has_far_field = far_frac >= far_scene_min_fraction;
-                LOG_INFO("MRNF: deep-far fraction {:.4f} at {}x orbit (threshold {:.2f}, far features {})",
-                         far_frac, kDeepFarRadiusOrbits, far_scene_min_fraction,
-                         _scene_has_far_field ? "active" : "inert");
-            }
-
-            if (!far_operators_active()) {
-                _camera_hull_valid = false;
-                _far_field_mask = lfs::core::Tensor();
-            }
-            update_far_starvation();
-            if (far_operators_active()) {
-                refresh_far_field_mask(n_now);
-            }
-        } else {
-            update_far_starvation();
-        }
-    }
-
-    int MRNF::cadence_scaled(const int count) const {
-        const int refine_every = _params
-                                     ? static_cast<int>(std::max<size_t>(_params->refine_every, size_t{1}))
-                                     : 100;
-        return static_cast<int>(std::lround(static_cast<double>(count) *
-                                            static_cast<double>(refine_every) / 100.0));
-    }
-
-    int MRNF::starved_cadence_count(const int count) const {
-        if (explore_starvation_weighting_enabled()) {
-            return static_cast<int>(std::lround(static_cast<double>(cadence_scaled(count)) *
-                                                static_cast<double>(kExploreStarvDose)));
-        }
-        return static_cast<int>(std::lround(static_cast<double>(cadence_scaled(count)) *
-                                            static_cast<double>(_far_starvation)));
-    }
-
-    float MRNF::effective_far_growth_cap() const {
-        if (!background_improvements_enabled()) {
-            return 1.0f;
-        }
-        return 1.0f - _far_starvation * (1.0f - kFarGrowthCap);
-    }
-
-    float MRNF::effective_far_decay_scale() const {
-        if (!background_improvements_enabled()) {
-            return 1.0f;
-        }
-        return 1.0f - _far_starvation * (1.0f - kFarDecayScale);
-    }
-
-    float MRNF::effective_mean_step_ratio_max() const {
-        if (!background_improvements_enabled()) {
-            return 1.0f;
-        }
-        return 1.0f + _far_starvation * (kPerSplatMeanStepRatioMax - 1.0f);
-    }
-
-    float MRNF::far_starvation_factor(const float ratio, const float full, const float rich) {
-        if (!std::isfinite(ratio) || !std::isfinite(full) || !std::isfinite(rich) ||
-            !(full > 0.0f) || !(rich > full)) {
-            return 0.0f;
-        }
-        return std::clamp((rich - ratio) / (rich - full), 0.0f, 1.0f);
-    }
-
-    float MRNF::explore_starvation_multiplier(const float vis_i, const float median_vis) {
-        if (vis_i == 0.0f) {
-            return 0.0f;
-        }
-        const float denom = std::max(median_vis, std::numeric_limits<float>::epsilon());
-        const float starved = std::clamp(1.0f - vis_i / denom, 0.0f, 1.0f);
-        const float term = std::pow(starved, kStarvGamma);
-        return kStarvEps + term;
-    }
-
-    void MRNF::update_far_starvation() {
-        // Params and P are bound at initialize(); skip the pre-init hull/setter pass.
-        if (!_params || _initial_sfm_point_count == 0) {
-            return;
-        }
-        // Census-active scenes keep s = 1 at any capacity for all far features.
-        // Census-inert scenes anneal mask-gated features with the cap/points ramp
-        // (uncapped = rich / 0). Exploration dose is independent of s.
-        const bool uncapped = _params->max_cap == 0;
-        const bool census_forces_full = _scene_has_far_field;
-        float s = 0.0f;
-        float ratio = 0.0f;
-        if (census_forces_full) {
-            s = 1.0f;
-        } else if (!uncapped) {
-            const float max_cap = static_cast<float>(_params->max_cap);
-            const float points = static_cast<float>(_initial_sfm_point_count);
-            ratio = max_cap / points;
-            s = far_starvation_factor(ratio, kFarCapRatioFull, kFarCapRatioRich);
-        }
-        _far_starvation = s;
-        if (std::abs(s - _logged_far_starvation) > 0.1f) {
-            if (census_forces_full) {
-                LOG_INFO("MRNF: far starvation 1.00 (far-field scene)");
-            } else if (uncapped) {
-                LOG_INFO("MRNF: far starvation 0.00 (uncapped)");
-            } else {
-                LOG_INFO("MRNF: far starvation {:.2f} (cap/points {:.2f})", s, ratio);
-            }
-            _logged_far_starvation = s;
-        }
-        if (_optimizer && _optimizer->per_splat_mean_step()) {
-            _optimizer->set_per_splat_mean_step(
-                true, _median_splat_extent, kPerSplatMeanStepRatioMin,
-                effective_mean_step_ratio_max());
+        const size_t n = _splat_data ? static_cast<size_t>(_splat_data->size()) : 0;
+        if (n > 0) {
+            refresh_far_field_mask(n);
         }
     }
 
@@ -1718,7 +1132,6 @@ namespace lfs::training {
         using namespace lfs::core;
         if (!_camera_hull_valid || n == 0) {
             _far_field_mask = Tensor();
-            update_far_starvation();
             publish_mean_step_far_mask();
             return;
         }
@@ -1728,23 +1141,15 @@ namespace lfs::training {
             _far_field_mask.numel() != n) {
             _far_field_mask = Tensor::zeros_bool({n}, Device::GPU);
         }
-        mrnf_strategy::launch_far_field_mask(
-            _splat_data->means().ptr<float>(),
-            _cam_centroid[0],
-            _cam_centroid[1],
-            _cam_centroid[2],
-            kFarMaskOrbits * _orbit_radius,
-            _far_field_mask.ptr<bool>(),
-            n);
+        const auto center = Tensor::from_vector(std::vector<float>{_cam_centroid[0], _cam_centroid[1], _cam_centroid[2]}, {1, 3}, Device::GPU);
+        const auto offset = _splat_data->means() - center;
+        const float radius = kFarMaskOrbits * _orbit_radius;
+        _far_field_mask = (offset * offset).sum(1) > radius * radius;
         publish_mean_step_far_mask();
     }
 
     void MRNF::publish_mean_step_far_mask() {
         if (!_optimizer) {
-            return;
-        }
-        if (!background_improvements_enabled()) {
-            _optimizer->set_mean_step_far_mask({});
             return;
         }
         const size_t n = _splat_data ? static_cast<size_t>(_splat_data->size()) : 0;
@@ -1757,34 +1162,11 @@ namespace lfs::training {
     }
 
     void MRNF::ensure_mean_step_far_mask() {
-        if (!background_improvements_enabled()) {
-            publish_mean_step_far_mask();
-            return;
-        }
         const size_t n = _splat_data ? static_cast<size_t>(_splat_data->size()) : 0;
         refresh_far_field_mask(n);
     }
 
-    void MRNF::begin_far_growth_window(const size_t n, const int reserved_seeds) {
-        using namespace lfs::core;
-        _far_growth = FarGrowthState{};
-        _far_growth.cap = effective_far_growth_cap();
-        _far_growth.reserved_for_seeds = std::max(0, reserved_seeds);
-        if (!_camera_hull_valid || !_params || _far_growth.cap >= 1.0f || n == 0) {
-            _far_growth.active = false;
-            if (_camera_hull_valid && n > 0) {
-                refresh_far_field_mask(n);
-                _far_growth.outside_mask = _far_field_mask;
-            }
-            return;
-        }
-
-        _far_growth.active = true;
-        refresh_far_field_mask(n);
-        _far_growth.outside_mask = _far_field_mask;
-    }
-
-    lfs::core::Tensor MRNF::sample_gumbel_with_far_guard(
+    lfs::core::Tensor MRNF::sample_gumbel_topk(
         const lfs::core::Tensor& weights,
         const int k,
         const uint64_t seed,
@@ -1794,139 +1176,11 @@ namespace lfs::training {
             return {};
         }
 
-        const size_t n = weights.numel();
-        _gumbel_scratch.ensure_n(n, Device::GPU);
-        if (!_far_growth.active || !_far_growth.outside_mask.is_valid() ||
-            _far_growth.outside_mask.numel() != n) {
-            auto indices = Tensor::empty({static_cast<size_t>(k)}, Device::GPU, DataType::Int64);
-            mrnf_strategy::launch_gumbel_topk(
-                weights.ptr<float>(), n, static_cast<size_t>(k), seed, indices.ptr<int64_t>(),
-                nullptr, true, &_gumbel_scratch, known_nnz);
-            _far_growth.allocated += k;
-            return indices;
-        }
-
-        if (!_refine_counts_dev.is_valid() || _refine_counts_dev.numel() < 4) {
-            _refine_counts_dev = Tensor::zeros({4}, Device::GPU, DataType::Int64);
-        }
-
-        auto weights_out = weights.masked_fill(_far_growth.outside_mask.logical_not(), 0.0f);
-        auto weights_in = weights.masked_fill(_far_growth.outside_mask, 0.0f);
-
-        kernels::launch_packed_refine_counts(
-            nullptr, 0, nullptr, 0,
-            weights_out.ptr<float>(), n,
-            weights_in.ptr<float>(), n,
-            _refine_counts_dev.ptr<int64_t>());
-        const auto host_counts = _refine_counts_dev.to_vector_int64();
-        const int selectable_out = static_cast<int>(host_counts[2]);
-        const int selectable_in = static_cast<int>(host_counts[3]);
-
-        const int prospective_total = _far_growth.allocated + k + _far_growth.reserved_for_seeds;
-        const int window_out_budget = static_cast<int>(
-            std::lround(static_cast<double>(_far_growth.cap) * static_cast<double>(prospective_total)));
-        const int remaining_window_out = std::max(
-            0, window_out_budget - _far_growth.outside_used - _far_growth.reserved_for_seeds);
-        const int stage_out = static_cast<int>(
-            std::lround(static_cast<double>(_far_growth.cap) * static_cast<double>(k)));
-        int k_out = std::min({k, remaining_window_out, selectable_out, std::max(0, stage_out)});
-        int k_in = k - k_out;
-        if (k_in > selectable_in) {
-            k_in = selectable_in;
-        }
-
-        Tensor out_inds;
-        Tensor in_inds;
-        if (k_out > 0) {
-            out_inds = Tensor::empty({static_cast<size_t>(k_out)}, Device::GPU, DataType::Int64);
-            mrnf_strategy::launch_gumbel_topk(
-                weights_out.ptr<float>(), n, static_cast<size_t>(k_out), seed,
-                out_inds.ptr<int64_t>(), nullptr, true, &_gumbel_scratch,
-                static_cast<size_t>(selectable_out));
-        }
-        if (k_in > 0) {
-            in_inds = Tensor::empty({static_cast<size_t>(k_in)}, Device::GPU, DataType::Int64);
-            mrnf_strategy::launch_gumbel_topk(
-                weights_in.ptr<float>(), n, static_cast<size_t>(k_in), seed + 17,
-                in_inds.ptr<int64_t>(), nullptr, true, &_gumbel_scratch,
-                static_cast<size_t>(selectable_in));
-        }
-
-        Tensor selected;
-        if (out_inds.is_valid() && out_inds.numel() > 0 && in_inds.is_valid() && in_inds.numel() > 0) {
-            selected = Tensor::cat({out_inds, in_inds}, 0);
-        } else if (out_inds.is_valid() && out_inds.numel() > 0) {
-            selected = out_inds;
-        } else if (in_inds.is_valid() && in_inds.numel() > 0) {
-            selected = in_inds;
-        }
-
-        _far_growth.allocated += static_cast<int>(selected.is_valid() ? selected.numel() : 0);
-        _far_growth.outside_used += k_out;
-        return selected;
-    }
-
-    void MRNF::apply_explore_starvation_weights(lfs::core::Tensor& weights, const size_t n) {
-        using namespace lfs::core;
-        if (_topology_frozen) {
-            return;
-        }
-        auto vis_count = visibility_accumulator();
-        if (!weights.is_valid() || weights.numel() != n ||
-            !vis_count.is_valid() || vis_count.numel() != n) {
-            return;
-        }
-
-        float median_vis = 0.0f;
-        Tensor live_vis = vis_count;
-        if (_free_mask.is_valid() && _free_mask.numel() >= n) {
-            live_vis = vis_count.masked_select(_free_mask.slice(0, 0, n).logical_not());
-        }
-        if (live_vis.is_valid() && live_vis.numel() > 0) {
-            mrnf_strategy::launch_sorted_median(
-                live_vis.ptr<float>(), live_vis.numel(), &median_vis, &_median_scratch);
-        }
-        mrnf_strategy::launch_apply_explore_starvation_weights(
-            weights.ptr<float>(), vis_count.ptr<float>(), n, median_vis);
-    }
-
-    lfs::core::Tensor MRNF::build_explore_split_weights(
-        const size_t n,
-        const lfs::core::Tensor& active_mask,
-        const lfs::core::Tensor& trainable_mask,
-        const lfs::core::Tensor& replace_mask,
-        const lfs::core::Tensor& growth_inds) {
-        using namespace lfs::core;
-        auto log_scales = _splat_data->scaling_raw();
-        auto score_mean = Tensor::zeros({n}, Device::GPU);
-        if (_explore_score_sum.is_valid() &&
-            _explore_score_sum.ndim() == 1 &&
-            _explore_score_sum.numel() == n) {
-            const float denom = static_cast<float>(std::max(_explore_sample_count, 1));
-            score_mean = _explore_score_sum / denom;
-        }
-        auto logw = log_scales.sum(1) + (score_mean + MRNF_EXPLORE_SCORE_FLOOR).log();
-        auto explore_weights = (logw - logw.max()).exp();
-        if (explore_starvation_weighting_enabled()) {
-            apply_explore_starvation_weights(explore_weights, n);
-        }
-        if (active_mask.is_valid()) {
-            explore_weights = explore_weights * active_mask;
-        }
-        if (trainable_mask.is_valid()) {
-            explore_weights = explore_weights * trainable_mask;
-        }
-        explore_weights = apply_crop_damping_to_scores(*_optimizer, explore_weights);
-        if (replace_mask.is_valid()) {
-            explore_weights = explore_weights.masked_fill(replace_mask, 0.0f);
-        }
-        if (growth_inds.is_valid() && growth_inds.numel() > 0) {
-            auto growth_mask = Tensor::zeros_bool({n}, Device::GPU);
-            auto true_vals = Tensor::ones_bool({growth_inds.numel()}, Device::GPU);
-            growth_mask.index_put_(growth_inds, true_vals);
-            explore_weights = explore_weights.masked_fill(growth_mask, 0.0f);
-        }
-        return explore_weights;
+        auto indices = Tensor::empty({static_cast<size_t>(k)}, Device::GPU, DataType::Int64);
+        mrnf_ops().gumbel(
+            &_gumbel_scratch, weights, indices,
+            {.seed = seed, .known_nnz = known_nnz, .compact_sparse = true});
+        return indices;
     }
 
     void MRNF::grow_and_split(int iter, int pruned_count) {
@@ -1934,13 +1188,7 @@ namespace lfs::training {
         LFS_VRAM_SCOPE("MRNF::grow_and_split");
         using namespace lfs::core;
         const size_t n = static_cast<size_t>(_splat_data->size());
-        if (!_far_growth.outside_mask.is_valid() || _far_growth.outside_mask.numel() != n) {
-            begin_far_growth_window(n, 0);
-        }
         const size_t current_active = active_count();
-        // densify N-scratch pre-sized to the parameter reservation; views avoid
-        // per-refine driver allocs (post-refine trim_memory_pool would otherwise force
-        // pool misses on every growing exact size).
         _densify_n_scratch.ensure_n(n, Device::GPU);
         if (PerfBenchCollector::enabled()) {
             PerfBenchCollector::instance().set_densify_workspace_bytes(
@@ -1989,33 +1237,10 @@ namespace lfs::training {
         if (!_refine_counts_dev.is_valid() || _refine_counts_dev.numel() < 4) {
             _refine_counts_dev = Tensor::zeros({4}, Device::GPU, DataType::Int64);
         }
-        kernels::launch_packed_refine_counts(
-            refine_candidates.ptr<bool>(), n,
-            nullptr, 0,
-            (replace_weights.is_valid() ? replace_weights.ptr<float>() : nullptr),
-            (replace_weights.is_valid() ? n : 0),
-            nullptr, 0,
-            _refine_counts_dev.ptr<int64_t>());
+        training_ops(lfs::core::default_gpu_backend()).refine->counts(refine_candidates, {}, replace_weights, {}, _refine_counts_dev);
         auto host_counts = _refine_counts_dev.to_vector_int64();
         int desired_total = static_cast<int>(
             std::round(static_cast<float>(host_counts[0]) * _params->grow_fraction));
-        const int candidate_count = static_cast<int>(host_counts[0]);
-
-        int pacing_windows_left = 0;
-        if (cfg_fill_target_iter() > 0 && _params->max_cap > 0) {
-            const int refine_every = std::max(1, static_cast<int>(_params->refine_every));
-            pacing_windows_left = std::max(1, (cfg_fill_target_iter() - iter) / refine_every);
-            const long long remaining = std::max<long long>(
-                0,
-                static_cast<long long>(_params->max_cap) - static_cast<long long>(current_active));
-            const long long paced =
-                (remaining + static_cast<long long>(pacing_windows_left) - 1) /
-                static_cast<long long>(pacing_windows_left); // ceil(remaining / windows_left)
-
-            if (desired_total > 0 && paced < static_cast<long long>(desired_total)) {
-                desired_total = static_cast<int>(std::min<long long>(paced, INT_MAX));
-            }
-        }
         const int selectable_replace = static_cast<int>(host_counts[2]);
 
         if (requested_replace > 0) {
@@ -2023,7 +1248,7 @@ namespace lfs::training {
             if (actual_replace > 0) {
                 // grow-only index/mask scratch (no per-refine driver alloc).
                 _densify_n_scratch.ensure_n(n, Device::GPU);
-                replace_inds = sample_gumbel_with_far_guard(
+                replace_inds = sample_gumbel_topk(
                     replace_weights, actual_replace, seed,
                     static_cast<size_t>(selectable_replace));
                 actual_replace = replace_inds.is_valid() ? static_cast<int>(replace_inds.numel()) : 0;
@@ -2036,97 +1261,14 @@ namespace lfs::training {
             }
         }
 
-        if (iter < effective_grow_until_iter()) {
+        if (iter < static_cast<int>(_params->grow_until_iter)) {
             above_threshold = refine_candidates;
             n_grow = std::max(0, desired_total - actual_replace);
             n_grow = std::min(n_grow, budget - actual_replace);
         }
 
-        Tensor oversize_inds;
-        Tensor oversize_mask;
-        int actual_oversize = 0;
-        if (n_grow > 0 &&
-            _params->oversize_split_fraction > 0.0f &&
-            screen_share_cap_active(_params->max_screen_share) &&
-            _splat_data->_max_screen_share.is_valid() &&
-            _splat_data->_max_screen_share.numel() == n) {
-            int n_oversize = static_cast<int>(std::round(
-                static_cast<float>(n_grow) * _params->oversize_split_fraction));
-            n_oversize = std::max(0, std::min(n_oversize, n_grow));
-            if (n_oversize > 0) {
-                const bool use_ratio_rank = cfg_ratio_rank_on() &&
-                                            _refine_ratio_max.is_valid() &&
-                                            _refine_ratio_max.numel() == n;
-                Tensor error_score = use_ratio_rank ? _refine_ratio_max : _refine_weight_max;
-                if (edge_guidance.is_valid()) {
-                    error_score = error_score * edge_guidance;
-                }
-                if (_optimizer) {
-                    error_score = apply_crop_damping_to_scores(*_optimizer, error_score);
-                }
-                error_score = error_score.contiguous();
-                Tensor oversize_weights = Tensor::zeros({n}, Device::GPU);
-                const bool* frozen = nullptr;
-                size_t frozen_n = 0;
-                if (_optimizer) {
-                    const auto& mask = _optimizer->frozen_mask();
-                    if (mask.is_valid()) {
-                        frozen = mask.ptr<bool>();
-                        frozen_n = mask.numel();
-                    }
-                }
-                kernels::launch_oversize_split_scores(
-                    error_score.ptr<float>(),
-                    _splat_data->_max_screen_share.ptr<float>(),
-                    frozen,
-                    frozen_n,
-                    oversize_weights.ptr<float>(),
-                    _params->max_screen_share,
-                    n);
-                if (active_mask.is_valid()) {
-                    oversize_weights = oversize_weights * active_mask;
-                }
-                if (trainable_mask.is_valid()) {
-                    oversize_weights = oversize_weights * trainable_mask;
-                }
-                if (replace_mask.is_valid()) {
-                    oversize_weights = oversize_weights.masked_fill(replace_mask, 0.0f);
-                }
-                kernels::launch_packed_refine_counts(
-                    nullptr, 0, nullptr, 0,
-                    oversize_weights.ptr<float>(), n,
-                    nullptr, 0,
-                    _refine_counts_dev.ptr<int64_t>());
-                host_counts = _refine_counts_dev.to_vector_int64();
-                const int selectable_oversize = static_cast<int>(host_counts[2]);
-                if (selectable_oversize > 0) {
-                    const int oversize_budget = std::min(n_oversize, selectable_oversize);
-                    oversize_inds = sample_gumbel_with_far_guard(
-                        oversize_weights, oversize_budget, seed + 3,
-                        static_cast<size_t>(selectable_oversize));
-                    actual_oversize =
-                        oversize_inds.is_valid() ? static_cast<int>(oversize_inds.numel()) : 0;
-                    if (actual_oversize > 0) {
-                        oversize_mask = Tensor::zeros_bool({n}, Device::GPU);
-                        auto true_vals = Tensor::ones_bool(
-                            {static_cast<size_t>(actual_oversize)}, Device::GPU);
-                        oversize_mask.index_put_(oversize_inds, true_vals);
-                        LFS_COUNTER_ADD("strategy.mrnf.oversize_split", actual_oversize);
-                    }
-                }
-            }
-        }
-
         if (n_grow > 0) {
-            n_grow = std::max(0, n_grow - actual_oversize);
-        }
-
-        if (n_grow > 0) {
-            const bool use_ratio_rank = cfg_ratio_rank_on() &&
-                                        _refine_ratio_max.is_valid() &&
-                                        _refine_ratio_max.numel() == n;
-            Tensor growth_weights =
-                above_threshold * (use_ratio_rank ? _refine_ratio_max : _refine_weight_max);
+            Tensor growth_weights = above_threshold * _refine_weight_max;
             if (edge_guidance.is_valid()) {
                 growth_weights = growth_weights * edge_guidance;
             }
@@ -2136,82 +1278,16 @@ namespace lfs::training {
                 // deduplicating sampled indices on the host.
                 growth_weights = growth_weights.masked_fill(replace_mask, 0.0f);
             }
-            if (oversize_mask.is_valid()) {
-                growth_weights = growth_weights.masked_fill(oversize_mask, 0.0f);
-            }
 
             // Growth nnz is data-dependent on replace_mask — second packed slot.
-            kernels::launch_packed_refine_counts(
-                nullptr, 0, nullptr, 0,
-                growth_weights.ptr<float>(), n,
-                nullptr, 0,
-                _refine_counts_dev.ptr<int64_t>());
+            training_ops(lfs::core::default_gpu_backend()).refine->counts({}, {}, growth_weights, {}, _refine_counts_dev);
             host_counts = _refine_counts_dev.to_vector_int64();
             const int selectable_growth = static_cast<int>(host_counts[2]);
             if (selectable_growth > 0) {
                 const int growth_budget = std::min(n_grow, selectable_growth);
-                growth_inds = sample_gumbel_with_far_guard(
+                growth_inds = sample_gumbel_topk(
                     growth_weights, growth_budget, seed + 1,
                     static_cast<size_t>(selectable_growth));
-            }
-        }
-
-        ++_growth_window_count;
-
-        if (cfg_ratio_rank_on() &&
-            (_growth_window_count % MRNF_RATIO_RANK_LOG_INTERVAL) == 1) {
-            const int grow_sampled =
-                growth_inds.is_valid() ? static_cast<int>(growth_inds.numel()) : 0;
-            LOG_INFO("MRNF ratio-rank iter={} candidates={} grow={}",
-                     iter, candidate_count, grow_sampled);
-        }
-        if (cfg_fill_target_iter() > 0 &&
-            (_growth_window_count % MRNF_RATIO_RANK_LOG_INTERVAL) == 1) {
-            LOG_INFO("MRNF pacing iter={} active={} desired={} windows_left={}",
-                     iter, current_active, desired_total, pacing_windows_left);
-        }
-        Tensor explore_inds;
-        if (iter < effective_grow_until_iter() && background_improvements_enabled() &&
-            far_operators_active()) {
-            const int growth_count = (growth_inds.is_valid() ? static_cast<int>(growth_inds.numel()) : 0);
-            const int remaining_budget =
-                std::max(0, budget - actual_replace - growth_count - actual_oversize);
-            int n_explore = std::min(starved_cadence_count(kExploreSplits), remaining_budget);
-            if (n_explore > 0) {
-                auto log_scales = _splat_data->scaling_raw();
-                if (log_scales.ndim() != 2 || log_scales.shape()[0] != n || log_scales.shape()[1] != 3) {
-                    n_explore = 0;
-                } else {
-                    Tensor taken_inds = growth_inds;
-                    if (oversize_inds.is_valid() && oversize_inds.numel() > 0) {
-                        if (taken_inds.is_valid() && taken_inds.numel() > 0) {
-                            taken_inds = Tensor::cat({oversize_inds, taken_inds}, 0);
-                        } else {
-                            taken_inds = oversize_inds;
-                        }
-                    }
-                    auto explore_weights = build_explore_split_weights(
-                        n, active_mask, trainable_mask, replace_mask, taken_inds);
-                    if (!explore_weights.is_valid() || explore_weights.numel() != n) {
-                        n_explore = 0;
-                    } else {
-                        kernels::launch_packed_refine_counts(
-                            nullptr, 0, nullptr, 0,
-                            explore_weights.ptr<float>(), n,
-                            nullptr, 0,
-                            _refine_counts_dev.ptr<int64_t>());
-                        host_counts = _refine_counts_dev.to_vector_int64();
-                        const int selectable_explore = static_cast<int>(host_counts[2]);
-                        n_explore = std::min(n_explore, selectable_explore);
-                        if (n_explore > 0) {
-                            explore_inds = sample_gumbel_with_far_guard(
-                                explore_weights, n_explore, seed + 2,
-                                static_cast<size_t>(selectable_explore));
-                            n_explore = explore_inds.is_valid() ? static_cast<int>(explore_inds.numel()) : 0;
-                            LFS_COUNTER_ADD("strategy.mrnf.explore_split", n_explore);
-                        }
-                    }
-                }
             }
         }
 
@@ -2219,14 +1295,8 @@ namespace lfs::training {
         if (replace_inds.is_valid() && replace_inds.numel() > 0) {
             split_parts.push_back(replace_inds);
         }
-        if (oversize_inds.is_valid() && oversize_inds.numel() > 0) {
-            split_parts.push_back(oversize_inds);
-        }
         if (growth_inds.is_valid() && growth_inds.numel() > 0) {
             split_parts.push_back(growth_inds);
-        }
-        if (explore_inds.is_valid() && explore_inds.numel() > 0) {
-            split_parts.push_back(explore_inds);
         }
         if (split_parts.size() == 1) {
             split_indices = split_parts[0];
@@ -2249,50 +1319,6 @@ namespace lfs::training {
                              _splat_data->shN().is_valid() &&
                              _splat_data->shN().numel() > 0;
 
-        // Child rows are consumed synchronously by the split/fill/append
-        // sequence below. Keep this staging allocation local to the refine
-        // event so its Tensor owners return storage to the CUDA pool before
-        // the next phase; no later refine reads the prior children.
-        DensifyChildWorkspace densify_ws;
-        densify_ws.ensure(K, sh_rest, use_shN, /*sh0_flat_layout=*/false, Device::GPU);
-        _densify_child_required_peak_bytes = std::max(
-            _densify_child_required_peak_bytes, densify_ws.required_bytes());
-        _densify_child_allocated_peak_bytes = std::max(
-            _densify_child_allocated_peak_bytes, densify_ws.resident_bytes());
-        publish_vram_attribution();
-        auto child_means = densify_ws.means_view(K);
-        auto child_log_scales = densify_ws.scales_view(K);
-        auto child_raw_opacities = densify_ws.opacities_view(K);
-        auto child_rotations = densify_ws.rotations_view(K);
-        auto child_sh0 = densify_ws.sh0_view(K);
-        Tensor child_shN = use_shN ? densify_ws.shN_view(K) : Tensor();
-
-        // The LAS kernel only needs linear shN to copy child rows. shN itself is unchanged
-        // for the parent rows, so keep the resident swizzled buffer in place and gather the
-        // selected child rows below.
-        kernels::launch_long_axis_split_gaussians_inplace(
-            _splat_data->means().ptr<float>(),
-            _splat_data->rotation_raw().ptr<float>(),
-            _splat_data->scaling_raw().ptr<float>(),
-            _splat_data->sh0().ptr<float>(),
-            nullptr,
-            _splat_data->opacity_raw().ptr<float>(),
-            child_means.ptr<float>(),
-            child_rotations.ptr<float>(),
-            child_log_scales.ptr<float>(),
-            child_sh0.ptr<float>(),
-            nullptr,
-            child_raw_opacities.ptr<float>(),
-            split_indices.ptr<int64_t>(),
-            static_cast<int>(K),
-            0,
-            nullptr);
-
-        if (use_shN) {
-            lfs::training::sh_value::gather_shN_to_canonical(
-                *_splat_data, split_indices, child_shN);
-        }
-
         reset_optimizer_state_at_indices(*_optimizer, ParamType::Means, split_indices);
         reset_optimizer_state_at_indices(*_optimizer, ParamType::Sh0, split_indices);
         reset_optimizer_state_at_indices(*_optimizer, ParamType::ShN, split_indices, layout_rest);
@@ -2300,40 +1326,100 @@ namespace lfs::training {
         reset_optimizer_state_at_indices(*_optimizer, ParamType::Rotation, split_indices);
         reset_optimizer_state_at_indices(*_optimizer, ParamType::Opacity, split_indices);
 
-        size_t append_start = 0;
-        lfs::training::sh_value::ShNMutationBatch shn_batch(*_splat_data);
-        if (free_count() > 0) {
-            auto [filled_indices, remaining_after_fill] = fill_free_slots_with_data(
+        // Children are staged in canonical fp32 (the SH rest dominates). Large
+        // growth events are split into chunks so the staging rows and the SH
+        // re-encode batch stay bounded instead of scaling with every new child.
+        // A q16 SH block touched by several chunks is re-encoded once per chunk,
+        // so its values may differ from a single pass by one quantization step.
+        constexpr std::size_t CHILD_CHUNK_BYTES = 256ull << 20;
+        const std::size_t child_row_bytes = (3 + 4 + 3 + 3 + 1 + (use_shN ? sh_rest * 3 : 0)) * sizeof(float);
+        const auto [reused, n_append] = split_parents_into_children(
+            split_indices, std::max<std::size_t>(1, CHILD_CHUNK_BYTES / child_row_bytes));
+
+        LOG_DEBUG("MRNF: split {} splats at iter {} (reused: {}, appended: {}, active: {}, total slots: {})",
+                  K, iter, reused, n_append, active_count(), _splat_data->size());
+        LFS_COUNTER_ADD("strategy.mrnf.split", K);
+        LFS_COUNTER_ADD("strategy.mrnf.appended", n_append);
+        LFS_GAUGE("model.gaussians.live", active_count());
+        LFS_GAUGE("model.gaussians.capacity", static_cast<double>(_splat_data->size()));
+        publish_vram_attribution();
+    }
+
+    std::pair<size_t, size_t> MRNF::split_parents_into_children(
+        const lfs::core::Tensor& split_indices, const size_t chunk_rows) {
+        using namespace lfs::core;
+        assert(split_indices.ndim() == 1 && split_indices.dtype() == DataType::Int64 && chunk_rows > 0);
+        const size_t K = split_indices.numel();
+        const size_t sh_rest = _splat_data->max_sh_coeffs_rest();
+        const bool use_shN = sh_rest > 0 &&
+                             _splat_data->shN().is_valid() &&
+                             _splat_data->shN().numel() > 0;
+
+        // Parents and child destinations are disjoint rows, so each chunk splits
+        // its own parents and places its own children.
+        // Local to the refine event so the staging storage returns to the CUDA
+        // pool before the next phase; no later refine reads the prior children.
+        DensifyChildWorkspace densify_ws;
+        densify_ws.ensure(std::min(K, chunk_rows), sh_rest, use_shN, /*sh0_flat_layout=*/false, Device::GPU);
+        _densify_child_required_peak_bytes = std::max(
+            _densify_child_required_peak_bytes, densify_ws.required_bytes());
+        _densify_child_allocated_peak_bytes = std::max(
+            _densify_child_allocated_peak_bytes, densify_ws.resident_bytes());
+        publish_vram_attribution();
+
+        size_t reused = 0;
+        size_t n_append = 0;
+        for (size_t first = 0; first < K; first += chunk_rows) {
+            const size_t count = std::min(chunk_rows, K - first);
+            const Tensor chunk_indices = split_indices.slice(0, first, first + count);
+            auto child_means = densify_ws.means_view(count);
+            auto child_log_scales = densify_ws.scales_view(count);
+            auto child_raw_opacities = densify_ws.opacities_view(count);
+            auto child_rotations = densify_ws.rotations_view(count);
+            auto child_sh0 = densify_ws.sh0_view(count);
+            Tensor child_shN = use_shN ? densify_ws.shN_view(count) : Tensor();
+
+            // The LAS kernel only needs linear shN to copy child rows. shN itself is unchanged
+            // for the parent rows, so keep the resident swizzled buffer in place and gather the
+            // selected child rows below.
+            training_ops(lfs::core::default_gpu_backend()).refine->split({_splat_data->means(), _splat_data->rotation_raw(), _splat_data->scaling_raw(), _splat_data->sh0(), _splat_data->opacity_raw()}, {child_means, child_rotations, child_log_scales, child_sh0, child_raw_opacities}, chunk_indices);
+
+            if (use_shN) {
+                lfs::training::sh_value::gather_shN_to_canonical(
+                    *_splat_data, chunk_indices, child_shN);
+            }
+
+            size_t append_start = 0;
+            lfs::training::sh_value::ShNMutationBatch shn_batch(*_splat_data);
+            if (free_count() > 0) {
+                auto [filled_indices, remaining_after_fill] = fill_free_slots_with_data(
+                    child_means,
+                    child_rotations,
+                    child_log_scales,
+                    child_sh0,
+                    child_shN,
+                    child_raw_opacities,
+                    static_cast<int64_t>(count),
+                    &shn_batch);
+                append_start = count - static_cast<size_t>(remaining_after_fill);
+            }
+
+            n_append += append_child_rows(
                 child_means,
                 child_rotations,
                 child_log_scales,
                 child_sh0,
                 child_shN,
                 child_raw_opacities,
-                static_cast<int64_t>(K),
+                append_start,
+                count,
                 &shn_batch);
-            append_start = K - static_cast<size_t>(remaining_after_fill);
+            clear_rendered_support(chunk_indices);
+            shn_batch.flush();
+            reused += append_start;
         }
 
-        const size_t n_append = append_child_rows(
-            child_means,
-            child_rotations,
-            child_log_scales,
-            child_sh0,
-            child_shN,
-            child_raw_opacities,
-            append_start,
-            K,
-            &shn_batch);
-        shn_batch.flush();
-
-        LOG_DEBUG("MRNF: split {} splats at iter {} (reused: {}, appended: {}, active: {}, total slots: {})",
-                  K, iter, append_start, n_append, active_count(), _splat_data->size());
-        LFS_COUNTER_ADD("strategy.mrnf.split", K);
-        LFS_COUNTER_ADD("strategy.mrnf.appended", n_append);
-        LFS_GAUGE("model.gaussians.live", active_count());
-        LFS_GAUGE("model.gaussians.capacity", static_cast<double>(_splat_data->size()));
-        publish_vram_attribution();
+        return {reused, n_append};
     }
 
     lfs::core::Tensor MRNF::build_replace_parent_weights(
@@ -2343,27 +1429,17 @@ namespace lfs::training {
         const lfs::core::Tensor& edge_guidance) const {
         using namespace lfs::core;
 
-        Tensor replace_weights;
-        {
-            auto opacities = _splat_data->get_opacity();
-            if (opacities.ndim() == 2 && opacities.shape()[1] == 1)
-                opacities = opacities.squeeze(-1);
-            replace_weights = opacities * (visibility_accumulator() > 0.0f);
-        }
-        if (active_mask.is_valid()) {
-            replace_weights = replace_weights * active_mask;
-        }
-        if (trainable_mask.is_valid()) {
-            replace_weights = replace_weights * trainable_mask;
-        }
-        if (edge_guidance.is_valid()) {
-            replace_weights = replace_weights * edge_guidance;
-        }
-
-        // Stash into scratch so subsequent growth_weights path can reuse
-        // the same physical buffer after replace stage is done.
+        auto opacities = _splat_data->get_opacity();
+        if (opacities.ndim() == 2 && opacities.shape()[1] == 1)
+            opacities = opacities.squeeze(-1);
+        const auto visibility = visibility_accumulator();
+        assert(opacities.ndim() == 1 && opacities.numel() == n);
+        assert(visibility.ndim() == 1 && visibility.numel() == n);
+        assert(!active_mask.is_valid() || (active_mask.ndim() == 1 && active_mask.numel() == n));
+        assert(!trainable_mask.is_valid() || (trainable_mask.ndim() == 1 && trainable_mask.numel() == n));
+        assert(!edge_guidance.is_valid() || (edge_guidance.ndim() == 1 && edge_guidance.numel() == n));
         auto w_view = _densify_n_scratch.f32_a_view(n);
-        w_view.copy_(replace_weights);
+        training_ops(default_gpu_backend()).mrnf->replace_parent_weights(opacities, visibility, active_mask, trainable_mask, edge_guidance, w_view);
         return w_view;
     }
 
@@ -2410,30 +1486,26 @@ namespace lfs::training {
             const size_t cap_floats = cap_rows > 0 ? lfs::core::sh_swizzled_float_count(cap_rows, layout_rest_u32)
                                                    : lfs::core::sh_swizzled_float_count(new_size, layout_rest_u32);
             const size_t logical_floats = lfs::core::sh_swizzled_float_count(new_size, layout_rest_u32);
-            const auto stream = getCurrentCUDAStream();
+            const auto stream = lfs::core::TensorExecutionTarget::current();
             t.sync_to_stream(stream);
             idx_i32.sync_to_stream(stream);
             auto fresh = Tensor::zeros_direct(TensorShape({logical_floats}), cap_floats, t.device(), t.dtype());
+            const lfs::gpu_ops::ShRowsParams rows{
+                .source_rows = old_size,
+                .count = new_size,
+                .destination_offset = 0,
+                .source_rest = layout_rest_u32,
+                .destination_rest = layout_rest_u32,
+            };
             if (t.dtype() == DataType::Float32) {
-                lfs::core::shN_swizzled_gather_self(
-                    t.ptr<float>(), fresh.ptr<float>(),
-                    idx_i32.ptr<int>(), new_size, 0, layout_rest_u32, stream);
+                training_sh_ops().gather_swizzled(t, idx_i32, fresh, rows);
             } else if (t.dtype() == DataType::UInt8 || t.dtype() == DataType::Bool) {
                 if (uint8_fill >= 0 && cap_floats > 0) {
-                    const cudaError_t err = cudaMemsetAsync(
-                        fresh.ptr<uint8_t>(),
-                        static_cast<unsigned char>(uint8_fill),
-                        cap_floats * sizeof(uint8_t),
-                        stream);
-                    if (err != cudaSuccess) {
-                        throw std::runtime_error(
-                            std::string("MRNF::compact_splats: cudaMemsetAsync failed: ") +
-                            cudaGetErrorString(err));
-                    }
+                    training_sh_ops().fill_bytes(
+                        fresh, cap_floats * sizeof(std::uint8_t),
+                        static_cast<std::uint8_t>(uint8_fill));
                 }
-                lfs::core::shN_swizzled_gather_self_u8(
-                    t.ptr<uint8_t>(), fresh.ptr<uint8_t>(),
-                    idx_i32.ptr<int>(), new_size, 0, layout_rest_u32, stream);
+                training_sh_ops().gather_swizzled(t, idx_i32, fresh, rows);
             } else {
                 throw std::runtime_error("MRNF::compact_splats: unsupported swizzled shN dtype");
             }
@@ -2484,7 +1556,7 @@ namespace lfs::training {
                 } else {
                     compact(state->exp_avg);
                     state->size = new_size;
-                    state->capacity = cap;
+                    state->capacity = cap > 0 ? cap : new_size;
                 }
                 // grow-only zero bounds (free-zero moments after compact).
                 ensure_joint_bounds_capacity(state->joint_bounds, new_size, cap,
@@ -2497,7 +1569,7 @@ namespace lfs::training {
             } else {
                 compact(state->exp_avg);
                 state->size = new_size;
-                state->capacity = cap;
+                state->capacity = cap > 0 ? cap : new_size;
             }
             // Grad buffers match param dtype/shape (fp32), not joint packed bytes.
             // Fused FastGS leaves grads empty; rebuilding them here would be a
@@ -2607,24 +1679,20 @@ namespace lfs::training {
         }
         if (_refine_weight_max.is_valid() && _refine_weight_max.numel() > new_size)
             compact(_refine_weight_max);
-        if (_refine_ratio_max.is_valid() && _refine_ratio_max.numel() > new_size)
-            compact(_refine_ratio_max);
-        if (has_separate_visibility_buffer() && _vis_count.numel() > new_size)
-            compact(_vis_count);
+        if (_rendered_count.is_valid() && _rendered_count.numel() > new_size)
+            compact(_rendered_count);
         if (_precomputed_edge_scores.is_valid() && _precomputed_edge_scores.numel() > new_size)
             compact(_precomputed_edge_scores);
         if (_edge_score_sum.is_valid() && _edge_score_sum.numel() > new_size)
             compact(_edge_score_sum);
         _edge_view_scores = Tensor();
-        if (_explore_score_sum.is_valid() && _explore_score_sum.numel() > new_size)
-            compact(_explore_score_sum);
 
         remap_frozen_ranges_after_compaction(*_splat_data, valid_indices, old_size);
         apply_frozen_ranges_to_optimizer(*_splat_data, *_optimizer);
         ensure_mean_step_far_mask();
     }
 
-    void MRNF::inject_noise(int /*iter*/) {
+    void MRNF::inject_noise(int iter) {
         const size_t n = static_cast<size_t>(_splat_data->size());
         if (n == 0)
             return;
@@ -2635,16 +1703,20 @@ namespace lfs::training {
             std::chrono::high_resolution_clock::now().time_since_epoch().count());
         const auto frozen_mask = make_frozen_mask(*_splat_data, n, _splat_data->means().device());
 
-        mrnf_strategy::launch_mrnf_noise_injection(
-            _splat_data->means().ptr<float>(),
-            _splat_data->opacity_raw().ptr<float>(),
-            visibility_accumulator().ptr<float>(),
-            frozen_mask.is_valid() ? frozen_mask.ptr<bool>() : nullptr,
-            frozen_mask.is_valid() ? frozen_mask.numel() : 0,
-            lr_mean,
-            _params->means_noise_weight,
-            _bounds.median_size,
-            n, seed);
+        mrnf_ops().noise(
+            _splat_data->means(),
+            _splat_data->opacity_raw(),
+            visibility_accumulator(),
+            frozen_mask,
+            {.seed = seed,
+             .lr_mean = lr_mean,
+             .noise_weight = _params->means_noise_weight,
+             .median_scale = _bounds.median_size});
+    }
+
+    void MRNF::clear_rendered_support(const lfs::core::Tensor& indices) {
+        if (_rendered_count.is_valid() && indices.numel() > 0)
+            _rendered_count.index_put_(indices, lfs::core::Tensor::zeros({indices.numel()}, _splat_data->means().device()));
     }
 
     void MRNF::apply_decay(int iter) {
@@ -2654,24 +1726,16 @@ namespace lfs::training {
 
         const float train_t = static_cast<float>(iter) / static_cast<float>(_params->iterations);
         const auto frozen_mask = make_frozen_mask(*_splat_data, n, _splat_data->means().device());
-        const bool scale_far = background_improvements_enabled() &&
-                               _camera_hull_valid;
-        if (scale_far) {
-            refresh_far_field_mask(n);
-        }
 
-        mrnf_strategy::launch_mrnf_decay(
-            _splat_data->opacity_raw().ptr<float>(),
-            _splat_data->scaling_raw().ptr<float>(),
-            frozen_mask.is_valid() ? frozen_mask.ptr<bool>() : nullptr,
-            frozen_mask.is_valid() ? frozen_mask.numel() : 0,
-            scale_far && _far_field_mask.is_valid() ? _far_field_mask.ptr<bool>() : nullptr,
-            scale_far && _far_field_mask.is_valid() ? _far_field_mask.numel() : 0,
-            _params->opacity_decay,
-            _params->scale_decay,
-            scale_far ? effective_far_decay_scale() : 1.0f,
-            train_t,
-            n);
+        assert(!_params->opacity_decay_rendered_only || _params->gut || _rendered_count.numel() == n);
+        mrnf_ops().decay(
+            _splat_data->opacity_raw(),
+            _splat_data->scaling_raw(),
+            frozen_mask,
+            {.opacity_decay = _params->opacity_decay,
+             .scale_decay = _params->scale_decay,
+             .train_t = train_t,
+             .rendered_count = _params->opacity_decay_rendered_only && !_params->gut ? _rendered_count : lfs::core::Tensor{}});
     }
 
     void MRNF::enforce_max_cap() {
@@ -2713,18 +1777,14 @@ namespace lfs::training {
             if (!_refine_counts_dev.is_valid() || _refine_counts_dev.numel() < 4) {
                 _refine_counts_dev = Tensor::zeros({4}, Device::GPU, DataType::Int64);
             }
-            kernels::launch_packed_refine_counts(
-                nullptr, 0, nullptr, 0,
-                opacities.ptr<float>(), n,
-                nullptr, 0,
-                _refine_counts_dev.ptr<int64_t>());
+            training_ops(lfs::core::default_gpu_backend()).refine->counts({}, {}, opacities, {}, _refine_counts_dev);
             const auto host_counts = _refine_counts_dev.to_vector_int64();
             auto keep_indices = Tensor::empty({keep_budget}, Device::GPU, DataType::Int64);
-            _gumbel_scratch.ensure_n(n, Device::GPU);
-            mrnf_strategy::launch_gumbel_topk(
-                opacities.ptr<float>(), n, keep_budget, seed,
-                keep_indices.ptr<int64_t>(), nullptr, true, &_gumbel_scratch,
-                static_cast<size_t>(host_counts[2]));
+            mrnf_ops().gumbel(
+                &_gumbel_scratch, opacities, keep_indices,
+                {.seed = seed,
+                 .known_nnz = static_cast<size_t>(host_counts[2]),
+                 .compact_sparse = true});
 
             auto true_vals = Tensor::ones_bool({keep_budget}, opacities.device());
             keep_mask.index_put_(keep_indices, true_vals);
@@ -2814,7 +1874,8 @@ namespace lfs::training {
 
         const size_t current_size = static_cast<size_t>(_splat_data->size());
         auto active_region = _free_mask.slice(0, 0, current_size);
-        auto free_indices = active_region.nonzero().squeeze(-1);
+        auto free_indices = compact_bool_indices(active_region,
+                                                 active_region.count_nonzero());
         if (auto frozen_mask = make_frozen_mask(*_splat_data, current_size, free_indices.device());
             frozen_mask.is_valid() && free_indices.numel() > 0) {
             auto trainable = frozen_mask.index_select(0, free_indices).logical_not();
@@ -2829,29 +1890,13 @@ namespace lfs::training {
         const int64_t slots_to_fill = std::min(count, num_free);
         auto target_indices = free_indices.slice(0, 0, slots_to_fill);
 
-        const int opacity_dim = (_splat_data->opacity_raw().ndim() == 2) ? 1 : 0;
         auto pos_slice = positions.slice(0, 0, slots_to_fill);
         auto rot_slice = rotations.slice(0, 0, slots_to_fill);
         auto scale_slice = scales.slice(0, 0, slots_to_fill);
         auto sh0_slice = sh0.slice(0, 0, slots_to_fill);
         auto opac_slice = opacities.slice(0, 0, slots_to_fill);
 
-        kernels::launch_fill_free_slots_fused(
-            target_indices.ptr<int64_t>(),
-            static_cast<size_t>(slots_to_fill),
-            pos_slice.ptr<float>(),
-            rot_slice.ptr<float>(),
-            scale_slice.ptr<float>(),
-            sh0_slice.ptr<float>(),
-            opac_slice.ptr<float>(),
-            _splat_data->means().ptr<float>(),
-            _splat_data->rotation_raw().ptr<float>(),
-            _splat_data->scaling_raw().ptr<float>(),
-            _splat_data->sh0().ptr<float>(),
-            _splat_data->opacity_raw().ptr<float>(),
-            opacity_dim,
-            _free_mask.ptr<bool>(),
-            current_size);
+        training_ops(lfs::core::default_gpu_backend()).refine->fill_slots(target_indices, {pos_slice, rot_slice, scale_slice, sh0_slice, opac_slice}, {_splat_data->means(), _splat_data->rotation_raw(), _splat_data->scaling_raw(), _splat_data->sh0(), _splat_data->opacity_raw()}, _free_mask);
 
         const auto layout_rest = static_cast<uint32_t>(_splat_data->max_sh_coeffs_rest());
         if (layout_rest > 0 && shN.is_valid() && shN.numel() > 0 &&
@@ -2869,6 +1914,7 @@ namespace lfs::training {
         // previous-occupant / pre-split gradients on rewritten rows.
         zero_adam_grads_at_indices(*_optimizer, target_indices, layout_rest);
 
+        clear_rendered_support(target_indices);
         set_deleted_mask_rows(*_splat_data, _free_mask, target_indices, false);
 
         return {target_indices, count - slots_to_fill};
@@ -2979,290 +2025,79 @@ namespace lfs::training {
             }
         };
 
+        if (_params->opacity_decay_rendered_only && !_params->gut)
+            ensure(_rendered_count, DataType::Float32);
         ensure(_free_mask, DataType::Bool);
         ensure(_refine_weight_max, DataType::Float32);
-        if (has_separate_visibility_buffer()) {
-            ensure(_vis_count, DataType::Float32);
-        }
-        if (cfg_ratio_rank_on() || _refine_ratio_max.is_valid()) {
-            ensure(_refine_ratio_max, DataType::Float32);
-        }
-        if (_explore_score_sum.is_valid()) {
-            ensure(_explore_score_sum, DataType::Float32);
-        }
     }
 
-    void MRNF::seed_from_view(int iter, const RenderOutput& render_output) {
+    void MRNF::start_blob_seeding() {
+        std::promise<BlobSeeds> promise;
+        _blob_seeds = promise.get_future();
+        _blob_seed_worker = std::jthread(
+            [seeder = std::move(_blob_seeder), promise = std::move(promise), backend = lfs::core::default_gpu_backend()](const std::stop_token stop) mutable {
+                BlobSeeds seeds;
+                try {
+                    lfs::core::TensorWorkQueue queue(backend);
+                    const lfs::core::TensorWorkQueue::Scope guard(queue);
+                    seeds = seeder->triangulate(stop);
+                    seeder.reset();
+                    queue.wait();
+                } catch (const std::exception& e) {
+                    LOG_ERROR("Blob seeding failed: {}", e.what());
+                    seeds = {};
+                }
+                promise.set_value(std::move(seeds));
+            });
+    }
+
+    void MRNF::cancel_blob_seeding() {
+        _blob_seeder.reset();
+        _blob_seed_worker = {};
+        _blob_seeds = {};
+    }
+
+    void MRNF::append_blob_seeds(BlobSeeds seeds) {
         using namespace lfs::core;
-        if (!background_improvements_enabled() ||
-            iter >= effective_grow_until_iter() ||
-            !_camera_hull_valid || !_bounds_valid) {
+        LOG_TIMER("MRNF::append_blob_seeds");
+        const size_t budget = _params->max_cap > 0
+                                  ? std::min(static_cast<size_t>(std::max<int64_t>(0, int64_t{_params->max_cap} - static_cast<int64_t>(active_count()))),
+                                             static_cast<size_t>(kBlobSeedCapacityFraction * _params->max_cap))
+                                  : seeds.size();
+        const size_t count = std::min(seeds.size(), budget);
+        if (count == 0) {
             return;
         }
-        LOG_TIMER("MRNF::seed_from_view");
 
-        Tensor image = render_output.image;
-        Tensor target = render_output.target_image;
-        Tensor alpha = render_output.alpha;
-        Tensor depth = render_output.depth;
-        Camera* camera = render_output.camera;
-        int width = render_output.width;
-        int height = render_output.height;
-
-        const bool live_valid = camera &&
-                                is_cuda_image(image) &&
-                                is_cuda_image(target) &&
-                                alpha.is_valid() &&
-                                alpha.device() == Device::GPU &&
-                                same_spatial(image, target);
-        if (!live_valid) {
-            if (_cached_seed_valid && _cached_seed_camera) {
-                image = _cached_seed_image;
-                target = _cached_seed_target;
-                alpha = _cached_seed_alpha;
-                depth = _cached_seed_depth;
-                camera = _cached_seed_camera;
-                width = _cached_seed_width;
-                height = _cached_seed_height;
-            } else {
-                return;
+        std::vector<float> means(seeds.means.begin(), seeds.means.begin() + static_cast<std::ptrdiff_t>(count * 3));
+        std::vector<float> sh0(count * 3);
+        std::vector<float> scales(count * 3);
+        std::vector<float> rotations(count * 4, 0.0f);
+        for (size_t i = 0; i < count; ++i) {
+            for (int c = 0; c < 3; ++c) {
+                sh0[i * 3 + c] = (seeds.colors[i * 3 + c] - 0.5f) / MRNF_SH_C0;
+                scales[i * 3 + c] = seeds.log_scales[i];
             }
+            rotations[i * 4] = 1.0f;
         }
-
-        image = to_float01_cuda(image);
-        target = to_float01_cuda(target);
-        alpha = to_float01_cuda(alpha);
-        if (image.ndim() != 3 || target.ndim() != 3) {
-            return;
-        }
-        if (width <= 0 || height <= 0) {
-            height = static_cast<int>(image.shape()[1]);
-            width = static_cast<int>(image.shape()[2]);
-        }
-        if (width <= 0 || height <= 0) {
-            return;
-        }
-
-        if (!fill_mean_abs_error_hw(image, target, _explore_error_hw)) {
-            return;
-        }
-        auto alpha_flat = flatten_hw(alpha);
-        if (!_explore_error_hw.is_valid() || !alpha_flat.is_valid() ||
-            _explore_error_hw.numel() != alpha_flat.numel()) {
-            return;
-        }
-        const size_t error_n = _explore_error_hw.numel();
-        auto error_flat = _explore_error_hw.reshape(TensorShape({error_n}));
-        mrnf_strategy::launch_seed_weights_from_error_alpha(
-            error_flat.ptr<float>(),
-            alpha_flat.ptr<float>(),
-            error_flat.ptr<float>(),
-            error_n);
-        auto seed_weights = error_flat;
-
-        const size_t hw = seed_weights.numel();
-        const int remaining_budget = (_params->max_cap > 0)
-                                         ? std::max(0, _params->max_cap - static_cast<int>(active_count()))
-                                         : static_cast<int>(std::min(hw, static_cast<size_t>(INT_MAX)));
-        const int dose_seeds = cfg_seed_dose();
-        const int requested_cadence =
-            dose_seeds > 0 ? dose_seeds : starved_cadence_count(kExploreSeeds);
-        int n_seed = std::min({requested_cadence, remaining_budget,
-                               static_cast<int>(hw)});
-        if (n_seed <= 0) {
-            return;
-        }
-
-        if (!_refine_counts_dev.is_valid() || _refine_counts_dev.numel() < 4) {
-            _refine_counts_dev = Tensor::zeros({4}, Device::GPU, DataType::Int64);
-        }
-        kernels::launch_packed_refine_counts(
-            nullptr, 0, nullptr, 0,
-            seed_weights.ptr<float>(), hw,
-            nullptr, 0,
-            _refine_counts_dev.ptr<int64_t>());
-        const auto host_counts = _refine_counts_dev.to_vector_int64();
-        n_seed = std::min(n_seed, static_cast<int>(host_counts[2]));
-        if (n_seed <= 0) {
-            return;
-        }
-
-        auto seed = static_cast<uint64_t>(
-            std::chrono::high_resolution_clock::now().time_since_epoch().count());
-        auto pixel_inds = Tensor::empty({static_cast<size_t>(n_seed)}, Device::GPU, DataType::Int64);
-        _gumbel_scratch.ensure_n(hw, Device::GPU);
-        mrnf_strategy::launch_gumbel_topk(
-            seed_weights.ptr<float>(), hw, static_cast<size_t>(n_seed), seed,
-            pixel_inds.ptr<int64_t>(), nullptr, false, &_gumbel_scratch, hw);
-
-        Tensor depth_flat;
-        if (depth.is_valid() && depth.device() == Device::GPU && depth.numel() > 0) {
-            auto depth_f = to_float01_cuda(depth);
-            depth_flat = flatten_hw(depth_f);
-        }
-        if (!depth_flat.is_valid() || depth_flat.numel() != hw) {
-            depth_flat = Tensor::zeros({hw}, Device::GPU);
-        }
-
-        auto rgb = Tensor::empty({static_cast<size_t>(n_seed), 3}, Device::GPU, DataType::Float32);
-        auto seed_alpha = Tensor::empty({static_cast<size_t>(n_seed)}, Device::GPU, DataType::Float32);
-        auto seed_depth = Tensor::empty({static_cast<size_t>(n_seed)}, Device::GPU, DataType::Float32);
-        const int channels = static_cast<int>(target.shape()[0]);
-        mrnf_strategy::launch_gather_seed_payloads(
-            pixel_inds.ptr<int64_t>(),
-            static_cast<size_t>(n_seed),
-            hw,
-            target.ptr<float>(),
-            channels,
-            alpha_flat.ptr<float>(),
-            depth_flat.ptr<float>(),
-            rgb.ptr<float>(),
-            seed_alpha.ptr<float>(),
-            seed_depth.ptr<float>());
-
-        auto pix_cpu = pixel_inds.cpu();
-        auto rgb_cpu = rgb.cpu();
-        auto alpha_cpu = seed_alpha.cpu();
-        auto depth_cpu = seed_depth.cpu();
-        const auto* pix_ptr = pix_cpu.ptr<int64_t>();
-        const auto* rgb_ptr = rgb_cpu.ptr<float>();
-        const auto* a_ptr = alpha_cpu.ptr<float>();
-        const auto* d_ptr = depth_cpu.ptr<float>();
-
-        auto pos_cpu = camera->cam_position().cpu().contiguous();
-        auto R_cpu = camera->R().cpu().contiguous();
-        const float* cam_pos = pos_cpu.ptr<float>();
-        const float* R = R_cpu.ptr<float>();
-        const auto [fx, fy, cx, cy] = camera->get_intrinsics();
-        if (!(fx > 0.0f) || R_cpu.ndim() != 2 || R_cpu.shape()[0] != 3 || R_cpu.shape()[1] != 3) {
-            return;
-        }
-
-        const float d_hi = std::sqrt(
-                               (cam_pos[0] - _cam_centroid[0]) * (cam_pos[0] - _cam_centroid[0]) +
-                               (cam_pos[1] - _cam_centroid[1]) * (cam_pos[1] - _cam_centroid[1]) +
-                               (cam_pos[2] - _cam_centroid[2]) * (cam_pos[2] - _cam_centroid[2])) +
-                           kSeedDepthOrbits * _orbit_radius;
-
-        const float raw_opacity = logit_clamped(kSeedOpacity);
-        const size_t sh_rest = _splat_data->max_sh_coeffs_rest();
-        std::mt19937 rng{static_cast<unsigned int>(seed ^ 0x9E3779B9u)};
-        std::uniform_real_distribution<float> unit(0.0f, 1.0f);
-
-        std::vector<float> means_h;
-        std::vector<float> rotations_h;
-        std::vector<float> scales_h;
-        std::vector<float> sh0_h;
-        std::vector<float> opac_h;
-        means_h.reserve(static_cast<size_t>(n_seed) * 3);
-        rotations_h.reserve(static_cast<size_t>(n_seed) * 4);
-        scales_h.reserve(static_cast<size_t>(n_seed) * 3);
-        sh0_h.reserve(static_cast<size_t>(n_seed) * 3);
-        opac_h.reserve(static_cast<size_t>(n_seed));
-
-        int kept = 0;
-        int outside_kept = 0;
-        const int remaining_out = _far_growth.active
-                                      ? std::max(0, _far_growth.reserved_for_seeds)
-                                      : n_seed;
-
-        for (int i = 0; i < n_seed; ++i) {
-            const int64_t pix = pix_ptr[i];
-            if (pix < 0 || static_cast<size_t>(pix) >= hw) {
-                continue;
-            }
-            const int x = static_cast<int>(pix % static_cast<int64_t>(width));
-            const int y = static_cast<int>(pix / static_cast<int64_t>(width));
-            const float u = (static_cast<float>(x) + 0.5f - cx) / fx;
-            const float v = (static_cast<float>(y) + 0.5f - cy) / fy;
-            const float a_p = a_ptr[i];
-            float d_lo = 0.25f * _bounds.median_size;
-            if (a_p > 0.5f) {
-                const float depth_acc = d_ptr[i];
-                d_lo = (a_p > 1e-6f) ? (depth_acc / a_p) : depth_acc;
-            } else if (cfg_seed_dose() > 0 && _orbit_radius > 0.0f) {
-                // far seeding active: raise the transparent-pixel depth floor to the far shell
-                d_lo = std::max(d_lo, kFarMaskOrbits * _orbit_radius);
-            }
-            if (!(d_lo > 0.0f) || !(d_hi > d_lo) || !std::isfinite(d_lo) ||
-                !std::isfinite(d_hi)) {
-                continue;
-            }
-
-            const float inv_hi = 1.0f / d_hi;
-            const float inv_lo = 1.0f / d_lo;
-            const float inv_t = inv_hi + unit(rng) * (inv_lo - inv_hi);
-            if (!(inv_t > 0.0f) || !std::isfinite(inv_t)) {
-                continue;
-            }
-            const float t = 1.0f / inv_t;
-            const float pcam_x = u * t;
-            const float pcam_y = v * t;
-            const float pcam_z = t;
-            const float wx = R[0] * pcam_x + R[3] * pcam_y + R[6] * pcam_z + cam_pos[0];
-            const float wy = R[1] * pcam_x + R[4] * pcam_y + R[7] * pcam_z + cam_pos[1];
-            const float wz = R[2] * pcam_x + R[5] * pcam_y + R[8] * pcam_z + cam_pos[2];
-            if (!std::isfinite(wx) || !std::isfinite(wy) || !std::isfinite(wz)) {
-                continue;
-            }
-
-            const float far_dx = wx - _cam_centroid[0];
-            const float far_dy = wy - _cam_centroid[1];
-            const float far_dz = wz - _cam_centroid[2];
-            const float far_limit = kFarMaskOrbits * _orbit_radius;
-            const bool outside =
-                (far_dx * far_dx + far_dy * far_dy + far_dz * far_dz) > (far_limit * far_limit);
-            if (_far_growth.active && outside && outside_kept >= remaining_out) {
-                continue;
-            }
-
-            const float log_s = std::log(std::max(t * 4.0f / fx, 1e-6f));
-            means_h.push_back(wx);
-            means_h.push_back(wy);
-            means_h.push_back(wz);
-            rotations_h.push_back(1.0f);
-            rotations_h.push_back(0.0f);
-            rotations_h.push_back(0.0f);
-            rotations_h.push_back(0.0f);
-            scales_h.push_back(log_s);
-            scales_h.push_back(log_s);
-            scales_h.push_back(log_s);
-            sh0_h.push_back((rgb_ptr[i * 3 + 0] - 0.5f) / MRNF_SH_C0);
-            sh0_h.push_back((rgb_ptr[i * 3 + 1] - 0.5f) / MRNF_SH_C0);
-            sh0_h.push_back((rgb_ptr[i * 3 + 2] - 0.5f) / MRNF_SH_C0);
-            opac_h.push_back(raw_opacity);
-            ++kept;
-            if (outside) {
-                ++outside_kept;
-            }
-        }
-
-        if (kept == 0) {
-            return;
-        }
-
-        const size_t kept_n = static_cast<size_t>(kept);
-        auto pos = Tensor::from_vector(means_h, TensorShape({kept_n, 3}), Device::GPU);
-        auto rot = Tensor::from_vector(rotations_h, TensorShape({kept_n, 4}), Device::GPU);
-        auto scl = Tensor::from_vector(scales_h, TensorShape({kept_n, 3}), Device::GPU);
-        auto sh0 = Tensor::from_vector(sh0_h, TensorShape({kept_n, 1, 3}), Device::GPU);
-        auto opa = Tensor::from_vector(opac_h, TensorShape({kept_n}), Device::GPU);
+        auto pos = Tensor::from_vector(means, TensorShape({count, 3}), Device::GPU);
+        auto rot = Tensor::from_vector(rotations, TensorShape({count, 4}), Device::GPU);
+        auto scl = Tensor::from_vector(scales, TensorShape({count, 3}), Device::GPU);
+        auto sh0_t = Tensor::from_vector(sh0, TensorShape({count, 1, 3}), Device::GPU);
+        auto opa = Tensor::full({count}, logit_clamped(kBlobSeedOpacity), Device::GPU);
         Tensor shN;
-        if (sh_rest > 0) {
-            shN = Tensor::zeros({kept_n, sh_rest, 3}, Device::GPU);
+        if (const size_t sh_rest = _splat_data->max_sh_coeffs_rest(); sh_rest > 0) {
+            shN = Tensor::zeros({count, sh_rest, 3}, Device::GPU);
         }
 
         lfs::training::sh_value::ShNMutationBatch shn_batch(*_splat_data);
         auto [filled, remaining_after_fill] = fill_free_slots_with_data(
-            pos, rot, scl, sh0, shN, opa, static_cast<int64_t>(kept_n), &shn_batch);
-        const size_t append_start = kept_n - static_cast<size_t>(remaining_after_fill);
-        append_child_rows(pos, rot, scl, sh0, shN, opa, append_start, kept_n, &shn_batch);
+            pos, rot, scl, sh0_t, shN, opa, static_cast<int64_t>(count), &shn_batch);
+        const size_t append_start = count - static_cast<size_t>(remaining_after_fill);
+        append_child_rows(pos, rot, scl, sh0_t, shN, opa, append_start, count, &shn_batch);
         shn_batch.flush();
-
-        _far_growth.allocated += kept;
-        _far_growth.outside_used += outside_kept;
-        _far_growth.reserved_for_seeds = 0;
-        LFS_COUNTER_ADD("strategy.mrnf.explore_seed", kept);
+        LOG_INFO("MRNF: added {} blob seeds", count);
+        LFS_COUNTER_ADD("strategy.mrnf.blob_seed", count);
     }
 
     void MRNF::compute_bounds() {
@@ -3296,19 +2131,19 @@ namespace lfs::training {
             _median_splat_extent = 0.0f;
             _median_splat_extent_valid = false;
             if (_optimizer) {
-                _optimizer->set_per_splat_mean_step(
-                    false, 0.0f, kPerSplatMeanStepRatioMin,
-                    effective_mean_step_ratio_max());
+                _optimizer->set_per_splat_mean_step(false, 0.0f);
             }
             return;
         }
 
+        const auto sampled_bounds = mrnf_ops().percentile_bounds(active_means, _params->bounds_percentile);
         mrnf_strategy::MRNFBounds candidate{};
-        mrnf_strategy::launch_percentile_bounds(
-            active_means.ptr<float>(),
-            n,
-            _params->bounds_percentile,
-            &candidate);
+        for (int axis = 0; axis < 3; ++axis) {
+            candidate.center[axis] = sampled_bounds.center[axis];
+            candidate.extent[axis] = sampled_bounds.extent[axis];
+        }
+        candidate.median_size = sampled_bounds.median_size;
+        candidate.max_extent = sampled_bounds.max_extent;
 
         float coordinate_scale = 1.0f;
         bool finite_bounds = std::isfinite(candidate.max_extent) && candidate.max_extent >= 0.0f;
@@ -3351,11 +2186,13 @@ namespace lfs::training {
         bool median_ok = false;
         if (active_scales.is_valid() &&
             active_scales.numel() >= n * 3) {
-            mrnf_strategy::launch_median_geomean_extent(
-                active_scales.ptr<float>(),
-                n,
-                &median_extent,
-                &median_ok);
+            const auto extents = (active_scales.sum(1) * (1.0f / 3.0f)).exp();
+            const auto usable = extents.masked_select(extents.isfinite().logical_and(extents > 0.0f));
+            if (usable.numel() > 0) {
+                const auto [sorted, indices] = usable.sort();
+                median_extent = sorted[usable.numel() / 2].item_as<float>();
+                median_ok = std::isfinite(median_extent) && median_extent > 0.0f;
+            }
         }
         _median_splat_extent = median_extent;
         _median_splat_extent_valid =
@@ -3368,38 +2205,26 @@ namespace lfs::training {
         if (!_optimizer || !_bounds_valid)
             return;
         _optimizer->set_param_lr(ParamType::Means, _mean_lr_unscaled * _bounds.median_size);
-        if (background_improvements_enabled() && _median_splat_extent_valid) {
-            _optimizer->set_per_splat_mean_step(
-                true, _median_splat_extent, kPerSplatMeanStepRatioMin,
-                effective_mean_step_ratio_max());
+        if (_median_splat_extent_valid) {
+            _optimizer->set_per_splat_mean_step(true, _median_splat_extent);
             const size_t n = static_cast<size_t>(_splat_data->size());
-            if (!_far_field_mask.is_valid() || _far_field_mask.numel() != n) {
-                if (_camera_hull_valid && n > 0) {
-                    refresh_far_field_mask(n);
-                } else {
-                    publish_mean_step_far_mask();
-                }
+            if (_camera_hull_valid && n > 0 && (!_far_field_mask.is_valid() || _far_field_mask.numel() != n)) {
+                refresh_far_field_mask(n);
             } else {
                 publish_mean_step_far_mask();
             }
         } else {
-            _optimizer->set_per_splat_mean_step(
-                false, 0.0f, kPerSplatMeanStepRatioMin,
-                effective_mean_step_ratio_max());
+            _optimizer->set_per_splat_mean_step(false, 0.0f);
         }
     }
 
     bool MRNF::screen_share_shrink_active(const int iter) const {
-        if (!_params->gut) {
-            return true;
-        }
-        // During growth, oversized splats are split to preserve coverage.
         // Shrink only once growth has ended and refinement has begun. Compare
         // cadence buckets rather than multiplying a potentially large step.
         return iter > 0 && _params->refine_every > 0 &&
                static_cast<size_t>(iter) / _params->refine_every >
                    _params->start_refine / _params->refine_every &&
-               iter >= effective_grow_until_iter();
+               iter >= static_cast<int>(_params->grow_until_iter);
     }
 
     void MRNF::step(int iter) {
@@ -3416,7 +2241,23 @@ namespace lfs::training {
             _scale_lr_current *= _scale_lr_gamma;
             _optimizer->set_param_lr(ParamType::Scaling, _scale_lr_current);
             sync_mean_learning_rate();
+            apply_late_lr_anneal(iter);
         }
+    }
+
+    // Opacity and color keep fitting per-view detail after growth ends; decaying
+    // their rates from there to the last iteration stops that memorization.
+    void MRNF::apply_late_lr_anneal(const int iter) {
+        const int start = static_cast<int>(_params->grow_until_iter);
+        const int end = static_cast<int>(_params->iterations);
+        if (iter < start || end <= start)
+            return;
+        assert(_params->shs_lr > 0.0f && _params->late_lr_anneal > 0.0f && _params->late_lr_anneal <= 1.0f);
+        const double progress = std::min(1.0, static_cast<double>(iter - start) / static_cast<double>(end - start));
+        const double factor = std::pow(static_cast<double>(_params->late_lr_anneal), progress);
+        _optimizer->set_param_lr(ParamType::Opacity, static_cast<double>(_params->opacity_lr) * factor);
+        _optimizer->set_param_lr(ParamType::Sh0, static_cast<double>(_params->shs_lr) * factor);
+        _optimizer->set_param_lr(ParamType::ShN, static_cast<double>(_params->shs_lr / 20.0f) * factor);
     }
 
     void MRNF::remove_gaussians(const lfs::core::Tensor& mask) {
@@ -3460,7 +2301,7 @@ namespace lfs::training {
             return {};
         }
 
-        auto normalized_edge = normalized_by_positive_median(_precomputed_edge_scores, &_median_scratch);
+        auto normalized_edge = normalized_by_positive_median(_precomputed_edge_scores);
         return normalized_edge.mul(MRNF_EDGE_SCORE_WEIGHT).add(1.0f);
     }
 
@@ -3502,6 +2343,7 @@ namespace lfs::training {
     }
 
     void MRNF::deserialize(std::istream& is) {
+        cancel_blob_seeding();
         uint32_t magic = 0, version = 0;
         lfs::core::serialization_detail::read_exact(is, &magic, sizeof(magic), "MRNF magic");
         lfs::core::serialization_detail::read_exact(is, &version, sizeof(version), "MRNF version");
@@ -3582,30 +2424,14 @@ namespace lfs::training {
 
         const size_t n = static_cast<size_t>(_splat_data->size());
         const size_t capacity = splat_reserved_capacity(*_splat_data);
-        const auto device = _splat_data->means().device();
-        if (capacity > 0) {
-            _densify_n_scratch.ensure_n(capacity, device);
-            _gumbel_scratch.ensure_n(capacity, device);
-            _median_scratch.ensure_n(capacity, device);
-        }
         const size_t tracking_capacity = capacity;
         reset_vector_buffer(_refine_weight_max, n, _splat_data->means().device(), tracking_capacity);
-        reset_vector_buffer(_explore_score_sum, n, _splat_data->means().device(), tracking_capacity);
-        if (has_separate_visibility_buffer()) {
-            reset_vector_buffer(_vis_count, n, _splat_data->means().device(), tracking_capacity);
-        }
-        if (cfg_ratio_rank_on()) {
-            reset_vector_buffer(_refine_ratio_max, n, _splat_data->means().device(), tracking_capacity);
-        }
-        _explore_sample_count = 0;
-        _explore_last_sample_iter = -1;
+        if (_params->opacity_decay_rendered_only && !_params->gut) {
+            reset_vector_buffer(_rendered_count, n, _splat_data->means().device(), tracking_capacity);
+            _rendered_count.fill_(1.0f);
+        } else
+            _rendered_count = lfs::core::Tensor();
         ensure_densification_info_shape();
-        if (!cfg_ratio_rank_on() && !_vis_count.is_valid()) {
-            // Keep the legacy transient handle usable for checkpoint/tests
-            // without allocating a second visibility storage; MRNF uses row 0
-            // as the authoritative visibility accumulator in this mode.
-            _vis_count = _splat_data->_densification_info.slice(0, 0, 1).squeeze(0);
-        }
         _precomputed_edge_scores = lfs::core::Tensor();
         _edge_precompute_valid = false;
 
@@ -3637,6 +2463,7 @@ namespace lfs::training {
 
     void MRNF::adopt_checkpoint_state(IStrategy& loaded) noexcept {
         auto& source = checked_checkpoint_source<MRNF>(loaded);
+        cancel_blob_seeding();
         if (_optimizer)
             _optimizer->adopt_checkpoint_state(*source._optimizer);
         if (_scheduler)
@@ -3647,40 +2474,17 @@ namespace lfs::training {
                 _params->gut && screen_share_cap_active(_params->max_screen_share));
         }
         std::swap(_refine_weight_max, source._refine_weight_max);
-        std::swap(_refine_ratio_max, source._refine_ratio_max);
-        std::swap(_vis_count, source._vis_count);
+        std::swap(_rendered_count, source._rendered_count);
         std::swap(_precomputed_edge_scores, source._precomputed_edge_scores);
         std::swap(_edge_precompute_valid, source._edge_precompute_valid);
         std::swap(_edge_score_sum, source._edge_score_sum);
         std::swap(_edge_view_scores, source._edge_view_scores);
         std::swap(_edge_sample_count, source._edge_sample_count);
-        std::swap(_explore_score_sum, source._explore_score_sum);
-        std::swap(_explore_error_hw, source._explore_error_hw);
-        std::swap(_explore_view_scores, source._explore_view_scores);
-        std::swap(_explore_means2d, source._explore_means2d);
-        std::swap(_explore_radii, source._explore_radii);
-        std::swap(_explore_sample_count, source._explore_sample_count);
-        std::swap(_explore_last_sample_iter, source._explore_last_sample_iter);
-        std::swap(_cached_seed_image, source._cached_seed_image);
-        std::swap(_cached_seed_target, source._cached_seed_target);
-        std::swap(_cached_seed_alpha, source._cached_seed_alpha);
-        std::swap(_cached_seed_depth, source._cached_seed_depth);
-        std::swap(_cached_seed_camera, source._cached_seed_camera);
-        std::swap(_cached_seed_width, source._cached_seed_width);
-        std::swap(_cached_seed_height, source._cached_seed_height);
-        std::swap(_cached_seed_valid, source._cached_seed_valid);
         std::swap(_free_mask, source._free_mask);
-        std::swap(_far_growth, source._far_growth);
         std::swap(_far_field_mask, source._far_field_mask);
         std::swap(_cam_centroid, source._cam_centroid);
         std::swap(_orbit_radius, source._orbit_radius);
         std::swap(_camera_hull_valid, source._camera_hull_valid);
-        std::swap(_scene_has_far_field, source._scene_has_far_field);
-        std::swap(_logged_degenerate_hull, source._logged_degenerate_hull);
-        std::swap(_initial_sfm_point_count, source._initial_sfm_point_count);
-        std::swap(_far_starvation, source._far_starvation);
-        std::swap(_logged_far_starvation, source._logged_far_starvation);
-        std::swap(_growth_window_count, source._growth_window_count);
         std::swap(_bounds, source._bounds);
         std::swap(_bounds_valid, source._bounds_valid);
         std::swap(_refine_windows_since_bounds, source._refine_windows_since_bounds);
@@ -3702,9 +2506,19 @@ namespace lfs::training {
     }
 
     void MRNF::set_optimization_params(const lfs::core::param::OptimizationParameters& params) {
-        const bool background_changed = background_improvements_enabled() != params.background_improvements;
         const bool renderer_changed = _params && _params->gut != params.gut;
-        _params = std::make_unique<const lfs::core::param::OptimizationParameters>(params);
+        const bool support_changed = !_params || _params->opacity_decay_rendered_only != params.opacity_decay_rendered_only;
+        auto resolved_params = params;
+        resolved_params.resolve_mrnf_capacity_defaults();
+        _params = std::make_unique<const lfs::core::param::OptimizationParameters>(std::move(resolved_params));
+        if ((support_changed || renderer_changed) && params.gut && params.opacity_decay_rendered_only)
+            LOG_INFO("opacity_decay_rendered_only has no effect with GUT");
+        if (_splat_data && (support_changed || renderer_changed)) {
+            if (params.opacity_decay_rendered_only && !params.gut)
+                reset_vector_buffer(_rendered_count, _splat_data->size(), _splat_data->means().device(), splat_reserved_capacity(*_splat_data));
+            else
+                _rendered_count = lfs::core::Tensor();
+        }
 
         if (_mean_lr_unscaled <= 0.0) {
             _mean_lr_unscaled = params.means_lr;
@@ -3723,15 +2537,10 @@ namespace lfs::training {
             }
         }
 
-        if (background_changed) {
-            refresh_camera_hull();
-            ensure_mean_step_far_mask();
-        }
         if (_optimizer) {
             _optimizer->set_param_lr(ParamType::Scaling, _scale_lr_current);
             sync_mean_learning_rate();
         }
-        update_far_starvation();
     }
 
     void MRNF::refresh_decay_schedule_from_current_state() {

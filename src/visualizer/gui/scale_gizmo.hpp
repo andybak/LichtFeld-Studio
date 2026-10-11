@@ -45,11 +45,16 @@ namespace lfs::vis::gui {
         ScaleGizmoHandle active_handle = ScaleGizmoHandle::None;
         glm::vec3 delta_scale{1.0f};
         glm::vec3 total_scale{1.0f};
+        bool released = false;
+        bool returned_to_start = false;
     };
+
+    LFS_VIS_API void beginScaleGizmoFrame();
 
     LFS_VIS_API ScaleGizmoResult drawScaleGizmo(const ScaleGizmoConfig& config);
 
-    [[nodiscard]] bool isScaleGizmoHovered();
-    [[nodiscard]] bool isScaleGizmoActive();
+    [[nodiscard]] LFS_VIS_API bool isScaleGizmoHovered();
+    [[nodiscard]] LFS_VIS_API bool isScaleGizmoActive();
+    LFS_VIS_API void cancelScaleGizmoDrag();
 
 } // namespace lfs::vis::gui

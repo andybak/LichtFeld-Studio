@@ -2,6 +2,15 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+add_library(lfs_geometry_camera STATIC ops/geometry_camera.cpp)
+target_include_directories(lfs_geometry_camera PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(lfs_geometry_camera PUBLIC lfs_core)
+set_target_properties(lfs_geometry_camera PROPERTIES POSITION_INDEPENDENT_CODE ON)
+lfs_add_gpu_program(lfs_geometry_camera geometry_camera_program SOURCE ops/geometry_camera.slang COMPUTE setup collect
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/vulkan/shaders/gsplat_common.slangh"
+            "${CMAKE_SOURCE_DIR}/src/core/tensor/backend/vulkan/shaders/sh_decode.slangh")
+
+if(LFS_HAS_CUDA)
 # Add fastlfs backend
 add_subdirectory(rasterization/fastgs)
 
@@ -12,6 +21,9 @@ add_subdirectory(rasterization/gsplat)
 set(LFS_TRAINING_KERNEL_SOURCES
     kernels/loss_tensor_contract.cpp
     kernels/camera_loss_heatmap.cu
+    kernels/thin_structure.cu
+    kernels/blob_seeding.cu
+    kernels/gradient_residual.cu
     kernels/ssim.cu
     kernels/l1_loss.cu
     kernels/ssim_reduction.cu
@@ -26,13 +38,15 @@ set(LFS_TRAINING_KERNEL_SOURCES
     kernels/densification_kernels.cu
     kernels/morton_reorder_kernels.cu
     kernels/grad_alpha.cu
+    ops/geometry_cuda.cpp
     kernels/depth_loss.cu
     kernels/normal_loss.cu
     kernels/normal_consistency_loss.cu
     kernels/roi_weight_map.cu
     kernels/image_kernels.cu
+    kernels/mesh_mask.cu
     kernels/mask_preprocess.cu
-    components/sparsity_optimizer_kernels.cu
+    kernels/sparsity_optimizer_kernels.cu
 )
 
 # Create CUDA kernels library
@@ -74,6 +88,7 @@ if(MSVC)
             $<$<COMPILE_LANGUAGE:CUDA>:FMT_UNICODE=0>
     )
 endif()
+endif()
 
 # Shared depth-anchor fit + sidecar cache (reused by the preprocess CLI)
 add_subdirectory(depth_anchor)
@@ -87,27 +102,31 @@ set(TRAINING_NEW_SOURCES
     live_model_mutation_guard.cpp
     optimizer/scheduler.cpp
     losses/regularization.cpp
+    ops/blob.cpp
+    ops/structure.cpp
     ops/registry.cpp
+    $<$<BOOL:${LFS_TENSOR_VULKAN}>:ops/table_vulkan.cpp>
+    $<$<NOT:$<BOOL:${LFS_TENSOR_VULKAN}>>:ops/table_backend_unavailable.cpp>
     ops/requirements.cpp
-    ops/photometric_cuda.cpp
-    ops/adam_cuda.cpp
-    ops/mcmc_cuda.cpp
+    ops/fast_services.cpp
+    ops/gsplat_services.cpp
     losses/mask_loss.cpp
     strategies/strategy_utils.cpp
     strategies/mcmc.cpp
     strategies/mrnf.cpp
+    strategies/blob_seeding.cpp
     strategies/strategy_factory.cpp
     strategies/improved_gs_plus.cpp
-    rasterization/fast_rasterizer.cpp
-    rasterization/gsplat_rasterizer.cpp
     components/config_serialization.cpp
     components/bilateral_grid.cpp
     components/ppisp.cpp
-    components/ppisp_controller_pool.cu
+    components/ppisp_controller_pool.cpp
     components/ppisp_file.cpp
     components/sparsity_optimizer.cpp
     control/command_api.cpp
     metrics/eval_mask.cpp
+    metrics/mesh_mask.cpp
+    metrics/flip.cpp
     metrics/metrics.cpp
         checkpoint.cpp
         project_snapshot_chapters.cpp
@@ -120,9 +139,117 @@ set(TRAINING_NEW_SOURCES
         perf_bench.cpp
     training_setup.cpp
 )
+if(LFS_HAS_CUDA)
+    list(APPEND TRAINING_NEW_SOURCES
+        kernels/flip.cu
+        ops/table_cuda.cpp
+        ops/session_cuda.cpp
+        ops/blob_cuda.cpp
+        ops/structure_cuda.cpp
+        ops/photometric_cuda.cpp
+        ops/gsplat_cuda.cpp
+        ops/adam_cuda.cpp
+        ops/lpips_cuda.cpp
+        ops/bilateral_cuda.cpp
+        ops/training_image_cuda.cpp
+        ops/ppisp_cuda.cpp
+        ops/mcmc_cuda.cpp
+        ops/mrnf_cuda.cpp
+        ops/morton_cuda.cpp
+        ops/masks_cuda.cpp
+        ops/extra_loss_cuda.cpp
+        ops/sh_cuda.cpp
+        ops/refine_cuda.cpp
+        rasterization/fast_rasterizer_cuda.cpp
+        rasterization/gsplat_rasterizer_cuda.cpp
+        kernels/ppisp_controller.cu
+    )
+else()
+    list(APPEND TRAINING_NEW_SOURCES
+        ops/cuda_table_stub.cpp
+    )
+endif()
+
+# Metal trainer kernels are embedded as MSL and compiled at runtime, so the
+# build needs no Metal toolchain. common.metal comes first.
+if(LFS_TENSOR_METAL)
+    set(LFS_TRAINING_METAL_KERNELS
+        kernels/metal/common.metal
+        kernels/metal/joint_adam.metal
+        kernels/metal/sh_storage.metal
+        kernels/metal/training_image.metal
+        kernels/metal/adam.metal
+        kernels/metal/sh.metal
+        kernels/metal/morton.metal
+        kernels/metal/fast_raster.metal
+        kernels/metal/effective_rank.metal
+        kernels/metal/fast_backward.metal
+        kernels/metal/gsplat.metal
+        kernels/metal/blob.metal
+        kernels/metal/structure.metal
+        kernels/metal/flip.metal
+        kernels/metal/photometric.metal
+        kernels/metal/masks.metal
+        kernels/metal/mesh_mask.metal
+        kernels/metal/extra_loss.metal
+        kernels/metal/geometry.metal
+        kernels/metal/mrnf.metal
+        kernels/metal/refine.metal
+        kernels/metal/mcmc.metal
+        kernels/metal/ppisp.metal
+        kernels/metal/bilateral.metal
+        kernels/metal/lpips.metal
+    )
+    set(_lfs_training_metal_cpp ${CMAKE_CURRENT_BINARY_DIR}/lfs_training_metal_kernels.cpp)
+    list(TRANSFORM LFS_TRAINING_METAL_KERNELS PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/
+         OUTPUT_VARIABLE _lfs_training_metal_inputs)
+    string(REPLACE ";" "$<SEMICOLON>" _lfs_training_metal_inputs "${_lfs_training_metal_inputs}")
+    set(_lfs_embed_script ${CMAKE_SOURCE_DIR}/src/core/tensor/backend/metal/embed_kernels.cmake)
+    add_custom_command(
+        OUTPUT ${_lfs_training_metal_cpp}
+        COMMAND ${CMAKE_COMMAND}
+            "-DINPUTS=${_lfs_training_metal_inputs}"
+            -DOUTPUT=${_lfs_training_metal_cpp}
+            -DNAMESPACE=lfs::training::metal
+            -DSYMBOL=kTrainingKernelSource
+            -P ${_lfs_embed_script}
+        DEPENDS ${LFS_TRAINING_METAL_KERNELS} ${_lfs_embed_script}
+        COMMENT "Embedding Metal trainer kernels"
+        VERBATIM)
+    list(APPEND TRAINING_NEW_SOURCES
+        ${_lfs_training_metal_cpp}
+        ops/metal_kernels.cpp
+        ops/table_metal.cpp
+        ops/session_metal.cpp
+        ops/training_image_metal.cpp
+        ops/adam_metal.cpp
+        ops/sh_metal.cpp
+        ops/morton_metal.cpp
+        ops/fast_metal.cpp
+        ops/gsplat_metal.cpp
+        ops/blob_metal.cpp
+        ops/structure_metal.cpp
+        ops/flip_metal.cpp
+        ops/photometric_metal.cpp
+        ops/masks_metal.cpp
+        ops/extra_loss_metal.cpp
+        ops/geometry_metal.cpp
+        ops/mrnf_metal.cpp
+        ops/refine_metal.cpp
+        ops/mcmc_metal.cpp
+        ops/bilateral_metal.cpp
+        ops/ppisp_metal.cpp
+        ops/lpips_metal.cpp
+    )
+else()
+    list(APPEND TRAINING_NEW_SOURCES
+        ops/metal_table_stub.cpp
+    )
+endif()
 
 # lfs_training - Training module with optimizer
 add_library(lfs_training STATIC ${TRAINING_NEW_SOURCES})
+target_link_libraries(lfs_training PRIVATE lfs_geometry_camera)
 
 target_include_directories(lfs_training
     PUBLIC
@@ -150,14 +277,23 @@ target_link_libraries(lfs_training
         lfs_diagnostics         # Live VRAM diagnostic accounting
         lfs_io                  # For CacheLoader, exporter, pipelined loader
         lfs_event_bridge        # Shared event bridge for cross-module singletons
-        lfs_training_kernels    # LibTorch-free SSIM kernels
-        fastlfs_backend         # LibTorch-free FastGS rasterization and optimizer kernels
-        gsplat_backend_lfs      # LibTorch-free gsplat rasterization backend
-    PRIVATE
         lfs_depth_anchor        # Shared depth-anchor fit + sidecar cache
+    PRIVATE
         lfs_preprocessing       # MoGe-2 normal auto-generate
         lfs_python_utils
 )
+if(LFS_TENSOR_VULKAN)
+    add_subdirectory(vulkan)
+    target_link_libraries(lfs_training PRIVATE lfs_training_vulkan)
+    target_compile_definitions(lfs_training PRIVATE LFS_TENSOR_VULKAN=1)
+endif()
+if(LFS_HAS_CUDA)
+    target_link_libraries(lfs_training PUBLIC
+        lfs_training_kernels
+        fastlfs_backend
+        gsplat_backend_lfs
+    )
+endif()
 
 # Set C++ standard
 set_target_properties(lfs_training PROPERTIES

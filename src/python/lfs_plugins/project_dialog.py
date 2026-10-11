@@ -20,8 +20,8 @@ def form_content(kind: str, data: dict[str, Any], *, tr: Callable[[str], str],
         row_class = "modal-field modal-field--multiline" if multiline else "modal-field"
         return f'<div class="{row_class}">{caption}{control}</div>'
 
-    def fact(key: str, value: Any, *, id: str = "") -> str:
-        return form_row(key, f'<span id="{id}" class="modal-field-value" title="{text(value)}">{text(value)}</span>')
+    def fact(key: str, value: Any) -> str:
+        return form_row(key, f'<span id="" class="modal-field-value" title="{text(value)}">{text(value)}</span>')
 
     def field(name: str, key: str) -> str:
         return form_row(key, f'<input id="{name}" name="{name}" type="text" value="{text(data.get(name, ""))}" />', name)
@@ -40,10 +40,6 @@ def form_content(kind: str, data: dict[str, Any], *, tr: Callable[[str], str],
     buttons = []
     if busy:
         body += f'<div class="modal-note">{label("projects.status.reading")}</div>'
-    elif kind == "export_as":
-        body += choice("format", "projects.dialog.format", [(value, value.upper()) for value in data.get("formats", [])])
-        body += field("destination", "projects.dialog.choose_destination")
-        buttons = [button("projects.dialog.choose_destination")]
     elif kind == "update_thumbnail":
         keys = {"viewport": "projects.dialog.current_viewport", "first_dataset": "projects.dialog.first_dataset_image", "first_embedded": "projects.dialog.first_embedded_image", "image_file": "projects.dialog.image_file"}
         sources = data.get("sources") or ["image_file"]

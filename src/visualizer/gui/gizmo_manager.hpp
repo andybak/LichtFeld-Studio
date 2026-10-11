@@ -7,7 +7,7 @@
 #include "core/export.hpp"
 #include "core/scene.hpp"
 #include "gui/gizmo_transform.hpp"
-#include "gui/panel_layout.hpp"
+#include "gui/gui_input.hpp"
 #include "gui/pie_menu.hpp"
 #include "gui/ui_context.hpp"
 #include "rendering/rendering_types.hpp"
@@ -49,24 +49,26 @@ namespace lfs::vis {
         public:
             explicit GizmoManager(VisualizerImpl* viewer);
 
-            void setupEvents();
-            void updateToolState(const UIContext& ctx, bool ui_hidden);
+            LFS_VIS_API void setupEvents();
+            LFS_VIS_API void updateToolState(const UIContext& ctx, bool ui_hidden);
 
-            void renderNodeTransformGizmo(const UIContext& ctx, const ViewportLayout& viewport);
-            void renderCropBoxGizmo(const UIContext& ctx, const ViewportLayout& viewport);
-            void renderEllipsoidGizmo(const UIContext& ctx, const ViewportLayout& viewport);
+            LFS_VIS_API void renderNodeTransformGizmo(const UIContext& ctx, const ViewportLayout& viewport);
+            void renderNodeGraphGizmo(const UIContext& ctx, const ViewportLayout& viewport);
+            LFS_VIS_API void renderCropBoxGizmo(const UIContext& ctx, const ViewportLayout& viewport);
+            LFS_VIS_API void renderEllipsoidGizmo(const UIContext& ctx, const ViewportLayout& viewport);
             void renderViewportGizmo(const ViewportLayout& viewport);
             void updateCropFlash();
-            void deactivateAllTools();
-            void setSelectionSubMode(SelectionSubMode mode);
-            void setSelectionVolumeFromDrag(SelectionSubMode mode,
-                                            SelectionMode apply_mode,
-                                            uint64_t source_generation,
-                                            const glm::vec3& center_world,
-                                            float radius);
+            LFS_VIS_API void deactivateAllTools();
+            bool cancelActiveNodeTransformDrag();
+            LFS_VIS_API void setSelectionSubMode(SelectionSubMode mode);
+            LFS_VIS_API void setSelectionVolumeFromDrag(SelectionSubMode mode,
+                                                        SelectionMode apply_mode,
+                                                        uint64_t source_generation,
+                                                        const glm::vec3& center_world,
+                                                        float radius);
 
             [[nodiscard]] TransformSpace getTransformSpace() const { return transform_space_; }
-            void setTransformSpace(TransformSpace space);
+            LFS_VIS_API void setTransformSpace(TransformSpace space);
             [[nodiscard]] GizmoOperation getOperation() const {
                 return current_operation_;
             }
@@ -75,9 +77,9 @@ namespace lfs::vis {
                 node_gizmo_operation_ = operation;
             }
             [[nodiscard]] PivotMode getPivotMode() const { return pivot_mode_; }
-            void setPivotMode(PivotMode mode);
+            LFS_VIS_API void setPivotMode(PivotMode mode);
             [[nodiscard]] MultiTransformMode getMultiTransformMode() const { return multi_transform_mode_; }
-            void setMultiTransformMode(MultiTransformMode mode);
+            LFS_VIS_API void setMultiTransformMode(MultiTransformMode mode);
             [[nodiscard]] SelectionSubMode getSelectionSubMode() const { return selection_mode_; }
 
             [[nodiscard]] bool isCropboxGizmoActive() const;
@@ -85,13 +87,11 @@ namespace lfs::vis {
             LFS_VIS_API void setCropToolShape(const std::string& shape);
             [[nodiscard]] LFS_VIS_API std::string cropToolShape() const;
             LFS_VIS_API void setCropToolOperation(const std::string& operation);
-            [[nodiscard]] bool ensureCropToolStateForRestore() {
-                return ensureCropToolState();
-            }
+            [[nodiscard]] LFS_VIS_API bool ensureCropToolStateForRestore();
             [[nodiscard]] LFS_VIS_API std::string cropToolOperation() const;
             LFS_VIS_API void applyActiveCropTool();
             LFS_VIS_API void deleteActiveCropToolVolume();
-            [[nodiscard]] bool isViewportGizmoDragging() const { return viewport_gizmo_dragging_; }
+            [[nodiscard]] ViewId viewportGizmoDragView() const { return viewport_gizmo_dragging_ ? viewport_gizmo_view_ : kNoView; }
             [[nodiscard]] bool isPositionInViewportGizmo(double x, double y) const;
             [[nodiscard]] ToolType getCurrentToolMode() const;
 
@@ -142,6 +142,7 @@ namespace lfs::vis {
             glm::vec3 gizmo_pivot_{0.0f};
             glm::mat3 gizmo_cumulative_rotation_{1.0f};
             glm::vec3 gizmo_cumulative_scale_{1.0f};
+            bool node_graph_gizmo_active_ = false;
 
             // Cropbox gizmo
             bool cropbox_gizmo_active_ = false;
@@ -182,7 +183,9 @@ namespace lfs::vis {
 
             // Viewport gizmo
             bool viewport_gizmo_dragging_ = false;
-            SplitViewPanelId viewport_gizmo_active_panel_ = SplitViewPanelId::Left;
+            std::uint64_t viewport_gizmo_epoch_ = 0;
+            ViewId viewport_gizmo_view_ = kNoView;
+            ViewId transform_gizmo_view_ = kNoView;
             glm::dvec2 gizmo_drag_start_cursor_{0.0, 0.0};
             bool show_viewport_gizmo_ = true;
             static constexpr float VIEWPORT_GIZMO_SIZE = 95.0f;

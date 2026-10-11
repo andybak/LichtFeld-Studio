@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "input/view_targets.hpp"
+
 #include "core/events.hpp"
 #include "core/export.hpp"
 #include "core/services.hpp"
@@ -14,6 +16,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <glm/glm.hpp>
 #include <memory>
 #include <optional>
@@ -35,6 +38,7 @@ namespace lfs::vis {
         class AlignTool;
         class SelectionTool;
     } // namespace tools
+    class SceneManager;
     class ToolContext;
     class Visualizer;
 
@@ -54,7 +58,7 @@ namespace lfs::vis {
         [[nodiscard]] static std::optional<CameraNavigationMode>
         cameraNavigationModeFromName(std::string_view name);
 
-        InputController(SDL_Window* window, Viewport& viewport);
+        InputController(SDL_Window* window, ViewTargets& views);
         ~InputController();
 
         void initialize();
@@ -79,17 +83,22 @@ namespace lfs::vis {
         // Called every frame by GUI manager to update viewport bounds
         void updateViewportBounds(float x, float y, float w, float h) {
             viewport_bounds_ = {x, y, w, h};
-            cached_split_divider_screen_x_.reset();
         }
 
-        void setFocusedSplitPanel(const SplitViewPanelId panel) {
-            focusSplitPanel(panel);
-        }
+        // Frames the selection (or the whole scene when nothing is selected, or
+        // when `selection` is false) in one 3D view.
+        bool frameView(ViewId view, bool selection);
+        // Makes the 3D view under a window point the active one.
+        void activateViewAt(double x, double y);
+
         void applySplitterCursorOverride() const;
         void releaseDepthWindowCursor();
         bool applyDepthWindowHoverCursor(double x, double y, bool modifiers_held);
 
-        void toggleIndependentSplitView();
+        // A second 3D view beside the one under the pointer, or back to one.
+        void toggleSplitViewport();
+        // The 3D view keys act on: the one under the pointer, else the active one.
+        [[nodiscard]] ViewTarget keyboardView();
 
         // Set special input modes
         void setPointCloudMode(bool enabled) {
@@ -99,6 +108,9 @@ namespace lfs::vis {
         // Input bindings (customizable hotkeys/mouse)
         input::InputBindings& getBindings() { return bindings_; }
         const input::InputBindings& getBindings() const { return bindings_; }
+        [[nodiscard]] bool isPanDrag(input::MouseButton button, int modifiers) const {
+            return bindings_.getActionForDrag(getCurrentToolMode(), button, modifiers, held_keys_) == input::Action::CAMERA_PAN;
+        }
         void loadInputProfile(const std::string& name) { bindings_.loadProfile(name); }
         [[nodiscard]] CameraNavigationMode cameraNavigationMode() const { return camera_navigation_mode_; }
         void setCameraNavigationMode(CameraNavigationMode mode);
@@ -108,6 +120,8 @@ namespace lfs::vis {
         // Trackpad navigation reads two-finger swipes over the viewport as
         // orbit/pan/zoom. Mouse drags and pinch zoom work in both modes.
         [[nodiscard]] const TrackpadPreferenceState& trackpadPreferences() const { return trackpad_; }
+        [[nodiscard]] int trackpadTouchCount() const { return trackpad_touches_; }
+        [[nodiscard]] float wheelZoomSpeed() const { return viewport().camera.getZoomSpeed(); }
         void setTrackpadPreferences(const TrackpadPreferenceState& state) { trackpad_ = state; }
         void restoreProjectNavigation(
             CameraNavigationMode mode,
@@ -115,7 +129,7 @@ namespace lfs::vis {
             setCameraNavigationMode(mode);
             camera_view_snap_enabled_ =
                 view_snap_enabled;
-            viewport_.camera.clearTransientMotion();
+            viewport().camera.clearTransientMotion();
             clearViewportDragState();
             clearWasdMomentumViewport();
             depth_range_initialized_ = true;
@@ -127,23 +141,31 @@ namespace lfs::vis {
 
         // Check if continuous input is active (WASD keys or camera drag)
         [[nodiscard]] bool isContinuousInputActive() const {
+            return isCameraDragging() || needsCameraAnimationFrame();
+        }
+        [[nodiscard]] bool isCameraDragging() const {
+            return dragViewport() && (drag_mode_ == DragMode::Orbit || drag_mode_ == DragMode::Pan ||
+                                      drag_mode_ == DragMode::Rotate);
+        }
+        // A held pointer gesture only changes the camera when motion arrives.
+        // Stored drag velocity is not an animation until the button is released.
+        [[nodiscard]] bool needsCameraAnimationFrame() const {
             const bool movement_active = keys_movement_[0] || keys_movement_[1] || keys_movement_[2] ||
                                          keys_movement_[3] || keys_movement_[4] || keys_movement_[5];
-            const bool camera_drag = drag_mode_ == DragMode::Orbit ||
-                                     drag_mode_ == DragMode::Pan ||
-                                     drag_mode_ == DragMode::Rotate;
             auto& keyboard_camera = activeKeyboardViewport().camera;
             const bool orbit_coasting =
-                orbit_coast_viewport_ && orbit_coast_viewport_->camera.hasOrbitMomentum();
+                drag_mode_ != DragMode::Orbit && orbitCoastViewport() &&
+                orbitCoastViewport()->camera.hasOrbitMomentum();
             const bool pan_coasting =
-                pan_coast_viewport_ && pan_coast_viewport_->camera.hasPanMomentum();
+                drag_mode_ != DragMode::Pan && panCoastViewport() &&
+                panCoastViewport()->camera.hasPanMomentum();
             const bool wasd_coasting =
-                (wasd_momentum_viewport_ && wasd_momentum_viewport_->camera.hasWasdMomentum()) ||
+                (wasdMomentumViewport() && wasdMomentumViewport()->camera.hasWasdMomentum()) ||
                 keyboard_camera.hasWasdMomentum();
             const bool drone_settling =
-                (wasd_momentum_viewport_ && wasd_momentum_viewport_->camera.hasDroneMotion()) ||
+                (wasdMomentumViewport() && wasdMomentumViewport()->camera.hasDroneMotion()) ||
                 keyboard_camera.hasDroneMotion();
-            return movement_active || camera_drag || orbit_coasting || pan_coasting ||
+            return movement_active || orbit_coasting || pan_coasting ||
                    keyboard_camera.isGliding() || wasd_coasting || drone_settling;
         }
         [[nodiscard]] bool isCameraNavigating() const {
@@ -170,16 +192,10 @@ namespace lfs::vis {
         // A finger touched (down) or left the trackpad.
         void handleTrackpadTouch(bool down);
         void handleKey(int key, int action, int mods);
-        void handleKey(int physical_key, int logical_key, int scancode, int action, int mods);
+        void handleKey(int physical_key, int logical_key, int scancode, int action, int mods, bool owned_release = false, bool gui_consumed = false);
         void handleFileDrop(const std::vector<std::string>& paths);
         void onWindowFocusLost();
         bool focusSelection();
-
-        // Toolbar actions target their named panel's camera without moving focus.
-        // Outside independent-dual mode, resolvePanelViewport returns the primary
-        // viewport for either panel.
-        void resetCameraForPanel(SplitViewPanelId panel);
-        bool focusSelectionForPanel(SplitViewPanelId panel);
 
     private:
         struct PanelInteractionState {
@@ -194,27 +210,17 @@ namespace lfs::vis {
         };
 
         void handleGoToCamView(const lfs::core::events::cmd::GoToCamView& event);
-        // Optional action identity guards only the shared-anchor side effect in
-        // publishCameraMove; panel-less paths pass nullopt. It never selects a viewport.
-        bool handleFocusSelection(Viewport& target_viewport,
-                                  std::optional<SplitViewPanelId> acted_panel = std::nullopt);
-        // Shared home reset: the legacy event passes viewport_; explicit-panel
-        // callers pass the resolved panel viewport.
-        void handleResetCameraHome(Viewport& target_viewport,
-                                   std::optional<SplitViewPanelId> acted_panel = std::nullopt);
-        // The panel's viewport, or the primary one when rendering is unavailable
-        // or the mode is not independent-dual. Reads no focus state.
-        Viewport& panelViewport(SplitViewPanelId panel);
-        bool computeWholeSceneBounds(glm::vec3& out_min, glm::vec3& out_max,
-                                     bool use_percentile = false) const;
+        bool handleFocusSelection(Viewport& target_viewport);
+        void handleResetCameraHome(Viewport& target_viewport);
+        bool computeWholeSceneBounds(glm::vec3& out_min, glm::vec3& out_max, bool use_percentile = false) const;
         float sceneExtent();
         void maybeInitializeDepthViewRange();
 
         // WASD processing with proper frame timing
-        void processWASDMovement();
 
         // Helpers
         bool isInViewport(double x, double y) const;
+        bool appendNodePaintSample(SceneManager& scene_manager, double x, double y);
         bool isPointerOverBlockingUi(double x, double y) const;
         bool isPointerOverUiHover(double x, double y) const;
         bool shouldCameraHandleInput() const;
@@ -229,21 +235,16 @@ namespace lfs::vis {
         bool scaleOrthographicView(Viewport& target_viewport, float factor);
         // Middle-drag style orbit/look by drag pixels, without release momentum.
         void orbitViewport(Viewport& target_viewport, const glm::vec2& drag);
-        void publishCameraMove(Viewport* target_viewport = nullptr,
-                               std::optional<SplitViewPanelId> acted_panel = std::nullopt);
-        // Suppress shared transform/x-y re-anchoring only for an explicitly addressed,
-        // off-focus panel in independent-dual mode. Home/Eye still move that panel's
-        // camera; this predicate neither selects a viewport nor changes focus.
-        [[nodiscard]] bool shouldSkipDepthAnchorSync(std::optional<SplitViewPanelId> acted_panel) const;
+        void publishCameraMove(Viewport* target_viewport = nullptr, bool preserve_gt_comparison = false);
+        // Suppress shared transform/x-y re-anchoring only for an explicitly
+        // that panel's camera; this predicate neither selects a viewport nor changes
+        // focus.
         bool isNearSplitter(double x, double y) const;
-        void refreshSplitDividerCache() const;
         int getModifierKeys() const;
         bool isKeyPressed(int app_key) const;
         bool isMouseButtonPressed(int app_button) const;
-        [[nodiscard]] bool isIndependentSplitViewActive() const;
         [[nodiscard]] SplitViewPanelId splitPanelForScreenX(double x) const;
         [[nodiscard]] std::optional<PanelInteractionState> resolvePanelInteraction(double x, double y);
-        void focusSplitPanel(SplitViewPanelId panel);
         [[nodiscard]] Viewport& activeKeyboardViewport();
         [[nodiscard]] const Viewport& activeKeyboardViewport() const;
         glm::vec3 unprojectScreenPoint(double x, double y, float fallback_distance = 5.0f) const;
@@ -256,7 +257,7 @@ namespace lfs::vis {
         [[nodiscard]] bool canOpenSelectedCameraContextMenu(int hovered_camera_uid) const;
         void openSelectedCameraContextMenu(int hovered_camera_uid, float screen_x, float screen_y);
         void applyCameraTrainingStateToSelection(const std::vector<std::string>& selected_names, bool enabled);
-        bool snapViewportToNearestAxis(Viewport& target_viewport, SplitViewPanelId panel);
+        bool snapViewportToNearestAxis(Viewport& target_viewport);
 
         // Camera motion tracking (flag + idle timeout; does not pause training)
         void onCameraMovementStart();
@@ -265,8 +266,11 @@ namespace lfs::vis {
 
         // Core state
         SDL_Window* window_;
-        Viewport& viewport_;
-        mutable std::optional<float> cached_split_divider_screen_x_;
+        ViewTargets& views_;
+        // The active 3D view's camera: the view keyboard navigation and
+        // panel-less commands act on.
+        [[nodiscard]] Viewport& viewport() { return *views_.activeView().viewport; }
+        [[nodiscard]] const Viewport& viewport() const { return *views_.activeView().viewport; }
 
         // Input bindings for customizable hotkeys
         input::InputBindings bindings_;
@@ -289,7 +293,8 @@ namespace lfs::vis {
             Rotate,
             Orbit,
             Gizmo,
-            Splitter
+            Splitter,
+            GTImagePan
         };
         DragMode drag_mode_ = DragMode::None;
         CameraNavigationMode camera_navigation_mode_ = CameraNavigationMode::Orbit;
@@ -298,22 +303,34 @@ namespace lfs::vis {
         int trackpad_touches_ = 0;
         int drag_button_ = -1;
         glm::dvec2 last_mouse_pos_{0, 0};
+        // Latest pointer position, drag or not; keys target the view under it.
+        glm::dvec2 hover_pos_{-1.0, -1.0};
         float splitter_start_pos_ = 0.5f;
         double splitter_start_x_ = 0.0;
-        Viewport* drag_viewport_ = nullptr;
-        Viewport* orbit_coast_viewport_ = nullptr;
-        Viewport* pan_coast_viewport_ = nullptr;
-        Viewport* wasd_momentum_viewport_ = nullptr;
+        std::uint64_t camera_view_epoch_ = 0;
+        Viewport* rememberedViewport(ViewId id) const;
+        ViewId rememberViewport(Viewport* camera);
+        ViewId drag_view_ = kNoView;
+        Viewport* dragViewport() const { return rememberedViewport(drag_view_); }
+        ViewId orbit_coast_view_ = kNoView;
+        Viewport* orbitCoastViewport() const { return rememberedViewport(orbit_coast_view_); }
+        ViewId pan_coast_view_ = kNoView;
+        Viewport* panCoastViewport() const { return rememberedViewport(pan_coast_view_); }
+        ViewId wasd_momentum_view_ = kNoView;
+        Viewport* wasdMomentumViewport() const { return rememberedViewport(wasd_momentum_view_); }
+        glm::dvec2 gt_image_pan_start_mouse_{0.0, 0.0};
+        glm::ivec2 gt_image_pan_start_origin_{0, 0};
+        bool gt_image_pan_started_while_loading_ = false;
+        std::chrono::steady_clock::time_point drag_momentum_updated_at_ = std::chrono::steady_clock::now();
+        void decayHeldDragMomentum();
 
-        // Cached whole-scene radius (half the bounds diagonal) that scales WASD
-        // speed and caps pan distance by splat size; 0 means "recompute" (after scene
-        // load/clear).
+        // Cached whole-scene radius (half the bounds diagonal) that caps pan
+        // distance by splat size; 0 means "recompute" (after scene load/clear).
         float scene_extent_ = 0.0f;
         // One-shot guard: the depth-view range is seeded from the trimmed scene
         // radius the first frame the extent is known after a load, then left to
         // the user. Reset on scene load/clear.
         bool depth_range_initialized_ = false;
-        SplitViewPanelId drag_split_panel_ = SplitViewPanelId::Left;
         SplitViewPanelId node_rect_panel_ = SplitViewPanelId::Left;
         int node_rect_button_ = -1;
         int node_rect_modifiers_ = input::MODIFIER_NONE;
@@ -380,12 +397,17 @@ namespace lfs::vis {
             Default,
             Resize,
             Hand,
-            DepthWindow
+            DepthWindow,
+            Eyedropper,
+            Paint
         };
         CursorType current_cursor_ = CursorType::Default;
         int depth_window_cursor_ = 0;
         SDL_Cursor* resize_cursor_ = nullptr;
         SDL_Cursor* hand_cursor_ = nullptr;
+        bool node_paint_dragging_ = false;
+        bool node_paint_erasing_ = false;
+        std::optional<glm::vec2> node_paint_last_screen_; // last attempted paint sample
 
         // Double-click detection
         static constexpr double DOUBLE_CLICK_TIME = 0.3;
@@ -418,7 +440,6 @@ namespace lfs::vis {
         std::size_t dataset_load_completed_handler_id_ = 0;
         std::size_t window_focus_lost_handler_id_ = 0;
         std::size_t split_toggle_handler_id_ = 0;
-        std::size_t independent_split_toggle_handler_id_ = 0;
         std::size_t gt_comparison_toggle_handler_id_ = 0;
         std::size_t scene_cleared_handler_id_ = 0;
         std::size_t scene_loaded_handler_id_ = 0;

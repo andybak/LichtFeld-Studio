@@ -13,13 +13,13 @@ def _read(relative: str) -> str:
 
 
 def test_mask_cache_and_eight_bit_staging_contracts():
-    pipeline = _read("src/io/pipelined_image_loader.cpp")
+    pipeline = _read("src/io/pipelined_image_loader_cuda.cpp")
     nvcodec = _read("src/io/nvcodec_image_loader.cpp")
 
     mask_start = pipeline.index("} else if (batch[i].is_mask) {")
     mask_end = pipeline.index("} else {", mask_start + 1)
     mask_body = pipeline[mask_start:mask_end]
-    assert "pipeline JPEG2000 mask cache must contain eight-bit samples" in mask_body
+    assert "raw.dtype() == lfs::core::DataType::UInt8" in mask_body
     assert "reinterpret_cast<const uint16_t*>(raw.data_ptr())" not in mask_body
 
     encode_start = nvcodec.index("NvCodecImageLoader::encode_grayscale_to_jpeg2k")
@@ -29,3 +29,4 @@ def test_mask_cache_and_eight_bit_staging_contracts():
     assert "cuda_stream = image_execution_stream(cuda_stream);" in encode_body
     assert "cudaStreamSynchronize(static_cast<cudaStream_t>(cuda_stream))" in encode_body
     assert "cuda_stream == nullptr" not in encode_body
+    assert "cudaDeviceSynchronize" not in encode_body

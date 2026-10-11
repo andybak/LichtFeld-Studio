@@ -117,20 +117,33 @@ def _poll_has_gaussians(context) -> bool:
     )
 
 
+def _splat_editing_blocked() -> bool:
+    try:
+        import lichtfeld as lf
+
+        is_blocked = getattr(getattr(lf, "ui", None), "is_splat_editing_blocked", None)
+        return bool(is_blocked()) if callable(is_blocked) else False
+    except Exception:
+        return False
+
+
 def _poll_can_select(context) -> bool:
-    return _poll_has_gaussians(context) and not _selection_is_crop_volume()
+    return (
+        _poll_has_gaussians(context)
+        and not _splat_editing_blocked()
+    )
 
 
 def _poll_can_transform(context) -> bool:
-    return bool(getattr(context, "can_transform", False)) and not _selection_is_crop_volume()
+    return bool(getattr(context, "can_transform", False))
 
 
 def _poll_can_mirror(_context) -> bool:
-    return _poll_builtin_tool_available("builtin.mirror") and not _selection_is_crop_volume()
+    return _poll_builtin_tool_available("builtin.mirror")
 
 
 def _poll_can_align(_context) -> bool:
-    return _poll_builtin_tool_available("builtin.align") and not _selection_is_crop_volume()
+    return _poll_builtin_tool_available("builtin.align")
 
 
 def _poll_can_cropbox(context) -> bool:
@@ -279,29 +292,3 @@ def get_tool_by_id(tool_id: str) -> ToolDef | None:
         if tool.id == tool_id:
             return tool
     return None
-
-
-def get_tools_by_group(group: str) -> list[ToolDef]:
-    """Get all builtin tools in a group, sorted by order.
-
-    Args:
-        group: Group name (e.g., "transform").
-
-    Returns:
-        List of tools in the group, sorted by order.
-    """
-    return sorted(
-        [t for t in BUILTIN_TOOLS if t.group == group],
-        key=lambda t: t.order,
-    )
-
-
-def get_all_groups() -> list[str]:
-    """Get all unique group names, in order of first appearance."""
-    seen = set()
-    groups = []
-    for tool in BUILTIN_TOOLS:
-        if tool.group not in seen:
-            seen.add(tool.group)
-            groups.append(tool.group)
-    return groups

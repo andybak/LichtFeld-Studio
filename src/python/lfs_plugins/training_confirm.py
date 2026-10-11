@@ -72,8 +72,15 @@ def _save_titled_project() -> bool:
     return result is not False
 
 
-def _invoke_project_save_as():
-    save_as = getattr(lf, "project_save_as", None)
+def _invoke_project_save_as(fresh_training_start=False):
+    api = (
+        "project_save_as_for_training_start"
+        if fresh_training_start
+        else "project_save_as"
+    )
+    save_as = getattr(lf, api, None)
+    if fresh_training_start and not callable(save_as):
+        save_as = getattr(lf, "project_save_as", None)
     if not callable(save_as):
         return False
     try:
@@ -105,7 +112,6 @@ def confirm_discard_work_then(
     title,
     on_proceed,
     *,
-    message_key="exit_popup.unsaved_warning",
     ask_stop_training=True,
 ) -> None:
     def _after_save():
@@ -144,7 +150,7 @@ def confirm_discard_work_then(
 
     lf.ui.confirm_dialog(
         title,
-        tr(message_key),
+        tr("exit_popup.unsaved_warning"),
         [save_label, continue_label, cancel_label],
         _on_result,
     )

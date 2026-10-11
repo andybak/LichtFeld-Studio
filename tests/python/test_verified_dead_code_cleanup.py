@@ -18,23 +18,20 @@ def test_verified_zero_reference_census_stays_removed() -> None:
     assert "dense_for_kernel" not in zero_stride
     assert "dense_for_kernel" not in source("src/core/tensor/internal/tensor_impl.hpp")
 
-    joint_device = source("src/training/include/lfs/training/joint_adam_codec.cuh")
+    joint_device = source("src/training/kernels/joint_adam_codec.cuh")
     assert "encode_g1g2" not in joint_device
     sh_device = source("src/core/include/core/sh_value_codec.cuh")
     for token in ("kBlockSizeDevice", "decode_slot", "encode_slot"):
         assert token not in sh_device
 
-    fused_structs = (
-        source("src/training/optimizer/adam_optimizer.hpp").split(
-            "struct FastGSFusedAdamParam", 1
-        )[1].split("};", 1)[0],
-        source(
-            "src/training/rasterization/fastgs/rasterization/include/fused_adam_types.h"
-        ).split("struct FusedAdamParam", 1)[1].split("};", 1)[0],
-    )
-    for text in fused_structs:
-        for token in ("exp_avg_q", "exp_avg_sq_q", "exp_avg_scale", "exp_avg_sq_scale"):
-            assert token not in text
+    optimizer_header = source("src/training/optimizer/adam_optimizer.hpp")
+    for token in ("struct FastGSFusedAdamParam", "struct FastGSFusedAdamState", "fast_adam_groups"):
+        assert token not in optimizer_header
+    fused_param = source(
+        "src/training/rasterization/fastgs/rasterization/include/fused_adam_types.h"
+    ).split("struct FusedAdamParam", 1)[1].split("};", 1)[0]
+    for token in ("exp_avg_q", "exp_avg_sq_q", "exp_avg_scale", "exp_avg_sq_scale"):
+        assert token not in fused_param
 
     adam_param_state = source("src/training/optimizer/adam_optimizer.hpp").split(
         "struct AdamParamState", 1

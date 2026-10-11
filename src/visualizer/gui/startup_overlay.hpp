@@ -4,7 +4,8 @@
 
 #pragma once
 
-#include "gui/panel_layout.hpp"
+#include "core/export.hpp"
+#include "gui/gui_input.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "gui/startup_overlay_geometry.hpp"
 
@@ -28,7 +29,7 @@ namespace lfs::vis::gui {
 
     class RmlUIManager;
 
-    class StartupOverlay {
+    class LFS_VIS_API StartupOverlay {
     public:
         void init(RmlUIManager* mgr);
         void shutdown();
@@ -47,8 +48,8 @@ namespace lfs::vis::gui {
         static void openURL(const char* url);
 
     private:
+        friend class lfs::vis::WindowInputDispatchTest;
         struct InputForwardResult {
-            bool escape_consumed = false;
             bool event_forwarded = false;
         };
 
@@ -61,11 +62,11 @@ namespace lfs::vis::gui {
         [[nodiscard]] bool isLanguageSelectOpen() const;
         [[nodiscard]] bool isLanguageSelectHit(float local_x, float local_y) const;
         [[nodiscard]] bool isLanguageDropdownHit(float local_x, float local_y) const;
+        [[nodiscard]] std::string attributeAt(float local_x, float local_y, const char* attribute) const;
         [[nodiscard]] bool isLinkHit(float local_x, float local_y) const;
         [[nodiscard]] std::optional<StartupOverlayRect> elementBorderRect(Rml::Element* element) const;
         [[nodiscard]] std::optional<StartupOverlayRect> languageDropdownRect() const;
         bool applyFitRatio(int context_width, int context_height, float maximum_ratio);
-        [[nodiscard]] bool hasInputActivity(const PanelInputState& input) const;
         InputForwardResult forwardInput(const PanelInputState& input, float overlay_x, float overlay_y,
                                         float overlay_w, float overlay_h);
 
@@ -75,6 +76,7 @@ namespace lfs::vis::gui {
             std::string stage;
         };
 
+        bool drag_hovering_ = false;
         bool visible_ = true;
         int shown_frames_ = 0;
 
@@ -87,7 +89,7 @@ namespace lfs::vis::gui {
         std::uint64_t last_language_generation_ = 0;
         bool has_language_generation_ = false;
         const PanelInputState* input_ = nullptr;
-        CachedVulkanContextRender direct_cache_;
+        CachedUiContextRender direct_cache_;
         int width_ = 0;
         int height_ = 0;
         float fitted_dp_ratio_ = 0.0f;

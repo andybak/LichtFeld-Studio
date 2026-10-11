@@ -7,6 +7,7 @@
 #include "core/tensor.hpp"
 #include "frame_contract.hpp"
 #include "render_constants.hpp"
+#include "viewer_backend.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -142,7 +143,6 @@ namespace lfs::rendering {
         GaussianTransientMaskOverlayState transient_mask;
         std::vector<bool> emphasized_node_mask;
         bool dim_non_emphasized = false;
-        float flash_intensity = 0.0f;
         int focused_gaussian_id = -1;
     };
 
@@ -224,6 +224,14 @@ namespace lfs::rendering {
         GaussianOverlayState overlay;
         bool transparent_background = false;
         bool depth_view = false;
+        // Export-only capture before RGBA8 presentation; interactive/default
+        // renders retain their current allocation and readback behavior.
+        bool capture_float_color = false;
+        // Occlusion consumers need per-pixel depth, not HiGS batch-leading depth.
+        bool require_exact_depth = false;
+        // Optional row-major bitset of 4x4 pixel regions (rounded up at edges).
+        // Empty requests exact depth everywhere.
+        std::vector<uint32_t> exact_depth_sample_mask{};
         float depth_view_min = DEFAULT_DEPTH_VIEW_MIN;
         float depth_view_max = DEFAULT_DEPTH_VIEW_MAX;
         DepthVisualizationMode depth_visualization_mode = DepthVisualizationMode::Palette;
@@ -287,6 +295,7 @@ namespace lfs::rendering {
     };
 
     struct FrameMetadata {
+        std::optional<ViewerBackend> viewer_backend;
         std::array<FramePanelMetadata, 2> depth_panels{};
         size_t depth_panel_count = 0;
         bool valid = false;
@@ -308,66 +317,12 @@ namespace lfs::rendering {
         FrameMetadata metadata;
     };
 
-    // Split view support
-    enum class PanelContentType {
-        Model3D,     // Regular 3D model rendering
-        Image2D,     // GT image display
-        CachedRender // Previously rendered frame
-    };
-
-    struct SplitViewGaussianPanelRenderState {
-        FrameView frame_view;
-        float scaling_modifier = 1.0f;
-        bool antialiasing = false;
-        bool mip_filter = false;
-        int sh_degree = 3;
-        GaussianRasterBackend raster_backend = GaussianRasterBackend::ThreeDgs;
-        bool gut = false;
-        bool equirectangular = false;
-        GaussianSceneState scene;
-        GaussianFilterState filters;
-        GaussianOverlayState overlay;
-    };
-
     struct SplitViewPointCloudPanelRenderState {
         FrameView frame_view;
         PointCloudRenderState render;
         PointCloudSceneState scene;
         PointCloudFilterState filters;
         PointCloudOverlayState overlay;
-    };
-
-    struct SplitViewPanelContent {
-        PanelContentType type = PanelContentType::Model3D;
-        const lfs::core::SplatData* model = nullptr;
-        glm::mat4 model_transform{1.0f};
-        std::optional<SplitViewGaussianPanelRenderState> gaussian_render;
-        std::optional<SplitViewPointCloudPanelRenderState> point_cloud_render;
-        uint64_t image_handle = 0;
-    };
-
-    struct SplitViewPanelPresentation {
-        float start_position = 0.0f;
-        float end_position = 1.0f;
-        glm::vec2 texcoord_scale{1.0f, 1.0f};
-        std::optional<bool> flip_y;
-        bool normalize_x_to_panel = false;
-    };
-
-    struct SplitViewPanel {
-        SplitViewPanelContent content;
-        SplitViewPanelPresentation presentation;
-    };
-
-    struct SplitViewCompositeState {
-        glm::ivec2 output_size{0, 0};
-        glm::vec3 background_color{0.0f, 0.0f, 0.0f};
-    };
-
-    struct SplitViewPresentationState {
-        glm::vec4 divider_color{0.29f, 0.33f, 0.42f, 1.0f};
-        bool letterbox = false;
-        glm::ivec2 content_size{0, 0};
     };
 
     // Render modes
@@ -391,7 +346,6 @@ namespace lfs::rendering {
         int shadow_map_resolution = 2048;
         bool is_emphasized = false;
         bool dim_non_emphasized = false;
-        float flash_intensity = 0.0f;
         glm::vec3 background_color{0.0f};
         bool transparent_background = false;
     };

@@ -175,15 +175,6 @@ scene-graph,
     tab-index: auto;
 }
 
-/* Match the compact Training parameter scrollbar without hiding scroll state. */
-scene-graph scrollbarvertical {
-    width: 4dp;
-}
-
-scene-graph scrollbarvertical sliderbar {
-    min-height: 12dp;
-}
-
 .scene-graph-content {
     position: relative;
     width: 100%;
@@ -539,6 +530,11 @@ scene-graph scrollbarvertical sliderbar {
     min-width: 0;
 }
 
+/* Keep the hierarchy gutter and icons fixed when long names are truncated. */
+.expand-toggle, .leaf-spacer, .row-icon, .node-icon {
+    flex-shrink: 0;
+}
+
 /* Expand/collapse toggle — inline before name */
 .expand-toggle {
     display: inline;
@@ -800,6 +796,20 @@ scene-graph scrollbarvertical sliderbar {
 
 .node-name.training-disabled {
     color: #a6adc8;
+}
+
+/* Pill after a streamed splat's name; streamed models are view-dependent and read-only */
+.streamed-badge {
+    display: none;
+    flex-shrink: 0;
+    margin-left: 6dp;
+    padding: 0dp 5dp;
+    height: 14dp;
+    line-height: 14dp;
+    font-size: 10dp;
+    border-width: 1dp;
+    border-radius: 7dp;
+    white-space: nowrap;
 }
 
 

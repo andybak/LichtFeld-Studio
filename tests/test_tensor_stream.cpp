@@ -3,19 +3,28 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
+#include <cstdint>
 #include <cuda_runtime.h>
+#include <functional>
+#include <future>
 #include <gtest/gtest.h>
 #include <iostream>
 #include <numeric>
+#include <string>
+#include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
+#include "core/logger.hpp"
 #include "core/tensor.hpp"
 #include "core/tensor/backend/cuda/runtime/cuda_stream_context.hpp"
 #include "core/tensor/backend/cuda/runtime/memory_pool.hpp"
 #include "core/tensor_upload.hpp"
 #include "cuda_backend_test.hpp"
+#include "cuda_stream_gate.hpp"
 
 using namespace lfs::core;
 
@@ -626,4 +635,193 @@ TEST_F(TensorStreamTest, DirectZerosPublishTheExecutionStream) {
         }
     }
     queue.wait();
+}
+
+TEST_F(TensorStreamTest, ZeroJoinsProducerAndPublishesExecutionQueue) {
+    TensorWorkQueue producer(GpuBackend::CUDA), consumer(GpuBackend::CUDA);
+    Tensor value;
+    const auto producer_stream = static_cast<cudaStream_t>(producer.native_handle());
+    {
+        TensorWorkQueue::Scope scope(producer);
+        value = Tensor::ones({1024}, Device::GPU);
+    }
+    producer.wait();
+    lfs::test::CudaStreamGate gate;
+    ASSERT_EQ(gate.block(producer_stream), cudaSuccess);
+    ASSERT_TRUE(gate.entered());
+    ASSERT_EQ(cudaMemsetAsync(value.data_ptr(), 0x3f, value.bytes(), producer_stream), cudaSuccess);
+    auto zero = std::async(std::launch::async, [&] {
+        TensorWorkQueue::Scope scope(consumer);
+        value.zero_();
+    });
+    const auto ready = zero.wait_for(std::chrono::seconds(1));
+    gate.release();
+    zero.get();
+    EXPECT_EQ(ready, std::future_status::ready);
+    EXPECT_EQ(value.stream(), consumer.native_handle());
+    EXPECT_EQ(value.to_vector(), std::vector<float>(1024, 0.0f));
+}
+
+TEST_F(TensorStreamTest, FillJoinsProducerAndPublishesExecutionQueue) {
+    TensorWorkQueue producer(GpuBackend::CUDA), consumer(GpuBackend::CUDA);
+    Tensor value;
+    const auto producer_stream = static_cast<cudaStream_t>(producer.native_handle());
+    {
+        TensorWorkQueue::Scope scope(producer);
+        value = Tensor::ones({1024}, Device::GPU);
+    }
+    producer.wait();
+    lfs::test::CudaStreamGate gate;
+    ASSERT_EQ(gate.block(producer_stream), cudaSuccess);
+    ASSERT_TRUE(gate.entered());
+    ASSERT_EQ(cudaMemsetAsync(value.data_ptr(), 0x3f, value.bytes(), producer_stream), cudaSuccess);
+    auto fill = std::async(std::launch::async, [&] {
+        TensorWorkQueue::Scope scope(consumer);
+        value.fill_(7.0f);
+    });
+    const auto ready = fill.wait_for(std::chrono::seconds(1));
+    gate.release();
+    fill.get();
+    EXPECT_EQ(ready, std::future_status::ready);
+    EXPECT_EQ(value.stream(), consumer.native_handle());
+    EXPECT_EQ(value.to_vector(), std::vector<float>(1024, 7.0f));
+}
+
+TEST_F(TensorStreamTest, FillNegativeZeroJoinsProducerAndPublishesExecutionQueue) {
+    TensorWorkQueue producer(GpuBackend::CUDA), consumer(GpuBackend::CUDA);
+    Tensor value;
+    const auto producer_stream = static_cast<cudaStream_t>(producer.native_handle());
+    {
+        TensorWorkQueue::Scope scope(producer);
+        value = Tensor::ones({1024}, Device::GPU);
+    }
+    producer.wait();
+    lfs::test::CudaStreamGate gate;
+    ASSERT_EQ(gate.block(producer_stream), cudaSuccess);
+    ASSERT_TRUE(gate.entered());
+    ASSERT_EQ(cudaMemsetAsync(value.data_ptr(), 0x3f, value.bytes(), producer_stream), cudaSuccess);
+    auto fill = std::async(std::launch::async, [&] {
+        TensorWorkQueue::Scope scope(consumer);
+        value.fill_(-0.0f);
+    });
+    const auto ready = fill.wait_for(std::chrono::seconds(1));
+    gate.release();
+    fill.get();
+    EXPECT_EQ(ready, std::future_status::ready);
+    EXPECT_EQ(value.stream(), consumer.native_handle());
+    for (const float result : value.to_vector()) {
+        EXPECT_EQ(std::bit_cast<uint32_t>(result), 0x80000000u);
+    }
+}
+
+TEST_F(TensorStreamTest, ReadbacksDoNotWaitForUnrelatedLegacyWork) {
+    TensorWorkQueue queue(GpuBackend::CUDA);
+    Tensor value;
+    {
+        TensorWorkQueue::Scope scope(queue);
+        value = Tensor::from_vector({2.0f, 3.0f, 4.0f}, {3}, Device::GPU);
+    }
+    {
+        TensorWorkQueue::Scope scope(queue);
+        (void)value.cpu();
+        (void)value.count_nonzero();
+    }
+    queue.wait();
+    std::atomic<int> completed{0};
+    lfs::test::CudaStreamGate gate;
+    ASSERT_EQ(gate.block(nullptr), cudaSuccess);
+    ASSERT_TRUE(gate.entered());
+    auto read = std::async(std::launch::async, [&] {
+        TensorWorkQueue::Scope scope(queue);
+        EXPECT_EQ(value[1].item(), 3.0f);
+        completed.store(1);
+        EXPECT_EQ(value.slice(0, 0, 1).item<float>(), 2.0f);
+        completed.store(2);
+        EXPECT_EQ(value.to_vector(), (std::vector<float>{2.0f, 3.0f, 4.0f}));
+        completed.store(3);
+        EXPECT_EQ(value.cpu().to_vector(), (std::vector<float>{2.0f, 3.0f, 4.0f}));
+        completed.store(4);
+        EXPECT_EQ(value.count_nonzero(), 3);
+    });
+    const auto ready = read.wait_for(std::chrono::seconds(1));
+    const auto completed_before_release = completed.load();
+    gate.release();
+    read.get();
+    EXPECT_EQ(ready, std::future_status::ready) << "completed readbacks: " << completed_before_release;
+    ASSERT_EQ(cudaStreamSynchronize(nullptr), cudaSuccess);
+}
+
+TEST_F(TensorStreamTest, FusedSliceReductionOfStreamTensorWaitsForItsResult) {
+    constexpr size_t rows = 5'000'000;
+    cudaStream_t producer;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&producer, cudaStreamNonBlocking), cudaSuccess);
+    {
+        Tensor produced;
+        {
+            CUDAStreamGuard guard(producer);
+            produced = (Tensor::full({rows, 3}, 0.25f, Device::CUDA) +
+                        Tensor::from_vector({0.0f, -0.5f, 0.0f}, {1, 3}, Device::CUDA))
+                           .contiguous();
+        }
+        ASSERT_EQ(cudaStreamSynchronize(producer), cudaSuccess);
+        const auto column_gap = [](const Tensor& value) {
+            const auto scaled = value * 0.5f + 0.5f;
+            return (scaled.slice(1, 1, 2).squeeze(1) - scaled.slice(1, 0, 1).squeeze(1)).mean().item<float>();
+        };
+        EXPECT_FLOAT_EQ(column_gap(Tensor::full({rows, 3}, 1.0f, Device::CUDA)), 0.0f);
+
+        // Hold the producer back so an unordered consumer reads unwritten memory.
+        ASSERT_EQ(cudaLaunchHostFunc(producer, [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); }, nullptr), cudaSuccess);
+        EXPECT_FLOAT_EQ(column_gap(produced), -0.25f);
+    }
+    destroyStreamSafely(producer);
+}
+
+TEST_F(TensorStreamTest, EagerOpsOnStreamTensorWaitForItsProducer) {
+    constexpr size_t rows = 1'000'000;
+    cudaStream_t producer;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&producer, cudaStreamNonBlocking), cudaSuccess);
+    {
+        Tensor produced;
+        {
+            CUDAStreamGuard guard(producer);
+            produced = (Tensor::full({rows, 3}, 0.25f, Device::CUDA) + Tensor::zeros({rows, 3}, Device::CUDA)).contiguous();
+        }
+        ASSERT_EQ(cudaStreamSynchronize(producer), cudaSuccess);
+        using Probe = std::function<float(const Tensor&)>;
+        const std::vector<std::tuple<const char*, Probe, float>> probes = {
+            {"to", [](const Tensor& v) { return (v * 4.0f).gt(1.5f).to(DataType::Float32).sum().item<float>(); }, 0.0f},
+            {"clamp", [](const Tensor& v) { return (v * 4.0f).clamp(0.0f, 0.5f).sum().item<float>(); }, 1.5e6f},
+            {"cat", [](const Tensor& v) { return Tensor::cat({v * 4.0f, v * 4.0f}, 0).sum().item<float>(); }, 6.0e6f},
+        };
+        for (const auto& [name, probe, expected] : probes) {
+            // Same expressions on other values first, so pooled buffers hold wrong results.
+            (void)probe(Tensor::full({rows, 3}, 0.6f, Device::CUDA));
+            // Hold the producer back so an unordered consumer reads unwritten memory.
+            ASSERT_EQ(cudaLaunchHostFunc(producer, [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); }, nullptr), cudaSuccess);
+            EXPECT_FLOAT_EQ(probe(produced), expected) << name;
+        }
+    }
+    destroyStreamSafely(producer);
+}
+
+// Fails if moving an empty CUDA tensor to another stream asks the memory pool to rehome storage the pool never
+// allocated: the pool then logs a missed allocation.
+TEST_F(TensorStreamTest, EmptyTensorChangesStreamWithoutRehomingStorage) {
+    std::vector<std::string> warnings;
+    const auto token = Logger::get().add_log_handler(
+        [&warnings](const LogLevel level, const SourceSite&, const std::string_view message) {
+            if (level == LogLevel::Warn && message.find("rehome_stream missed") != std::string_view::npos)
+                warnings.emplace_back(message);
+        });
+    cudaStream_t stream;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    {
+        auto empty = Tensor::empty({0}, Device::CUDA, DataType::Int64);
+        empty.set_stream(stream);
+        EXPECT_EQ(empty.stream(), stream);
+    }
+    Logger::get().remove_log_handler(token);
+    destroyStreamSafely(stream);
+    EXPECT_TRUE(warnings.empty()) << warnings.front();
 }

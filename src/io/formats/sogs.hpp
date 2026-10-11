@@ -22,6 +22,9 @@ namespace lfs::io {
     }
 
     inline constexpr size_t MAX_METADATA_BYTES = 16ULL * 1024 * 1024;
+    // A streamed-SOG lod-meta.json grows with its leaf count (~0.5 KiB per
+    // leaf), so it gets its own cap: 512 MiB is roughly one million leaves.
+    inline constexpr size_t MAX_SSOG_MANIFEST_BYTES = 512ULL * 1024 * 1024;
     inline constexpr size_t MAX_ENCODED_IMAGE_BYTES = 512ULL * 1024 * 1024;
     inline constexpr size_t MAX_ARCHIVE_BYTES = 4ULL * 1024 * 1024 * 1024;
 
@@ -50,7 +53,9 @@ namespace lfs::io {
     // Bounded entry access shared by directory and bundle readers.
     using SogEntryReader = std::function<Result<std::vector<uint8_t>>(const std::string&, size_t)>;
     Result<SogDirectoryReconstruct> prepare_sog_entries(const SogEntryReader&, const std::string& prefix);
-    std::unique_ptr<SogSink> make_sog_archive(const std::filesystem::path&);
+    // WebP members are always stored; store_every_member also stores the JSON members, so a streaming server can
+    // hand out any member as an exact byte range of the archive.
+    std::unique_ptr<SogSink> make_sog_archive(const std::filesystem::path&, bool store_every_member = false);
 
     // Internal: Loading function (not in public API)
     Result<SplatData> load_sog(const std::filesystem::path& filepath,

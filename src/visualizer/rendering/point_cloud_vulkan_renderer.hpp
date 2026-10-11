@@ -3,9 +3,12 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #pragma once
+#include "scene_renderer.hpp"
 
+#include "core/error.hpp"
 #include "core/export.hpp"
 #include "core/tensor.hpp"
+#include "render_target_id.hpp"
 #include "rendering/rendering.hpp"
 #include "window/vulkan_context.hpp"
 
@@ -28,92 +31,16 @@ namespace lfs::vis {
     // manager can route them through the same external-image plumbing as
     // VkSplat (no CUDA tensor staging on the display path).
     class LFS_VIS_API PointCloudVulkanRenderer {
+        friend struct PointCloudOutputOwnershipTestAccess;
+
     public:
-        struct RenderResult {
-            VkImage image = VK_NULL_HANDLE;
-            VkImageView image_view = VK_NULL_HANDLE;
-            VkImageLayout image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-            std::uint64_t generation = 0;
-            VkImage depth_image = VK_NULL_HANDLE;
-            VkImageView depth_image_view = VK_NULL_HANDLE;
-            VkImageLayout depth_image_layout = VK_IMAGE_LAYOUT_UNDEFINED;
-            std::uint64_t depth_generation = 0;
-            glm::ivec2 size{0, 0};
-            bool flip_y = false;
-        };
+        using RenderResult = PointSceneRenderer::RenderResult;
+        using RenderRequest = PointSceneRenderer::RenderRequest;
+        using CropBox = PointSceneRenderer::CropBox;
+        using CropEllipsoid = PointSceneRenderer::CropEllipsoid;
 
-        struct CropBox {
-            glm::mat4 to_local{1.0f};
-            glm::vec3 min{0.0f};
-            glm::vec3 max{0.0f};
-            bool inverse = false;
-            bool desaturate = false;
-        };
-
-        struct CropEllipsoid {
-            glm::mat4 to_local{1.0f};
-            glm::vec3 radii{1.0f};
-            bool inverse = false;
-            bool desaturate = false;
-        };
-
-        struct RenderRequest {
-            // Positions/colors are float [N, 3] tensors. Either CUDA or CPU; we
-            // copy to Vulkan device-local on first use and cache by pointer plus
-            // caller-provided content revisions for in-place tensor mutations.
-            const lfs::core::Tensor* positions = nullptr;
-            const lfs::core::Tensor* colors = nullptr;
-            std::uint64_t positions_revision = 0;
-            std::uint64_t colors_revision = 0;
-
-            // Optional model_transforms[K, 16] + per-point transform_indices[N];
-            // empty/null disables the transform path.
-            const std::vector<glm::mat4>* model_transforms = nullptr;
-            const lfs::core::Tensor* transform_indices = nullptr;
-
-            // Optional per-transform visibility (size matches model_transforms).
-            const std::vector<bool>* node_visibility_mask = nullptr;
-
-            // Optional per-point soft-delete mask. Nonzero entries are hidden.
-            const lfs::core::Tensor* deleted_mask = nullptr;
-            std::uint64_t deleted_mask_revision = 0;
-
-            // Optional selection overlays. Masks are per-point UInt8/Bool tensors
-            // where 0 means unselected and nonzero means selection group/preview.
-            const lfs::core::Tensor* selection_mask = nullptr;
-            const lfs::core::Tensor* preview_selection_mask = nullptr;
-            const std::array<glm::vec4, lfs::rendering::kSelectionColorTableCount>* selection_colors = nullptr;
-            bool preview_selection_additive = true;
-            std::uint64_t selection_revision = 0;
-            std::uint64_t preview_selection_revision = 0;
-
-            // Optional crop. When set, points outside the active crop volume are
-            // dropped (default) or rendered desaturated.
-            std::optional<CropBox> crop;
-            std::optional<CropEllipsoid> crop_ellipsoid;
-
-            glm::mat4 view{1.0f};
-            glm::mat4 view_projection{1.0f};
-            glm::ivec2 size{0, 0};
-            glm::vec3 background_color{0.0f};
-            bool transparent_background = false;
-            bool orthographic = false;
-            float ortho_scale = 1.0f;
-            float focal_y = 1.0f;
-            float voxel_size = 0.01f;
-            float scaling_modifier = 1.0f;
-            bool depth_view = false;
-            float depth_view_min = lfs::rendering::DEFAULT_DEPTH_VIEW_MIN;
-            float depth_view_max = lfs::rendering::DEFAULT_DEPTH_VIEW_MAX;
-            lfs::rendering::DepthVisualizationMode depth_visualization_mode =
-                lfs::rendering::DepthVisualizationMode::Palette;
-        };
-
-        enum class OutputSlot : std::size_t {
-            Main = 0,
-            SplitLeft = 1,
-            SplitRight = 2,
-        };
+        static constexpr float kDepthSamplePending = PointSceneRenderer::kDepthSamplePending;
+        using DepthSampleRequest = PointSceneRenderer::DepthSampleRequest;
 
         PointCloudVulkanRenderer();
         ~PointCloudVulkanRenderer();
@@ -124,16 +51,31 @@ namespace lfs::vis {
         [[nodiscard]] std::expected<RenderResult, std::string> render(
             VulkanContext& context,
             const RenderRequest& request,
-            OutputSlot output_slot = OutputSlot::Main);
+            RenderTargetId target);
         [[nodiscard]] std::expected<std::shared_ptr<lfs::core::Tensor>, std::string> readOutputImage(
             VulkanContext& context,
-            OutputSlot output_slot = OutputSlot::Main);
+            RenderTargetId target);
+
+        [[nodiscard]] bool hasRenderTarget(RenderTargetId target) const;
+        [[nodiscard]] bool releaseRenderTarget(RenderTargetId target);
+        [[nodiscard]] lfs::Result<float> sampleDepthAtPixel(
+            VulkanContext& context, const DepthSampleRequest& request);
+        [[nodiscard]] bool takeRefinementRequest();
 
         void reset();
 
     private:
         struct Impl;
         std::unique_ptr<Impl> impl_;
+    };
+
+    struct LFS_VIS_API PointCloudOutputOwnershipTestAccess {
+        // Cumulative position/color host upload bytes over the renderer lifetime.
+        // Compare snapshots for an interval; zero proves no host upload at all.
+        static uint64_t hostVertexUploadBytes(const PointCloudVulkanRenderer& renderer);
+        static std::weak_ptr<const void> residentStorage(const PointCloudVulkanRenderer& renderer);
+        static const void* createEmptyOutput(PointCloudVulkanRenderer& renderer, RenderTargetId target);
+        static const void* outputIdentity(const PointCloudVulkanRenderer& renderer, RenderTargetId target);
     };
 
 } // namespace lfs::vis

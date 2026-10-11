@@ -42,13 +42,13 @@ namespace lfs::training {
         ops_.push_back({.name = "set_lr",
                         .target = CommandTarget::Optimizer,
                         .selectors = {SelectionKind::All},
-                        .args = {{"value", ArgType::Float, true, "Learning rate"}},
+                        .args = {{"value", ArgType::Float, true, "Learning rate, in (0, 1]", 0.0, 1.0}},
                         .description = "Set global learning rate."});
 
         ops_.push_back({.name = "scale_lr",
                         .target = CommandTarget::Optimizer,
                         .selectors = {SelectionKind::All},
-                        .args = {{"factor", ArgType::Float, true, "Scale factor"}},
+                        .args = {{"factor", ArgType::Float, true, "Scale factor, > 0", 0.0, std::nullopt}},
                         .description = "Scale global learning rate."});
 
         ops_.push_back({.name = "pause",
@@ -68,14 +68,6 @@ namespace lfs::training {
                         .selectors = {SelectionKind::All},
                         .args = {},
                         .description = "Request graceful stop."});
-
-        // Mutable fields
-        mutable_fields_.push_back({"means", CommandTarget::Model, "[N,3]", "Gaussian means", true});
-        mutable_fields_.push_back({"scaling", CommandTarget::Model, "[N,3]", "Log scaling", true});
-        mutable_fields_.push_back({"rotation", CommandTarget::Model, "[N,4]", "Quaternion rotation", true});
-        mutable_fields_.push_back({"opacity", CommandTarget::Model, "[N]", "Opacity logits", true});
-        mutable_fields_.push_back({"sh0", CommandTarget::Model, "[N,3]", "SH0 coefficients", true});
-        mutable_fields_.push_back({"shN", CommandTarget::Model, "[N,?]", "Higher-order SH coefficients", true});
     }
 
     void CommandCenter::bind_state_events() {
@@ -111,7 +103,15 @@ namespace lfs::training {
         if (snapshot_.trainer != trainer) {
             return;
         }
+        // The finished run's counters stay readable (training.get_state, scene/state) until
+        // the next run or reset_snapshot() replaces them; only the live-run state goes.
+        const TrainingSnapshot finished = std::move(snapshot_);
         reset_snapshot_locked();
+        snapshot_.iteration = finished.iteration;
+        snapshot_.max_iterations = finished.max_iterations;
+        snapshot_.loss = finished.loss;
+        snapshot_.num_gaussians = finished.num_gaussians;
+        snapshot_.strategy = finished.strategy;
     }
 
     void CommandCenter::reset_snapshot() {
@@ -155,19 +155,6 @@ namespace lfs::training {
         for (const auto& op : ops_) {
             if (op.target == *target) {
                 filtered.push_back(op);
-            }
-        }
-        return filtered;
-    }
-
-    std::vector<MutableFieldInfo> CommandCenter::mutables(std::optional<CommandTarget> target) const {
-        if (!target) {
-            return mutable_fields_;
-        }
-        std::vector<MutableFieldInfo> filtered;
-        for (const auto& f : mutable_fields_) {
-            if (f.target == *target) {
-                filtered.push_back(f);
             }
         }
         return filtered;

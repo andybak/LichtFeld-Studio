@@ -7,6 +7,7 @@
 #include "core/cuda_types.hpp"
 #include "core/detail/tensor_half.hpp"
 #include "core/gpu_backend_fwd.hpp"
+#include "core/tensor_execution.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -101,6 +102,7 @@ namespace lfs::core {
     class TensorIndexer;
     class MaskedTensorProxy;
     class TensorRowProxy;
+    class TensorElementProxy;
 
     // ============================================================================
     // Type Promotion System
@@ -431,6 +433,7 @@ namespace lfs::core {
         Device device = Device::GPU;
         DataType dtype = DataType::Float32;
         bool use_pinned = true;
+        std::optional<uint64_t> random_seed;
         std::variant<
             std::monostate,
             float,
@@ -506,29 +509,18 @@ namespace lfs::core {
         std::shared_ptr<void> external_owner;
         mutable std::mutex vulkan_interop_mutex;
         mutable std::unordered_map<void*, std::shared_ptr<void>> vulkan_interop_owners;
-        // Exportable packed-SoA provenance. When set, bind sites
-        // re-resolve the device pointer through the live control block instead of
-        // trusting the baked data_ pointer across a capacity grow.
-        // exportable_control holds shared_ptr<SplatExportableStorage::Control>.
-        std::shared_ptr<void> exportable_control;
-        std::uint32_t exportable_region = 0;
-        std::uint64_t exportable_bound_generation = 0;
+        // Exportable provenance lives on TensorState. Region views share this
+        // descriptor (Vulkan buffer, timeline) and must not share that identity.
     };
 
     namespace internal {
         // Synchronous host copies run on the legacy default stream, which a
-        // non-blocking home stream neither waits for nor is waited on by. A
-        // download must follow the home stream's producer; an upload from
-        // pageable memory returns while its DMA is still in flight, so the home
-        // stream must wait for it. Both orderings are event edges; the host
-        // never waits on the home stream, so a gated stream cannot deadlock.
-        LFS_LOCAL_SYMBOL void order_legacy_after_home(const Tensor& tensor);
-        LFS_LOCAL_SYMBOL void order_home_after_legacy(const Tensor& tensor);
         LFS_LOCAL_SYMBOL GpuBackend resolve_new_gpu_storage_backend();
         // Cache trimming for every GPU backend that has a live context; a
         // backend that was never initialized is not brought up to be trimmed.
         LFS_LOCAL_SYMBOL void trim_live_gpu_backends();
         LFS_LOCAL_SYMBOL void trim_live_gpu_backends_if_reserved_unused_exceeds(size_t threshold_bytes);
+        LFS_LOCAL_SYMBOL void hold_freed_gpu_memory(bool hold);
         LFS_CORE_API Tensor allocate_like(const Tensor& input,
                                           const TensorShape& shape,
                                           DataType dtype);
@@ -632,6 +624,16 @@ namespace lfs::core {
             std::string name; // Optional name for identification in traces
 
             std::shared_ptr<LazyExprState> lazy;
+
+            // Per-tensor exportable provenance. Region views share one allocation
+            // descriptor and must not share this identity.
+            std::shared_ptr<void> exportable_control;
+            std::uint32_t exportable_region = 0;
+            std::uint64_t exportable_bound_generation = 0;
+
+            // Storage supplied by the active viewer allocator and directly
+            // consumable by its renderer without a migration copy.
+            bool renderer_storage = false;
         };
 
         void* data_ = nullptr;
@@ -687,10 +689,7 @@ namespace lfs::core {
         ///   flat-buffer consumer safe. storage_ptr() stays non-materializing
         ///   (allocation base for lifetime / sharing checks only).
         ///
-        /// Do not assign `contiguous()` back to `*this`: expand views
-        /// set is_view_=true, so operator= takes the view deep-copy path (copy_from),
-        /// which re-enters data_ptr() → infinite recursion. Rebind fields like
-        /// materialize_deferred_slow instead (implemented in tensor.cpp).
+        /// Rebind materialized storage at the raw-pointer escape boundary.
         void materialize_zero_stride_for_raw_ptr_escape();
         void materialize_zero_stride_for_raw_ptr_escape() const {
             // has_zero_stride is cheap; avoid a virtual-ish hop when dense.
@@ -811,8 +810,6 @@ namespace lfs::core {
         template <typename SrcT = float, typename Op>
         Tensor& binary_op_inplace_generic(const Tensor& other, Op op);
 
-        std::pair<Tensor, Tensor> _broadcasted(const Tensor& other, bool match_dtype = true) const;
-
         int resolve_dim(int dim) const {
             if (!is_valid())
                 return -1;
@@ -879,9 +876,6 @@ namespace lfs::core {
 
         std::vector<size_t> resolve_dims(std::span<const int> dims) const;
         size_t calculate_offset(const std::vector<size_t>& indices) const;
-        Tensor copy_slice(const std::vector<size_t>& starts,
-                          const std::vector<size_t>& ends,
-                          const std::vector<size_t>& new_shape) const;
 
     public:
         Tensor() = default;
@@ -889,7 +883,8 @@ namespace lfs::core {
         Tensor(void* data, TensorShape shape, Device device, DataType dtype,
                cudaStream_t home_stream = nullptr);
 
-        // Copy constructor and assignment - SHALLOW COPY (LibTorch behavior)
+        // Copy construction and assignment share storage, including for view destinations.
+        // Use copy_from() to write data into existing storage.
         Tensor(const Tensor& other);
         Tensor& operator=(const Tensor& other);
 
@@ -979,6 +974,10 @@ namespace lfs::core {
                             DataType dtype = DataType::Float32);
         static Tensor zeros_direct(TensorShape shape, size_t capacity, Device device = Device::GPU,
                                    DataType dtype = DataType::Float32);
+        // Uninitialized CUDA storage of exactly the requested size, stream-ordered
+        // and outside the size buckets. For large buffers retained across steps,
+        // where bucket rounding would be permanent waste.
+        static Tensor empty_exact(TensorShape shape, DataType dtype = DataType::Float32);
         static Tensor ones(TensorShape shape, Device device = Device::GPU,
                            DataType dtype = DataType::Float32);
         static Tensor full(TensorShape shape, float value, Device device = Device::GPU,
@@ -990,18 +989,22 @@ namespace lfs::core {
                            DataType dtype = DataType::Float32);
         static Tensor randn(TensorShape shape, Device device = Device::GPU,
                             DataType dtype = DataType::Float32);
+        // Explicit seeds are local to the call and leave the global RNG untouched.
         static Tensor uniform(TensorShape shape, float low = 0.0f, float high = 1.0f,
-                              Device device = Device::GPU, DataType dtype = DataType::Float32);
+                              Device device = Device::GPU, DataType dtype = DataType::Float32,
+                              std::optional<uint64_t> seed = std::nullopt);
         static Tensor normal(TensorShape shape, float mean = 0.0f, float std = 1.0f,
                              Device device = Device::GPU, DataType dtype = DataType::Float32);
         static Tensor randint(TensorShape shape, int low, int high,
                               Device device = Device::GPU, DataType dtype = DataType::Int32);
         static Tensor bernoulli(TensorShape shape, float p = 0.5f,
                                 Device device = Device::GPU, DataType dtype = DataType::Float32);
+        // Explicit seeds are local to the call and leave the global RNG untouched.
         static Tensor multinomial(const Tensor& weights, int num_samples,
-                                  bool replacement = false);
+                                  bool replacement = false, std::optional<uint64_t> seed = std::nullopt);
         static Tensor arange(float end);
         static Tensor arange(float start, float end, float step = 1.0f);
+        static Tensor arange(float start, float end, float step, Device device);
         static Tensor linspace(float start, float end, size_t steps, Device device = Device::GPU);
         static Tensor eye(size_t n, Device device = Device::GPU);
         static Tensor eye(size_t m, size_t n, Device device = Device::GPU);
@@ -1013,6 +1016,8 @@ namespace lfs::core {
                            "from_blob received null data for a non-empty tensor");
             return Tensor(data, shape, device, dtype, home_stream);
         }
+        static Tensor from_blob(void* data, TensorShape shape, Device device, DataType dtype,
+                                TensorExecutionTarget target);
         static Tensor from_external_owner(void* data,
                                           TensorShape shape,
                                           Device device,
@@ -1030,15 +1035,16 @@ namespace lfs::core {
                                           DataType dtype,
                                           std::shared_ptr<void> owner,
                                           size_t capacity,
-                                          cudaStream_t stream);
-        static Tensor from_external_owner(void* data,
-                                          TensorShape shape,
-                                          Device device,
-                                          DataType dtype,
-                                          std::shared_ptr<void> owner,
-                                          size_t capacity,
                                           cudaStream_t stream,
                                           std::string external_kind);
+        // View of one byte range of `backing`. Shares the allocation and its
+        // backend descriptor so Vulkan address math stays on the parent buffer.
+        static Tensor view_sharing_storage(const Tensor& backing,
+                                           size_t byte_offset,
+                                           TensorShape shape,
+                                           size_t capacity,
+                                           DataType dtype,
+                                           std::string external_kind);
 
         static Tensor from_vector(const std::vector<float>& data, TensorShape shape,
                                   Device device = Device::GPU);
@@ -1136,13 +1142,15 @@ namespace lfs::core {
 
         static void trim_memory_pool();
         static void trim_memory_pool_if_reserved_unused_exceeds(size_t threshold_bytes);
+        // While held, freed device memory stays pooled across synchronizations instead of returning to
+        // the system; releasing the last hold trims the pool back. Holds nest and may span threads.
+        static void hold_freed_memory();
+        static void release_freed_memory();
         // CUDA device pool only; leaves the pinned host cache intact.
         static void trim_device_memory_pool();
         static void shutdown_memory_pool();
         static void set_memory_pool_iteration(int iteration);
 
-        void set_bool(std::initializer_list<size_t> indices, bool value);
-        bool get_bool(std::initializer_list<size_t> indices) const;
         void set_bool(std::span<const size_t> indices, bool value);
         bool get_bool(std::span<const size_t> indices) const;
 
@@ -1236,6 +1244,13 @@ namespace lfs::core {
         bool is_external_storage() const {
             return storage_meta_ && static_cast<bool>(storage_meta_->external_owner);
         }
+        void mark_renderer_storage() {
+            ensure_state();
+            state_->renderer_storage = true;
+        }
+        [[nodiscard]] bool is_renderer_storage() const noexcept {
+            return state_ && state_->renderer_storage;
+        }
         bool is_empty() const { return !is_valid() || numel() == 0; }
         // Local deferred flag only — never takes the global IR mutex. Eager IR
         // nodes (debug map) are NOT reported here; use lazy_expr_id() / IR APIs.
@@ -1280,14 +1295,18 @@ namespace lfs::core {
         // Declarative re-homing: future writes happen on `stream`. The old home
         // becomes a recorded use so the eventual free stays ordered after it.
         void set_stream(cudaStream_t stream);
+        void set_stream(TensorExecutionTarget target);
+        [[nodiscard]] TensorExecutionTarget execution_target() const;
 
         // Marks a read of this tensor on `stream` (other than its home) so the
         // allocator defers recycling until that stream passes the read.
         void record_stream(cudaStream_t stream) const;
+        void record_stream(TensorExecutionTarget target) const;
 
         // Orders `execution_stream` after this tensor's pending work, then records
         // the use. The standard prologue for consuming a tensor on another stream.
         void sync_to_stream(cudaStream_t execution_stream) const;
+        void sync_to_stream(TensorExecutionTarget target) const;
 
         // Debug tracking - mark tensor to trace all operations it's involved in
         bool is_tracked() const { return state_ && state_->tracked; }
@@ -1347,26 +1366,26 @@ namespace lfs::core {
         void set_exportable_provenance(std::shared_ptr<void> control,
                                        std::uint32_t region,
                                        std::uint64_t bound_generation) {
-            ensure_storage_meta();
-            storage_meta_->exportable_control = std::move(control);
-            storage_meta_->exportable_region = region;
-            storage_meta_->exportable_bound_generation = bound_generation;
+            ensure_state();
+            state_->exportable_control = std::move(control);
+            state_->exportable_region = region;
+            state_->exportable_bound_generation = bound_generation;
         }
         [[nodiscard]] bool has_exportable_provenance() const noexcept {
-            return storage_meta_ && static_cast<bool>(storage_meta_->exportable_control);
+            return state_ && static_cast<bool>(state_->exportable_control);
         }
         [[nodiscard]] std::shared_ptr<void> exportable_control() const noexcept {
-            return storage_meta_ ? storage_meta_->exportable_control : nullptr;
+            return state_ ? state_->exportable_control : nullptr;
         }
         [[nodiscard]] std::uint32_t exportable_region() const noexcept {
-            return storage_meta_ ? storage_meta_->exportable_region : 0u;
+            return state_ ? state_->exportable_region : 0u;
         }
         [[nodiscard]] std::uint64_t exportable_bound_generation() const noexcept {
-            return storage_meta_ ? storage_meta_->exportable_bound_generation : 0u;
+            return state_ ? state_->exportable_bound_generation : 0u;
         }
         static std::string storage_memory_summary();
-        static void log_storage_memory();
-        static void log_storage_memory(std::string_view label);
+        static std::size_t cuda_direct_storage_live_bytes();
+        static std::size_t vulkan_external_storage_live_bytes();
 
         // reserve() pre-allocates memory for future growth along dimension 0
         // Supports multi-dimensional tensors: [N, D1, D2, ...] reserves N "rows"
@@ -1376,6 +1395,7 @@ namespace lfs::core {
         Tensor clone() const;      // Deep copy
         Tensor contiguous() const; // Materialize to contiguous if strided
         Tensor to(Device device, cudaStream_t stream = nullptr) const;
+        Tensor to(Device device, TensorExecutionTarget target) const;
         // Synchronous export-oriented copy to ordinary pageable host memory.
         Tensor to_pageable_host(cudaStream_t stream = nullptr) const;
         Tensor to(DataType dtype) const;
@@ -1493,6 +1513,7 @@ namespace lfs::core {
             return slice(std::span<const std::pair<int, int>>(ranges));
         }
         Tensor slice(size_t dim, size_t start, size_t end) const;
+        Tensor slice(size_t dim, size_t start, size_t end, size_t step) const;
 
         Tensor cat(const Tensor& other, int dim = 0) const;
 
@@ -1876,14 +1897,11 @@ namespace lfs::core {
         Tensor clamp(float min_val, float max_val) const;
 
         Tensor clamp_min(float min) const {
-            return clamp(min, dtype_ == DataType::Int32 ? std::numeric_limits<float>::infinity()
-                                                        : std::numeric_limits<float>::max());
+            return clamp(min, std::numeric_limits<float>::infinity());
         }
 
         Tensor clamp_max(float max) const {
-            return clamp(dtype_ == DataType::Int32 ? -std::numeric_limits<float>::infinity()
-                                                   : std::numeric_limits<float>::lowest(),
-                         max);
+            return clamp(-std::numeric_limits<float>::infinity(), max);
         }
 
         Tensor& clamp_(float min_val, float max_val);
@@ -2015,7 +2033,7 @@ namespace lfs::core {
         TensorIndexer operator[](const std::vector<Tensor>& indices);
         MaskedTensorProxy operator[](const Tensor& mask) const;
 
-        float& at(std::initializer_list<size_t> indices);
+        TensorElementProxy at(std::initializer_list<size_t> indices);
         float at(std::initializer_list<size_t> indices) const;
 
         // ============= ADVANCED OPERATIONS =============
@@ -2049,7 +2067,6 @@ namespace lfs::core {
         std::pair<Tensor, Tensor> sort(int dim = -1, bool descending = false) const;
 
         // Scalar boolean reductions
-        bool any_scalar() const;
 
         // ============= OPERATOR OVERLOADS (Template-based) =============
 
@@ -2107,14 +2124,11 @@ namespace lfs::core {
         Tensor& zero_();
         Tensor& fill_(float value);
         Tensor& fill_(float value, cudaStream_t stream); // Stream-aware version (no sync)
+        Tensor& fill_(float value, TensorExecutionTarget target);
         Tensor& copy_from(const Tensor& other);
         Tensor& copy_(const Tensor& src) { return copy_from(src); }
         Tensor& uniform_(float low = 0.0f, float high = 1.0f);
         Tensor& normal_(float mean = 0.0f, float std = 1.0f);
-
-        std::optional<Tensor> try_reshape(TensorShape shape) const;
-
-        static std::vector<Tensor> split_batch(const Tensor& tensor, size_t batch_size);
 
         // Utility template methods
         template <typename Func>
@@ -2143,10 +2157,6 @@ namespace lfs::core {
         }
 
         // Validation & assertions
-        Tensor& assert_shape(TensorShape expected);
-        Tensor& assert_shape(TensorShape expected, const std::string& msg);
-        Tensor& assert_device(Device expected);
-        Tensor& assert_dtype(DataType expected);
         Tensor& assert_finite();
 
         // Comparison operations
@@ -2231,6 +2241,25 @@ namespace lfs::core {
         }
         return internal::tensor_lazy_expr_id(*this);
     }
+
+    // A mutable scalar view. Reads transfer one value; writes and arithmetic
+    // execute on the tensor backend and retain the storage's lifetime.
+    class LFS_CORE_API TensorElementProxy {
+    public:
+        TensorElementProxy(const TensorElementProxy&) = default;
+        operator float() const;
+        TensorElementProxy& operator=(float value);
+        TensorElementProxy& operator=(const TensorElementProxy& other);
+        TensorElementProxy& operator+=(float value);
+        TensorElementProxy& operator-=(float value);
+        TensorElementProxy& operator*=(float value);
+        TensorElementProxy& operator/=(float value);
+
+    private:
+        friend class Tensor;
+        explicit TensorElementProxy(Tensor element);
+        Tensor element_;
+    };
 
     // ============= TensorRowProxy for operator[] =============
     // Implementations in tensor_row_proxy.cpp (except template methods)
@@ -2340,13 +2369,6 @@ namespace lfs::core {
 
         // Unary Operations
         Tensor operator-() const;
-        Tensor pow(float exponent) const;
-        Tensor sqrt() const;
-        Tensor abs() const;
-        Tensor neg() const;
-        Tensor sum() const;
-        Tensor mean() const;
-        Tensor square() const;
     };
 
     // Implementation of Tensor::operator[]
@@ -2523,9 +2545,6 @@ namespace lfs::core {
         size_t pool_reserved_high = 0;
 
         static MemoryInfo cuda();
-        static MemoryInfo cpu();
-
-        void log() const;
     };
 
     // ========================================================================

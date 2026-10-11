@@ -23,6 +23,9 @@ namespace lfs::mcp {
         if (id.is_number_integer()) {
             return RequestId{id.get<std::int64_t>()};
         }
+        if (id.is_number_float()) {
+            return RequestId{id.get<double>()};
+        }
         if (id.is_string()) {
             return RequestId{id.get<std::string>()};
         }
@@ -79,14 +82,6 @@ namespace lfs::mcp {
             j["error"] = err;
         }
 
-        return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
-    }
-
-    std::string serialize_notification(const std::string& method, const json& params) {
-        json j;
-        j["jsonrpc"] = "2.0";
-        j["method"] = method;
-        j["params"] = params;
         return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
     }
 

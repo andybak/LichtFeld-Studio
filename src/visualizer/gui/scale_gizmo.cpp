@@ -474,9 +474,10 @@ namespace lfs::vis::gui {
         }
     } // namespace
 
+    void beginScaleGizmoFrame() { g_hovered = false; }
+
     ScaleGizmoResult drawScaleGizmo(const ScaleGizmoConfig& config) {
         ScaleGizmoResult result;
-        g_hovered = false;
 
         if (!config.draw_list || config.viewport_size.x <= 1.0f || config.viewport_size.y <= 1.0f) {
             return result;
@@ -522,12 +523,10 @@ namespace lfs::vis::gui {
             hovered_handle = nearestHandle(projected_axes, projected_planes, mouse, pivot_screen);
         }
 
-        if (g_active.active && g_active.id == config.id) {
-            result.active = config.input.mouse_left_down;
-            if (!result.active) {
-                g_active = ActiveState{};
-            }
-        }
+        const bool release_active_drag =
+            g_active.active && g_active.id == config.id && !config.input.mouse_left_down;
+        if (g_active.active && g_active.id == config.id)
+            result.active = true;
 
         if (!g_active.active && config.input_enabled &&
             hovered_handle != ScaleGizmoHandle::None &&
@@ -551,7 +550,6 @@ namespace lfs::vis::gui {
 
         result.hovered_handle = hovered_handle;
         result.hovered = hovered_handle != ScaleGizmoHandle::None;
-        g_hovered = result.hovered || result.active;
 
         const ScaleGizmoHandle emphasized = result.active ? g_active.handle : hovered_handle;
         for (const auto& plane : projected_planes) {
@@ -569,6 +567,14 @@ namespace lfs::vis::gui {
                          emphasized == ScaleGizmoHandle::Uniform && !result.active,
                          emphasized == ScaleGizmoHandle::Uniform && result.active);
 
+        result.released = release_active_drag;
+        result.returned_to_start = release_active_drag && mouse == g_active.start_mouse;
+        if (release_active_drag)
+            result.active = false;
+        g_hovered |= result.hovered || result.active;
+        if (release_active_drag)
+            g_active = ActiveState{};
+
         return result;
     }
 
@@ -578,6 +584,11 @@ namespace lfs::vis::gui {
 
     bool isScaleGizmoActive() {
         return g_active.active;
+    }
+
+    void cancelScaleGizmoDrag() {
+        g_active = ActiveState{};
+        g_hovered = false;
     }
 
 } // namespace lfs::vis::gui

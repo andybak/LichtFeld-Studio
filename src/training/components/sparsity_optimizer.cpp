@@ -3,9 +3,8 @@
 
 #include "sparsity_optimizer.hpp"
 #include "core/logger.hpp"
-#include "core/tensor/internal/tensor_serialization.hpp"
 #include "core/tensor_serialization.hpp"
-#include <cuda_runtime.h>
+#include "lfs/training/ops/registry.hpp"
 #include <format>
 #include <limits>
 #include <stdexcept>
@@ -73,17 +72,6 @@ namespace lfs::training {
             return checked_add(bytes, tensor.ndim() * sizeof(uint64_t));
         }
     } // namespace
-
-    // Forward declaration of CUDA kernel launcher (defined in sparsity_optimizer_kernels.cu)
-    void launch_admm_backward_fused(
-        float* grad_opacities,
-        const float* opa_sigmoid,
-        const float* z,
-        const float* u,
-        float rho,
-        float grad_loss,
-        size_t n,
-        bool accumulate);
 
     ADMMSparsityOptimizer::ADMMSparsityOptimizer(const Config& config)
         : config_(config) {
@@ -244,31 +232,11 @@ namespace lfs::training {
                                                  float grad_loss,
                                                  lfs::core::Tensor& grad_opacities) {
         try {
-            // Use FUSED CUDA KERNEL for maximum performance
-            // Computes: grad_opacities = rho * (opa - z + u) * opa * (1 - opa) * grad_loss
-            // Single kernel launch, zero intermediate tensor allocations!
-            // accumulate=true: adds to existing gradients (if grad_opacities already has values)
-            // accumulate=false: overwrites (no need to zero first - saves 6 μs!)
-
-            const size_t n = ctx.n;
-
-            // Launch fused kernel via wrapper function
-            // Note: Use accumulate=true in production if other losses contribute gradients
-            launch_admm_backward_fused(
-                grad_opacities.ptr<float>(), // Output: gradients
-                ctx.opa_sigmoid_ptr,         // Input: sigmoid(opacities)
-                ctx.z_ptr,                   // Input: ADMM auxiliary variable
-                ctx.u_ptr,                   // Input: ADMM dual variable
-                ctx.rho,                     // ADMM penalty parameter
-                grad_loss,                   // Gradient from upstream
-                n,                           // Number of elements
-                true                         // accumulate: add to existing grads
-            );
+            training_ops(core::default_gpu_backend()).extra_loss->admm(opa_sigmoid_, z_, u_, grad_opacities, ctx.rho, grad_loss, true);
 
             // Check for kernel errors
-            cudaError_t err = cudaGetLastError();
-            if (err != cudaSuccess) {
-                return std::unexpected(std::format("CUDA kernel error: {}", cudaGetErrorString(err)));
+            if (auto error = training_session_ops().last_error()) {
+                return std::unexpected(*error);
             }
 
             return {};

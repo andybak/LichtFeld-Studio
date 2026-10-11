@@ -6,9 +6,9 @@
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "cuda_backend_test.hpp"
+#include "fast_raster_test_helpers.hpp"
 #include "training/kernels/grad_alpha.hpp"
 #include "training/optimizer/adam_optimizer.hpp"
-#include "training/rasterization/fast_rasterizer.hpp"
 
 #include <cmath>
 #include <cuda_runtime.h>
@@ -164,4 +164,27 @@ TEST_F(FusedBgBlendTest, BackwardGradsMatchWithBlendedImage) {
     EXPECT_LT(max_abs_diff(splat_color->means(), splat_color2->means()), 1e-6f);
     EXPECT_LT(max_abs_diff(splat_color->scaling_raw(), splat_color2->scaling_raw()), 1e-6f);
     EXPECT_LT(max_abs_diff(splat_color->opacity_raw(), splat_color2->opacity_raw()), 1e-6f);
+}
+
+// The blend backward reads H x W values from each extra gradient, so a
+// wrongly shaped one must be rejected in every build, not only with asserts.
+TEST_F(FusedBgBlendTest, BackwardRejectsMisshapenExtraGradients) {
+    auto splat = make_splat(16);
+    AdamConfig cfg{.lr = 0.01f, .beta1 = 0.9, .beta2 = 0.999, .eps = 1e-15};
+    AdamOptimizer opt(*splat, cfg);
+    opt.allocate_gradients();
+    opt.zero_grad(0);
+    const auto run = [&](const Tensor& alpha, const Tensor& depth, const Tensor& normal) {
+        auto fwd = fast_rasterize_forward(*camera_, *splat, color_bg_, 0, 0, 0, 0, false);
+        ASSERT_TRUE(fwd.has_value());
+        auto grad_out = Tensor::full_like(fwd->first.image, 1.0f);
+        EXPECT_THROW(fast_rasterize_backward(fwd->second, grad_out, *splat, opt, alpha, {},
+                                             DensificationType::None, 1, {}, depth, normal),
+                     std::runtime_error);
+        fwd->second.release_forward_context();
+    };
+    const auto wrong = Tensor::ones({2}, Device::CUDA);
+    run(wrong, {}, {});
+    run({}, wrong, {});
+    run({}, {}, wrong);
 }

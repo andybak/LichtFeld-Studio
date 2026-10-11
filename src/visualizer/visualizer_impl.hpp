@@ -14,13 +14,17 @@
 #include "core/training_manager.hpp"
 #include "core/training_progress_publisher.hpp"
 #include "gui/gui_manager.hpp"
+#include "input/camera_animation_cadence.hpp"
 #include "input/input_controller.hpp"
+#include "input/view_targets.hpp"
 #include "internal/viewport.hpp"
 #include "project/project_lifecycle.hpp"
 #include "project/session_state.hpp"
 #include "rendering/rendering.hpp"
 #include "rendering/rendering_manager.hpp"
+#include "scene/point_cloud_updates.hpp"
 #include "scene/scene_manager.hpp"
+#include "screen/screen_service.hpp"
 #include "tools/tool_base.hpp"
 #include "visualizer/visualizer.hpp"
 #include "window/window_manager.hpp"
@@ -61,7 +65,8 @@ namespace lfs::vis {
         class SelectionTool;
     } // namespace tools
 
-    class LFS_VIS_API VisualizerImpl : public Visualizer {
+    class LFS_VIS_API VisualizerImpl : public Visualizer, public ViewTargets {
+        friend class SequencerFrameDemandTest_PropagatesPlaybackStreamAndPreviewDemand_Test;
         friend class gui::GuiManager;
         friend class gui::AsyncTaskManager;
 
@@ -81,6 +86,7 @@ namespace lfs::vis {
         [[nodiscard]] const core::Scene& getScene() const {
             return scene_manager_->getScene();
         }
+        std::shared_ptr<PointCloudUpdateManager> pointCloudUpdates() override { return std::atomic_load(&point_cloud_updates_); }
         bool postWork(WorkItem work) override;
         bool pumpPostedWorkForProjectWrite() override;
         bool postRenderWork(WorkItem work);
@@ -96,6 +102,12 @@ namespace lfs::vis {
         void set_evaluation_weights_preparer(
             std::function<std::optional<std::filesystem::path>(bool allow_download)> preparer) override;
         std::expected<void, std::string> startTraining() override;
+        [[nodiscard]] bool isTrainingStartPending() const {
+            return project_lifecycle_ && project_lifecycle_->isTrainingStartPending();
+        }
+        bool cancelTrainingStartPreparation() {
+            return project_lifecycle_ && project_lifecycle_->cancelTrainingStartPreparation();
+        }
         [[nodiscard]] ProjectTrainingSessionState
         projectTrainingSessionState() const override;
         lfs::Result<void>
@@ -107,6 +119,10 @@ namespace lfs::vis {
         lfs::Result<void>
         projectSaveAs(const std::filesystem::path& path,
                       bool regenerate_preview = true) override;
+        lfs::Result<void>
+        projectSaveAs(const std::filesystem::path& path,
+                      bool regenerate_preview,
+                      bool fresh_training_start);
         lfs::Result<void>
         projectCreateAt(
             const std::filesystem::path& path,
@@ -177,6 +193,7 @@ namespace lfs::vis {
             return trainer_manager_.get();
         }
         SceneManager* getSceneManager() override { return scene_manager_.get(); }
+        const SceneManager* getSceneManager() const { return scene_manager_.get(); }
         SDL_Window* getWindow() const { return window_manager_->getWindow(); }
         WindowManager* getWindowManager() { return window_manager_.get(); }
         const WindowManager* getWindowManager() const {
@@ -196,8 +213,25 @@ namespace lfs::vis {
         [[nodiscard]] const JobRegistry& jobs() const noexcept {
             return job_registry_;
         }
-        const Viewport& getViewport() const { return viewport_; }
-        Viewport& getViewport() { return viewport_; }
+        // The active 3D view's camera.
+        const Viewport& getViewport() const { return screen_service_.activeView3D().camera; }
+        Viewport& getViewport() { return screen_service_.activeView3D().camera; }
+        [[nodiscard]] screen::ScreenService& screens() { return screen_service_; }
+        [[nodiscard]] const screen::ScreenService& screens() const { return screen_service_; }
+
+        // ViewTargets
+        [[nodiscard]] ViewTarget activeView() override;
+        [[nodiscard]] ViewTarget viewAt(float x, float y) override;
+        [[nodiscard]] ViewTarget findView(ViewId id) override;
+        [[nodiscard]] ViewId viewId(const Viewport& viewport) const override;
+        [[nodiscard]] std::uint64_t viewEpoch() const override { return screen_service_.screenEpoch(); }
+        void activateView(ViewId id) override;
+        // Runs a named command on one 3D view: frame_all, frame_selected,
+        // area:quad. Returns false for unknown commands or views.
+        [[nodiscard]] screen::Rect areaRect(screen::AreaId id);
+        bool runViewCommand(ViewId id, std::string_view command) override;
+        // Until every view renders on its own, the renderer's settings carry the
+        // active view's half; this keeps the two in step each frame.
         [[nodiscard]] lfs::Result<
             lfs::io::project::ProjectSessionChapters>
         captureProjectSession(
@@ -226,11 +260,6 @@ namespace lfs::vis {
         // FPS monitoring
         [[nodiscard]] float getAverageFPS() const {
             return rendering_manager_ ? rendering_manager_->getAverageFPS() : 0.0f;
-        }
-
-        // Antialiasing state
-        bool isAntiAliasingEnabled() const {
-            return rendering_manager_ ? rendering_manager_->getSettings().antialiasing : false;
         }
 
         tools::AlignTool* getAlignTool() {
@@ -283,6 +312,19 @@ namespace lfs::vis {
         friend class DepthWindowGtHookTest;
         friend class P5SessionCaptureTestAccess;
         friend class VisualizerImplResetTest_ActiveProjectPreviewWritePreservesEditsAndQueuesSave_Test;
+        friend class VisualizerImplResetTest_AsyncTrainingBindReturnsBeforeSlowWriteAndCoalescesStarts_Test;
+        friend class VisualizerImplResetTest_AsyncTrainingBindFailureDoesNotStart_Test;
+        friend class VisualizerImplResetTest_AsyncTrainingBindCloseDoesNotStart_Test;
+        friend class VisualizerImplResetTest_AsyncViewerTrainingStartCanBeCanceledBeforeInitialization_Test;
+        friend class VisualizerImplResetTest_AsyncTrainingBindCancelDoesNotStart_Test;
+        friend class VisualizerImplResetTest_AsyncTrainingBoundProjectPropagatesStartRejection_Test;
+
+        friend class VisualizerImplResetTest_AsyncTrainingBindWaitsForAutosave_Test;
+        friend class VisualizerImplResetTest_AsyncTrainingBindTrainerReplacementCancels_Test;
+        friend class VisualizerImplResetTest_AsyncPausedPreparationCancelPreservesSession_Test;
+        friend class VisualizerImplResetTest_AsyncPreparationCancelDrainsDeferredLoad_Test;
+        friend class VisualizerImplResetTest_AsyncPausedExplicitPreparationAdoptsItsSnapshot_Test;
+
         friend class VisualizerImplResetTest_OpenWithoutRestoreKeepsCheckpointBytesOnSave_Test;
         friend class VisualizerImplResetTest_StartWhileProjectIsLoadingReturnsRetryReason_Test;
         friend class VisualizerImplResetTest_StoredSessionAtPrmsIterationsReportsCompleted_Test;
@@ -311,6 +353,8 @@ namespace lfs::vis {
         friend class VisualizerImplResetTest_RestoreThenTrainWritesNewCheckpoint_Test;
         friend class VisualizerImplResetTest_HeadlessOpenPrintsHydrationStagesWhenBenchPathSet_Test;
         friend class VisualizerImplResetTest_ResetTrainingPreservesExplicitInitPath_Test;
+        friend class VisualizerImplResetTest_FreshTrainingStartSaveAsDropsCheckpointHistory_Test;
+        friend class VisualizerImplResetTest_FailedFreshTrainingStartSaveAsPreservesSourceHistory_Test;
         friend class VisualizerImplResetTest_ResetTrainingStopsTrainerDuringStarting_Test;
         friend class VisualizerImplResetTest_DirtyProjectSwitchRequiresExplicitDiscardAuthorization_Test;
         friend class VisualizerImplResetTest_NewProjectDirtyGateRunsBelowEveryCommandEntry_Test;
@@ -347,7 +391,8 @@ namespace lfs::vis {
         friend class VisualizerImplResetTest_TrainingSnapshotCancelTerminalizesBeforeSettlement_Test;
         friend class VisualizerImplResetTest_FailedAutosaveSettlementAppliesBackoffBeforeRetry_Test;
         friend class VisualizerImplResetTest_PendingCloseSuppressesBackgroundAutosave_Test;
-        friend class VisualizerImplResetTest_StoppingTrainerBlocksIdleCompactionAndAutosave_Test;
+        friend class VisualizerImplResetTest_StoppingTrainerBlocksAutosave_Test;
+        friend class VisualizerImplResetTest_IdleMaintenanceKeepsEverySave_Test;
         friend class VisualizerImplResetTest_SessionSoftDirtyDoesNotPromptOrArmAutosave_Test;
         friend class VisualizerImplResetTest_SceneEditStillPromptsAndArmsAutosave_Test;
         friend class VisualizerImplResetTest_ParametersUnchangedRoundTripStaysClean_Test;
@@ -401,6 +446,7 @@ namespace lfs::vis {
         friend class VisualizerImplResetTest_BoundCheckpointIterationCacheSkipsHeaderWhenWarm_Test;
         friend class VisualizerImplResetTest_SelectedGaussiansAndSelectionToolSurviveSaveAndReopen_Test;
         friend class VisualizerImplResetTest_DatasetProjectWithoutCheckpointReloadsTrainer_Test;
+        friend class VisualizerImplResetTest_DatasetProjectWithoutCheckpointOpensReady_Test;
         friend class VisualizerImplResetTest_HydratedDatasetReopenMarksDeletedImageMissing_Test;
         friend class VisualizerImplResetTest_HydratedDatasetReopenIncludesRestoredImage_Test;
         friend class VisualizerImplResetTest_HydratedDatasetReopenAllImagesMissingDoesNotCrash_Test;
@@ -434,6 +480,7 @@ namespace lfs::vis {
         friend class VisualizerImplResetTest_DirtyUntitledSessionUpdateMaintenanceWritesScratch_Test;
         friend class VisualizerImplResetTest_DirtyUntitledSessionUpdateMaintenanceWaitsForAutosaveQuietPeriod_Test;
         friend class VisualizerImplResetTest_SaveAsMigratesScratchAutosaveToSidecar_Test;
+        friend class VisualizerImplResetTest_SaveAsSettlesCompletedSidecarAutosave_Test;
         friend class VisualizerImplResetTest_RecoveryDismissalPersistsAndNewerCandidateIsOffered_Test;
         friend class VisualizerImplResetTest_RecoverThenCleanQuitDoesNotReoffer_Test;
         friend class VisualizerImplResetTest_RecoverThenDiscardExitRemovesMasterSidecar_Test;
@@ -458,10 +505,13 @@ namespace lfs::vis {
         friend class DatasetEmbedIntegrationTest_CreateLoadDeferredDatasetEmbedCompletes_Test;
         friend class DatasetEmbedIntegrationTest_ProjectInfoReportsLiveDatasetBeforeFirstSave_Test;
         friend class VisualizerImplResetTest_SplatDropOntoTitledDatasetProjectStartsUntitledSessionAndKeepsProjectFile_Test;
+        friend class VisualizerImplResetTest_DroppedProjectReplacesCurrentDuringHydration_Test;
+        friend class VisualizerImplResetTest_DroppedProjectReplacesCurrentAfterHydration_Test;
         friend class VisualizerImplResetTest_SplatAddOntoSplatSceneKeepsTitledProject_Test;
         friend class VisualizerImplResetTest_PreTrainingProjectSaveRestoresCameraEnabledAndHidden_Test;
         friend class VisualizerImplResetTest_PostTrainingProjectSaveRestoresCameraEnabledAndHidden_Test;
         friend class VisualizerImplResetTest_CaptureOmitsPlySequenceClipAndCollapsedUuid_Test;
+        friend class VisualizerImplResetTest_SequencerCaptureDropsRemovedTailAndPreservesExtensions_Test;
         friend class VisualizerImplResetTest_AssetManagerProjectRestorePreservesLeftDockWidth_Test;
         friend class VisualizerImplResetTest_SaveAsAssignsNewProjectIdentity_Test;
 
@@ -471,7 +521,8 @@ namespace lfs::vis {
     private:
         lfs::Result<void> projectSaveAsFromDialog(
             const std::filesystem::path& path,
-            bool regenerate_preview);
+            bool regenerate_preview,
+            bool fresh_training_start = false);
         void abandonSaveAndExitAttempt();
         void armStopSaveAndExit(
             std::optional<std::filesystem::path>
@@ -567,7 +618,6 @@ namespace lfs::vis {
             bool python_redraw = false;
             bool gui_animation = false;
             bool input_event = false;
-            bool posted_work = false;
             bool render_work = false;
             bool store_dirty = false;
             bool swapchain_resize_pending = false;
@@ -578,16 +628,16 @@ namespace lfs::vis {
 
             [[nodiscard]] bool shouldRenderFrame() const {
                 return viewport_export_locked || scene_dirty || continuous_input ||
-                       python_animation || python_overlay || python_redraw ||
-                       gui_animation || input_event || posted_work || render_work ||
+                       python_animation || python_redraw ||
+                       gui_animation || input_event || render_work ||
                        store_dirty || swapchain_resize_ready || window_resize_paint_pending ||
                        viewport_resize_settle_ready;
             }
 
             [[nodiscard]] bool onlySceneDirty() const {
                 return scene_dirty && !viewport_export_locked && !continuous_input &&
-                       !python_animation && !python_overlay && !python_redraw &&
-                       !gui_animation && !input_event && !posted_work && !render_work &&
+                       !python_animation && !python_redraw &&
+                       !gui_animation && !input_event && !render_work &&
                        !store_dirty && !swapchain_resize_ready && !window_resize_paint_pending &&
                        !viewport_resize_settle_ready;
             }
@@ -597,7 +647,7 @@ namespace lfs::vis {
                     viewport_resize_deferring ||
                     (swapchain_resize_pending && !swapchain_resize_ready);
                 return scene_dirty || continuous_input || python_animation ||
-                       python_overlay || python_redraw ||
+                       python_redraw ||
                        (gui_animation && !resize_deferral_throttles_animation) ||
                        render_work || viewport_export_locked || store_dirty ||
                        swapchain_resize_ready || window_resize_paint_pending ||
@@ -606,11 +656,10 @@ namespace lfs::vis {
         };
 
         [[nodiscard]] FrameDemand collectFrameDemand(bool viewport_export_locked,
-                                                     bool drained_store_dirty = false,
-                                                     bool consume_python_redraw = true);
+                                                     bool drained_store_dirty);
         [[nodiscard]] bool isMotionOnlyWake() const;
-        [[nodiscard]] double guiAnimationFrameInterval() const;
-        void waitForNextEvent(bool is_training);
+        [[nodiscard]] double displayFrameInterval() const;
+        void waitForNextEvent(bool is_training, bool continuous_animation = false);
 
         class CallbackCleanup {
             std::vector<std::function<void()>> cleanups_;
@@ -632,10 +681,12 @@ namespace lfs::vis {
         ViewerOptions options_;
 
         // Core components
-        Viewport viewport_;
+        screen::ScreenService screen_service_;
         std::unique_ptr<WindowManager> window_manager_;
         std::unique_ptr<InputController> input_controller_;
         std::unique_ptr<RenderingManager> rendering_manager_;
+        DemandToken gui_animation_demand_;
+        DemandToken python_animation_demand_;
         std::unique_ptr<SceneManager> scene_manager_;
         std::shared_ptr<TrainerManager> trainer_manager_;
         std::unique_ptr<DataLoadingService> data_loader_;
@@ -657,6 +708,7 @@ namespace lfs::vis {
         EditorContext editor_context_;
 
         mutable std::mutex work_queue_mutex_;
+        std::shared_ptr<PointCloudUpdateManager> point_cloud_updates_;
         std::vector<WorkItem> work_queue_;
         std::vector<WorkItem> render_work_queue_;
         std::thread::id viewer_thread_id_;
@@ -674,6 +726,8 @@ namespace lfs::vis {
         bool window_initialized_ = false;
         mutable std::chrono::steady_clock::time_point display_refresh_queried_at_{};
         mutable double gui_animation_frame_interval_ = 1.0 / 60.0;
+        CameraAnimationCadence camera_animation_cadence_;
+        std::optional<std::chrono::steady_clock::time_point> last_presented_frame_start_;
         bool gui_initialized_ = false;
         bool tools_initialized_ = false;
         bool view_context_bridge_initialized_ = false;
@@ -731,7 +785,6 @@ namespace lfs::vis {
         std::uint64_t startup_plugin_load_status_revision_ = 0;
         bool plugin_preload_timing_active_ = false;
         std::chrono::nanoseconds plugin_preload_max_update_stall_{};
-        bool update_work_processed_ = false;
         std::chrono::high_resolution_clock::time_point last_frame_time_ = std::chrono::high_resolution_clock::now();
         float live_scene_clip_time_ = 0.0f;
         std::unique_ptr<python::SequencerUIStateData> sequencer_ui_state_;

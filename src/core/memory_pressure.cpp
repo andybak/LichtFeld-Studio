@@ -203,9 +203,6 @@ namespace lfs::core {
         std::atomic<size_t> last_target_free{0};
         std::chrono::steady_clock::time_point last_recover_check{};
 
-        mutable std::mutex status_mutex;
-        std::string last_status;
-
         std::mutex probe_mutex;
         std::atomic<bool> probe_armed{false};
         std::function<bool(MemoryDomain, size_t)> alloc_probe;
@@ -446,8 +443,15 @@ namespace lfs::core {
         }
 
         const uint64_t episode_id = impl_->episode_counter.fetch_add(1) + 1;
-        impl_->pressure_active.store(true);
-        impl_->last_target_free.store(target);
+        // Preview degradation belongs to failures that reached the frame boundary.
+        // Training allocations share the device heap, but their retry episodes must
+        // neither lower viewer quality nor replace its recovery target.
+        const bool viewer_failure = context == PressureContext::RenderThread &&
+                                    is_device_heap(failure.domain);
+        if (viewer_failure) {
+            impl_->pressure_active.store(true);
+            impl_->last_target_free.store(target);
+        }
 
         PressureRequest request{
             .domain = failure.domain,
@@ -484,6 +488,11 @@ namespace lfs::core {
 
         const size_t free_after = impl_->query_free(failure.domain);
         const bool satisfied = !is_device_heap(failure.domain) || free_after >= target;
+        if (viewer_failure && satisfied) {
+            // Reclaim already freed enough for the failed viewer allocation and its
+            // reserve. Retry at full quality instead of waiting for extra headroom.
+            impl_->pressure_active.store(false);
+        }
         const size_t observed_released = free_after > free_before ? free_after - free_before : 0;
 
 #if LFS_HAS_CUDA
@@ -506,11 +515,6 @@ namespace lfs::core {
             LOG_WARN("{}", summary);
         } else {
             LOG_ERROR("{}", summary);
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(impl_->status_mutex);
-            impl_->last_status = summary;
         }
 
         // Formatting/emitting after relief keeps the raw OOM path allocation-free.
@@ -591,6 +595,11 @@ namespace lfs::core {
         if (!impl_->pressure_active.load()) {
             return;
         }
+        // Do not clear a lease while another thread is recording a new failure.
+        std::unique_lock episode_lock(impl_->episode_mutex, std::try_to_lock);
+        if (!episode_lock.owns_lock()) {
+            return;
+        }
         const auto now = std::chrono::steady_clock::now();
         if (now - impl_->last_recover_check < std::chrono::milliseconds(250)) {
             return;
@@ -608,11 +617,6 @@ namespace lfs::core {
 
     uint64_t MemoryPressureCoordinator::episode_count() const noexcept {
         return impl_->episode_counter.load();
-    }
-
-    std::string MemoryPressureCoordinator::last_status() const {
-        std::lock_guard<std::mutex> lock(impl_->status_mutex);
-        return impl_->last_status;
     }
 
     void MemoryPressureCoordinator::set_allocation_probe(std::function<bool(MemoryDomain, size_t)> probe) {
@@ -652,10 +656,7 @@ namespace lfs::core {
         impl_->episode_counter.store(0);
         impl_->pressure_active.store(false);
         impl_->last_target_free.store(0);
-        {
-            std::lock_guard<std::mutex> lock(impl_->status_mutex);
-            impl_->last_status.clear();
-        }
+        impl_->last_recover_check = {};
     }
 
 } // namespace lfs::core

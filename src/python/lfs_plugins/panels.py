@@ -20,16 +20,39 @@ class _PanelSpec:
     height_mode: str
     size: tuple[int, int]
     options: tuple[str, ...] = ("DEFAULT_CLOSED",)
-    update_policy: str = "interval"
-    update_interval_ms: int = 100
+    update_policy: str = "dirty"
+    update_interval_ms: int | None = None
     style: str = ""
     has_poll: bool = False
     has_draw: bool = False
+    parent: str = ""
+    # Panels that were registered eagerly stay enabled; other lazy panels
+    # open on demand.
+    start_enabled: bool = False
 
 
 # Keep the registration contract in one place. The implementation classes use
 # panel_metadata() too, so registration cannot silently drift from the class.
 PANEL_SPECS = {
+    "rendering": _PanelSpec(
+        "lfs_plugins.rendering_panel", "RenderingPanel", "lfs.rendering",
+        "window.rendering", "MAIN_PANEL_TAB", 10, "rmlui/rendering.rml",
+        "FILL", (0, 0), options=(), update_policy="dirty",
+        start_enabled=True,
+    ),
+    "training": _PanelSpec(
+        "lfs_plugins.training_panel", "TrainingPanel", "lfs.training",
+        "window.training", "MAIN_PANEL_TAB", 20, "rmlui/training.rml",
+        "FILL", (0, 0), options=(), update_policy="dirty",
+        start_enabled=True,
+    ),
+    "startup_recent": _PanelSpec(
+        "lfs_plugins.startup_recent_panel", "StartupRecentPanel",
+        "lfs.startup_recent", "Recent Projects", "FLOATING", 5,
+        "rmlui/startup_recent_panel.rml", "CONTENT", (520, 0),
+        options=("DEFAULT_CLOSED",), update_policy="dirty",
+        start_enabled=True,
+    ),
     "new_project": _PanelSpec(
         "lfs_plugins.import_panels", "NewProjectPanel", "lfs.new_project",
         "New Project", "FLOATING", 11, "rmlui/new_project_panel.rml",
@@ -89,6 +112,10 @@ PANEL_SPECS = {
         "Mesh to Splat", "FLOATING", 12, "rmlui/mesh2splat_panel.rml", "CONTENT",
         (420, 0), update_policy="dirty",
     ),
+    "tiles3d": _PanelSpec(
+        "lfs_plugins.tiles3d_panel", "Tiles3dPanel", "lfs.tiles3d", "Streaming Viewer Settings",
+        "FLOATING", 95, "rmlui/tiles3d_panel.rml", "FILL", (380, 520), has_poll=True, has_draw=True,
+    ),
     "plugin_marketplace": _PanelSpec(
         "lfs_plugins.plugin_marketplace_panel", "PluginMarketplacePanel",
         "lfs.plugin_marketplace", "Plugin Marketplace", "FLOATING", 91,
@@ -104,13 +131,15 @@ PANEL_SPECS = {
 
 _PANEL_METADATA_FIELDS = (
     "id", "label", "space", "order", "template", "height_mode", "size",
-    "options", "update_policy", "update_interval_ms", "style",
+    "options", "update_policy", "update_interval_ms", "style", "parent",
 )
 
 
 def panel_metadata(name, lf):
     """Resolve a shared panel spec into class attributes for a runtime."""
     spec = PANEL_SPECS[name]
+    if spec.update_policy == "interval" and spec.update_interval_ms is None:
+        raise ValueError(f"Panel {spec.id!r} uses interval updates but has no update_interval_ms")
     return {
         "id": spec.id,
         "label": spec.label,
@@ -123,7 +152,13 @@ def panel_metadata(name, lf):
         "update_policy": spec.update_policy,
         "update_interval_ms": spec.update_interval_ms,
         "style": spec.style,
+        "parent": spec.parent,
     }
+
+
+def _skip_panel_field(field, metadata):
+    # Child panels inherit their parent's space and must not declare one.
+    return field == "space" and bool(metadata["parent"])
 
 
 def panel_class(name):
@@ -134,6 +169,8 @@ def panel_class(name):
 
     def decorate(cls):
         for field in _PANEL_METADATA_FIELDS:
+            if _skip_panel_field(field, metadata):
+                continue
             setattr(cls, field, metadata[field])
         return cls
 
@@ -193,6 +230,8 @@ def _register_lazy_panel(lf, name):
     LazyPanel.__qualname__ = spec.class_name
     LazyPanel.__module__ = "lfs_plugins.panels"
     for field in _PANEL_METADATA_FIELDS:
+        if _skip_panel_field(field, metadata):
+            continue
         setattr(LazyPanel, field, metadata[field])
     if spec.has_poll:
         def poll(self, context):
@@ -205,7 +244,8 @@ def _register_lazy_panel(lf, name):
 
         LazyPanel.draw = draw
     lf.register_class(LazyPanel)
-    lf.ui.set_panel_enabled(spec.id, False)
+    if not spec.start_enabled:
+        lf.ui.set_panel_enabled(spec.id, False)
     return LazyPanel
 
 
@@ -226,25 +266,16 @@ def _build_builtin_panel_steps(lf):
     """
 
     def rendering_panel():
-        from .rendering_panel import RenderingPanel
-
-        lf.register_class(RenderingPanel)
+        _register_lazy_panel(lf, "rendering")
 
     def training_panel():
         if not getattr(getattr(lf, "build_info", None), "training_enabled", True):
             return
-        from .training_panel import TrainingPanel
-
-        lf.register_class(TrainingPanel)
+        _register_lazy_panel(lf, "training")
 
     def import_panels():
         _register_lazy_panel(lf, "new_project")
         _register_lazy_panel(lf, "resume_checkpoint")
-
-    def selection_groups():
-        from . import selection_groups as selection_groups_mod
-
-        selection_groups_mod.register()
 
     def operators():
         from . import operators as operators_mod
@@ -295,10 +326,7 @@ def _build_builtin_panel_steps(lf):
         _register_lazy_panel(lf, "getting_started")
 
     def startup_recent_panel():
-        from .startup_recent_panel import StartupRecentPanel
-
-        lf.register_class(StartupRecentPanel)
-        lf.ui.set_panel_enabled("lfs.startup_recent", False)
+        _register_lazy_panel(lf, "startup_recent")
 
     def image_preview_panel():
         _register_lazy_panel(lf, "image_preview")
@@ -321,6 +349,9 @@ def _build_builtin_panel_steps(lf):
     def mesh2splat_panel():
         _register_lazy_panel(lf, "mesh2splat")
 
+    def tiles3d_panel():
+        _register_lazy_panel(lf, "tiles3d")
+
     def plugin_marketplace_panel():
         _register_lazy_panel(lf, "plugin_marketplace")
 
@@ -342,7 +373,6 @@ def _build_builtin_panel_steps(lf):
         ("rendering_panel", rendering_panel),
         ("training_panel", training_panel),
         ("import_panels", import_panels),
-        ("selection_groups", selection_groups),
         ("operators", operators),
         ("sequencer_ops", sequencer_ops),
         ("tools", tools),
@@ -358,6 +388,7 @@ def _build_builtin_panel_steps(lf):
         ("scripts_panel", scripts_panel),
         ("preferences_panel", preferences_panel),
         ("mesh2splat_panel", mesh2splat_panel),
+        ("tiles3d_panel", tiles3d_panel),
         ("plugin_marketplace_panel", plugin_marketplace_panel),
         ("asset_manager_panel", asset_manager_panel),
         ("overlays", overlays),

@@ -8,6 +8,7 @@
 #include "core/gpu_backend_fwd.hpp"
 
 #include <cstddef>
+#include <span>
 #include <string>
 
 namespace lfs::vis::gui {
@@ -18,15 +19,40 @@ namespace lfs::vis::gui {
         size_t total = 0;
         float gpu_utilization_percent = -1.f;
         bool gpu_utilization_valid = false;
+        bool process_valid = false;
+        bool process_over_budget = false;
+        bool device_estimated = false;
         std::string device_name;
         // Vulkan exposes a process budget, not whole-device usage. Keep the
         // two measurements distinct for the status bar and diagnostics.
         bool uses_process_budget = false;
         size_t process_budget = 0;
         size_t process_budget_used = 0;
+        // Apple unified memory: `total` is the GPU working-set limit and
+        // `total_used` what the GPU cannot use anymore, counting every GPU
+        // client and the host memory other processes hold.
+        bool unified_memory = false;
+    };
+
+    struct LFS_VIS_API GpuProcessUsage {
+        unsigned int pid = 0;
+        unsigned long long bytes = 0;
     };
 
     LFS_VIS_API GpuMemoryInfo queryGpuMemory(lfs::core::GpuBackend backend = lfs::core::default_gpu_backend());
     LFS_VIS_API float queryGpuUtilization();
+    LFS_VIS_API GpuMemoryInfo selectGpuMemory(size_t compute_bytes, size_t graphics_bytes,
+                                              size_t dxgi_bytes, size_t cuda_used,
+                                              size_t cuda_total, size_t nvml_used,
+                                              size_t nvml_total, size_t dxgi_budget = 0,
+                                              bool dxgi_valid = false);
+    LFS_VIS_API GpuMemoryInfo selectUnifiedGpuMemory(size_t process_used, size_t working_set,
+                                                     size_t gpu_in_use, size_t host_available);
+    LFS_VIS_API std::string formatGpuGiB(size_t bytes);
+    // Localization keys naming the source of the process and device readings.
+    LFS_VIS_API const char* gpuProcessMemoryTooltipKey(const GpuMemoryInfo& info);
+    LFS_VIS_API const char* gpuDeviceMemoryTooltipKey(const GpuMemoryInfo& info);
+    LFS_VIS_API size_t parseGpuProcessBytes(unsigned int pid,
+                                            std::span<const GpuProcessUsage> processes);
 
 } // namespace lfs::vis::gui

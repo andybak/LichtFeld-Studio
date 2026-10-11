@@ -5,6 +5,7 @@
 #include "core/cuda/undistort/undistort.hpp"
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
+#include "core/shared_image_ops.hpp"
 #include "core/tensor_backend.hpp"
 #include "io/pipelined_image_loader.hpp"
 
@@ -12,12 +13,14 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -167,9 +170,9 @@ namespace {
                 return {};
             }
             auto& ready = *completion->outcome;
-            for (auto* event : {&ready.depth_ready_event, &ready.normal_ready_event}) {
-                if (*event)
-                    TensorFence::adopt(GpuBackend::CUDA, std::exchange(*event, nullptr)).wait();
+            for (auto* fence : {&ready.depth_ready, &ready.normal_ready}) {
+                if (*fence)
+                    (*fence)->wait();
             }
             EXPECT_TRUE(gpu_backend_of(ready.tensor) == GetParam());
             // Exercise a consumer GPU operation on a different thread before readback.
@@ -185,6 +188,79 @@ namespace {
         static inline std::vector<uint16_t> rgb16_, depth_;
     };
 
+    TEST_P(PipelinedLoaderBackends, EvaluationFloatReferencePreservesGraySamples) {
+        const GpuBackendScope scope(GetParam());
+        // Minimal one-channel Float32 TIFF: values are off both integer grids.
+        std::vector<uint8_t> bytes{'I', 'I', 42, 0, 8, 0, 0, 0};
+        const auto append = [&](uint32_t value, int count) {
+            for (int i = 0; i < count; ++i)
+                bytes.push_back(static_cast<uint8_t>(value >> (8 * i)));
+        };
+        append(10, 2);
+        const auto tag = [&](uint16_t key, uint16_t type, uint32_t value) {
+            append(key, 2);
+            append(type, 2);
+            append(1, 4);
+            append(value, 4);
+        };
+        tag(256, 3, 2);
+        tag(257, 3, 1);
+        tag(258, 3, 32);
+        tag(259, 3, 1);
+        tag(262, 3, 1);
+        tag(273, 4, 134);
+        tag(277, 3, 1);
+        tag(278, 4, 1);
+        tag(279, 4, 8);
+        tag(339, 3, 3);
+        append(0, 4);
+        constexpr float a = 0.123456f, b = 0.654321f;
+        append(std::bit_cast<uint32_t>(a), 4);
+        append(std::bit_cast<uint32_t>(b), 4);
+        const auto file = path("eval-float-gray.tiff");
+        {
+            std::ofstream out(file, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            ASSERT_TRUE(out.good());
+        }
+        PipelinedLoaderConfig config;
+        config.backend = GetParam();
+        PipelinedImageLoader loader(config);
+        lfs::io::LoadParams params;
+        params.decode_float = true;
+        params.decode_16bit = true;
+        params.skip_blob_cache = true;
+        const auto image = loader.load_image_immediate(file, params);
+        ASSERT_EQ(image.dtype(), DataType::Float32);
+        expect_close(image, host({a, b, a, b, a, b}, {3, 1, 2}), 0.0f);
+    }
+
+    TEST_P(PipelinedLoaderBackends, DecodeAheadMatchesImmediateOnEachBackend) {
+        const GpuBackendScope scope(GetParam());
+        auto distortion = distorted_camera();
+        for (const bool sixteen_bit : {false, true}) {
+            for (const bool undistort : {false, true}) {
+                PipelinedLoaderConfig config;
+                config.backend = GetParam();
+                config.use_16bit_color = sixteen_bit;
+                config.io_threads = 1;
+                config.cold_process_threads = 1;
+                config.decoder_pool_size = 1;
+                lfs::io::LoadParams params;
+                params.max_width = WIDTH / 2;
+                params.output_uint8 = false;
+                params.undistort = undistort ? &distortion : nullptr;
+                PipelinedImageLoader plain(config), ahead(config);
+                const auto expected = plain.load_image_immediate(path(sixteen_bit ? "rgb16.png" : "rgb8.png"), params).cpu().contiguous();
+                ahead.decode_ahead(path(sixteen_bit ? "rgb16.png" : "rgb8.png"), params);
+                const auto actual = ahead.load_image_immediate(path(sixteen_bit ? "rgb16.png" : "rgb8.png"), params).cpu().contiguous();
+                ASSERT_EQ(actual.shape(), expected.shape());
+                ASSERT_EQ(actual.dtype(), expected.dtype());
+                EXPECT_EQ(actual.to_vector(), expected.to_vector());
+            }
+        }
+    }
+
     TEST_P(PipelinedLoaderBackends, ImagesMatchHostReference) {
         const TensorShape chw{3, HEIGHT, WIDTH};
 
@@ -198,25 +274,35 @@ namespace {
 
         expect_close(load(request("rgb16.png"), true).image, host(planar(rgb16_, 3, UINT16_SCALE), chw), 0.0f);
 
+        // CPU-decoded images are downscaled on the GPU with a size-2 Lanczos kernel.
         auto resized = request("rgb8.png");
         resized.params.max_width = 7;
-        auto [data, width, height, channels] = load_image(path("rgb8.png"), 1, 7);
-        ASSERT_NE(data, nullptr);
-        const Tensor expected = Tensor::from_blob(data, {size_t(height), size_t(width), 3}, Device::CPU, DataType::UInt8)
-                                    .permute({2, 0, 1})
-                                    .to(DataType::Float32)
-                                    .mul(UINT8_SCALE)
-                                    .contiguous();
-        free_image(data);
+        const auto [target_width, target_height] = resized_image_dimensions(WIDTH, HEIGHT, 1, 7);
+        Tensor expected;
+        {
+            GpuBackendScope scope(GetParam());
+            const auto source = Tensor::from_blob(rgb8_.data(), {size_t(HEIGHT), size_t(WIDTH), 3}, Device::CPU,
+                                                  DataType::UInt8)
+                                    .to(Device::GPU);
+            expected = shared_image_ops(GetParam())
+                           ->resize(source, target_height, target_width, lfs::gpu_ops::Resample::LanczosRGB, 2)
+                           .cpu();
+        }
         expect_close(load(resized).image, expected, 0.0f);
 
         auto undistorted = request("rgb8.png");
         const auto camera = distorted_camera();
         undistorted.undistort = &camera;
         undistorted.params.undistort = &camera;
-        expect_close(load(undistorted).image,
-                     undistort_image(host(planar(rgb8_, 3, UINT8_SCALE), chw), camera, nullptr),
-                     1.5e-4f);
+        // Warped RGB is bounded and quantized to the lossless 16-bit cache grid.
+        const auto warped = undistort_image(host(planar(rgb8_, 3, UINT8_SCALE), chw), camera, nullptr)
+                                .clamp(0.0f, 1.0f)
+                                .mul(65535.0f)
+                                .add(0.5f)
+                                .to(DataType::Int32)
+                                .to(DataType::Float32)
+                                .mul(UINT16_SCALE);
+        expect_close(load(undistorted).image, warped, 1.5e-4f);
     }
 
     TEST_P(PipelinedLoaderBackends, MasksMatchHostReference) {
@@ -233,7 +319,9 @@ namespace {
         for (size_t i = 0; i < size_t(WIDTH) * HEIGHT; ++i)
             std::copy_n(&rgba_[i * 4], 3, &rgb[i * 3]);
         expect_close(split.image, host(planar(rgb, 3, UINT8_SCALE), {3, HEIGHT, WIDTH}), 0.0f);
-        expect_close(split.mask, host(alpha, hw), 0.0f);
+        // A driver may contract 1 - a / 255 into one fma (MoltenVK does); the
+        // host reference rounds twice, so allow the last bit.
+        expect_close(split.mask, host(alpha, hw), 1e-6f);
 
         auto binary = request("rgb8.png");
         binary.mask_path = path("mask.png");
@@ -296,6 +384,59 @@ namespace {
     INSTANTIATE_TEST_SUITE_P(Backends, PipelinedLoaderBackends,
                              ::testing::Values(GpuBackend::CUDA, GpuBackend::Vulkan),
                              [](const auto& info) { return std::string(gpu_backend_name(info.param)); });
+
+    TEST(PipelinedLoaderVulkan, PortableLoaderDecodesEveryRequestAndCachesOnlyEncodedBytes) {
+        if (!gpu_backend_available(GpuBackend::Vulkan))
+            GTEST_SKIP();
+        const GpuBackendScope backend(GpuBackend::Vulkan);
+        const auto directory = fixture_directory() / "rgb_cache";
+        std::filesystem::create_directories(directory);
+        const auto first = directory / "first.jpg", second = directory / "second.jpg";
+        const auto pixels = samples<uint8_t>(3, 255, 17);
+        auto encoded = pixels;
+        const auto host_pixels = lfs::core::Tensor::from_blob(encoded.data(), {size_t(HEIGHT), size_t(WIDTH), size_t(3)}, lfs::core::Device::CPU,
+                                                              DataType::UInt8);
+        lfs::core::save_image_u8(first, host_pixels, 95);
+        lfs::core::save_image_u8(second, host_pixels, 95);
+        {
+            PipelinedLoaderConfig config;
+            config.backend = GpuBackend::Vulkan;
+            PipelinedImageLoader loader(config);
+            lfs::io::LoadParams params;
+            auto initial = loader.load_image_immediate(first, params);
+            const auto expected = initial.cpu();
+            initial.fill_(0.f);
+            // No decoded image is kept: the second request decodes again and
+            // does not see the first output's writes.
+            expect_close(loader.load_image_immediate(first, params), expected, 0.f);
+            EXPECT_EQ(loader.get_stats().cpu_decode_calls, 2u);
+            params.output_uint8 = true;
+            EXPECT_EQ(loader.load_image_immediate(first, params).dtype(), DataType::UInt8);
+            params.output_uint8 = false;
+            params.resize_factor = 2;
+            EXPECT_NE(loader.load_image_immediate(first, params).shape(), expected.shape());
+            params.resize_factor = -1;
+
+            // Prefetched JPEGs decode from the encoded-bytes cache, like CUDA.
+            std::vector<ImageRequest> requests;
+            for (size_t i = 0; i < 6; ++i) {
+                ImageRequest request;
+                request.sequence_id = i;
+                request.path = i % 2 ? second : first;
+                requests.push_back(request);
+            }
+            loader.prefetch(requests);
+            for (size_t i = 0; i < requests.size(); ++i) {
+                auto completion = loader.try_get_completion_for(std::chrono::seconds(20));
+                ASSERT_TRUE(completion);
+                ASSERT_TRUE(completion->outcome);
+                expect_close(completion->outcome->tensor, expected, 0.f);
+            }
+            EXPECT_EQ(loader.get_stats().cpu_decode_calls, 10u);
+            EXPECT_GT(loader.release_host_cache(std::numeric_limits<size_t>::max()), 0u);
+        }
+        std::filesystem::remove_all(directory);
+    }
 
     // Runs in a fresh process: an earlier codec probe elsewhere would otherwise hide one here.
     TEST(PipelinedLoaderVulkan, NeverProbesOrCreatesTheCudaCodec) {

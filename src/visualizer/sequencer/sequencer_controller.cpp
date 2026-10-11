@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "sequencer_controller.hpp"
+#include "visualizer/nodes/modifier_manager.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -58,6 +59,16 @@ namespace lfs::vis {
 
     bool SequencerController::hasPlayableContent() const {
         return hasTimelineCameraContent(timeline_) || hasPlySequence();
+    }
+
+    void SequencerController::animationTracksChanged() {
+        timeline_.setClipDuration(std::max(timeline_.clipDuration(), timeline_.totalDuration()));
+        markTimelineChanged();
+    }
+
+    ModifierResult SequencerController::prepareExportFrame(
+        ModifierManager& nodes, const float seconds, const float fps) const {
+        return nodes.evaluateAtTime(seconds, fps);
     }
 
     float SequencerController::playbackStartTime() const {
@@ -210,6 +221,13 @@ namespace lfs::vis {
         markTimelineChanged();
     }
 
+    void SequencerController::editClipDuration(const float duration) {
+        const float before = clipDuration();
+        setClipDuration(duration);
+        if (before != clipDuration() && clip_duration_commit_callback_)
+            clip_duration_commit_callback_(before, clipDuration());
+    }
+
     void SequencerController::setLoopMode(const LoopMode mode) {
         if (loop_mode_ == mode)
             return;
@@ -323,10 +341,9 @@ namespace lfs::vis {
                     phase += period;
                 if (phase <= end) {
                     playhead_ = phase;
-                    reverse_direction_ = false;
                 } else {
                     playhead_ = period - phase;
-                    reverse_direction_ = true;
+                    reverse_direction_ = !reverse_direction_;
                 }
             }
             break;
@@ -363,11 +380,15 @@ namespace lfs::vis {
         if (!keyframe || keyframe->is_loop_point)
             return false;
 
+        const float time_before = keyframe->time;
+        pending_keyframe_time_edit_.reset();
         removeLoopKeyframe();
         const bool changed = timeline_.setKeyframeTimeById(id, new_time, true);
         rebuildLoopKeyframe();
         if (changed)
             markTimelineChanged();
+        if (changed && time_before != new_time && keyframe_time_commit_callback_)
+            keyframe_time_commit_callback_(id, time_before, new_time);
         return changed;
     }
 
@@ -376,10 +397,21 @@ namespace lfs::vis {
         if (!keyframe || keyframe->is_loop_point || keyframe->time == new_time)
             return false;
 
+        const float time_before = keyframe->time;
+        const bool continuing_edit = pending_keyframe_time_edit_ &&
+                                     pending_keyframe_time_edit_->id == id &&
+                                     pending_keyframe_time_edit_->revision == timeline_revision_;
         removeLoopKeyframe();
         const bool changed = timeline_.setKeyframeTimeById(id, new_time, false);
-        if (changed)
+        if (changed) {
             markTimelineChanged();
+            if (keyframe_time_commit_callback_) {
+                if (!continuing_edit)
+                    pending_keyframe_time_edit_ = PendingKeyframeTimeEdit{id, time_before, timeline_revision_};
+                else
+                    pending_keyframe_time_edit_->revision = timeline_revision_;
+            }
+        }
         return changed;
     }
 
@@ -388,9 +420,14 @@ namespace lfs::vis {
         if (!keyframe || keyframe->is_loop_point)
             return false;
 
+        const float time_after = keyframe->time;
+        const auto edit = std::exchange(pending_keyframe_time_edit_, std::nullopt);
+        const bool committed_edit = edit && edit->id == id && edit->revision == timeline_revision_;
         timeline_.sortKeyframes();
         rebuildLoopKeyframe();
         markTimelineChanged();
+        if (committed_edit && edit->time_before != time_after && keyframe_time_commit_callback_)
+            keyframe_time_commit_callback_(id, edit->time_before, time_after);
         return true;
     }
 
@@ -446,9 +483,12 @@ namespace lfs::vis {
         if (!keyframe || keyframe->is_loop_point)
             return false;
 
+        const auto before = keyframe_easing_changed_callback_ ? std::optional(*keyframe) : std::nullopt;
         const bool changed = timeline_.setKeyframeEasingById(id, easing);
         if (changed)
             markTimelineChanged();
+        if (changed && before && before->easing != easing)
+            keyframe_easing_changed_callback_(*before, easing);
         return changed;
     }
 
@@ -457,6 +497,8 @@ namespace lfs::vis {
         if (!keyframe || keyframe->is_loop_point)
             return false;
 
+        const auto before = keyframe_removed_callback_ ? std::optional(*keyframe) : std::nullopt;
+        const float duration_before = clipDuration();
         removeLoopKeyframe();
         const bool removed = timeline_.removeKeyframeById(id);
         rebuildLoopKeyframe();
@@ -464,6 +506,8 @@ namespace lfs::vis {
             if (selected_keyframe_id_ == id)
                 deselectKeyframe();
             markTimelineChanged();
+            if (before)
+                keyframe_removed_callback_(*before, duration_before);
         }
         return removed;
     }
@@ -473,11 +517,22 @@ namespace lfs::vis {
                removeKeyframeById(*selected_keyframe_id_);
     }
 
-    void SequencerController::clear() {
+    void SequencerController::clearKeyframes() {
         stop();
+        deselectKeyframe();
+        timeline_.clear();
+        if (const auto* sequence = plySequence())
+            timeline_.setClipDuration(sequence->duration());
+        markTimelineChanged();
+    }
+
+    void SequencerController::clear() {
+        ++timeline_generation_;
+        pending_keyframe_time_edit_.reset();
         deselectKeyframe();
         ply_sequence_.reset();
         timeline_.clear();
+        stop();
         markTimelineChanged();
     }
 
@@ -486,7 +541,9 @@ namespace lfs::vis {
     }
 
     nlohmann::json SequencerController::saveToJson() const {
-        return timeline_.saveToJson();
+        auto json = timeline_.saveToJson();
+        json["frames_per_second"] = frames_per_second_;
+        return json;
     }
 
     bool SequencerController::loadFromJson(const std::string& path) {
@@ -495,6 +552,8 @@ namespace lfs::vis {
         const bool loaded = timeline_.loadFromJson(path);
         if (!loaded)
             return false;
+        ++timeline_generation_;
+        pending_keyframe_time_edit_.reset();
         rebuildLoopKeyframe();
         markTimelineChanged();
         return true;
@@ -506,6 +565,9 @@ namespace lfs::vis {
         deselectKeyframe();
         if (!timeline_.loadFromJson(json))
             return false;
+        frames_per_second_ = clampSequenceFps(json.value("frames_per_second", DEFAULT_SEQUENCE_FPS));
+        ++timeline_generation_;
+        pending_keyframe_time_edit_.reset();
         rebuildLoopKeyframe();
         markTimelineChanged();
         return true;

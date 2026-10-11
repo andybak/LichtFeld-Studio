@@ -5,10 +5,10 @@
 #pragma once
 
 #include "core/export.hpp"
-#include "io/video_frame_extractor.hpp"
-#include "io/video_player.hpp"
+#include "gui/ui_texture.hpp"
+#include "media/video_frame_extractor.hpp"
+#include "media/video_player.hpp"
 #include "visualizer/gui/video_widget_interface.hpp"
-#include "visualizer/gui/vulkan_ui_texture.hpp"
 
 #include <RmlUi/Core/EventListener.h>
 #include <array>
@@ -44,6 +44,9 @@ namespace lfs::gui {
         int frame_interval = 1;
         io::ImageFormat format = io::ImageFormat::PNG;
         int jpg_quality = 95;
+        media::ExrOutputOptions exr;
+        media::FrameColor input_color;
+        bool remove_stale_frames = false;
 
         double start_time = 0.0;
         double end_time = -1.0;
@@ -91,6 +94,7 @@ namespace lfs::gui {
         void reloadRmlResources() override;
 
     private:
+        friend class VideoExtractorDialogTestAccess;
         struct EventListener final : Rml::EventListener {
             VideoExtractorDialog* owner = nullptr;
             void ProcessEvent(Rml::Event& event) override;
@@ -144,7 +148,7 @@ namespace lfs::gui {
         void syncOutputPreview();
         void handleEvent(Rml::Event& event);
         void handleClick(const std::string& id);
-        void handleChange(const std::string& id);
+        void handleChange(const std::string& id, bool explicit_edit = true);
         void handleTimelineEvent(Rml::Event& event);
         void seekFromTimeline(float mouse_x);
         void setTrimFromTimeline(TimelineDragTarget target, float mouse_x);
@@ -156,6 +160,10 @@ namespace lfs::gui {
         [[nodiscard]] bool hasDynamicState() const;
         [[nodiscard]] double trimDuration() const;
 
+        [[nodiscard]] std::string exrPreflightError() const;
+        std::optional<media::StreamDescription> source_description_;
+        std::string source_probe_error_;
+        Rml::Element* exr_preflight_el_ = nullptr;
         std::filesystem::path video_path_;
         std::filesystem::path output_dir_;
 
@@ -164,6 +172,10 @@ namespace lfs::gui {
         int frame_interval_ = 1;
 
         int format_selection_ = 0;
+        std::array<int, 4> exr_selections_{};
+        std::array<Rml::ElementFormControlSelect*, 4> exr_selects_{};
+        Rml::Element* exr_options_el_ = nullptr;
+        Rml::Element* metadata_option_el_ = nullptr;
         int jpg_quality_ = 95;
         int window_candidates_target_ = 10;
 
@@ -176,6 +188,7 @@ namespace lfs::gui {
 
         float trim_start_ = 0.0f;
         float trim_end_ = -1.0f;
+        bool trim_end_is_auto_ = true;
 
         std::atomic<bool> extracting_{false};
         std::atomic<bool> stop_extraction_requested_{false};
@@ -188,7 +201,7 @@ namespace lfs::gui {
         ExtractionStatusMessage status_message_ = ExtractionStatusMessage::None;
 
         std::unique_ptr<io::VideoPlayer> player_;
-        std::unique_ptr<lfs::vis::gui::VulkanUiTexture> preview_texture_;
+        std::unique_ptr<lfs::vis::gui::UiTexture> preview_texture_;
         int preview_texture_width_ = 0;
         int preview_texture_height_ = 0;
         bool texture_needs_update_ = true;

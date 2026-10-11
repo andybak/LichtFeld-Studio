@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """File menu implementation using Blender-style operators."""
 
+from collections.abc import Callable
 from pathlib import Path, PureWindowsPath
 import threading
+import time
 import uuid
 
 import lichtfeld as lf
-from .asset_index import display_name
 from .types import Operator
 from .layouts.menus import (
     menu_action,
@@ -127,8 +128,12 @@ def open_project_with_confirmation(
     path: str,
     *,
     keep_asset_manager_open: bool = False,
+    then: Callable[[], None] | None = None,
 ) -> None:
-    """Open a known project path through the standard project-switch flow."""
+    """Open a known project path through the standard project-switch flow.
+
+    then runs after the project opened; it does not run when the user cancels or the open fails.
+    """
     title = lf.ui.tr("menu.file.open_project")
 
     def _open_checked(stop_training: bool) -> None:
@@ -142,6 +147,9 @@ def open_project_with_confirmation(
         except Exception as exc:
             message = str(exc).strip() or title
             lf.ui.message_dialog(title, message, "error")
+            return
+        if then is not None:
+            then()
 
     confirm_discard_work_then(title, _open_checked)
 
@@ -199,6 +207,8 @@ def _open_recent_project(path: str) -> None:
 
 def format_recent_project_entry(path: str, tr) -> tuple[str, str]:
     """Return the compact recent-project label and full-path tooltip."""
+    from .asset_index import display_name
+
     windows_path = PureWindowsPath(path)
     display_path = windows_path if windows_path.drive or "\\" in path else Path(path)
     name = display_name({"path": display_path.as_posix(), "name": "", "name_origin": "stem"}) or path
@@ -274,6 +284,10 @@ class CompactProjectOperator(Operator):
     description = "Reclaim dead bytes in the active LichtFeld project"
 
     def execute(self, context) -> set:
+        if lf.is_training_active():
+            lf.ui.message_dialog(lf.ui.tr("menu.file.compact_project"),
+                                 lf.ui.tr("menu.file.compact_stop_training"), "error")
+            return {"CANCELLED"}
         lf.project_compact()
         return {"FINISHED"}
 
@@ -317,6 +331,58 @@ class ImportPlyOperator(Operator):
             if not _run_import(path, _load):
                 return {"CANCELLED"}
         return {"FINISHED"}
+
+
+class CreateSplatFromPhotoOperator(Operator):
+    label = "menu.file.create_splat_from_photo"
+    description = "Create editable Gaussian splats from one photo using Apple Reframe"
+
+    def execute(self, context) -> set:
+        if not callable(getattr(lf, "create_splat_from_photo", None)):
+            return {"CANCELLED"}
+        path = lf.ui.open_image_file_dialog("")
+        if not path:
+            return {"CANCELLED"}
+        if not _run_import(path, lambda: lf.create_splat_from_photo(path)):
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+_reframe_probe_lock = threading.Lock()
+_reframe_probe_running = False
+_reframe_probe_checked = None
+_reframe_probe_ready = False
+
+
+def _probe_apple_reframe(available):
+    global _reframe_probe_running, _reframe_probe_checked, _reframe_probe_ready
+    ready = False
+    try:
+        ready = bool(available())
+    except Exception as exc:
+        lf.log.debug(f"Apple Reframe availability probe failed: {exc}")
+    finally:
+        with _reframe_probe_lock:
+            _reframe_probe_ready = ready
+            _reframe_probe_checked = time.monotonic()
+            _reframe_probe_running = False
+
+
+def _apple_reframe_available() -> bool:
+    """Read cached readiness; model loading always runs off the UI thread."""
+    global _reframe_probe_running
+    available = getattr(lf, "apple_reframe_available", None)
+    if not callable(available) or not callable(getattr(lf, "create_splat_from_photo", None)):
+        return False
+    with _reframe_probe_lock:
+        ready = _reframe_probe_ready
+        if _reframe_probe_running or (_reframe_probe_checked is not None
+                                     and time.monotonic() - _reframe_probe_checked < 30):
+            return ready
+        _reframe_probe_running = True
+    threading.Thread(target=_probe_apple_reframe, args=(available,),
+                     name="apple-reframe-availability", daemon=True).start()
+    return ready
 
 
 class ImportSsogOperator(Operator):
@@ -478,24 +544,31 @@ def _show_project_switch_confirmation(
     keep_asset_manager_open: bool = False,
     create_path: str = "",
     overwrite: bool = False,
+    stop_training: bool = False,
 ) -> None:
+    prior_stop_approval = stop_training
     if new_project:
         title = lf.ui.tr("menu.file.new_project")
         if create_path:
-            callback = lambda stop_training: lf.project_create(
+            callback = lambda confirmed_stop: lf.project_create(
                 create_path,
                 discard_changes=True,
-                stop_training=stop_training,
+                stop_training=prior_stop_approval or confirmed_stop,
                 overwrite=overwrite,
             )
         else:
-            callback = lambda stop_training: _new_project(True, stop_training)
+            callback = lambda approved_stop: _new_project(
+                True, prior_stop_approval or approved_stop
+            )
     else:
         title = lf.ui.tr("menu.file.open_project")
-        callback = lambda stop_training: _open_project(
-            path, True, stop_training, keep_asset_manager_open
+        callback = lambda confirmed_stop: _open_project(
+            path, True, prior_stop_approval or confirmed_stop,
+            keep_asset_manager_open
         )
-    confirm_discard_work_then(title, callback)
+    confirm_discard_work_then(
+        title, callback, ask_stop_training=not prior_stop_approval
+    )
 
 
 def _show_stop_training_confirmation(
@@ -538,12 +611,16 @@ def _show_stop_training_confirmation(
     )
 
 
-def _show_load_file_confirmation(paths, is_dataset: bool, replace: bool) -> None:
+def _show_load_file_confirmation(paths, is_dataset: bool, replace: bool, user_batch: bool = False) -> None:
     title = lf.ui.tr(
         "load_dataset_popup.save_title" if is_dataset else "unsaved_work.title"
     )
 
     def _proceed(stop_training: bool) -> None:
+        if not is_dataset:
+            lf.load_files(paths, discard_changes=True, replace=replace,
+                          stop_training=stop_training, _user_batch=user_batch)
+            return
         for i, path in enumerate(paths):
             lf.load_file(
                 path,
@@ -576,15 +653,24 @@ def _can_publish_scene() -> bool:
     return _project_has_path() or bool(getattr(lf, "has_scene", lambda: False)())
 
 
+def _visible_splats() -> list:
+    scene = lf.get_scene()
+    return [node for node in scene.get_nodes()
+            if node.type == lf.scene.NodeType.SPLAT and scene.is_node_effectively_visible(node.id)]
+
+
+def _splat_publication(nodes) -> dict:
+    """What the gallery review estimates from; the SH degree is unknown without materializing geometry."""
+    return {"estimatedPoints": sum(node.gaussian_count for node in nodes)}
+
+
 def _open_unlinked_gallery_review() -> None:
     from .gallery_controller import get_gallery_controller
     from .gallery_file_panel import open_gallery_file_panel
     from .gallery_actions import gallery_quota
     from .gallery_messages import tr as gallery_tr
 
-    scene = lf.get_scene()
-    nodes = [node for node in scene.get_nodes()
-             if node.type == lf.scene.NodeType.SPLAT and scene.is_node_effectively_visible(node.id)]
+    nodes = _visible_splats()
     name = nodes[0].name if len(nodes) == 1 else lf.ui.tr("menu.file.untitled_scene")
     controller = get_gallery_controller()
     state = controller.snapshot()
@@ -592,7 +678,8 @@ def _open_unlinked_gallery_review() -> None:
     quota = (gallery_tr("quota.used", used=f"{used_bytes / 1e9:.1f}", quota=f"{quota_bytes / 1e9:g}")
              if quota_bytes is not None else "")
     asset = {"id": str(uuid.uuid4()), "path": "", "name": name, "exists": True,
-             "status": "AVAILABLE", "publication": {"visibleSplats": len(nodes)}}
+             "status": "AVAILABLE",
+             "publication": dict(_splat_publication(nodes), visibleSplats=len(nodes))}
     open_gallery_file_panel(controller=controller, asset=asset, scene=None, action="publish",
                             fields={"title": name, "description": "", "visibility": "private",
                                     "upload_format": controller.upload_format},
@@ -751,7 +838,7 @@ def _publish_current_project_to_gallery(*, refresh_once: bool = True) -> None:
             "has_preview": bool(card.has_preview),
             "exists": True,
             "status": "AVAILABLE",
-            "publication": {},
+            "publication": _splat_publication(_visible_splats()),
         }
         fields = {
             "title": str(linked_fields.get("title") or project_name),
@@ -920,6 +1007,7 @@ class FileMenu:
                 [
                     menu_operator(ImportDatasetOperator),
                     menu_operator(ImportPlyOperator),
+                    *([menu_operator(CreateSplatFromPhotoOperator)] if _apple_reframe_available() else []),
                     menu_operator(ImportSsogOperator),
                     menu_operator(ImportMeshOperator),
                     menu_operator(ImportCheckpointOperator),
@@ -960,7 +1048,11 @@ _operator_classes = [
 
 
 def register():
-    for cls in _operator_classes:
+    _apple_reframe_available()
+    classes = list(_operator_classes)
+    if callable(getattr(lf, "create_splat_from_photo", None)):
+        classes.append(CreateSplatFromPhotoOperator)
+    for cls in classes:
         lf.register_class(cls)
 
     lf.ui.on_show_new_project_dialog(_on_show_new_project_dialog)
@@ -969,7 +1061,7 @@ def register():
     lf.ui.on_project_switch_confirmation(
         _show_project_switch_confirmation
     )
-    lf.ui.on_show_load_file_confirmation(
+    lf.ui.on_show_load_file_confirmation_with_batch(
         _show_load_file_confirmation
     )
     lf.ui.on_stop_training_confirmation(
@@ -978,5 +1070,8 @@ def register():
 
 
 def unregister():
-    for cls in reversed(_operator_classes):
+    classes = list(_operator_classes)
+    if callable(getattr(lf, "create_splat_from_photo", None)):
+        classes.append(CreateSplatFromPhotoOperator)
+    for cls in reversed(classes):
         lf.unregister_class(cls)

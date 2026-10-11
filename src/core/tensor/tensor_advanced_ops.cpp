@@ -6,6 +6,7 @@
 #include "internal/tensor_impl.hpp"
 #include <algorithm>
 #include <cmath>
+#include <format>
 #include <numeric>
 
 namespace lfs::core {
@@ -112,6 +113,69 @@ namespace lfs::core {
     }
 
     namespace {
+        // The CPU loop's choice along `dim`, on the input's backend: the
+        // first NaN after the first element, else the first element if it is
+        // NaN, else the first strict extreme.
+        std::pair<Tensor, Tensor> gpu_extreme_with_indices(
+            const Tensor& input, const int dim, const bool keepdim, const bool find_maximum) {
+            const size_t size = input.size(static_cast<size_t>(dim));
+            LFS_ASSERT_MSG(size <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
+                           std::format("indexed extrema index their dimension in int32 (dim={}, size={})", dim,
+                                       size));
+            const Tensor x = input.contiguous();
+            std::vector<size_t> kept = x.shape().dims();
+            size_t outer = 1, inner = 1;
+            for (int axis = 0; axis < dim; ++axis)
+                outer *= kept[static_cast<size_t>(axis)];
+            for (size_t axis = static_cast<size_t>(dim) + 1; axis < kept.size(); ++axis)
+                inner *= kept[axis];
+            kept[static_cast<size_t>(dim)] = 1;
+            Tensor kernel_values = internal::allocate_like(x, TensorShape(kept), DataType::Float32);
+            Tensor kernel_indices = internal::allocate_like(x, TensorShape(kept), DataType::Int64);
+            if (internal::backend_ops_for(x).arg_extreme(
+                    internal::storage_ref(x), internal::storage_ref(kernel_values),
+                    internal::storage_ref(kernel_indices),
+                    internal::ArgExtremeProgram{.outer = outer, .reduce = size, .inner = inner, .maximum = find_maximum},
+                    internal::ExecContext{kernel_values.stream()})) {
+                if (!keepdim) {
+                    kernel_values = kernel_values.squeeze(dim);
+                    kernel_indices = kernel_indices.squeeze(dim);
+                }
+                return {kernel_values, kernel_indices};
+            }
+            // Backends without the kernel compose it from tensor ops.
+            std::vector<int32_t> positions(size);
+            for (size_t i = 0; i < size; ++i)
+                positions[i] = static_cast<int32_t>(i);
+            std::vector<size_t> position_shape(x.ndim(), 1);
+            position_shape[static_cast<size_t>(dim)] = size;
+            const Tensor position = internal::copy_to_backend(
+                                        Tensor::from_vector(positions, {size}, Device::CPU), *gpu_backend_of(x))
+                                        .reshape(TensorShape(position_shape))
+                                        .expand(x.shape())
+                                        .contiguous();
+            const float past_end = static_cast<float>(size);
+            // The first position where `mask` holds, or size where it never does.
+            const auto first = [&](const Tensor& mask) {
+                return position.masked_fill(mask.logical_not(), past_end).min(dim, true);
+            };
+            const Tensor nan = x.isnan();
+            const Tensor first_nan = first(nan);
+            const float excluded = find_maximum ? -std::numeric_limits<float>::infinity()
+                                                : std::numeric_limits<float>::infinity();
+            const Tensor finite = x.masked_fill(nan, excluded);
+            const Tensor extreme = find_maximum ? finite.max(dim, true) : finite.min(dim, true);
+            const Tensor first_extreme = first(finite.eq(extreme));
+            const Tensor chosen = Tensor::where(first_nan.lt(past_end), first_nan, first_extreme);
+            Tensor indices = chosen.to(DataType::Int64);
+            Tensor values = x.gather(dim, indices);
+            if (!keepdim) {
+                indices = indices.squeeze(dim);
+                values = values.squeeze(dim);
+            }
+            return {values.contiguous(), indices.contiguous()};
+        }
+
         std::pair<Tensor, Tensor> indexed_extreme_with_indices(
             const Tensor& input, int dim, const bool keepdim, const bool find_maximum) {
             LFS_ASSERT_MSG(input.is_valid(),
@@ -130,6 +194,9 @@ namespace lfs::core {
                 LFS_ASSERT_MSG(dim >= 0 && dim < static_cast<int>(rank),
                                "indexed-extrema dimension is out of range");
             }
+
+            if (input.device() == Device::GPU && rank > 0 && input.numel() > 0)
+                return gpu_extreme_with_indices(input, dim, keepdim, find_maximum);
 
             Tensor cpu = input.device() == Device::CPU
                              ? input.contiguous()
@@ -177,16 +244,15 @@ namespace lfs::core {
                         const size_t base = outer * dim_size * inner_size + inner;
                         float selected = src[base];
                         int64_t selected_index = 0;
-                        for (size_t index = 1; index < dim_size; ++index) {
+                        for (size_t index = 1; index < dim_size && !std::isnan(selected); ++index) {
                             const float candidate = src[base + index * inner_size];
                             if (std::isnan(candidate)) {
                                 selected = candidate;
                                 selected_index = static_cast<int64_t>(index);
                                 break;
                             }
-                            if (!std::isnan(selected) &&
-                                (find_maximum ? candidate > selected
-                                              : candidate < selected)) {
+                            if (find_maximum ? candidate > selected
+                                             : candidate < selected) {
                                 selected = candidate;
                                 selected_index = static_cast<int64_t>(index);
                             }
@@ -353,13 +419,4 @@ namespace lfs::core {
     }
 
     // ============= SCALAR BOOLEAN REDUCTIONS =============
-    bool Tensor::any_scalar() const {
-        LFS_ASSERT_MSG(is_valid(),
-                       "any_scalar requires a valid tensor");
-        if (numel() == 0) {
-            return false;
-        }
-        return count_nonzero() > 0;
-    }
-
 } // namespace lfs::core

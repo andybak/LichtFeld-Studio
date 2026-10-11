@@ -6,10 +6,10 @@
 #include "core/splat_data.hpp"
 #include "core/tensor.hpp"
 #include "cuda_backend_test.hpp"
-#include "lfs/kernels/l1_loss.cuh"
 #include "lfs/kernels/ssim.cuh"
 #include "lfs/training/ops/photometric_cuda.hpp"
 #include "lfs/training/ops/registry.hpp"
+#include "training/kernels/l1_loss.cuh"
 #include "training/metrics/metrics.hpp"
 
 #include <algorithm>
@@ -65,7 +65,9 @@ namespace {
         EXPECT_EQ(0, std::memcmp(actual_cpu.ptr<float>(), reference_cpu.ptr<float>(), actual_cpu.bytes()));
     }
 
+    // The outputs are views into the saved workspace, so the run keeps it alive.
     struct PhotoRun {
+        lfs::gpu_ops::PhotoSaved saved;
         Tensor loss;
         Tensor grad_corrected;
         Tensor grad_raw;
@@ -74,23 +76,48 @@ namespace {
     PhotoRun evaluate_path(const lfs::gpu_ops::PhotoPath path, const float weight, const Tensor& corrected,
                            const Tensor& raw, const Tensor& target, const Tensor& mask) {
         const auto& ops = lfs::training::cuda_photometric_ops();
-        lfs::gpu_ops::PhotoSaved saved{.backend = ops.create()};
-        PhotoRun run;
+        PhotoRun run{.saved = {.backend = ops.create()}};
         ops.evaluate(
-            saved, corrected, raw, target, mask,
+            run.saved, corrected, raw, target, mask,
             {.path = path, .ssim_weight = weight, .valid_padding = true},
             run.loss, run.grad_corrected, run.grad_raw);
         return run;
     }
 
+    // The decoupled paths leave grad_raw empty and add the raw-render gradient later.
+    Tensor added_raw_gradient(PhotoRun& run, const Tensor& raw) {
+        EXPECT_FALSE(run.grad_raw.is_valid());
+        auto gradient = Tensor::zeros(raw.shape(), Device::GPU);
+        lfs::training::cuda_photometric_ops().add_raw_gradient(run.saved, gradient);
+        return gradient;
+    }
+
+    template <typename Context>
+    Tensor kernel_raw_gradient(const Context& ctx, const Tensor& raw) {
+        auto gradient = Tensor::zeros(raw.shape(), Device::GPU);
+        lfs::training::kernels::accumulate_decoupled_raw_gradient(
+            lfs::training::kernels::decoupled_raw_gradient(ctx), gradient);
+        return gradient;
+    }
+
 } // namespace
 
-TEST(TrainingOpsCapability, VulkanConfigurationIsRejectedBeforeAllocation) {
+TEST(TrainingOpsCapability, VulkanConfigurationAvailabilityIsCheckedBeforeAllocation) {
     const auto before = lfs::core::alloc_counter::snapshot();
     lfs::core::param::TrainingParameters params;
     const auto dependencies = lfs::training::training_loader_dependencies(params);
     const auto reason = lfs::training::unavailable_training_reason(
         params, lfs::core::GpuBackend::Vulkan, dependencies);
+#if defined(LFS_TEST_TENSOR_VULKAN)
+    // Every family of the default configuration has a Vulkan implementation.
+    EXPECT_FALSE(reason.has_value()) << *reason;
+    // The 3DGUT configuration has the complete Gsplat family as well.
+    params.optimization.set_raster_backend(lfs::core::param::RasterBackendId::ThreeDGUT);
+    const auto gut = lfs::training::unavailable_training_reason(
+        params, lfs::core::GpuBackend::Vulkan, lfs::training::training_loader_dependencies(params));
+    EXPECT_FALSE(gut.has_value()) << *gut;
+    params = {};
+#else
     ASSERT_TRUE(reason.has_value());
     EXPECT_EQ(
         reason->rfind("Vulkan training is unavailable for this configuration.\nMissing families: ", 0),
@@ -99,6 +126,7 @@ TEST(TrainingOpsCapability, VulkanConfigurationIsRejectedBeforeAllocation) {
     EXPECT_NE(reason->find("Fast"), std::string::npos);
     EXPECT_NE(reason->find("Mrnf"), std::string::npos);
     EXPECT_EQ(reason->back(), '.');
+#endif
     EXPECT_FALSE(lfs::training::unavailable_training_reason(
         params, lfs::core::GpuBackend::CUDA, dependencies));
     const auto metal = lfs::training::unavailable_training_reason(
@@ -117,10 +145,14 @@ TEST(TrainingOpsCapability, EvaluationWithoutPhotometricFamilyFailsBeforeAllocat
         "Metal training is unavailable for this configuration.\nMissing families: Photometric.");
     const auto vulkan = lfs::training::unavailable_training_family(
         lfs::core::GpuBackend::Vulkan, lfs::training::Family::Photometric);
+#if defined(LFS_TEST_TENSOR_VULKAN)
+    EXPECT_FALSE(vulkan.has_value());
+#else
     ASSERT_TRUE(vulkan.has_value());
     EXPECT_EQ(
         *vulkan,
         "Vulkan training is unavailable for this configuration.\nMissing families: Photometric.");
+#endif
     EXPECT_FALSE(lfs::training::unavailable_training_family(
         lfs::core::GpuBackend::CUDA, lfs::training::Family::Photometric));
 
@@ -220,10 +252,11 @@ TEST_F(PhotometricOpsBytes, FixedInputsMatchKernelBytes) {
         auto [loss, ctx] = lfs::training::kernels::decoupled_fused_l1_ssim_forward(
             corrected, raw, target, kWeight, workspace, true);
         const auto grads = lfs::training::kernels::decoupled_fused_l1_ssim_backward(ctx, workspace);
-        const PhotoRun ops = evaluate_path(lfs::gpu_ops::PhotoPath::Decoupled, kWeight, corrected, raw, target, {});
+        const Tensor raw_gradient = kernel_raw_gradient(ctx, raw);
+        PhotoRun ops = evaluate_path(lfs::gpu_ops::PhotoPath::Decoupled, kWeight, corrected, raw, target, {});
         expect_identical(ops.loss, loss);
         expect_identical(ops.grad_corrected, grads.grad_corrected);
-        expect_identical(ops.grad_raw, grads.grad_raw);
+        expect_identical(added_raw_gradient(ops, raw), raw_gradient);
     }
 
     {
@@ -241,11 +274,11 @@ TEST_F(PhotometricOpsBytes, FixedInputsMatchKernelBytes) {
         auto [loss, ctx] = lfs::training::kernels::masked_decoupled_fused_l1_ssim_forward(
             corrected, raw, target, mask, kWeight, workspace);
         const auto grads = lfs::training::kernels::masked_decoupled_fused_l1_ssim_backward(ctx, workspace);
-        const PhotoRun ops =
-            evaluate_path(lfs::gpu_ops::PhotoPath::MaskedDecoupled, kWeight, corrected, raw, target, mask);
+        const Tensor raw_gradient = kernel_raw_gradient(ctx, raw);
+        PhotoRun ops = evaluate_path(lfs::gpu_ops::PhotoPath::MaskedDecoupled, kWeight, corrected, raw, target, mask);
         expect_identical(ops.loss, loss);
         expect_identical(ops.grad_corrected, grads.grad_corrected);
-        expect_identical(ops.grad_raw, grads.grad_raw);
+        expect_identical(added_raw_gradient(ops, raw), raw_gradient);
     }
 }
 

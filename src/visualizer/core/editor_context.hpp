@@ -89,11 +89,13 @@ namespace lfs::vis {
 
         // Tool availability
         [[nodiscard]] bool isToolAvailable(ToolType tool) const;
-        [[nodiscard]] const char* getToolUnavailableReason(ToolType tool) const;
 
         // Capability queries
         [[nodiscard]] bool canTransformSelectedNode() const;
         [[nodiscard]] bool canSelectGaussians() const;
+        // A visible streamed model swaps its splats at any time, so splat-level
+        // selection and edits are unsafe while it is shown.
+        [[nodiscard]] bool isSplatEditingBlocked() const { return has_visible_streamed_model_; }
         [[nodiscard]] bool forcePointCloudMode() const { return mode_ == EditorMode::PRE_TRAINING; }
 
         // Active tool management (legacy - will be removed)
@@ -149,12 +151,10 @@ namespace lfs::vis {
         bool has_selection_ = false;
         bool has_gaussians_ = false;
         bool has_editable_transform_selection_ = false;
-        bool has_splat_selection_ = false;
         bool has_editable_splat_selection_ = false;
+        bool has_visible_streamed_model_ = false;
         bool has_editable_align_selection_ = false;
-        bool has_locked_align_selection_ = false;
         bool tool_restore_guard_ = false;
-        std::string transform_selection_error_;
 
         // String-based operator system
         std::string active_operator_id_;

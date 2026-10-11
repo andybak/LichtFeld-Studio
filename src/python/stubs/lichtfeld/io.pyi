@@ -6,6 +6,7 @@ import os
 import pathlib
 
 import lichtfeld
+import lichtfeld.media
 import lichtfeld.scene
 
 
@@ -502,6 +503,12 @@ class ProjectInspectorParameters:
     def embedded_images(self) -> int: ...
 
     @property
+    def embedded_masks(self) -> int: ...
+
+    @property
+    def embedded_depths(self) -> int: ...
+
+    @property
     def embedded_normals(self) -> int: ...
 
     @property
@@ -713,6 +720,12 @@ class DatasetEmbedResult:
     def images_embedded(self) -> int: ...
 
     @property
+    def masks_embedded(self) -> int: ...
+
+    @property
+    def depths_embedded(self) -> int: ...
+
+    @property
     def normals_embedded(self) -> int: ...
 
     @property
@@ -759,6 +772,21 @@ class ProjectRepairResult:
 
     @property
     def saves_recovered(self) -> int: ...
+
+class ProjectHeadIdentity:
+    @property
+    def project_uuid(self) -> str: ...
+
+    @property
+    def commit_uuid(self) -> str: ...
+
+    @property
+    def generation(self) -> int: ...
+
+def inspect_project_head(path: str | os.PathLike) -> ProjectHeadIdentity:
+    """
+    Read the project and commit identity from the head slots without opening the project.
+    """
 
 def classify_project(path: str | os.PathLike) -> ProjectOpenClassification:
     """Classify a .licht path without throwing for damaged heads."""
@@ -913,6 +941,9 @@ def export_html(data: lichtfeld.scene.SplatData, path: str | os.PathLike, kmeans
 def is_ssog_path(path: str | os.PathLike) -> bool:
     """Check for an SSOG bundle, manifest or directory."""
 
+def is_tiles3d_path(path: str | os.PathLike) -> bool:
+    """Check for a 3D Tiles tileset JSON."""
+
 def is_dataset_path(path: str | os.PathLike) -> bool:
     """Check if path is a dataset directory"""
 
@@ -929,5 +960,10 @@ def get_supported_extensions() -> list[str]:
 
 def save_image(path: str | os.PathLike, image: lichtfeld.Tensor, include_provenance: bool = True) -> None:
     """
-    Save image tensor to file (PNG, JPG, TIFF, EXR). Accepts [H,W,C] or [C,H,W] float [0,1]. include_provenance (default true) writes a full Comment stamp on PNG and JPEG; when false, a minimal build stamp is still embedded.
+    Save display image tensor to PNG, JPG or TIFF. Accepts [H,W,C] or [C,H,W] float [0,1]. include_provenance (default true) writes a full Comment stamp on PNG and JPEG; when false, a minimal build stamp is still embedded.
+    """
+
+def save_exr_image(path: str | os.PathLike, image: lichtfeld.Tensor, color: lichtfeld.media.FrameColor, options: lichtfeld.media.ExrOutputOptions, include_provenance: bool = True) -> None:
+    """
+    Save an HWC Float16/Float32 RGB/RGBA tensor through the shared EXR writer. Requires explicit linear color/alpha and ExrOutputOptions (HALF/FLOAT, ZIP/none, overwrite). No display quantization, transfer conversion or layout guessing; preserves signed/high-range samples. Uses a synchronized CPU transfer for GPU tensors; existing provenance is preserved.
     """

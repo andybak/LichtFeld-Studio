@@ -44,7 +44,7 @@ ACTION_NAMES = (
     "ZOOM_SPEED_UP",
     "ZOOM_SPEED_DOWN",
     "TOGGLE_SPLIT_VIEW",
-    "TOGGLE_INDEPENDENT_SPLIT_VIEW",
+    "TOGGLE_SPLIT_VIEWPORT",
     "TOGGLE_GT_COMPARISON",
     "TOGGLE_DEPTH_MODE",
     "CYCLE_PLY",
@@ -106,6 +106,22 @@ ACTION_NAMES = (
     "TOGGLE_SCENE_SELECTION_VISIBILITY",
     "TOGGLE_SCENE_SELECTION_TRAINING",
     "DEPTH_ADJUST_SIZE",
+    "GROUP_SELECTED_SCENE_NODES",
+    "UNGROUP_SELECTED_SCENE_NODE",
+    "ASSET_GALLERY_PRIMARY",
+    "ASSET_GALLERY_COPY_LINK",
+    "ASSET_REFRESH",
+    "VIEW_AXIS_TOP",
+    "VIEW_AXIS_BOTTOM",
+    "VIEW_AXIS_FRONT",
+    "VIEW_AXIS_BACK",
+    "VIEW_AXIS_RIGHT",
+    "VIEW_AXIS_LEFT",
+    "VIEW_TOGGLE_PERSPECTIVE",
+    "VIEW_FRAME_ALL",
+    "TOGGLE_QUAD_VIEW",
+    "TOGGLE_MAXIMIZE_AREA",
+    "TOGGLE_NODE_EDITOR",
     "DEPTH_WINDOW_DRAG",
 )
 
@@ -164,6 +180,7 @@ def _install_lf_stub(monkeypatch):
             "error_port": 0,
             "safe_mode": False,
         },
+        viewer_backend="auto",
         render_settings=SimpleNamespace(
             scene_upscaler="native",
             scene_upscaler_preset="native",
@@ -256,15 +273,21 @@ def _install_lf_stub(monkeypatch):
         PanelHeightMode=panel_height_mode,
         PanelOption=panel_option,
         get_panel=lambda _panel_id: SimpleNamespace(space=panel_space.BOTTOM_DOCK),
-        get_bottom_dock_active_tab=lambda: "",
-        set_bottom_dock_active_tab=lambda _panel_id: None,
+        screen=SimpleNamespace(
+            areas=lambda: [],
+            open_editor=lambda _editor: 0,
+            close_editor=lambda _editor: False,
+        ),
         set_sequencer_visible=lambda _visible: None,
         is_sequencer_visible=lambda: False,
         set_panel_enabled=lambda _panel_id, _enabled: None,
         tr=tr,
         get_current_language=lambda: state.language[0],
+        get_viewer_backend_preference=lambda: state.viewer_backend,
+        set_viewer_backend_preference=lambda value="auto": setattr(state, "viewer_backend", value),
         request_redraw=lambda: None,
         get_mcp_preferences=lambda: dict(state.mcp_preferences),
+        get_mcp_port_override=lambda: None,
         get_project_location=lambda: "/home/tester/.lichtfeld/projects",
         get_project_location_preference=lambda: "",
         get_default_project_location=lambda: "/home/tester/.lichtfeld/projects",
@@ -512,6 +535,21 @@ def test_keymap_builds_profile_and_mode_records(keymap_bindings_module):
     ]
 
 
+def test_keymap_selecting_the_active_profile_does_not_reload_it(keymap_bindings_module):
+    # Catches the profile select reloading the active profile from disk when it binds.
+    prefs, state = keymap_bindings_module
+    panel, _model = _bind_panel(prefs)
+    section = panel._keymap
+    loads = []
+    sys.modules["lichtfeld"].keymap.load_profile = lambda name: (loads.append(name), state.current_profile.__setitem__(0, name))
+
+    section._set_profile_idx("0")
+    assert loads == []
+
+    section._set_profile_idx("1")
+    assert loads == ["Studio"]
+
+
 def test_keymap_builds_binding_rows_with_capture_state(keymap_bindings_module):
     prefs, state = keymap_bindings_module
     panel, _model = _bind_panel(prefs)
@@ -589,6 +627,31 @@ def test_keymap_marks_conflicting_binding_rows(keymap_bindings_module):
     )
     assert orbit_row["desc_text"] == "GLOBAL:CAMERA_ORBIT :: also Action CAMERA_ZOOM"
     assert orbit_row["desc_class"] == "preferences-binding-desc preferences-conflict"
+
+
+def test_keymap_pending_capture_polls_until_the_key_arrives(keymap_bindings_module):
+    # Catches a dirty-policy panel that never notices the native capture finishing.
+    prefs, state = keymap_bindings_module
+    panel, model = _bind_panel(prefs)
+    section = panel._keymap
+    doc = _DocStub(with_conflict_overlay=True)
+    section.ensure_binding_rows()
+    section._rebinding_action = prefs.lf.keymap.Action.CAMERA_ORBIT
+    section._rebinding_mode = prefs.lf.keymap.ToolMode.GLOBAL
+    section._previous_trigger = None
+    state.capturing[0] = True
+
+    panel.on_update(doc)
+    assert model.handle.request_update_count == 1
+
+    state.capturing[0] = False
+    state.captured.append({"type": "key", "key": 85, "modifiers": 0})
+    panel.on_update(doc)
+    requests_after_capture = model.handle.request_update_count
+    panel.on_update(doc)
+
+    assert section._rebinding_action is None
+    assert model.handle.request_update_count == requests_after_capture
 
 
 def test_keymap_capture_conflict_prompts_to_replace(keymap_bindings_module):

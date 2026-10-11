@@ -1246,11 +1246,12 @@ class GalleryController:
             self._save_pending["canceled"] = True
 
     def _review_publish(self, scene, details, upload_format, publish_as_new, *, update=False, expected_commit=None):
+        from .gallery_preferences import UPLOAD_FORMATS
         project = self._project_identity()
         metadata = self._details(details)
         if publish_as_new:
             metadata["_publishAsNew"] = True
-        if upload_format not in ("studio", "sog", "ssog", "spz"):
+        if upload_format not in UPLOAD_FORMATS:
             raise ValueError("Choose a supported upload format.")
         metadata["viewerSettings"] = capture_view(lf)
         environment_source = str(lf.get_render_settings().environment_map_path) if metadata["viewerSettings"].get("environment") else None
@@ -1282,8 +1283,6 @@ class GalleryController:
                 raise ValueError(tr("error.preview"))
             metadata["_previewPng"] = base64.b64encode(gallery_preparation.publication_preview(preview)).decode("ascii")
 
-    def _owns_export(self, state):
-        return self._publish_steps.owns_export(state)
 
     def _cancel_own_export(self):
         return self._publish_steps.cancel_export()
@@ -1391,8 +1390,6 @@ class GalleryController:
     def _finish_local_update(self, job):
         return self._local_update_steps.advance(job)
 
-    def _prepare_update_backup(self, job):
-        return self._local_update_steps.prepare_backup(job)
 
     def _recover_failed_update(self, update, exc):
         return self._local_update_steps.recover_failure(update, exc)

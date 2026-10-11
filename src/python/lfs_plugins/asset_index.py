@@ -130,19 +130,6 @@ _PROJECT_STORAGE_FIELDS = frozenset(
 )
 _LEGACY_PROJECT_FIELDS = frozenset({"aliases", "gallery"})
 _COPY_ID_NAMESPACE = uuid.UUID("0c2e5d4a-7f3b-5e61-9a28-4d1b6c9e8f07")
-_INSPECTION_STORAGE_FIELDS = _PROJECT_STORAGE_FIELDS - {
-    "name",
-    "path",
-    "folder_id",
-    "size",
-    "mtime_ns",
-    "fallback_preview_path",
-    "name_origin",
-    "previous_project_uuid",
-    "project_uuid",
-    "stat_identity",
-    "inspection",
-}
 
 
 def _normalize_path(path: str) -> str:
@@ -315,10 +302,8 @@ def _dedupe_paths(paths: List[Path]) -> List[Path]:
     return result
 
 
-def _legacy_storage_paths(native_storage: Optional[Path] = None) -> List[Path]:
+def _legacy_storage_paths() -> List[Path]:
     paths: List[Path] = []
-    if native_storage is not None:
-        paths.append(native_storage.parent.parent / "asset_manager")
     paths.append(Path.home() / ".lichtfeld" / "asset_manager")
     for variable in ("APPDATA", "LOCALAPPDATA"):
         base = environment_value(variable)
@@ -621,13 +606,6 @@ class AssetIndex:
         project = self._projects.get(str(asset_id))
         return project.to_dict() if project is not None else None
 
-    @_synchronized
-    def iter_project_ids(self) -> List[str]:
-        return list(self._projects)
-
-    @_synchronized
-    def count(self) -> int:
-        return len(self._projects)
 
     @staticmethod
     def _path_key(path: str) -> str:
@@ -750,7 +728,9 @@ class AssetIndex:
                 self._projects[project_id].extra["display_name"] = title
         return False
 
-    def _apply_inspection(self, project: Project, inspection: Any) -> None:
+    def _apply_inspection(
+        self, project: Project, inspection: Any, *, fallback_resolved: bool = True
+    ) -> None:
         if self._projects.get(project.id) is project:
             self._remember_identity(project.path, project.project_uuid)
         project.file_uuid = str(inspection.file_uuid)
@@ -762,17 +742,20 @@ class AssetIndex:
         project.role = _enum_name(inspection.role)
         project.open_state = _enum_name(inspection.open_state)
         project.has_preview = bool(inspection.has_preview)
-        project.preview_width = int(getattr(inspection, "preview_width", 0) or 0)
-        project.preview_height = int(getattr(inspection, "preview_height", 0) or 0)
+        # An inspection that skipped the dataset image lookup knows nothing about the fallback thumbnail.
+        keeps_fallback = not fallback_resolved and not project.has_preview
+        if not keeps_fallback:
+            project.preview_width = int(getattr(inspection, "preview_width", 0) or 0)
+            project.preview_height = int(getattr(inspection, "preview_height", 0) or 0)
+            project.fallback_preview_path = str(
+                getattr(inspection, "fallback_preview_path", "") or ""
+            )
         iteration = getattr(inspection, "iteration", None)
         if iteration is not None:
             try:
                 project.iteration = int(iteration)
             except (TypeError, ValueError):
                 pass
-        project.fallback_preview_path = str(
-            getattr(inspection, "fallback_preview_path", "") or ""
-        )
         self._set_inspection_runtime_state(project)
         project.inspection_verified = True
         project.inspection_restored = False
@@ -933,10 +916,12 @@ class AssetIndex:
             return "UNSUPPORTED", "Not a master project container"
         return "AVAILABLE", inspection
 
-    def _apply_runtime_result(self, project: Project, kind: str, payload: Any) -> None:
+    def _apply_runtime_result(
+        self, project: Project, kind: str, payload: Any, *, fallback_resolved: bool = True
+    ) -> None:
         if kind == "AVAILABLE":
             project.relocation_candidate = ""
-            self._apply_inspection(project, payload)
+            self._apply_inspection(project, payload, fallback_resolved=fallback_resolved)
             return
         if kind == "IDENTITY_MISMATCH":
             self._clear_runtime(
@@ -991,8 +976,9 @@ class AssetIndex:
         for path, (identity, expected) in self._write_checks.items():
             identity.validate()
             if expected is not None:
-                inspection = self._inspect_path(path)
-                if str(inspection.project_uuid) != expected:
+                head = self._cheap_head_identity(path)
+                project_uuid = head[0] if head is not None else str(self._inspect_path(path).project_uuid)
+                if project_uuid != expected:
                     raise ValueError(f"The project identity changed at {path}. Refresh Projects and try again.")
                 identity.validate()
 
@@ -1002,11 +988,11 @@ class AssetIndex:
             for entry_id, project in self._projects.items()
         }
 
-    def _observation_from(self, value: Any, folder_id: str = "") -> AssetObservation:
+    def _observation_from(self, value: Any) -> AssetObservation:
         if isinstance(value, AssetObservation):
             return AssetObservation(
                 path=value.path,
-                folder_id=self._folder_id_for_path(value.path) or value.folder_id or folder_id,
+                folder_id=self._folder_id_for_path(value.path) or value.folder_id or "",
                 inspection=value.inspection,
                 error=value.error,
                 stat_identity=dict(value.stat_identity),
@@ -1016,7 +1002,7 @@ class AssetIndex:
             path = str(value.get("path") or "")
             inspection = value.get("inspection")
             effective_folder = self._folder_id_for_path(path) or str(
-                value.get("folder_id") or folder_id
+                value.get("folder_id") or ""
             )
             return AssetObservation(
                 path=path,
@@ -1028,7 +1014,7 @@ class AssetIndex:
             )
         path = str(getattr(value, "path", "") or "")
         effective_folder = self._folder_id_for_path(path) or str(
-            getattr(value, "folder_id", "") or folder_id
+            getattr(value, "folder_id", "") or ""
         )
         return AssetObservation(
             path=path,
@@ -1768,11 +1754,6 @@ class AssetIndex:
                     return False
                 self._cleanup_obsolete_storage()
                 _log.info("Migrated Asset Manager catalog to schema v%d", SCHEMA_VERSION)
-            _log.info(
-                "Loaded Asset Manager library with %d folders and %d projects",
-                len(self._folders),
-                len(self._projects),
-            )
             self._touch_catalog()
             return True
         except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
@@ -2183,15 +2164,11 @@ class AssetIndex:
                 return None
             if project.path != path or project.project_uuid != expected_uuid:
                 return project
-            if kind == "UNCHANGED":
-                project.inspection_verified = True
-                project.inspection_restored = False
-            else:
-                previous_state = self._snapshot_state(project_ids=[asset_id])
-                self._write_checks[path] = (path_identity, expected_uuid if kind == "AVAILABLE" else None)
-                self._apply_runtime_result(project, kind, payload)
-                if not self.save():
-                    self._restore_state(previous_state)
+            previous_state = self._snapshot_state(project_ids=[asset_id])
+            self._write_checks[path] = (path_identity, expected_uuid if kind == "AVAILABLE" else None)
+            self._apply_runtime_result(project, kind, payload)
+            if not self.save():
+                self._restore_state(previous_state)
             return self._projects[asset_id]
 
     @_synchronized
@@ -2239,7 +2216,21 @@ class AssetIndex:
         self._restore_state(previous_state)
         return False
 
-    def verify_projects_batch(self, asset_ids: List[str]) -> int:
+    @staticmethod
+    def _inspected_file_identity(project: Project) -> Optional[Dict[str, Any]]:
+        # Reopening every project on a refresh is slow on some systems and blocks the folder scan
+        # queued behind it; a file still matching its last inspection needs only a stat.
+        if (
+            project.status != "AVAILABLE"
+            or not project.stat_identity
+            or not {"has_checkpoint", "has_dataset"}.issubset(project.inspection)
+        ):
+            return None
+        return {**project.stat_identity, "commit_uuid": project.commit_uuid}
+
+    def verify_projects_batch(
+        self, asset_ids: List[str], *, cancel_event: Optional[threading.Event] = None
+    ) -> int:
         with self._lock:
             work = []
             for asset_id in dict.fromkeys(asset_ids):
@@ -2251,10 +2242,13 @@ class AssetIndex:
                             project.path,
                             project.project_uuid,
                             ProjectPathIdentity.capture(project.path),
+                            self._inspected_file_identity(project),
                         )
                     )
         results = []
-        for asset_id, path, expected_uuid, path_identity in work:
+        for asset_id, path, expected_uuid, path_identity, known_identity in work:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             results.append(
                 (
                     asset_id,
@@ -2262,7 +2256,7 @@ class AssetIndex:
                     expected_uuid,
                     path_identity,
                     self._read_project_runtime(
-                        path, expected_uuid
+                        path, expected_uuid, known_metadata=known_identity
                     ),
                 )
             )
@@ -2283,7 +2277,7 @@ class AssetIndex:
                     project.inspection_restored = False
                 else:
                     self._write_checks[path] = (path_identity, expected_uuid if kind == "AVAILABLE" else None)
-                    self._apply_runtime_result(project, kind, payload)
+                    self._apply_runtime_result(project, kind, payload, fallback_resolved=False)
                     changed = True
                 verified += 1
             if changed and not self.save():
@@ -2298,51 +2292,6 @@ class AssetIndex:
             projects = [project for project in projects if project.folder_id == folder_id]
         return projects
 
-    def reconcile_all(
-        self,
-        *,
-        progress: Optional[Callable[..., Any]] = None,
-        cancel_event: Optional[threading.Event] = None,
-    ) -> Dict[str, int]:
-        """Force-read every catalog path and reconcile one complete observation set."""
-        with self._lock:
-            projects = list(self._projects.values())
-        total = len(projects)
-        observations: List[AssetObservation] = []
-        for done, project in enumerate(projects):
-            if cancel_event is not None and cancel_event.is_set():
-                return {"cancelled": 1, "processed": done, "total": total}
-            path_identity = ProjectPathIdentity.capture(project.path)
-            kind, payload = self._read_project_runtime(
-                project.path, project.project_uuid, resolve_fallback=True
-            )
-            inspection = (
-                payload if kind == "AVAILABLE" else
-                payload.get("inspection") if kind == "IDENTITY_MISMATCH" and isinstance(payload, dict) else None
-            )
-            observations.append(
-                AssetObservation(
-                    path=project.path,
-                    folder_id=project.folder_id,
-                    inspection=inspection,
-                    error=str(payload or "") if inspection is None else "",
-                    stat_identity=_stat_identity(project.path) or project.stat_identity,
-                    path_identity=path_identity,
-                )
-            )
-            if progress is not None:
-                try:
-                    progress(done + 1, total, project.path)
-                except TypeError:
-                    try:
-                        progress({"done": done + 1, "total": total, "path": project.path})
-                    except TypeError:
-                        progress(done + 1)
-        result = self.reconcile_observations(
-            observations, folder_ids=self._folders.keys(), save=True
-        )
-        result.update({"processed": total, "total": total, "cancelled": 0})
-        return result
 
     @_synchronized
     def find_asset_by_path(
@@ -2401,35 +2350,15 @@ class LibraryService:
     def snapshot(self) -> Dict[str, Any]:
         return self.index.snapshot()
 
-    def register(self, *args: Any, **kwargs: Any) -> Any:
-        return self._call("register_licht_asset", *args, **kwargs)
-
-    def verify(self, *args: Any, **kwargs: Any) -> Any:
-        return self._call("verify_asset", *args, **kwargs)
 
     def list_projects(self) -> List[Project]:
         return self._call("list_projects")
 
-    def verify_projects_batch(self, asset_ids: List[str]) -> int:
-        return self._call("verify_projects_batch", asset_ids)
+    def verify_projects_batch(
+        self, asset_ids: List[str], *, cancel_event: Optional[threading.Event] = None
+    ) -> int:
+        return self._call("verify_projects_batch", asset_ids, cancel_event=cancel_event)
 
-    def relink(self, *args: Any, **kwargs: Any) -> Any:
-        return self._call("relink_asset", *args, **kwargs)
-
-    def delete(self, *args: Any, **kwargs: Any) -> Any:
-        return self._call("delete_asset", *args, **kwargs)
-
-    def add_folder(self, *args: Any, **kwargs: Any) -> Any:
-        return self._call("add_folder", *args, **kwargs)
-
-    def remove_folder(self, *args: Any, **kwargs: Any) -> Any:
-        return self._call("delete_folder", *args, **kwargs)
-
-    def clean_missing(self, *args: Any, **kwargs: Any) -> Any:
-        return self._call("clean_missing_entries", *args, **kwargs)
-
-    def reconcile(self, *args: Any, **kwargs: Any) -> Any:
-        return self._call("reconcile_all", *args, **kwargs)
 
     def scan(self, *args: Any, **kwargs: Any) -> Any:
         if self._closed:

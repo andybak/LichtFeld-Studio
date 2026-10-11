@@ -92,16 +92,6 @@ namespace lfs::python {
             });
         }
 
-        void do_psnr(float psnr) {
-            if (!g_initialized) {
-                return;
-            }
-
-            nb::gil_scoped_acquire gil;
-
-            set_signal_value("psnr", psnr);
-        }
-
         void do_scene(bool has_scene, const char* path) {
             if (!g_initialized) {
                 return;
@@ -185,12 +175,9 @@ namespace lfs::python {
                 callbacks.training_progress = do_training_progress;
                 callbacks.training_state = do_training_state;
                 callbacks.trainer_loaded = do_trainer_loaded;
-                callbacks.psnr = do_psnr;
                 callbacks.scene = do_scene;
                 callbacks.selection = do_selection;
                 set_signal_bridge_callbacks(callbacks);
-
-                LOG_INFO("Signal bridge initialized");
             } catch (const std::exception& e) {
                 LOG_ERROR("Failed to initialize signal bridge: {}", e.what());
                 g_initialized = false;
@@ -218,7 +205,6 @@ namespace lfs::python {
             g_app_state = nb::object();
             g_initialized = false;
             g_training = TrainingBuffer{};
-            LOG_INFO("Signal bridge shutdown");
         }
 
     } // namespace

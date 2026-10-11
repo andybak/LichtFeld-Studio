@@ -17,6 +17,7 @@ namespace lfs::vis::gui {
         constexpr float CENTER_HIT_RADIUS_PX = 12.0f;
         constexpr float PLANE_NEAR_PX = 24.0f;
         constexpr float PLANE_FAR_PX = 48.0f;
+        constexpr float PLANE_PROJECTED_AREA_EPSILON = 0.001f;
         constexpr float DELTA_EPSILON = 0.000001f;
 
         struct AxisVisual {
@@ -164,6 +165,16 @@ namespace lfs::vis::gui {
         }
 
         [[nodiscard]] bool pointInConvexQuad(const glm::vec2& p, const std::array<glm::vec2, 4>& quad) {
+            float twice_area = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                const glm::vec2 a = quad[static_cast<size_t>(i)];
+                const glm::vec2 b = quad[static_cast<size_t>((i + 1) % 4)];
+                twice_area += a.x * b.y - b.x * a.y;
+            }
+            if (std::abs(twice_area) <= PLANE_PROJECTED_AREA_EPSILON) {
+                return false;
+            }
+
             float sign = 0.0f;
             for (int i = 0; i < 4; ++i) {
                 const glm::vec2 a = quad[static_cast<size_t>(i)];
@@ -454,12 +465,6 @@ namespace lfs::vis::gui {
                 return TranslationGizmoHandle::View;
             }
 
-            for (const auto& plane : planes) {
-                if (plane.valid && pointInConvexQuad(mouse, plane.quad)) {
-                    return plane.plane.handle;
-                }
-            }
-
             float best_distance2 = std::numeric_limits<float>::max();
             TranslationGizmoHandle best_handle = TranslationGizmoHandle::None;
             for (const auto& axis : axes) {
@@ -473,7 +478,17 @@ namespace lfs::vis::gui {
                 }
             }
 
-            return best_distance2 <= axis_hit_threshold2 ? best_handle : TranslationGizmoHandle::None;
+            if (best_distance2 <= axis_hit_threshold2) {
+                return best_handle;
+            }
+
+            for (const auto& plane : planes) {
+                if (plane.valid && pointInConvexQuad(mouse, plane.quad)) {
+                    return plane.plane.handle;
+                }
+            }
+
+            return TranslationGizmoHandle::None;
         }
 
         [[nodiscard]] glm::vec3 translationForMouse(const TranslationGizmoConfig& config,
@@ -562,9 +577,10 @@ namespace lfs::vis::gui {
         }
     } // namespace
 
+    void beginTranslationGizmoFrame() { g_hovered = false; }
+
     TranslationGizmoResult drawTranslationGizmo(const TranslationGizmoConfig& config) {
         TranslationGizmoResult result;
-        g_hovered = false;
 
         if (!config.draw_list || config.viewport_size.x <= 1.0f || config.viewport_size.y <= 1.0f) {
             return result;
@@ -610,12 +626,10 @@ namespace lfs::vis::gui {
             hovered_handle = nearestHandle(projected_axes, projected_planes, mouse, pivot_screen);
         }
 
-        if (g_active.active && g_active.id == config.id) {
-            result.active = config.input.mouse_left_down;
-            if (!result.active) {
-                g_active = ActiveState{};
-            }
-        }
+        const bool release_active_drag =
+            g_active.active && g_active.id == config.id && !config.input.mouse_left_down;
+        if (g_active.active && g_active.id == config.id)
+            result.active = true;
 
         if (!g_active.active && config.input_enabled &&
             hovered_handle != TranslationGizmoHandle::None &&
@@ -645,7 +659,6 @@ namespace lfs::vis::gui {
 
         result.hovered_handle = hovered_handle;
         result.hovered = hovered_handle != TranslationGizmoHandle::None;
-        g_hovered = result.hovered || result.active;
 
         const TranslationGizmoHandle emphasized = result.active ? g_active.handle : hovered_handle;
         for (const auto& plane : projected_planes) {
@@ -668,6 +681,14 @@ namespace lfs::vis::gui {
                                                center_active ? 5.5f : (center_hovered ? 5.0f : 4.2f),
                                                overlayColor(245, 248, 255, center_active ? 245 : 220), 24);
 
+        result.released = release_active_drag;
+        result.returned_to_start = release_active_drag && mouse == g_active.start_mouse;
+        if (release_active_drag)
+            result.active = false;
+        g_hovered |= result.hovered || result.active;
+        if (release_active_drag)
+            g_active = ActiveState{};
+
         return result;
     }
 
@@ -677,6 +698,11 @@ namespace lfs::vis::gui {
 
     bool isTranslationGizmoActive() {
         return g_active.active;
+    }
+
+    void cancelTranslationGizmoDrag() {
+        g_active = ActiveState{};
+        g_hovered = false;
     }
 
 } // namespace lfs::vis::gui

@@ -59,8 +59,10 @@ namespace lfs::io::project {
                 if (spaces == area.end() || !spaces->is_array())
                     continue;
                 for (auto& space : *spaces) {
-                    if (!space.is_object() ||
-                        space.value("type", std::string{}) != "fixed_arrangement")
+                    if (!space.is_object())
+                        continue;
+                    const auto type = space.value("type", std::string{});
+                    if (type != "fixed_arrangement" && type != "screen")
                         continue;
                     const auto payload = space.find("opaque_payload");
                     if (payload != space.end() && payload->is_object())
@@ -75,6 +77,7 @@ namespace lfs::io::project {
         Editor,
         View,
         Sequencer,
+        Nodes,
     };
 
     [[nodiscard]] LFS_IO_API JsonChapterDom
@@ -211,6 +214,9 @@ namespace lfs::io::project {
     using SequencerSessionChapter =
         BasicSessionJsonChapter<
             SessionJsonChapterKind::Sequencer>;
+    using NodesSessionChapter =
+        BasicSessionJsonChapter<
+            SessionJsonChapterKind::Nodes>;
 
     struct MetricHistorySample {
         std::int32_t iteration = 0;
@@ -272,6 +278,7 @@ namespace lfs::io::project {
         EditorSessionChapter editor;
         ViewSessionChapter view;
         SequencerSessionChapter sequencer;
+        NodesSessionChapter nodes;
         MetricsChapter metrics;
     };
 

@@ -47,8 +47,6 @@ namespace fast_lfs::optimizer {
         const float* mean_step_scale_raw = nullptr,
         int mean_step_scale_n = 0,
         float mean_step_median_extent = 0.0f,
-        float mean_step_r_min = 1.0f,
-        float mean_step_r_max = 300.0f,
         const bool* mean_step_far_mask = nullptr,
         int mean_step_far_mask_n = 0,
         const float* screen_share_max = nullptr,

@@ -10,6 +10,9 @@
 using namespace lfs::core;
 
 TEST(ViewerGpuMemory, VulkanStatusDoesNotRequireCudaOrReportDeviceUsageAsProcessUsage) {
+#ifdef __APPLE__
+    GTEST_SKIP() << "Apple GPUs report unified memory";
+#endif
     if (!gpu_backend_available(GpuBackend::Vulkan)) {
         GTEST_SKIP() << "Vulkan backend unavailable";
     }
@@ -64,3 +67,40 @@ TEST(ViewerGpuMemory, UnavailableCudaProducesUnknownStatusWithoutThrowing) {
     EXPECT_EQ(status.total_used, 0u);
     EXPECT_FALSE(status.gpu_utilization_valid);
 }
+
+#ifdef __APPLE__
+TEST(ViewerGpuMemory, AppleStatusUsesAvailableTelemetryOrBackendBudget) {
+    const auto backend = default_gpu_backend();
+    if (!gpu_backend_available(backend)) {
+        GTEST_SKIP() << "GPU backend unavailable";
+    }
+    const GpuBackendScope scope(backend);
+    const auto resident = Tensor::zeros({1 << 20}, Device::GPU);
+    const auto device = gpu_backend_device_info(backend);
+    ASSERT_TRUE(device);
+    const auto status = lfs::vis::gui::queryGpuMemory(backend);
+    EXPECT_FALSE(status.device_name.empty());
+    if (!status.unified_memory) {
+        // Virtualized macOS can expose Metal/MoltenVK without IOKit accelerator statistics.
+        EXPECT_TRUE(status.uses_process_budget);
+        EXPECT_EQ(status.total, device->total_memory_bytes);
+        EXPECT_EQ(status.process_used, 0u);
+        EXPECT_FALSE(status.process_valid);
+        EXPECT_EQ(status.total_used, 0u);
+        EXPECT_FALSE(status.gpu_utilization_valid);
+        EXPECT_LT(status.gpu_utilization_percent, 0.0f);
+        EXPECT_EQ(status.process_budget, device->supports_process_memory_budget ? device->process_memory_budget_bytes : 0u);
+        EXPECT_EQ(status.process_budget_used, device->supports_process_memory_budget ? device->process_memory_used_bytes : 0u);
+        return;
+    }
+    EXPECT_FALSE(status.uses_process_budget);
+    EXPECT_EQ(status.total, device->process_memory_budget_bytes);
+    EXPECT_GT(status.process_used, 0u);
+    EXPECT_GE(status.total_used, status.process_used);
+    EXPECT_LE(status.total_used, status.total);
+    ASSERT_TRUE(status.gpu_utilization_valid);
+    EXPECT_GE(status.gpu_utilization_percent, 0.0f);
+    EXPECT_LE(status.gpu_utilization_percent, 100.0f);
+    EXPECT_GE(lfs::vis::gui::queryGpuUtilization(), 0.0f);
+}
+#endif

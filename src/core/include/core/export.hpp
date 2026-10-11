@@ -9,6 +9,10 @@
 // cross a DLL boundary and must not import or export those module interfaces.
 #ifdef LFS_STATIC_BUILD
 #define LFS_LOGGER_API
+#define LFS_ERROR_API
+#define LFS_IMAGE_CODECS_API
+#define LFS_FILE_IO_API
+#define LFS_MEDIA_API
 #define LFS_CORE_API
 #define LFS_VIS_API
 #define LFS_MCP_API
@@ -17,6 +21,26 @@
 #define LFS_LOGGER_API __declspec(dllexport)
 #else
 #define LFS_LOGGER_API __declspec(dllimport)
+#endif
+#ifdef LFS_ERROR_EXPORTS
+#define LFS_ERROR_API __declspec(dllexport)
+#else
+#define LFS_ERROR_API __declspec(dllimport)
+#endif
+#ifdef LFS_FILE_IO_EXPORTS
+#define LFS_FILE_IO_API __declspec(dllexport)
+#else
+#define LFS_FILE_IO_API __declspec(dllimport)
+#endif
+#ifdef LFS_IMAGE_CODECS_EXPORTS
+#define LFS_IMAGE_CODECS_API __declspec(dllexport)
+#else
+#define LFS_IMAGE_CODECS_API __declspec(dllimport)
+#endif
+#ifdef LFS_MEDIA_EXPORTS
+#define LFS_MEDIA_API __declspec(dllexport)
+#else
+#define LFS_MEDIA_API __declspec(dllimport)
 #endif
 #ifdef LFS_CORE_EXPORTS
 #define LFS_CORE_API __declspec(dllexport)
@@ -39,13 +63,17 @@
 // Empty on Windows like LFS_IO_API; visibility default on ELF.
 #define LFS_RENDERING_API
 #else
-#define LFS_LOCAL_SYMBOL  __attribute__((visibility("hidden")))
-#define LFS_LOGGER_API    __attribute__((visibility("default")))
-#define LFS_CORE_API      __attribute__((visibility("default")))
-#define LFS_IO_API        __attribute__((visibility("default")))
-#define LFS_VIS_API       __attribute__((visibility("default")))
-#define LFS_MCP_API       __attribute__((visibility("default")))
-#define LFS_RENDERING_API __attribute__((visibility("default")))
+#define LFS_LOCAL_SYMBOL     __attribute__((visibility("hidden")))
+#define LFS_LOGGER_API       __attribute__((visibility("default")))
+#define LFS_ERROR_API        __attribute__((visibility("default")))
+#define LFS_FILE_IO_API      __attribute__((visibility("default")))
+#define LFS_IMAGE_CODECS_API __attribute__((visibility("default")))
+#define LFS_MEDIA_API        __attribute__((visibility("default")))
+#define LFS_CORE_API         __attribute__((visibility("default")))
+#define LFS_IO_API           __attribute__((visibility("default")))
+#define LFS_VIS_API          __attribute__((visibility("default")))
+#define LFS_MCP_API          __attribute__((visibility("default")))
+#define LFS_RENDERING_API    __attribute__((visibility("default")))
 #endif
 
 // For functions in CUDA static libs (lfs_core_cuda) that are resolved directly

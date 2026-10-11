@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include "core/export.hpp"
+
+#include "input/frame_input_buffer.hpp"
+
 #include "gui/rmlui/rml_tooltip.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "gui/sequencer_ui_state.hpp"
@@ -13,6 +17,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace Rml {
@@ -51,25 +56,16 @@ namespace lfs::vis {
         bool want_capture_mouse = false;
         int screen_w = 0;
         int screen_h = 0;
+        std::vector<FrameInputEvent> input_events;
         std::vector<int> keys_pressed;
-        std::vector<int> keys_released;
-        std::vector<uint32_t> text_codepoints;
-        std::vector<std::string> text_inputs;
-        std::string text_editing;
-        int text_editing_start = -1;
-        int text_editing_length = -1;
-        bool has_text_editing = false;
     };
 
     namespace panel_config {
         inline constexpr float TRANSPORT_ROW_HEIGHT = 36.0f;
         inline constexpr float HEIGHT = 108.0f;
-        inline constexpr float PADDING_H = 16.0f;
-        inline constexpr float PADDING_BOTTOM = 18.0f;
         inline constexpr float INNER_PADDING = 8.0f;
         inline constexpr float INNER_PADDING_H = 16.0f;
         inline constexpr float RULER_HEIGHT = 16.0f;
-        inline constexpr float TIMELINE_HEIGHT = 24.0f;
         inline constexpr float KEYFRAME_RADIUS = 6.0f;
         inline constexpr float PLAYHEAD_WIDTH = 2.0f;
         // Drawn #playhead-handle is a 14dp circle; X-clamp span must match so the
@@ -77,8 +73,6 @@ namespace lfs::vis {
         inline constexpr float PLAYHEAD_HANDLE_WIDTH = 14.0f;
         inline constexpr float PLAYHEAD_HIT_RADIUS = 8.0f;
         inline constexpr float SCROLLBAR_HEIGHT = 6.0f;
-        inline constexpr float BUTTON_SIZE = 20.0f;
-        inline constexpr float BUTTON_SPACING = 4.0f;
 
         inline constexpr float MIN_ZOOM = 0.5f;
         inline constexpr float MAX_ZOOM = 4.0f;
@@ -120,7 +114,7 @@ namespace lfs::vis {
     public:
         RmlSequencerPanel(SequencerController& controller, gui::panels::SequencerUIState& ui_state,
                           gui::RmlUIManager* rml_manager);
-        ~RmlSequencerPanel();
+        LFS_VIS_API ~RmlSequencerPanel();
 
         RmlSequencerPanel(const RmlSequencerPanel&) = delete;
         RmlSequencerPanel& operator=(const RmlSequencerPanel&) = delete;
@@ -165,11 +159,16 @@ namespace lfs::vis {
         void reloadResources();
 
     private:
+        friend class SequencerMarkupRegressionTest;
+
+        friend class SequencerRulerRegressionTest;
         void initContext(int width, int height);
 
         void syncTheme();
 
         void clearElementCache();
+        void setTimelineMarkup(Rml::Element* element, std::string markup);
+        std::unordered_map<Rml::Element*, std::string> timeline_markup_;
         void cacheElements();
         void updateButtonStates();
         void updatePlayhead();
@@ -323,7 +322,7 @@ namespace lfs::vis {
 
         Rml::Context* rml_context_ = nullptr;
         Rml::ElementDocument* document_ = nullptr;
-        gui::CachedVulkanContextRender direct_cache_;
+        gui::CachedUiContextRender direct_cache_;
         std::optional<RenderSignature> last_render_signature_;
         bool direct_cache_dirty_ = true;
         std::string base_rcss_;
@@ -414,6 +413,7 @@ namespace lfs::vis {
         float last_ruler_zoom_ = -1.0f;
         float last_ruler_pan_ = -1.0f;
         float last_ruler_width_ = -1.0f;
+        float last_ruler_dp_ratio_ = -1.0f;
         float last_ruler_display_end_ = -1.0f;
         uint64_t last_timeline_revision_ = 0;
         uint64_t last_selection_revision_ = 0;

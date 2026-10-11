@@ -6,6 +6,7 @@
 #include "core/image_io.hpp"
 #include "core/logger.hpp"
 #include "core/path_utils.hpp"
+#include "core/shared_image_ops.hpp"
 #include "io/pipelined_image_loader.hpp"
 
 #include <stb_image.h>
@@ -46,6 +47,25 @@ namespace lfs::io {
                                                std::shared_ptr<void>(data, release));
         }
 
+        // Takes ownership of decoded interleaved 8-bit samples and returns them
+        // planar, so the device copy needs no transpose.
+        Tensor host_uint8_planar(void* const data, const int height, const int width, const int channels,
+                                 const ReleaseFn release) {
+            const std::unique_ptr<void, ReleaseFn> owner(data, release);
+            const size_t pixels = static_cast<size_t>(height) * static_cast<size_t>(width);
+            const auto c = static_cast<size_t>(channels);
+            auto planar = Tensor::empty_pageable_host(
+                TensorShape({c, static_cast<size_t>(height), static_cast<size_t>(width)}), DataType::UInt8);
+            const auto* const src = static_cast<const uint8_t*>(data);
+            auto* const dst = planar.ptr<uint8_t>();
+            for (size_t ch = 0; ch < c; ++ch) {
+                uint8_t* const plane = dst + ch * pixels;
+                for (size_t i = 0; i < pixels; ++i)
+                    plane[i] = src[i * c + ch];
+            }
+            return planar;
+        }
+
         // 16-bit samples have no tensor dtype; Int32 holds them exactly.
         Tensor host_uint16(void* const data, TensorShape shape, const ReleaseFn release) {
             const std::unique_ptr<void, ReleaseFn> owner(data, release);
@@ -59,6 +79,8 @@ namespace lfs::io {
             upload.wait();
             auto device = Tensor::empty(host.shape(), Device::GPU, host.dtype());
             upload.enqueue(device, host);
+            // The upload retains its source; GPU consumers follow the
+            // destination timeline without blocking this decode worker.
             return device;
         }
 
@@ -68,13 +90,13 @@ namespace lfs::io {
 
         lfs::core::UndistortParams undistort_for(const lfs::core::UndistortParams& params,
                                                  const Tensor& image,
-                                                 const int max_width) {
+                                                 const int resize_factor, const int max_width) {
             const size_t rank = image.ndim();
-            return lfs::core::scale_undistort_params(
+            return lfs::core::prepare_undistort_params(
                 params,
                 static_cast<int>(image.shape()[rank - 1]),
                 static_cast<int>(image.shape()[rank - 2]),
-                max_width);
+                resize_factor, max_width);
         }
 
         // Inversion precedes binarization; threshold compares with >=.
@@ -88,27 +110,23 @@ namespace lfs::io {
 
         std::pair<Tensor, Tensor> decode_rgba(const std::filesystem::path& path,
                                               const LoadParams& params,
-                                              lfs::core::TensorUpload& upload) {
-            auto [data, width, height, channels] =
-                lfs::core::load_image_with_alpha(path, params.resize_factor, params.max_width);
-            if (!data || channels != 4)
-                throw std::runtime_error("Failed to load RGBA image");
-            const auto rgba = to_device(upload, host_uint8(data, image_shape(height, width, 4),
-                                                           lfs::core::free_image));
-
-            Tensor rgb = rgba.slice(2, 0, 3).permute({2, 0, 1});
-            if (!params.output_uint8)
-                rgb = rgb.to(DataType::Float32).mul(UINT8_SCALE);
-            Tensor alpha = rgba.slice(2, 3, 4).squeeze(2).to(DataType::Float32).mul(UINT8_SCALE);
+                                              const bool decode_16bit) {
+            const auto rgba = load_rgba_image_cpu_decoded(path, params.undistort ? 1 : params.resize_factor,
+                                                          params.undistort ? 0 : params.max_width, nullptr, decode_16bit);
+            Tensor rgb = rgba.slice(0, 0, 3).contiguous();
+            if (params.output_uint8)
+                rgb = float_to_uint8(rgb);
+            Tensor alpha = rgba.slice(0, 3, 4).squeeze(0).contiguous();
             if (params.undistort) {
                 if (params.output_uint8)
                     rgb = rgb.to(DataType::Float32).div(255.0f);
-                const auto scaled = undistort_for(*params.undistort, alpha, params.max_width);
+                const auto scaled = undistort_for(*params.undistort, alpha, params.resize_factor, params.max_width);
                 rgb = lfs::core::undistort_image(rgb.contiguous(), scaled, nullptr);
                 alpha = lfs::core::undistort_mask(alpha.contiguous(), scaled, nullptr);
                 if (params.output_uint8)
                     rgb = float_to_uint8(rgb);
             }
+            alpha = alpha.clamp(0.0f, 1.0f).mul(65535.0f).add(0.5f).to(DataType::Int32).to(DataType::Float32).div(65535.0f);
             return {rgb.contiguous(), alpha};
         }
 
@@ -147,51 +165,91 @@ namespace lfs::io {
     lfs::core::Tensor PipelinedImageLoader::decode_portable_rgb(
         const std::filesystem::path& path,
         const LoadParams& params,
-        lfs::core::TensorUpload& upload) const {
+        lfs::core::TensorUpload& upload,
+        const std::vector<uint8_t>* const encoded) const {
+        // Like the CUDA path, only encoded bytes are cached; every request
+        // decodes, and every consumer gets a new asynchronously uploaded image.
         {
-            std::lock_guard<std::mutex> stats_lock(stats_mutex_);
+            std::lock_guard stats_lock(stats_mutex_);
             ++stats_.cpu_decode_calls;
         }
-
-        Tensor image;
-        if (config_.use_16bit_color) {
-            auto [data, width, height, channels] =
-                lfs::core::load_image_u16(path, params.resize_factor, params.max_width);
+        const bool float_decode = decodes_float(path, params);
+        if (!params.undistort && !float_decode && !encoded)
+            return load_rgb_decoded_ahead(path, params, decodes_16bit(params));
+        Tensor host;
+        if (params.undistort || float_decode) {
+            auto ahead = take_decoded_ahead(path, HostDecodeKind::Float32);
+            auto [data, width, height, channels] = ahead
+                                                       ? std::tuple{static_cast<float*>(ahead->data.release()), ahead->width, ahead->height, ahead->channels}
+                                                       : lfs::core::load_image_float(path);
             if (!data)
                 throw std::runtime_error("Failed to decode image: " + lfs::core::path_to_utf8(path));
-            image = to_device(upload, host_uint16(data, image_shape(height, width, channels),
-                                                  lfs::core::free_image))
-                        .permute({2, 0, 1})
-                        .to(DataType::Float32)
-                        .mul(UINT16_SCALE);
-            if (params.output_uint8)
-                image = float_to_uint8(image);
+            const std::unique_ptr<float, decltype(&lfs::core::free_image_float)> owner(data, lfs::core::free_image_float);
+            host = Tensor::from_blob(data, {static_cast<size_t>(height), static_cast<size_t>(width), static_cast<size_t>(channels)}, lfs::core::Device::CPU, DataType::Float32).clone();
+            if (channels <= 2) {
+                auto gray = host.slice(2, 0, 1);
+                host = Tensor::cat({gray, gray, gray}, 2);
+            } else if (channels == 4) {
+                host = host.slice(2, 0, 3);
+            }
+            host = host.permute({2, 0, 1}).contiguous();
+        } else if (decodes_16bit(params)) {
+            auto [data, width, height, channels] = lfs::core::load_image_u16(path, params.resize_factor, params.max_width);
+            if (!data)
+                throw std::runtime_error("Failed to decode image: " + lfs::core::path_to_utf8(path));
+            host = host_uint16(data, image_shape(height, width, channels), lfs::core::free_image)
+                       .permute({2, 0, 1})
+                       .contiguous();
         } else {
             auto [data, width, height, channels] =
-                lfs::core::load_image(path, params.resize_factor, params.max_width);
+                encoded != nullptr
+                    ? lfs::core::load_image_from_memory(encoded->data(), encoded->size(), params.resize_factor,
+                                                        params.max_width)
+                    : lfs::core::load_image(path, params.resize_factor, params.max_width);
             if (!data)
                 throw std::runtime_error("Failed to decode image: " + lfs::core::path_to_utf8(path));
-            image = to_device(upload, host_uint8(data, image_shape(height, width, channels),
-                                                 lfs::core::free_image))
-                        .permute({2, 0, 1});
-            if (!params.output_uint8)
-                image = image.to(DataType::Float32).mul(UINT8_SCALE);
+            // Planar bytes avoid a second device image and a per-step GPU transpose.
+            host = host_uint8_planar(data, height, width, channels, lfs::core::free_image);
+        }
+        Tensor image = to_device(upload, host);
+        if (!params.undistort && float_decode) {
+            const auto [target_width, target_height] = lfs::core::resized_image_dimensions(static_cast<int>(image.shape()[2]), static_cast<int>(image.shape()[1]), params.resize_factor, params.max_width);
+            if (target_width != static_cast<int>(image.shape()[2]) || target_height != static_cast<int>(image.shape()[1]))
+                image = lfs::core::shared_image_ops(config_.backend)->resize(image, target_height, target_width, lfs::gpu_ops::Resample::LanczosFloatCHW, 2);
+            if (params.output_uint8)
+                image = float_to_uint8(image);
+        } else if (!params.undistort && decodes_16bit(params)) {
+            image = image.to(DataType::Float32).mul(UINT16_SCALE);
+            if (params.output_uint8)
+                image = float_to_uint8(image);
+        } else if (!params.undistort && !params.output_uint8) {
+            image = image.to(DataType::Float32).mul(UINT8_SCALE);
         }
 
         if (params.undistort) {
-            const bool restore_uint8 = image.dtype() == DataType::UInt8;
-            if (restore_uint8)
+            const bool restore_uint8 = params.output_uint8;
+            if (image.dtype() == DataType::UInt8)
                 image = image.to(DataType::Float32).div(255.0f);
             image = lfs::core::undistort_image(
-                image.contiguous(), undistort_for(*params.undistort, image, params.max_width), nullptr);
+                image.contiguous(), undistort_for(*params.undistort, image, params.resize_factor, params.max_width), nullptr);
             if (restore_uint8)
                 image = float_to_uint8(image);
+            else if (!params.decode_float)
+                image = image.clamp(0.0f, 1.0f).mul(65535.0f).add(0.5f).to(DataType::Int32).to(DataType::Float32).div(65535.0f);
         }
         return image.contiguous();
     }
 
     void PipelinedImageLoader::portable_process_thread_func() {
         const lfs::core::GpuBackendScope backend(config_.backend);
+        // A worker upload must not order unrelated prefetched images against
+        // the legacy training queue. Consumers follow each image storage fence.
+        std::unique_ptr<lfs::core::TensorWorkQueue> queue;
+        std::unique_ptr<lfs::core::TensorWorkQueue::Scope> queue_scope;
+        if (config_.backend == lfs::core::GpuBackend::Vulkan) {
+            queue = std::make_unique<lfs::core::TensorWorkQueue>(config_.backend);
+            queue_scope = std::make_unique<lfs::core::TensorWorkQueue::Scope>(*queue);
+        }
         lfs::core::TensorUpload upload;
         while (running_) {
             PrefetchedImage item;
@@ -217,7 +275,7 @@ namespace lfs::io {
                             }
                         }
                         try_complete_pair(item.sequence_id, item.loader_generation, std::move(image),
-                                          std::nullopt, nullptr);
+                                          std::nullopt);
                     } catch (const std::exception& e) {
                         LOG_ERROR("[PipelinedImageLoader] RGB fallback also failed {}: {}",
                                   lfs::core::path_to_utf8(item.path), e.what());
@@ -241,9 +299,9 @@ namespace lfs::io {
 
             try {
                 if (item.alpha_as_mask) {
-                    auto [rgb, alpha] = decode_rgba(item.path, params, upload);
+                    auto [rgb, alpha] = decode_rgba(item.path, params, config_.use_16bit_color);
                     try_complete_pair(item.sequence_id, item.loader_generation, std::move(rgb),
-                                      finish_mask(std::move(alpha), item.alpha_mask_params), nullptr);
+                                      finish_mask(std::move(alpha), item.alpha_mask_params));
                 } else if (item.is_mask) {
                     int width = 0, height = 0, channels = 0;
                     stbi_uc* const gray = stbi_load(lfs::core::path_to_utf8(item.path).c_str(),
@@ -268,10 +326,10 @@ namespace lfs::io {
                     }
                     if (item.undistort) {
                         mask = lfs::core::undistort_mask(
-                            mask.contiguous(), undistort_for(*item.undistort, mask, params.max_width), nullptr);
+                            mask.contiguous(), undistort_for(*item.undistort, mask, params.resize_factor, params.max_width), nullptr);
                     }
                     try_complete_pair(item.sequence_id, item.loader_generation, std::nullopt,
-                                      finish_mask(std::move(mask), item.mask_params), nullptr);
+                                      finish_mask(std::move(mask), item.mask_params));
                 } else if (item.is_depth || item.is_normal) {
                     const std::string path_utf8 = lfs::core::path_to_utf8(item.path);
                     const int channels = item.is_depth ? 1 : 3;
@@ -309,12 +367,11 @@ namespace lfs::io {
                     };
                     prior = resize_prior(prior, target_h, target_w);
                     if (item.undistort) {
-                        const auto scaled = undistort_for(*item.undistort, prior, params.max_width);
+                        const auto scaled = undistort_for(*item.undistort, prior, params.resize_factor, params.max_width);
                         if (item.is_depth) {
-                            prior = lfs::core::undistort_mask(prior, scaled, nullptr);
+                            prior = lfs::core::undistort_depth_area(prior, scaled, nullptr);
                         } else {
-                            prior = lfs::core::undistort_image(prior, scaled, nullptr);
-                            prior = resize_prior(prior, static_cast<int>(prior.shape()[1]), static_cast<int>(prior.shape()[2]));
+                            prior = lfs::core::undistort_normal_area(prior, scaled, nullptr);
                         }
                     }
                     const size_t rank = prior.ndim();
@@ -326,15 +383,15 @@ namespace lfs::io {
                     prior = prior.contiguous();
                     if (item.is_depth) {
                         try_complete_pair(item.sequence_id, item.loader_generation, std::nullopt,
-                                          std::nullopt, nullptr, std::move(prior));
+                                          std::nullopt, std::move(prior));
                     } else {
                         try_complete_pair(item.sequence_id, item.loader_generation, std::nullopt,
-                                          std::nullopt, nullptr, std::nullopt, std::move(prior));
+                                          std::nullopt, std::nullopt, std::move(prior));
                     }
                 } else {
-                    auto image = decode_portable_rgb(item.path, params, upload);
+                    auto image = decode_portable_rgb(item.path, params, upload, item.jpeg_data.get());
                     try_complete_pair(item.sequence_id, item.loader_generation, std::move(image),
-                                      std::nullopt, nullptr);
+                                      std::nullopt);
                 }
             } catch (const std::exception& e) {
                 LOG_WARN("[PipelinedImageLoader] Host processing failed {}: {}",

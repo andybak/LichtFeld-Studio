@@ -1,6 +1,7 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include "ssog.hpp"
+#include "core/file_extensions.hpp"
 #include "core/logger.hpp"
 #include "core/tensor_backend.hpp"
 #include "io/atomic_output.hpp"
@@ -17,8 +18,13 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstring>
+#include <deque>
 #include <external/fast_float/include/fast_float/fast_float.h>
+#include <format>
 #include <fstream>
+#include <future>
+#include <list>
 #include <map>
 #include <mutex>
 #include <nlohmann/json.hpp>
@@ -28,6 +34,7 @@
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_invoke.h>
 #include <thread>
+#include <zlib.h>
 #ifdef _WIN32
 #include <process.h>
 #else
@@ -41,13 +48,15 @@ namespace lfs::io {
         using core::Device;
         using core::Tensor;
         using Clock = std::chrono::steady_clock;
+        // The streamed-SOG spec fixes the root manifest name.
+        constexpr std::string_view SSOG_MANIFEST = "lod-meta.json";
         struct Cancelled {};
         void progress(const SsogSaveOptions& o, float p, const std::string& stage) {
             if (o.progress_callback && !o.progress_callback(p, stage))
                 throw Cancelled{};
         }
         fs::path manifest_path(const fs::path& p) {
-            return fs::is_directory(p) ? p / "lod-meta.json" : p;
+            return fs::is_directory(p) ? p / SSOG_MANIFEST : p;
         }
         size_t integer(const Json& j, const char* name) {
             if (!j.is_number_integer() || j.get<double>() < 0 ||
@@ -123,7 +132,7 @@ namespace lfs::io {
                 std::vector<uint8_t> bytes(static_cast<size_t>(size));
                 if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size)))
                     throw std::runtime_error("Cannot read complete SSOG archive");
-                read_archive(bytes, "lod-meta.json");
+                read_archive(bytes, std::string(SSOG_MANIFEST));
             }
 
             EntryProvider(const std::vector<uint8_t>& bytes, const std::string& manifest, uint64_t expansion_limit)
@@ -172,9 +181,13 @@ namespace lfs::io {
                     lfs::io::detail::ascii_lower_inplace(extension);
                     // A bundled unit contains several textures and uses the
                     // archive allowance, rather than a single image's limit.
-                    const uint64_t limit = extension == ".json"  ? MAX_METADATA_BYTES
-                                           : extension == ".sog" ? MAX_ARCHIVE_BYTES
-                                                                 : MAX_ENCODED_IMAGE_BYTES;
+                    // A streamed-SOG manifest scales with leaf count; a unit's
+                    // meta.json (nested SOG archives) does not.
+                    const bool is_ssog_manifest = manifest == SSOG_MANIFEST && basename == manifest;
+                    const uint64_t limit = is_ssog_manifest       ? MAX_SSOG_MANIFEST_BYTES
+                                           : extension == ".json" ? MAX_METADATA_BYTES
+                                           : extension == ".sog"  ? MAX_ARCHIVE_BYTES
+                                                                  : MAX_ENCODED_IMAGE_BYTES;
                     if (!archive_entry_size_is_set(entry) || n < 0 || (n == 0 && !is_license) || uint64_t(n) > limit || uint64_t(n) > expansion_limit_ - total)
                         throw std::runtime_error("SSOG archive entry exceeds size limit");
                     total += uint64_t(n);
@@ -244,8 +257,8 @@ namespace lfs::io {
                     return data;
                 } catch (const std::exception& e) { return make_error(ErrorCode::READ_FAILURE, e.what()); }
             }
-            Json json(const std::string& name) const {
-                auto bytes = read(name, MAX_METADATA_BYTES);
+            Json json(const std::string& name, const size_t limit = MAX_METADATA_BYTES) const {
+                auto bytes = read(name, limit);
                 if (!bytes)
                     throw std::runtime_error(bytes.error().message);
                 return Json::parse(bytes->begin(), bytes->end());
@@ -290,10 +303,23 @@ namespace lfs::io {
             Json json;
             std::shared_ptr<EntryProvider> entries;
             std::vector<std::map<size_t, size_t>> files;
+            std::vector<int> sh_degrees; // per unit file
         };
+        // SH degree a SOG unit's meta.json declares (bands, or the coefficient count).
+        int unit_sh_degree(const Json& meta) {
+            if (!meta.is_object() || !meta.contains("shN"))
+                return 0;
+            const auto& shN = meta["shN"];
+            if (shN.contains("bands") && shN["bands"].is_number_integer())
+                return std::clamp(shN["bands"].get<int>(), 0, 3);
+            const int coeffs = shN.value("coeffs", 0);
+            return coeffs >= 15 ? 3 : coeffs >= 8 ? 2
+                                  : coeffs >= 3   ? 1
+                                                  : 0;
+        }
         Manifest parse_manifest(const fs::path& path) {
             auto entries = std::make_shared<EntryProvider>(path);
-            Manifest m{entries->json("lod-meta.json"), entries, {}};
+            Manifest m{entries->json(std::string(SSOG_MANIFEST), MAX_SSOG_MANIFEST_BYTES), entries, {}};
             const auto& j = m.json;
             if (!j.is_object())
                 throw std::runtime_error("Invalid lod-meta.json object");
@@ -310,7 +336,9 @@ namespace lfs::io {
                 const auto unit = core::utf8_to_path(name.get<std::string>()).lexically_normal();
                 if (!unique.insert(unit).second)
                     throw std::runtime_error("Duplicate SOG unit filename");
-                unit_counts.push_back(integer(m.entries->unit_metadata(unit.generic_string()).at("count"), "unit count"));
+                const auto meta = m.entries->unit_metadata(unit.generic_string());
+                unit_counts.push_back(integer(meta.at("count"), "unit count"));
+                m.sh_degrees.push_back(unit_sh_degree(meta));
             }
             m.files.resize(levels);
             std::vector<size_t> counts(levels);
@@ -407,26 +435,26 @@ namespace lfs::io {
             explicit HostSplats(const SplatData& s, bool resident = false)
                 : degree(s.get_max_sh_degree()), scale(s.get_scene_scale()), means(s.means().to_pageable_host()), sh0(resident ? Tensor{} : s.sh0().to_pageable_host()), shN(resident ? Tensor{} : s.shN_canonical_cpu()), scaling(s.scaling_raw().to_pageable_host()), rotation(s.rotation_raw().to_pageable_host()), opacity(resident ? Tensor{} : s.opacity_raw().to_pageable_host()) {
                 if (resident) {
-                    const auto borrow_cuda = [](const Tensor& t) {
-                        return t.device() == Device::CUDA ? t : t.cuda();
+                    const auto borrow_gpu = [](const Tensor& t) {
+                        return t.device() == Device::GPU ? t : t.gpu();
                     };
-                    device_means = borrow_cuda(s.means());
-                    device_sh0 = borrow_cuda(s.sh0());
-                    device_shN = borrow_cuda(s.shN_canonical());
-                    device_scaling = borrow_cuda(s.scaling_raw());
-                    device_rotation = borrow_cuda(s.rotation_raw());
-                    device_opacity = borrow_cuda(s.opacity_raw());
+                    device_means = borrow_gpu(s.means());
+                    device_sh0 = borrow_gpu(s.sh0());
+                    device_shN = borrow_gpu(s.shN_canonical());
+                    device_scaling = borrow_gpu(s.scaling_raw());
+                    device_rotation = borrow_gpu(s.rotation_raw());
+                    device_opacity = borrow_gpu(s.opacity_raw());
                 }
             }
             HostSplats() = default;
             SplatData materialize(const std::vector<int>& rows) const {
                 const bool resident = device_means.is_valid();
-                const auto indices = Tensor::from_vector(rows, {rows.size()}, resident ? Device::CUDA : Device::CPU);
+                const auto indices = Tensor::from_vector(rows, {rows.size()}, resident ? Device::GPU : Device::CPU);
                 const auto gather = [&](const Tensor& host, const Tensor& device) {
                     auto selected = (resident ? device : host).index_select(0, indices);
-                    return resident ? selected : selected.cuda();
+                    return resident ? selected : selected.gpu();
                 };
-                auto rest = degree ? gather(shN, device_shN) : Tensor::empty({rows.size(), 0, 3}, Device::CUDA);
+                auto rest = degree ? gather(shN, device_shN) : Tensor::empty({rows.size(), 0, 3}, Device::GPU);
                 return SplatData(degree, gather(means, device_means), gather(sh0, device_sh0), std::move(rest), gather(scaling, device_scaling), gather(rotation, device_rotation), gather(opacity, device_opacity), scale);
             }
             void filter(const Tensor& keep) {
@@ -436,7 +464,7 @@ namespace lfs::io {
                 if (degree && shN.is_valid())
                     shN = shN.index_select(0, keep);
                 if (device_means.is_valid()) {
-                    const auto ids = keep.cuda();
+                    const auto ids = keep.gpu();
                     for (auto* t : {&device_means, &device_sh0, &device_scaling, &device_rotation, &device_opacity})
                         *t = t->index_select(0, ids);
                     if (degree)
@@ -471,8 +499,8 @@ namespace lfs::io {
                 offset += p.size();
             }
             if (!count)
-                return SplatData(0, Tensor::empty({0, 3}, Device::CUDA), Tensor::empty({0, 1, 3}, Device::CUDA), Tensor::empty({0, 0, 3}, Device::CUDA), Tensor::empty({0, 3}, Device::CUDA), Tensor::empty({0, 4}, Device::CUDA), Tensor::empty({0, 1}, Device::CUDA), 1);
-            return SplatData(degree, Tensor::cat(means).cuda(), Tensor::cat(sh0).cuda(), shN.cuda(), Tensor::cat(scaling).cuda(), Tensor::cat(rotation).cuda(), Tensor::cat(opacity).cuda(), 1);
+                return SplatData(0, Tensor::empty({0, 3}, Device::GPU), Tensor::empty({0, 1, 3}, Device::GPU), Tensor::empty({0, 0, 3}, Device::GPU), Tensor::empty({0, 3}, Device::GPU), Tensor::empty({0, 4}, Device::GPU), Tensor::empty({0, 1}, Device::GPU), 1);
+            return SplatData(degree, Tensor::cat(means).gpu(), Tensor::cat(sh0).gpu(), shN.gpu(), Tensor::cat(scaling).gpu(), Tensor::cat(rotation).gpu(), Tensor::cat(opacity).gpu(), 1);
         }
         struct Bound {
             std::array<double, 3> min{INFINITY, INFINITY, INFINITY}, max{-INFINITY, -INFINITY, -INFINITY};
@@ -610,6 +638,347 @@ namespace lfs::io {
         } catch (const std::exception& e) { return make_error(ErrorCode::DECODING_FAILED, std::string("Failed to load SSOG: ") + e.what(), p); }
     }
 
+    namespace {
+        // Host memory for decoded units kept for the tiles that share them: a unit holds the
+        // ranges of many tiles of one level, which the view asks for together. A unit of
+        // ~512K SH3 splats takes ~120 MB, so this keeps about eight; the newest unit stays
+        // even when it alone exceeds the limit.
+        constexpr std::uint64_t kUnitCacheBytes = 1ull << 30;
+        // Leaves are small (the format chunks for its own streaming), so a tile of level L
+        // covers the smallest tree node holding at most this many level-L splats: coarse
+        // levels span large regions and finer levels split them, as in 3D Tiles. Per-tile
+        // overhead then stays negligible next to the content.
+        constexpr std::uint64_t kTileSplats = 65'536;
+        // Environment splats surround the scene: a box no frustum or distance test rejects.
+        constexpr float kUnboundedHalfExtent = 1e18f;
+
+        lfs::Error ssog_tile_error(std::string detail, const fs::path& path) {
+            lfs::SmallFields fields;
+            fields.add("path", core::path_to_utf8(path));
+            return lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::DataLoss,
+                .domain = lfs::ErrorDomain::IO,
+                .detail = std::move(detail),
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+                .fields = std::move(fields),
+            });
+        }
+
+        struct UnitRange {
+            std::size_t unit = 0; // index into the source's unit names
+            std::size_t offset = 0;
+            std::size_t count = 0;
+        };
+        using TileContent = std::vector<UnitRange>;
+
+        // Streamed SOG as a tile tree of REPLACE tiles, one level per tile: a tile of
+        // level L holds that level's rows for a tree node and refines into the level L-1
+        // tiles of the nodes below it. The environment, when present, is a sibling of the
+        // tree under a content-less root and always draws.
+        class SsogTileSource final : public SplatTileSource {
+        public:
+            std::vector<SplatTile> tiles_;
+            std::vector<TileContent> contents_;
+            std::shared_ptr<EntryProvider> entries_;
+            std::vector<std::string> units_;
+            fs::path path_;
+
+            std::span<const SplatTile> tiles() const override { return tiles_; }
+
+            lfs::Result<core::SplatData> load_tile(const std::uint32_t tile) const override {
+                try {
+                    if (tile >= tiles_.size() || tiles_[tile].splat_count == 0)
+                        throw std::runtime_error(std::format("SSOG tile {} has no content", tile));
+                    // Ranges are grouped by unit, so each unit is gathered once.
+                    std::vector<SplatData> parts;
+                    const auto& ranges = contents_[tile];
+                    for (std::size_t begin = 0; begin < ranges.size();) {
+                        std::size_t end = begin;
+                        std::vector<int> rows;
+                        const auto unit = decoded(ranges[begin].unit);
+                        for (; end < ranges.size() && ranges[end].unit == ranges[begin].unit; ++end) {
+                            const auto& range = ranges[end];
+                            if (unit->size() < range.offset + range.count)
+                                throw std::runtime_error("Decoded SOG unit count mismatch");
+                            for (std::size_t row = range.offset; row < range.offset + range.count; ++row)
+                                rows.push_back(static_cast<int>(row));
+                        }
+                        parts.push_back(unit->materialize(rows));
+                        begin = end;
+                    }
+                    if (parts.size() == 1)
+                        return std::move(parts.front());
+                    std::vector<std::uint32_t> indices(parts.size());
+                    std::iota(indices.begin(), indices.end(), 0u);
+                    auto merged = merge_splat_tiles(*this, indices, [&](const std::uint32_t i) { return &parts[i]; });
+                    if (!merged)
+                        throw std::runtime_error("tile has no splats");
+                    return std::move(*merged);
+                } catch (const std::exception& e) {
+                    // LFS-CENSUS-OK(empty-catch): tile decode failures become structured per-tile IO errors.
+                    return ssog_tile_error(std::format("SSOG tile {}: {}", tile, e.what()), path_);
+                }
+            }
+
+        private:
+            using Decoded = std::shared_ptr<const HostSplats>;
+
+            // One decode per unit at a time; concurrent requests wait for the same result.
+            Decoded decoded(const std::size_t unit) const {
+                std::promise<Decoded> promise;
+                std::shared_future<Decoded> future;
+                bool decode = false;
+                {
+                    std::lock_guard lock(mutex_);
+                    const auto it = std::ranges::find(lru_, unit, &CachedUnit::unit);
+                    if (it != lru_.end()) {
+                        lru_.splice(lru_.begin(), lru_, it);
+                        future = it->future;
+                    } else {
+                        future = promise.get_future().share();
+                        lru_.push_front({unit, future, 0});
+                        decode = true;
+                    }
+                }
+                if (decode) {
+                    std::uint64_t bytes = 0;
+                    bool decoded_ok = false;
+                    try {
+                        auto ready = entries_->prepare(units_[unit]);
+                        if (!ready)
+                            throw std::runtime_error(ready.error().message);
+                        auto data = (*ready)();
+                        if (!data)
+                            throw std::runtime_error(data.error().message);
+                        auto host = std::make_shared<const HostSplats>(*data);
+                        for (const auto* tensor : {&host->means, &host->sh0, &host->shN, &host->scaling, &host->rotation,
+                                                   &host->opacity})
+                            if (tensor->is_valid())
+                                bytes += tensor->numel() * sizeof(float);
+                        promise.set_value(std::move(host));
+                        decoded_ok = true;
+                    } catch (const std::exception&) {
+                        // LFS-CENSUS-OK(empty-catch): the failure reaches every waiter through the future; a later request retries.
+                        {
+                            std::lock_guard lock(mutex_);
+                            std::erase_if(lru_, [unit](const CachedUnit& entry) { return entry.unit == unit; });
+                        }
+                        promise.set_exception(std::current_exception());
+                    }
+                    if (decoded_ok) {
+                        std::lock_guard lock(mutex_);
+                        if (const auto it = std::ranges::find(lru_, unit, &CachedUnit::unit); it != lru_.end()) {
+                            it->bytes = bytes;
+                            cached_bytes_ += bytes;
+                        }
+                        // Evict least recently used units; units still decoding count nothing yet.
+                        while (cached_bytes_ > kUnitCacheBytes && lru_.size() > 1) {
+                            cached_bytes_ -= lru_.back().bytes;
+                            lru_.pop_back();
+                        }
+                    }
+                }
+                return future.get();
+            }
+
+            struct CachedUnit {
+                std::size_t unit = 0;
+                std::shared_future<Decoded> future;
+                std::uint64_t bytes = 0; // host memory once decoded
+            };
+            mutable std::mutex mutex_;
+            mutable std::list<CachedUnit> lru_; // most recent first
+            mutable std::uint64_t cached_bytes_ = 0;
+        };
+
+        // The manifest's spatial tree, with per-level splat counts summed over subtrees.
+        struct LodNode {
+            glm::vec3 center{0.0f};
+            glm::vec3 half{0.0f};
+            std::vector<std::uint32_t> children;
+            std::vector<std::uint64_t> counts;          // splats per level in the subtree
+            std::vector<std::vector<UnitRange>> ranges; // leaves only: rows per level
+        };
+
+        std::uint32_t read_tree(const Json& node, const std::size_t levels, std::vector<LodNode>& nodes) {
+            const auto index = static_cast<std::uint32_t>(nodes.size());
+            nodes.emplace_back();
+            glm::vec3 lo, hi;
+            for (int a = 0; a < 3; ++a) {
+                lo[a] = node["bound"]["min"][a].get<float>();
+                hi[a] = node["bound"]["max"][a].get<float>();
+            }
+            nodes[index].center = (lo + hi) * 0.5f;
+            nodes[index].half = (hi - lo) * 0.5f;
+            nodes[index].counts.assign(levels, 0);
+            if (node.contains("children")) {
+                for (const auto& child : node["children"]) {
+                    const auto c = read_tree(child, levels, nodes);
+                    nodes[index].children.push_back(c);
+                    for (std::size_t l = 0; l < levels; ++l)
+                        nodes[index].counts[l] += nodes[c].counts[l];
+                }
+                return index;
+            }
+            nodes[index].ranges.resize(levels);
+            for (const auto& [key, ref] : node["lods"].items()) {
+                std::size_t level = 0;
+                std::from_chars(key.data(), key.data() + key.size(), level);
+                const UnitRange range{.unit = ref.at("file").get<std::size_t>(),
+                                      .offset = ref.at("offset").get<std::size_t>(),
+                                      .count = ref.at("count").get<std::size_t>()};
+                if (range.count == 0)
+                    continue;
+                nodes[index].ranges[level].push_back(range);
+                nodes[index].counts[level] += range.count;
+            }
+            return index;
+        }
+
+        struct TileBuilder {
+            const std::vector<LodNode>& nodes;
+            const std::vector<int>& sh_degrees;
+
+            struct Built {
+                SplatTile tile;
+                TileContent content;
+                std::vector<Built> children;
+            };
+
+            // Topmost nodes under `node` whose level-`level` content fits one tile.
+            void cut(const std::uint32_t node, const std::size_t level, std::vector<std::uint32_t>& out) const {
+                if (nodes[node].children.empty() || nodes[node].counts[level] <= kTileSplats) {
+                    out.push_back(node);
+                    return;
+                }
+                for (const auto child : nodes[node].children)
+                    cut(child, level, out);
+            }
+
+            void gather(const std::uint32_t node, const std::size_t level, TileContent& out) const {
+                if (nodes[node].counts[level] == 0)
+                    return;
+                if (nodes[node].children.empty()) {
+                    out.insert(out.end(), nodes[node].ranges[level].begin(), nodes[node].ranges[level].end());
+                    return;
+                }
+                for (const auto child : nodes[node].children)
+                    gather(child, level, out);
+            }
+
+            Built make(const std::uint32_t node, const std::size_t level) const {
+                Built built;
+                const auto& n = nodes[node];
+                built.tile.center = n.center;
+                built.tile.half_axes = glm::mat3(n.half.x, 0, 0, 0, n.half.y, 0, 0, 0, n.half.z);
+                // Levels are chosen by distance, as PlayCanvas does; geometric_error holds the
+                // value at the default LOD distances.
+                built.tile.lod_level = static_cast<int>(level);
+                built.tile.geometric_error = distance_lod_error(built.tile.lod_level, {});
+                built.tile.splat_count = n.counts[level];
+                // Ranges sorted by unit and joined where contiguous, so a load gathers each
+                // unit once.
+                TileContent ranges;
+                gather(node, level, ranges);
+                std::ranges::sort(ranges, {}, [](const UnitRange& r) { return std::pair(r.unit, r.offset); });
+                for (const auto& range : ranges) {
+                    built.tile.sh_degree = std::max(built.tile.sh_degree, sh_degrees[range.unit]);
+                    if (!built.content.empty() && built.content.back().unit == range.unit &&
+                        built.content.back().offset + built.content.back().count == range.offset)
+                        built.content.back().count += range.count;
+                    else
+                        built.content.push_back(range);
+                }
+                if (level > 0) {
+                    std::vector<std::uint32_t> finer;
+                    cut(node, level - 1, finer);
+                    for (const auto child : finer)
+                        built.children.push_back(make(child, level - 1));
+                }
+                return built;
+            }
+        };
+        using BuiltTile = TileBuilder::Built;
+
+        // Breadth-first so every tile's children are contiguous.
+        void flatten(BuiltTile& root, SsogTileSource& source) {
+            std::deque<std::pair<BuiltTile*, std::uint32_t>> queue{{&root, 0u}};
+            source.tiles_.push_back(root.tile);
+            source.contents_.push_back(root.content);
+            while (!queue.empty()) {
+                auto [built, self] = queue.front();
+                queue.pop_front();
+                source.tiles_[self].first_child = static_cast<std::uint32_t>(source.tiles_.size());
+                source.tiles_[self].child_count = static_cast<std::uint32_t>(built->children.size());
+                for (auto& child : built->children) {
+                    child.tile.parent = self;
+                    const auto index = static_cast<std::uint32_t>(source.tiles_.size());
+                    source.tiles_.push_back(child.tile);
+                    source.contents_.push_back(child.content);
+                    queue.emplace_back(&child, index);
+                }
+            }
+        }
+    } // namespace
+
+    lfs::Result<std::shared_ptr<SplatTileSource>> open_ssog_tiles(const std::filesystem::path& p,
+                                                                  std::optional<std::vector<uint8_t>>* license_bytes) {
+        try {
+            if (license_bytes)
+                license_bytes->reset();
+            const auto m = parse_manifest(p);
+            if (license_bytes)
+                *license_bytes = m.entries->license_bytes();
+            auto source = std::make_shared<SsogTileSource>();
+            source->entries_ = m.entries;
+            source->path_ = p;
+            source->distance_lod = true;
+            for (const auto& name : m.json["filenames"])
+                source->units_.push_back(name.get<std::string>());
+            const std::size_t levels = m.files.size();
+            std::vector<LodNode> nodes;
+            read_tree(m.json.at("tree"), levels, nodes);
+            const TileBuilder builder{nodes, m.sh_degrees};
+            std::vector<std::uint32_t> coarsest;
+            builder.cut(0, levels - 1, coarsest);
+            BuiltTile root;
+            if (coarsest.size() == 1) {
+                root = builder.make(coarsest.front(), levels - 1);
+            } else {
+                root.tile.center = nodes[0].center;
+                root.tile.half_axes = glm::mat3(nodes[0].half.x, 0, 0, 0, nodes[0].half.y, 0, 0, 0, nodes[0].half.z);
+                for (const auto node : coarsest)
+                    root.children.push_back(builder.make(node, levels - 1));
+            }
+            if (m.json.contains("environment")) {
+                const auto unit = source->units_.size();
+                source->units_.push_back(m.json["environment"].get<std::string>());
+                const auto meta = m.entries->unit_metadata(source->units_.back());
+                const auto count = integer(meta.at("count"), "environment count");
+                BuiltTile environment;
+                environment.tile.half_axes = glm::mat3(kUnboundedHalfExtent);
+                environment.tile.splat_count = count;
+                environment.tile.sh_degree = unit_sh_degree(meta);
+                environment.content = {UnitRange{.unit = unit, .offset = 0, .count = count}};
+                BuiltTile top;
+                top.tile.half_axes = glm::mat3(kUnboundedHalfExtent);
+                top.children.push_back(std::move(root));
+                top.children.push_back(std::move(environment));
+                root = std::move(top);
+            }
+            flatten(root, *source);
+            std::uint64_t splats = 0;
+            for (const auto& tile : source->tiles_)
+                splats += tile.splat_count;
+            LOG_INFO("SSOG '{}': {} tiles, {} splats over {} levels", core::path_to_utf8(p), source->tiles_.size(),
+                     splats, m.files.size());
+            return source;
+        } catch (const std::exception& e) {
+            // LFS-CENSUS-OK(empty-catch): the public parser boundary returns a structured IO error.
+            return ssog_tile_error(std::format("Failed to load SSOG: {}", e.what()), p);
+        }
+    }
+
     Result<void> save_ssog(const SplatData& input, const SsogSaveOptions& o) {
         try {
             const auto started = Clock::now();
@@ -630,13 +999,13 @@ namespace lfs::io {
 #else
             const auto pid = getpid();
 #endif
-            const bool bundled = out.extension() == ".ssog";
+            const bool bundled = core::has_extension(out, ".ssog");
             std::unique_ptr<ScopedAtomicOutputFile> atomic_output;
             std::unique_ptr<SogSink> archive;
             std::mutex archive_mutex;
             if (bundled) {
                 atomic_output = std::make_unique<ScopedAtomicOutputFile>(out);
-                archive = make_sog_archive(atomic_output->temp_path());
+                archive = make_sog_archive(atomic_output->temp_path(), true);
                 if (auto opened = archive->open(); !opened)
                     return opened;
             }
@@ -1000,5 +1369,144 @@ namespace lfs::io {
         } catch (const Cancelled&) { return make_error(ErrorCode::CANCELLED, "Export cancelled by user", o.output_path); } catch (const std::exception& e) {
             return make_error(ErrorCode::ENCODING_FAILED, std::string("Failed to save SSOG: ") + e.what(), o.output_path);
         }
+    }
+
+    Result<SsogArchiveSummary> summarize_ssog_archive(const std::uint64_t size, const ByteRangeReader& read_at) {
+        const auto invalid = [](const char* what) {
+            return make_error(ErrorCode::INVALID_DATASET, std::string("Invalid SSOG archive: ") + what);
+        };
+        const auto read = [&](const std::uint64_t offset, const std::uint64_t length, std::vector<std::byte>& out) {
+            if (offset > size || length > size - offset)
+                return false;
+            out.resize(static_cast<std::size_t>(length));
+            return read_at(offset, out);
+        };
+        const auto le = [](const std::byte* p, const int bytes) {
+            std::uint64_t value = 0;
+            for (int i = bytes - 1; i >= 0; --i)
+                value = value << 8 | std::to_integer<std::uint64_t>(p[i]);
+            return value;
+        };
+        constexpr std::uint64_t kEndRecord = 22, kLocator = 20, kMaxDirectory = 64ull << 20, kMaxMeta = 16ull << 20;
+        if (size < kEndRecord)
+            return invalid("too small");
+        std::vector<std::byte> tail;
+        const auto tail_size = std::min<std::uint64_t>(size, kEndRecord + 0xFFFF + kLocator);
+        if (!read(size - tail_size, tail_size, tail))
+            return invalid("unreadable");
+        std::optional<std::size_t> end;
+        for (std::size_t i = tail.size() - kEndRecord + 1; i-- > 0;)
+            if (le(&tail[i], 4) == 0x06054b50) {
+                end = i;
+                break;
+            }
+        if (!end)
+            return invalid("no central directory");
+        std::uint64_t entries = le(&tail[*end + 10], 2), directory_size = le(&tail[*end + 12], 4),
+                      directory_offset = le(&tail[*end + 16], 4);
+        if (entries == 0xFFFF || directory_size == 0xFFFFFFFF || directory_offset == 0xFFFFFFFF) {
+            std::vector<std::byte> record;
+            if (*end < kLocator || le(&tail[*end - kLocator], 4) != 0x07064b50 ||
+                !read(le(&tail[*end - kLocator + 8], 8), 56, record) || le(record.data(), 4) != 0x06064b50)
+                return invalid("no ZIP64 directory");
+            entries = le(&record[32], 8);
+            directory_size = le(&record[40], 8);
+            directory_offset = le(&record[48], 8);
+        }
+        std::vector<std::byte> directory;
+        if (directory_size > kMaxDirectory || !read(directory_offset, directory_size, directory))
+            return invalid("central directory out of range");
+
+        struct Member {
+            std::uint64_t uncompressed = 0, compressed = 0, offset = 0;
+            std::uint64_t method = 0;
+        };
+        std::map<std::string, Member> members;
+        SsogArchiveSummary summary;
+        std::size_t at = 0;
+        for (std::uint64_t entry = 0; entry < entries; ++entry) {
+            if (at + 46 > directory.size() || le(&directory[at], 4) != 0x02014b50)
+                return invalid("damaged central directory");
+            const auto* header = &directory[at];
+            const auto name_length = le(header + 28, 2), extra_length = le(header + 30, 2), comment_length = le(header + 32, 2);
+            if (at + 46 + name_length + extra_length + comment_length > directory.size())
+                return invalid("damaged central directory");
+            Member member{le(header + 24, 4), le(header + 20, 4), le(header + 42, 4), le(header + 10, 2)};
+            // A ZIP64 extra field carries the saturated sizes and offset, in this order.
+            const auto extra_end = 46 + name_length + extra_length;
+            for (std::uint64_t x = 46 + name_length; x + 4 <= extra_end;) {
+                const auto id = le(header + x, 2), length = le(header + x + 2, 2);
+                if (x + 4 + length > extra_end)
+                    break;
+                if (id == 0x0001) {
+                    auto field = x + 4;
+                    for (auto* value : {&member.uncompressed, &member.compressed, &member.offset})
+                        if (*value == 0xFFFFFFFF && field + 8 <= x + 4 + length) {
+                            *value = le(header + field, 8);
+                            field += 8;
+                        }
+                }
+                x += 4 + length;
+            }
+            std::string name(reinterpret_cast<const char*>(header + 46), static_cast<std::size_t>(name_length));
+            at += static_cast<std::size_t>(46 + name_length + extra_length + comment_length);
+            if (name.ends_with(".webp") && member.method != 0)
+                summary.webp_stored = false;
+            members.insert_or_assign(std::move(name), member);
+        }
+
+        constexpr std::string_view kMeta = "lod-meta.json";
+        const std::string* meta_name = nullptr;
+        for (const auto& [name, member] : members)
+            if ((name == kMeta || name.ends_with(std::string("/").append(kMeta))) &&
+                (!meta_name || name.size() < meta_name->size()))
+                meta_name = &name;
+        if (!meta_name)
+            return invalid("no lod-meta.json");
+        const auto root = meta_name->substr(0, meta_name->size() - kMeta.size());
+        for (const auto& [name, member] : members)
+            if (name.starts_with(root) && name.find('/', root.size()) == std::string::npos &&
+                is_sog_license_member(std::string_view(name).substr(root.size())) && member.uncompressed == 0)
+                summary.empty_license = true;
+
+        const auto& meta = members.at(*meta_name);
+        std::vector<std::byte> local, packed;
+        if (meta.uncompressed > kMaxMeta || meta.compressed > kMaxMeta || !read(meta.offset, 30, local) ||
+            le(local.data(), 4) != 0x04034b50 ||
+            !read(meta.offset + 30 + le(&local[26], 2) + le(&local[28], 2), meta.compressed, packed))
+            return invalid("lod-meta.json unreadable");
+        std::string text(static_cast<std::size_t>(meta.uncompressed), '\0');
+        if (meta.method == 0) {
+            if (meta.compressed != meta.uncompressed)
+                return invalid("lod-meta.json size mismatch");
+            std::memcpy(text.data(), packed.data(), packed.size());
+        } else if (meta.method == 8) {
+            z_stream stream{};
+            if (inflateInit2(&stream, -MAX_WBITS) != Z_OK)
+                return invalid("lod-meta.json does not inflate");
+            stream.next_in = reinterpret_cast<Bytef*>(packed.data());
+            stream.avail_in = static_cast<uInt>(packed.size());
+            stream.next_out = reinterpret_cast<Bytef*>(text.data());
+            stream.avail_out = static_cast<uInt>(text.size());
+            const bool complete = inflate(&stream, Z_FINISH) == Z_STREAM_END && stream.total_out == text.size();
+            inflateEnd(&stream);
+            if (!complete)
+                return invalid("lod-meta.json does not inflate");
+        } else {
+            return invalid("lod-meta.json uses an unsupported compression");
+        }
+        const auto json = nlohmann::json::parse(text, nullptr, false);
+        if (json.is_discarded() || !json.is_object())
+            return invalid("lod-meta.json is not an object");
+        if (const auto counts = json.find("counts"); counts != json.end()) {
+            if (!counts->is_array())
+                return invalid("lod-meta.json counts");
+            for (const auto& count : *counts) {
+                if (!count.is_number_unsigned())
+                    return invalid("lod-meta.json counts");
+                summary.counts.push_back(count.get<std::size_t>());
+            }
+        }
+        return summary;
     }
 } // namespace lfs::io

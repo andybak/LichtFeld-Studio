@@ -59,6 +59,18 @@ typedef enum LfsSceneUpscalerPluginView {
     LFS_SCENE_UPSCALER_PLUGIN_VIEW_COUNT = 3,
 } LfsSceneUpscalerPluginView;
 
+/* UINT32_MAX is reserved as an unassigned host-side identity. */
+#define LFS_SCENE_UPSCALER_PLUGIN_VIEW_INVALID UINT32_MAX
+
+typedef enum LfsSceneUpscalerPluginCapability {
+    LFS_SCENE_UPSCALER_PLUGIN_CAPABILITY_NONE = 0,
+    /* The plugin accepts arbitrary non-invalid uint32 view identities. */
+    LFS_SCENE_UPSCALER_PLUGIN_CAPABILITY_DYNAMIC_VIEW_IDS = 1ull << 0u,
+    /* The plugin linearizes depth from the perspective camera fields of
+     * LfsSceneUpscalerEvaluateV1 and cannot reconstruct orthographic views. */
+    LFS_SCENE_UPSCALER_PLUGIN_CAPABILITY_REQUIRES_PERSPECTIVE = 1ull << 1u,
+} LfsSceneUpscalerPluginCapability;
+
 typedef enum LfsSceneUpscalerPluginResetFlag {
     LFS_SCENE_UPSCALER_PLUGIN_RESET_NONE = 0,
     LFS_SCENE_UPSCALER_PLUGIN_RESET_CAMERA_CUT = 1u << 0u,
@@ -104,6 +116,9 @@ typedef struct LfsSceneUpscalerOptimalSettingsV1 {
     uint32_t maximum_width;
     uint32_t maximum_height;
     float sharpness;
+    /* Optional tail: jitter sequence length the plugin expects at
+     * render_width; 0 keeps the host's default sequence. */
+    uint32_t jitter_phase_count;
 } LfsSceneUpscalerOptimalSettingsV1;
 
 typedef struct LfsSceneUpscalerFeatureConfigV1 {
@@ -149,6 +164,14 @@ typedef struct LfsSceneUpscalerEvaluateV1 {
     float pre_exposure;
     float frame_time_milliseconds;
     uint32_t reset_flags;
+    /*
+     * Optional tail: perspective camera of the current frame, for plugins that
+     * linearize raster depth themselves. Readers must check struct_size.
+     */
+    float camera_near;
+    float camera_far;
+    float camera_vertical_fov_radians;
+    float view_space_to_meters;
 } LfsSceneUpscalerEvaluateV1;
 
 typedef struct LfsSceneUpscalerPluginApiV1 {
@@ -183,6 +206,8 @@ typedef struct LfsSceneUpscalerPluginApiV1 {
     void (*release_feature)(void* plugin, uint32_t view);
     void (*shutdown_runtime)(void* plugin);
     size_t (*last_error)(void* plugin, char* destination, size_t capacity);
+    /* Optional fields, present when struct_size reaches this member. */
+    uint64_t capabilities;
 } LfsSceneUpscalerPluginApiV1;
 
 /*
@@ -204,6 +229,24 @@ static inline int lfs_scene_upscaler_plugin_api_v1_complete(
            api->create_feature != NULL && api->evaluate != NULL &&
            api->release_feature != NULL && api->shutdown_runtime != NULL &&
            api->last_error != NULL;
+}
+
+static inline int lfs_scene_upscaler_plugin_api_v1_has_capability(
+    const LfsSceneUpscalerPluginApiV1* api, const uint64_t capability) {
+    const size_t capabilities_end =
+        offsetof(LfsSceneUpscalerPluginApiV1, capabilities) + sizeof(api->capabilities);
+    return api != NULL && api->struct_size >= capabilities_end &&
+           (api->capabilities & capability) != 0;
+}
+
+static inline int lfs_scene_upscaler_plugin_api_v1_supports_dynamic_view_ids(
+    const LfsSceneUpscalerPluginApiV1* api) {
+    return lfs_scene_upscaler_plugin_api_v1_has_capability(
+        api, LFS_SCENE_UPSCALER_PLUGIN_CAPABILITY_DYNAMIC_VIEW_IDS);
+}
+
+static inline int lfs_scene_upscaler_plugin_view_id_valid(const uint32_t view) {
+    return view != LFS_SCENE_UPSCALER_PLUGIN_VIEW_INVALID;
 }
 
 typedef const LfsSceneUpscalerPluginApiV1* (*LfsSceneUpscalerGetPluginApiV1Fn)(void);

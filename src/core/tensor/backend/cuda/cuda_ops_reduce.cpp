@@ -62,9 +62,10 @@ namespace lfs::core::internal {
                     cuda_const_pointer<float>(input), device_result,
                     count, context.cuda_stream);
             }
+            LFS_CUDA_CHECK(cudaMemcpyAsync(
+                &result, device_result, sizeof(size_t), cudaMemcpyDeviceToHost,
+                context.cuda_stream));
             LFS_CUDA_CHECK(cudaStreamSynchronize(context.cuda_stream));
-            LFS_CUDA_CHECK(cudaMemcpy(
-                &result, device_result, sizeof(size_t), cudaMemcpyDeviceToHost));
             CudaMemoryPool::instance().deallocate(device_result, context.cuda_stream);
             return result;
         }
@@ -157,6 +158,15 @@ namespace lfs::core::internal {
         tensor_ops::launch_fused_segmented_transform_reduce(
             cuda_const_pointer<float>(input), cuda_pointer<float>(output),
             segment_count, segment_size, chain, program.op, context.cuda_stream);
+    }
+
+    bool CudaBackendOps::arg_extreme(const StorageRef input, const StorageRef values, const StorageRef indices,
+                                     const ArgExtremeProgram& program, const ExecContext context) {
+        LFS_FACADE_TRACE(arg_extreme);
+        tensor_ops::launch_arg_extreme(cuda_const_pointer<float>(input), cuda_pointer<float>(values),
+                                       cuda_pointer<int64_t>(indices), program.outer, program.reduce, program.inner,
+                                       program.maximum, context.cuda_stream);
+        return true;
     }
 
     size_t CudaBackendOps::count_nonzero_bool(

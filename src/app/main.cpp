@@ -5,6 +5,7 @@
 #include "app/application.hpp"
 #include "app/converter.hpp"
 #include "app/gpu_preflight.hpp"
+#include "app/licht_command.hpp"
 #include "core/abi.hpp"
 #include "core/crash_handler.hpp"
 #include "core/cuda_error.hpp"
@@ -19,6 +20,7 @@
 #include "diagnostics/vram_profiler.hpp"
 #include "git_version.h"
 #include "io/argument_parser.hpp"
+#include "io/media_studio_backends.hpp"
 #include "lfs_core_abi_stamp.h"
 #include "preferences.hpp"
 #include "preprocessing/preprocess.hpp"
@@ -32,18 +34,28 @@
 #include <filesystem>
 #include <print>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
 namespace {
-#ifdef __APPLE__
-    void configureHomebrewVulkanDriver() {
+#if defined(__APPLE__) && defined(LFS_GRAPHICS_VULKAN)
+    void configureVulkanDriver() {
         // The vcpkg Vulkan loader does not always discover Homebrew's MoltenVK
         // manifest. Keep an explicit Vulkan driver selection from the caller.
         if (std::getenv("VK_DRIVER_FILES") || std::getenv("VK_ICD_FILENAMES") ||
             std::getenv("VK_ADD_DRIVER_FILES"))
             return;
 
+#ifdef LFS_MACOS_PORTABLE_APP
+        const auto bundled_manifest = lfs::core::getExecutableDir().parent_path() /
+                                      "share/vulkan/icd.d/MoltenVK_icd.json";
+        std::error_code bundled_error;
+        if (std::filesystem::is_regular_file(bundled_manifest, bundled_error)) {
+            (void)lfs::core::environment::set_value("VK_DRIVER_FILES", bundled_manifest.string());
+        }
+        // A portable bundle must not silently use the build machine's Homebrew ICD.
+#else
         const auto try_prefix = [](const std::filesystem::path& prefix) {
             const auto manifest = prefix / "etc/vulkan/icd.d/MoltenVK_icd.json";
             std::error_code error;
@@ -59,6 +71,7 @@ namespace {
         if (try_prefix("/opt/homebrew"))
             return;
         (void)try_prefix("/usr/local");
+#endif
     }
 #endif
 
@@ -218,6 +231,8 @@ namespace {
                 return lfs::preprocessing::run_preprocess(mode.params);
             } else if constexpr (std::is_same_v<T, lfs::io::args::PluginMode>) {
                 return lfs::python::run_plugin_command(mode);
+            } else if constexpr (std::is_same_v<T, lfs::io::args::LichtMode>) {
+                return lfs::app::run_licht_command(mode);
             } else if constexpr (std::is_same_v<T, lfs::io::args::TrainingMode>) {
                 if constexpr (!LFS_BUILD_TRAINER) {
                     if (mode.params->optimization.headless && !mode.params->render_path) {
@@ -246,6 +261,8 @@ namespace {
 
                 const bool viewer_only = lfs::app::training_params_are_viewer_only(*mode.params);
                 preflightGpuOrExit(interactive, viewer_only);
+                LOG_INFO("Tensor GPU backend selected: {}",
+                         lfs::core::gpu_backend_name(lfs::core::configured_gpu_backend()));
 
                 // Probe and decompose the CUDA driver's context-creation cost only for the
                 // GPU app path. CLI-only modes such as --help, convert, preprocess,
@@ -297,11 +314,16 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
-#ifdef __APPLE__
-    configureHomebrewVulkanDriver();
+#ifdef LFS_MACOS_PORTABLE_APP
+    // Keep the signed app immutable, including for bundled Python child processes.
+    (void)lfs::core::environment::set_value("PYTHONDONTWRITEBYTECODE", "1");
+#endif
+#if defined(__APPLE__) && defined(LFS_GRAPHICS_VULKAN)
+    configureVulkanDriver();
 #endif
 
     lfs::core::install_crash_handlers();
+    lfs::io::registerStudioMediaBackends();
     lfs::core::record_session_start();
 #if LFS_HAS_CUDA
     lfs::core::initialize_cuda_diagnostics();
@@ -320,7 +342,7 @@ int main(int argc, char* argv[]) {
     }
     const auto tensor_preferences = use_default_preferences
                                         ? lfs::vis::TensorPreferenceState{}
-                                        : lfs::vis::UserPreferences::instance().tensorBackend();
+                                        : lfs::vis::UserPreferences::instance().sanitizeTensorBackend();
     const auto options_status = lfs::core::set_tensor_backend_options(tensor_preferences.options);
     // An automatic preference leaves the choice to default_gpu_backend().
     const auto backend_status = tensor_preferences.backend
@@ -333,10 +355,16 @@ int main(int argc, char* argv[]) {
 
     publishResolvedUserPaths();
 
+    const bool cpu_only_licht_mode =
+        std::holds_alternative<lfs::io::args::LichtMode>(*result) ||
+        (std::holds_alternative<lfs::io::args::HelpMode>(*result) &&
+         argc > 1 && std::string_view(argv[1]) == "licht");
     const int exit_code = lfs::core::run_with_exception_firewall(
         [&result] { return run_mode(std::move(*result)); });
     // CLI modes return here without the viewer's explicit GPU teardown. Drain
     // their backends before validation layers and driver libraries are unloaded.
-    lfs::core::teardown_gpu_before_exit();
+    // Licht embedding and its help path never initialize a GPU; teardown probes CUDA.
+    if (!cpu_only_licht_mode)
+        lfs::core::teardown_gpu_before_exit();
     return exit_code;
 }

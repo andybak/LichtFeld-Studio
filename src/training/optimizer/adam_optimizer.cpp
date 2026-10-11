@@ -6,14 +6,12 @@
 #include "core/alloc_counter.hpp"
 #include "core/assert.hpp"
 #include "core/checkpoint_format.hpp"
-#include "core/cuda_error.hpp"
 #include "core/logger.hpp"
 #include "core/sh_layout.hpp"
 #include "core/sh_value_quant.hpp"
 #include "core/splat_exportable_storage.hpp"
-#include "core/tensor/backend/cuda/runtime/cuda_stream_context.hpp"
-#include "core/tensor/internal/tensor_serialization.hpp"
 #include "core/tensor_completion.hpp"
+#include "core/tensor_execution.hpp"
 #include "core/tensor_serialization.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "lfs/training/joint_adam_codec.hpp"
@@ -23,7 +21,6 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <cuda_runtime.h>
 #include <limits>
 #include <optional>
 #include <span>
@@ -48,6 +45,29 @@ namespace lfs::training {
                 row_size *= tensor.shape()[i];
             }
             return row_size;
+        }
+
+        // A materialized gradient must cover state.size rows: zero_grad and the unfused
+        // step index it up to state.size. shN grads are created lazily (3DGUT requests
+        // them once SH bands activate), so every site that grows state.size grows them.
+        void grow_grad_rows(lfs::core::Tensor& grad, const std::string& name,
+                            const size_t old_rows, const size_t new_rows,
+                            const size_t capacity_rows) {
+            if (!grad.is_valid() || grad.numel() == 0) {
+                return;
+            }
+            const size_t rows = grad.shape()[0];
+            LFS_ASSERT_MSG(rows >= old_rows,
+                           std::format("AdamOptimizer: {} grad has {} rows but optimizer state "
+                                       "already had {} before growing to {}",
+                                       name, rows, old_rows, new_rows));
+            if (rows >= new_rows) {
+                return;
+            }
+            if (grad.capacity() < new_rows) {
+                grad.reserve(std::max(capacity_rows, new_rows));
+            }
+            grad.append_zeros(new_rows - rows);
         }
 
     } // namespace
@@ -141,11 +161,10 @@ namespace lfs::training {
         return {
             .frozen_lr_scale = frozen_lr_scale_,
             .cropbox_lr_scale = cropbox_lr_scale_,
-            .median_extent = mean_step_median_extent_,
-            .r_min = mean_step_r_min_,
-            .r_max = mean_step_r_max_,
+
             .screen_share_limit = screen_share_limit_,
             .screen_share_penalty = screen_share_penalty_,
+            .mean_step_median_extent = mean_step_median_extent_,
         };
     }
 
@@ -198,14 +217,9 @@ namespace lfs::training {
         cropbox_lr_scale_ = scale;
     }
 
-    void AdamOptimizer::set_per_splat_mean_step(const bool enabled,
-                                                const float median_extent,
-                                                const float r_min,
-                                                const float r_max) {
+    void AdamOptimizer::set_per_splat_mean_step(const bool enabled, const float median_extent) {
         per_splat_mean_step_ = enabled;
         mean_step_median_extent_ = median_extent;
-        mean_step_r_min_ = r_min;
-        mean_step_r_max_ = r_max;
         if (!enabled) {
             set_mean_step_far_mask({});
         }
@@ -222,14 +236,12 @@ namespace lfs::training {
                        "AdamOptimizer mean-step far mask must be a 1D bool tensor");
         LFS_ASSERT_MSG(mask.numel() <= static_cast<size_t>(std::numeric_limits<int>::max()),
                        "AdamOptimizer mean-step far mask exceeds the supported row count");
-        // Construct fresh handles: assignment to a view copies into its existing
-        // storage, even for mask = mask.cuda() or mask = mask.clone().
-        auto uploaded = mask.device() == lfs::core::Device::CUDA ? mask : mask.cuda();
+        // Retain owned, contiguous device storage for the raw mask pointer.
+        auto uploaded = mask.device() == lfs::core::Device::GPU ? mask : mask.gpu();
         auto storage = uploaded.is_contiguous() && uploaded.owns_memory()
                            ? uploaded
                            : uploaded.clone();
         const auto* pointer = storage.ptr<bool>();
-        LFS_VALIDATE_CUDA_DEVICE_POINTER(pointer, "mean_step_far_mask");
         // A raw pointer alone cannot keep a replaced strategy tensor alive.
         mean_step_far_mask_storage_ = std::move(storage);
         mean_step_far_mask_ = pointer;
@@ -279,8 +291,7 @@ namespace lfs::training {
         }
         last_step_zeroed_gradients_ = false;
 
-        const cudaStream_t batch_stream = lfs::core::getCurrentCUDAStream();
-        bool mean_step_scaled = false;
+        const lfs::core::TensorExecutionTarget batch_stream = lfs::core::TensorExecutionTarget::current();
         int n_present = 0;
 
         auto contiguous_step = [&](ParamType type) -> lfs::gpu_ops::JointStep {
@@ -320,15 +331,6 @@ namespace lfs::training {
             state.joint_bounds.sync_to_stream(batch_stream);
             state.grad.sync_to_stream(batch_stream);
             const size_t feature_dim = param_live.numel() / param_size;
-            bool apply_mean_step = false;
-            if (type == ParamType::Means && per_splat_mean_step_) {
-                auto& scaling = splat_data_.scaling_raw();
-                if (scaling.is_valid() && scaling.numel() > 0) {
-                    scaling.sync_to_stream(batch_stream);
-                    apply_mean_step = true;
-                    mean_step_scaled = true;
-                }
-            }
             param_live.set_stream(batch_stream);
             state.exp_avg.set_stream(batch_stream);
             state.joint_bounds.set_stream(batch_stream);
@@ -345,8 +347,8 @@ namespace lfs::training {
                 .lr = param_lr,
                 .bc1_rcp = static_cast<float>(bias_correction1_rcp),
                 .bc2_sqrt_rcp = static_cast<float>(bias_correction2_sqrt_rcp),
-                .apply_mean_step = apply_mean_step,
                 .apply_screen_share = type == ParamType::Scaling,
+                .apply_mean_step = type == ParamType::Means && per_splat_mean_step_,
             };
         };
 
@@ -358,9 +360,6 @@ namespace lfs::training {
             contiguous_step(ParamType::Opacity),
         };
         if (n_present > 0) {
-            if (mean_step_far_mask_storage_.is_valid()) {
-                mean_step_far_mask_storage_.sync_to_stream(batch_stream);
-            }
             if (frozen_mask_.is_valid()) {
                 frozen_mask_.sync_to_stream(batch_stream);
             }
@@ -370,9 +369,10 @@ namespace lfs::training {
             const lfs::gpu_ops::AdamMasks masks{
                 .frozen = frozen_mask_,
                 .crop_damping = crop_damping_mask_,
-                .raw_scales = mean_step_scaled ? splat_data_.scaling_raw() : absent_,
-                .far_mask = mean_step_far_mask_storage_,
+
                 .screen_share = screen_share_max_ != nullptr ? splat_data_._max_screen_share : absent_,
+                .mean_step_scales = per_splat_mean_step_ ? splat_data_.scaling_raw() : absent_,
+                .mean_step_far = mean_step_far_mask_storage_,
             };
             adam_ops().step_batch(steps, masks, adam_hyper(), adam_modifiers());
         }
@@ -456,12 +456,16 @@ namespace lfs::training {
             last_step_zeroed_gradients_ = false;
             return;
         }
-        for (auto& [_, state] : states_) {
+        for (auto& [name, state] : states_) {
             if (state.grad.is_valid() && state.grad.numel() > 0) {
+                LFS_ASSERT_MSG(state.size <= state.grad.shape()[0],
+                               std::format("AdamOptimizer::zero_grad: {} optimizer state has {} rows "
+                                           "but its grad buffer only {}",
+                                           name, state.size, state.grad.shape()[0]));
                 const size_t elements =
                     state.size * (state.grad.numel() / state.grad.shape()[0]);
                 if (elements > 0) {
-                    const auto stream = lfs::core::getCurrentCUDAStream();
+                    const auto stream = lfs::core::TensorExecutionTarget::current();
                     state.grad.set_stream(stream);
                     state.grad.flatten().slice(0, 0, elements).fill_(0.0f, stream);
                 }
@@ -507,30 +511,6 @@ namespace lfs::training {
     // contiguous params (shape[0] == N) and swizzled shN (separate 1D moment buffer, scale = N).
     size_t AdamOptimizer::scale_row_count(ParamType /*type*/) const {
         return static_cast<size_t>(splat_data_.size());
-    }
-
-    const bool* AdamOptimizer::frozen_mask_ptr() const {
-        return frozen_mask_.is_valid() && frozen_mask_.numel() > 0
-                   ? frozen_mask_.ptr<bool>()
-                   : nullptr;
-    }
-
-    int AdamOptimizer::frozen_mask_size() const {
-        return frozen_mask_.is_valid()
-                   ? static_cast<int>(frozen_mask_.numel())
-                   : 0;
-    }
-
-    const bool* AdamOptimizer::crop_damping_mask_ptr() const {
-        return crop_damping_mask_.is_valid() && crop_damping_mask_.numel() > 0
-                   ? crop_damping_mask_.ptr<bool>()
-                   : nullptr;
-    }
-
-    int AdamOptimizer::crop_damping_mask_size() const {
-        return crop_damping_mask_.is_valid()
-                   ? static_cast<int>(crop_damping_mask_.numel())
-                   : 0;
     }
 
     void AdamOptimizer::alloc_quantized_state(ParamType type, AdamParamState& state,
@@ -721,7 +701,7 @@ namespace lfs::training {
         const double bias_correction2_sqrt_rcp = 1.0 / std::sqrt(1.0 - std::pow(config_.beta2, state.step_count));
         const float param_lr = static_cast<float>(get_param_lr(ParamType::ShN));
 
-        const cudaStream_t execution_stream = lfs::core::getCurrentCUDAStream();
+        const lfs::core::TensorExecutionTarget execution_stream = lfs::core::TensorExecutionTarget::current();
         param_live.sync_to_stream(execution_stream);
         state.exp_avg.sync_to_stream(execution_stream);
         if (state.joint_bounds.is_valid())
@@ -757,8 +737,7 @@ namespace lfs::training {
         const lfs::gpu_ops::AdamMasks masks{
             .frozen = frozen_mask_,
             .crop_damping = crop_damping_mask_,
-            .raw_scales = absent_,
-            .far_mask = absent_,
+
             .screen_share = absent_,
         };
         adam_ops().step_sh(
@@ -788,9 +767,9 @@ namespace lfs::training {
         state.grad.set_stream(execution_stream);
     }
 
-    FastGSFusedAdamState AdamOptimizer::prepare_fastgs_fused_adam(
+    lfs::gpu_ops::BackwardAdam AdamOptimizer::prepare_fastgs_fused_adam(
         const int iteration,
-        const cudaStream_t execution_stream) {
+        const lfs::core::TensorExecutionTarget execution_stream) {
         validate_mean_step_far_mask();
         if (mean_step_far_mask_storage_.is_valid()) {
             mean_step_far_mask_storage_.sync_to_stream(execution_stream);
@@ -806,14 +785,31 @@ namespace lfs::training {
             splat_data_._max_screen_share.sync_to_stream(execution_stream);
         }
 
-        FastGSFusedAdamState fused;
-        fused.enabled = true;
-        fused.beta1 = static_cast<float>(config_.beta1);
-        fused.beta2 = static_cast<float>(config_.beta2);
-        fused.eps = static_cast<float>(config_.eps);
+        const float beta1 = static_cast<float>(config_.beta1);
+        const float beta2 = static_cast<float>(config_.beta2);
+        const float eps = static_cast<float>(config_.eps);
+
+        // Scalars only. Tensor references are bound after every group has finished
+        // growing, so a later init_state rehash cannot dangle them.
+        struct GroupFields {
+            int joint_bits = 0;
+            int value_bits = 0;
+            int value_cells = 0;
+            int primitives = 0;
+            int elements = 0;
+            int attributes = 0;
+            float step_size = 0.f;
+            float bc2_sqrt_rcp = 1.f;
+            float frozen_lr_scale = 0.f;
+            float cropbox_lr_scale = 1.f;
+            float screen_share_limit = 0.f;
+            float screen_share_penalty = 0.f;
+            bool enabled = false;
+            bool bind_sh_bounds = false;
+        };
 
         auto prepare_param = [&](ParamType type, const int n_attributes, const bool update_enabled) {
-            FastGSFusedAdamParam out;
+            GroupFields out;
             auto& param = get_param(type);
             if (!param.is_valid() || param.numel() == 0 || n_attributes <= 0) {
                 return out;
@@ -868,6 +864,7 @@ namespace lfs::training {
                     if (moment_cap_floats >= float_layout && state.size < float_layout) {
                         // Capacity reserved at max_cap: advance logical size (new slots
                         // already zero-initialized under joint bounds when pre-allocated).
+                        grow_grad_rows(state.grad, name, state.size, float_layout, moment_cap_floats);
                         state.size = float_layout;
                     } else if (state.size < float_layout) {
                         // Pad-aware: derive n_new from prim count, not float/N (pad jumps).
@@ -899,6 +896,7 @@ namespace lfs::training {
                                                   : state.exp_avg.capacity())
                                            : 0);
                             if (cap2 >= float_layout && state.size < float_layout) {
+                                grow_grad_rows(state.grad, name, state.size, float_layout, cap2);
                                 state.size = float_layout;
                             }
                         }
@@ -958,74 +956,97 @@ namespace lfs::training {
             const double bias_correction1_rcp = 1.0 / (1.0 - std::pow(config_.beta1, next_step));
             const double bias_correction2_sqrt_rcp = 1.0 / std::sqrt(1.0 - std::pow(config_.beta2, next_step));
 
-            // SH value quant stores u16 codes as Float16 bit-patterns; use data_ptr.
-            // Generation-checked when exportable-backed so a pre-grow raw pointer
-            // cannot survive into the fused step.
-            out.param = static_cast<float*>(
-                lfs::core::resolve_exportable_device_ptr(param));
-            out.n_primitives = static_cast<int>(splat_data_.size());
-            out.joint_packed = state.exp_avg.ptr<uint8_t>();
-            out.joint_bounds = state.joint_bounds.ptr<float>();
+            // Generation-checked when exportable-backed. Poisoned storage still
+            // throws here, before later groups allocate. The fused step re-resolves.
+            (void)lfs::core::resolve_exportable_device_ptr(param);
+            out.primitives = static_cast<int>(splat_data_.size());
             out.joint_bits = state.joint_bits;
-            out.frozen_mask = frozen_mask_ptr();
-            out.frozen_mask_size = frozen_mask_size();
             out.frozen_lr_scale = frozen_lr_scale_;
-            out.crop_damping_mask = crop_damping_mask_ptr();
-            out.crop_damping_mask_size = crop_damping_mask_size();
             out.cropbox_lr_scale = cropbox_lr_scale_;
-            out.n_elements = static_cast<int>(param.numel());
-            out.n_attributes = n_attributes;
+            out.elements = static_cast<int>(param.numel());
+            out.attributes = n_attributes;
             out.step_size = static_cast<float>(get_param_lr(type) * bias_correction1_rcp);
-            out.bias_correction2_sqrt_rcp = static_cast<float>(bias_correction2_sqrt_rcp);
+            out.bc2_sqrt_rcp = static_cast<float>(bias_correction2_sqrt_rcp);
             out.enabled = true;
             return out;
         };
 
-        fused.means = prepare_param(ParamType::Means, 3, true);
-        fused.sh0 = prepare_param(ParamType::Sh0, 3, true);
+        GroupFields means = prepare_param(ParamType::Means, 3, true);
+        GroupFields sh0 = prepare_param(ParamType::Sh0, 3, true);
         // shN is laid out in swizzled float4 order (vksplat shAt). The fused-backward kernel
         // indexes it via shAt(p, k) float4-slot reads/writes, not via
         // primitive_idx*n_attributes+offset, so n_attributes is informational only.
         const auto active_rest = static_cast<uint32_t>(splat_data_.active_sh_coeffs_rest());
         const auto layout_rest = static_cast<uint32_t>(splat_data_.max_sh_coeffs_rest());
-        fused.shN = prepare_param(ParamType::ShN,
-                                  static_cast<int>(lfs::core::sh_float4_slots_for_rest(layout_rest) * 4u),
-                                  active_rest > 0 && iteration > SH_WARMUP_ITERATIONS);
-        // Generation-checked q16 fetch — never bake a pre-grow exportable pointer.
-        if (fused.shN.enabled && splat_data_.shN_value_quantized() &&
+        GroupFields shN = prepare_param(ParamType::ShN,
+                                        static_cast<int>(lfs::core::sh_float4_slots_for_rest(layout_rest) * 4u),
+                                        active_rest > 0 && iteration > SH_WARMUP_ITERATIONS);
+        // Generation-checked q16 fetch. The neutral group binds the live tensors;
+        // fast_adam_group re-resolves their pointers for the kernel.
+        if (shN.enabled && splat_data_.shN_value_quantized() &&
             splat_data_.shN_value_bounds().is_valid()) {
             splat_data_.shN_value_bounds().set_stream(execution_stream);
             const auto q16 = lfs::core::resolve_q16_bind_ptrs(splat_data_);
-            fused.shN.param = const_cast<float*>(q16.codes);
-            fused.shN.sh_value_bounds = const_cast<float*>(q16.bounds);
-            fused.shN.sh_value_bits = 16;
-            fused.shN.sh_value_n_cells = static_cast<int>(q16.n_cells_per_prim);
-        } else if (fused.shN.enabled && splat_data_.shN_ieee_f16()) {
+            shN.value_bits = 16;
+            shN.value_cells = static_cast<int>(q16.n_cells_per_prim);
+            shN.bind_sh_bounds = q16.bounds != nullptr;
+        } else if (shN.enabled && splat_data_.shN_ieee_f16()) {
             // IEEE f16 float4-swizzle (exportable GUI): half load/store, no bounds.
-            fused.shN.param = static_cast<float*>(
-                lfs::core::resolve_exportable_device_ptr(splat_data_.shN()));
-            fused.shN.sh_value_bits = 16;
-            fused.shN.sh_value_bounds = nullptr;
-            fused.shN.sh_value_n_cells = 0;
+            (void)lfs::core::resolve_exportable_device_ptr(splat_data_.shN());
+            shN.value_bits = 16;
+            shN.value_cells = 0;
+            shN.bind_sh_bounds = false;
         }
-        fused.scaling = prepare_param(ParamType::Scaling, 3, true);
+        GroupFields scaling = prepare_param(ParamType::Scaling, 3, true);
         refresh_screen_share_buffer();
-        fused.scaling.screen_share_max = screen_share_max_;
-        fused.scaling.screen_share_n = screen_share_n_;
-        fused.scaling.screen_share_limit = screen_share_limit_;
-        fused.scaling.screen_share_penalty = screen_share_penalty_;
-        fused.rotation = prepare_param(ParamType::Rotation, 4, true);
-        fused.opacity = prepare_param(ParamType::Opacity, 1, true);
-        fused.per_splat_mean_step = per_splat_mean_step_;
-        fused.mean_step_median_extent = mean_step_median_extent_;
-        fused.mean_step_r_min = mean_step_r_min_;
-        fused.mean_step_r_max = mean_step_r_max_;
-        fused.mean_step_far_mask = mean_step_far_mask_;
-        fused.mean_step_far_mask_n = mean_step_far_mask_n_;
+        scaling.screen_share_limit = screen_share_limit_;
+        scaling.screen_share_penalty = screen_share_penalty_;
+        GroupFields rotation = prepare_param(ParamType::Rotation, 4, true);
+        GroupFields opacity = prepare_param(ParamType::Opacity, 1, true);
 
-        fused.enabled = fused.means.enabled || fused.sh0.enabled || fused.shN.enabled ||
-                        fused.scaling.enabled || fused.rotation.enabled || fused.opacity.enabled;
-        return fused;
+        auto bind_group = [&](ParamType type, const GroupFields& src) {
+            auto* state = get_state_mutable(type);
+            return lfs::gpu_ops::BackwardAdamParam{
+                .parameter = get_param(type),
+                .packed_moments = state && state->exp_avg.is_valid() ? state->exp_avg : absent_,
+                .joint_bounds = state && state->joint_bounds.is_valid() ? state->joint_bounds : absent_,
+                .sh_value_bounds = src.bind_sh_bounds ? splat_data_.shN_value_bounds() : absent_,
+                .frozen_mask = frozen_mask_,
+                .crop_damping_mask = crop_damping_mask_,
+                .screen_share = type == ParamType::Scaling ? splat_data_._max_screen_share : absent_,
+                .joint_bits = src.joint_bits,
+                .value_bits = src.value_bits,
+                .value_cells = src.value_cells,
+                .primitives = src.primitives,
+                .elements = src.elements,
+                .attributes = src.attributes,
+                .step_size = src.step_size,
+                .bc2_sqrt_rcp = src.bc2_sqrt_rcp,
+                .frozen_lr_scale = src.frozen_lr_scale,
+                .cropbox_lr_scale = src.cropbox_lr_scale,
+                .screen_share_limit = src.screen_share_limit,
+                .screen_share_penalty = src.screen_share_penalty,
+                .enabled = src.enabled,
+            };
+        };
+
+        return {
+            .groups = {bind_group(ParamType::Means, means), bind_group(ParamType::Scaling, scaling),
+                       bind_group(ParamType::Rotation, rotation), bind_group(ParamType::Opacity, opacity),
+                       bind_group(ParamType::Sh0, sh0), bind_group(ParamType::ShN, shN)},
+            .scale_reg_loss = absent_,
+            .opacity_reg_loss = absent_,
+            .sparsity_sigmoid = absent_,
+            .sparsity_z = absent_,
+            .sparsity_u = absent_,
+
+            .beta1 = beta1,
+            .beta2 = beta2,
+            .eps = eps,
+            .per_splat_mean_step = per_splat_mean_step_,
+            .mean_step_median_extent = mean_step_median_extent_,
+            .mean_step_far_mask = mean_step_far_mask_storage_,
+        };
     }
 
     void AdamOptimizer::commit_fastgs_fused_adam(const int iteration) {
@@ -1079,14 +1100,14 @@ namespace lfs::training {
             return;
         }
         // Encode true (m,v)=(0,0) under current block bounds (u=0,log_s=0).
-        const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
+        const lfs::core::TensorExecutionTarget stream = lfs::core::TensorExecutionTarget::current();
         if (reset_indices_upload_.pending() && !reset_indices_upload_.poll())
             reset_indices_upload_.wait();
         lfs::core::Tensor d_indices_tensor = lfs::core::Tensor::empty(
             {indices.size()}, lfs::core::Device::GPU, lfs::core::DataType::Int64);
         d_indices_tensor.set_stream(stream);
         reset_indices_upload_.enqueue(
-            d_indices_tensor, std::as_bytes(std::span(indices)), reinterpret_cast<void*>(stream));
+            d_indices_tensor, std::as_bytes(std::span(indices)), stream);
         state.exp_avg.sync_to_stream(stream);
         state.joint_bounds.sync_to_stream(stream);
         if (type == ParamType::ShN) {
@@ -1130,13 +1151,13 @@ namespace lfs::training {
             throw std::runtime_error("reset_state_at_indices: indices must be int32 or int64");
         }
 
-        if (indices.device() == lfs::core::Device::CUDA) {
+        if (indices.device() == lfs::core::Device::GPU) {
             auto device_indices = indices.is_contiguous() ? indices : indices.contiguous();
             if (device_indices.dtype() != lfs::core::DataType::Int64) {
                 device_indices = device_indices.to(lfs::core::DataType::Int64);
             }
-            const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
-            lfs::core::waitForCUDAStream(stream, device_indices.stream());
+            const lfs::core::TensorExecutionTarget stream = lfs::core::TensorExecutionTarget::current();
+            stream.wait_for(device_indices.execution_target());
             relocate_params_at_indices_gpu(type, device_indices);
             device_indices.set_stream(stream);
             return;
@@ -1209,8 +1230,7 @@ namespace lfs::training {
                               packed_new_rows <= state.exp_avg.capacity() &&
                               (!state.grad.is_valid() || new_size <= state.grad.capacity());
             if (fits) {
-                if (state.grad.is_valid())
-                    state.grad.append_zeros(growth);
+                grow_grad_rows(state.grad, name, state.size, new_size, new_size);
                 if (type == ParamType::ShN) {
                     state.exp_avg.append_zeros(packed_growth);
                 } else {
@@ -1236,8 +1256,7 @@ namespace lfs::training {
                 if (state.exp_avg.is_valid() && state.exp_avg.capacity() < moment_cap) {
                     state.exp_avg.reserve(moment_cap);
                 }
-                if (state.grad.is_valid())
-                    state.grad.reserve(moment_cap);
+                grow_grad_rows(state.grad, name, state.size, new_size, moment_cap);
                 if (old_packed.is_valid() && old_packed.numel() > 0 &&
                     state.exp_avg.is_valid() && state.exp_avg.numel() > 0) {
                     const size_t copy_n = std::min(old_packed.numel(), state.exp_avg.numel());
@@ -1265,7 +1284,7 @@ namespace lfs::training {
                 std::vector<int64_t> new_idx(n_new);
                 for (size_t i = 0; i < n_new; ++i)
                     new_idx[i] = static_cast<int64_t>(old_prims + i);
-                const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
+                const lfs::core::TensorExecutionTarget stream = lfs::core::TensorExecutionTarget::current();
                 if (extend_indices_upload_.pending() && !extend_indices_upload_.poll())
                     extend_indices_upload_.wait();
                 lfs::core::Tensor d_idx_tensor = lfs::core::Tensor::empty(
@@ -1273,7 +1292,7 @@ namespace lfs::training {
                 d_idx_tensor.set_stream(stream);
                 extend_indices_upload_.enqueue(
                     d_idx_tensor, std::as_bytes(std::span(new_idx)),
-                    reinterpret_cast<void*>(stream));
+                    stream);
                 state.exp_avg.sync_to_stream(stream);
                 state.joint_bounds.sync_to_stream(stream);
                 if (type == ParamType::ShN) {
@@ -1483,26 +1502,25 @@ namespace lfs::training {
 
             const bool indices_are_i64 = indices.dtype() == lfs::core::DataType::Int64;
             lfs::core::Tensor indices_i32;
-            const int* indices_i32_ptr = nullptr;
             if (!indices_are_i64) {
                 indices_i32 = indices.dtype() == lfs::core::DataType::Int32
                                   ? indices
                                   : indices.to(lfs::core::DataType::Int32);
-                indices_i32_ptr = indices_i32.ptr<int>();
             }
 
             auto gather_new_swizzled_rows = [&](lfs::core::Tensor& tensor) {
-                const auto stream = lfs::core::getCurrentCUDAStream();
+                const auto stream = lfs::core::TensorExecutionTarget::current();
                 (indices_are_i64 ? indices : indices_i32).sync_to_stream(stream);
                 tensor.set_stream(stream);
-                float* ptr = tensor.ptr<float>();
-                if (indices_are_i64) {
-                    lfs::core::shN_swizzled_gather_self_i64(
-                        ptr, ptr, indices.ptr<int64_t>(), n_new, old_N, layout_rest, stream);
-                } else {
-                    lfs::core::shN_swizzled_gather_self(
-                        ptr, ptr, indices_i32_ptr, n_new, old_N, layout_rest, stream);
-                }
+                training_sh_ops().gather_swizzled(
+                    tensor,
+                    indices_are_i64 ? indices : indices_i32,
+                    tensor,
+                    {.source_rows = old_N,
+                     .count = n_new,
+                     .destination_offset = old_N,
+                     .source_rest = layout_rest,
+                     .destination_rest = layout_rest});
             };
 
             // q16: gather-decode sources and encode only the appended 256-splat
@@ -1526,6 +1544,9 @@ namespace lfs::training {
             const auto name = param_name(type);
             if (states_.contains(name)) {
                 auto& state = states_[name];
+
+                grow_grad_rows(state.grad, name, state.size, new_floats,
+                               std::max(state.capacity, new_floats));
 
                 // Joint states grow packed exp_avg directly.
                 if (state.is_joint() && state.exp_avg.is_valid()) {
@@ -1566,7 +1587,7 @@ namespace lfs::training {
                         std::vector<int64_t> new_idx(n_new);
                         for (size_t i = 0; i < n_new; ++i)
                             new_idx[i] = static_cast<int64_t>(old_N + i);
-                        const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
+                        const lfs::core::TensorExecutionTarget stream = lfs::core::TensorExecutionTarget::current();
                         if (add_indices_upload_.pending() && !add_indices_upload_.poll())
                             add_indices_upload_.wait();
                         lfs::core::Tensor d_idx_tensor = lfs::core::Tensor::empty(
@@ -1574,7 +1595,7 @@ namespace lfs::training {
                         d_idx_tensor.set_stream(stream);
                         add_indices_upload_.enqueue(
                             d_idx_tensor, std::as_bytes(std::span(new_idx)),
-                            reinterpret_cast<void*>(stream));
+                            stream);
                         const int slots = static_cast<int>(
                             lfs::core::sh_float4_slots_for_rest(layout_rest));
                         if (slots > 0) {
@@ -1648,7 +1669,7 @@ namespace lfs::training {
                 LOG_WARN("relocate_params_at_indices_gpu: {} joint bounds invalid", name);
                 return;
             }
-            const cudaStream_t stream = lfs::core::getCurrentCUDAStream();
+            const lfs::core::TensorExecutionTarget stream = lfs::core::TensorExecutionTarget::current();
             state.exp_avg.sync_to_stream(stream);
             state.joint_bounds.sync_to_stream(stream);
             if (type == ParamType::ShN) {
@@ -1921,7 +1942,7 @@ namespace lfs::training {
 
         const auto cpu_decode_finished = std::chrono::steady_clock::now();
         // Tensor::to(CUDA, stream) rehomes onto that handle; do not destroy it.
-        const cudaStream_t upload_stream = lfs::core::getCurrentCUDAStream();
+        const lfs::core::TensorExecutionTarget upload_stream = lfs::core::TensorExecutionTarget::current();
         for (auto& [state_name, state] : loaded_states) {
             (void)state_name;
             auto upload = [&](lfs::core::Tensor& tensor) {
@@ -1934,7 +1955,7 @@ namespace lfs::training {
             upload(state.exp_avg);
             upload(state.joint_bounds);
         }
-        if (upload_stream != nullptr) {
+        if (!upload_stream.is_default_queue()) {
             lfs::core::TensorCompletion completion;
             for (const auto& [state_name, state] : loaded_states) {
                 (void)state_name;
@@ -2049,6 +2070,11 @@ namespace lfs::training {
         if (state->joint_bounds.is_valid())
             state->joint_bounds.zero_();
         state->step_count = 0;
+    }
+
+    void AdamOptimizer::reset_all_states() {
+        for (const auto type : all_param_types())
+            reset_state(type);
     }
 
 } // namespace lfs::training

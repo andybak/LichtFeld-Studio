@@ -182,7 +182,6 @@ void apply_crop_box_filter(
     StructuredBuffer<float4> overlay_params,
     uint flags_idx,
     float4 crop_flags,
-    bool node_data_enabled,
     int node_idx,
     float3 mean_ws,
     inout bool active,
@@ -192,7 +191,7 @@ void apply_crop_box_filter(
     if (!overlay_enabled(crop_flags.x)) return;
 
     int parent_node_idx = overlay_int(crop_flags.w);
-    bool applies = parent_node_idx < 0 || (node_data_enabled && node_idx == parent_node_idx);
+    bool applies = parent_node_idx < 0 || node_idx == parent_node_idx;
     if (!applies) return;
 
     float3 local = transform_point_rows(overlay_params, flags_idx + 3u, mean_ws);
@@ -218,7 +217,6 @@ void apply_ellipsoid_filter(
     StructuredBuffer<float4> overlay_params,
     uint flags_idx,
     float4 ellipsoid_flags,
-    bool node_data_enabled,
     int node_idx,
     float3 mean_ws,
     inout bool active,
@@ -228,7 +226,7 @@ void apply_ellipsoid_filter(
     if (!overlay_enabled(ellipsoid_flags.x)) return;
 
     int parent_node_idx = overlay_int(ellipsoid_flags.w);
-    bool applies = parent_node_idx < 0 || (node_data_enabled && node_idx == parent_node_idx);
+    bool applies = parent_node_idx < 0 || node_idx == parent_node_idx;
     if (!applies) return;
 
     float3 local = transform_point_rows(overlay_params, flags_idx + 2u, mean_ws);
@@ -263,9 +261,9 @@ SplatActiveState compute_splat_active_state(
     float4 emphasis_flags = overlay_params[OVERLAY_PARAM_EMPHASIS_FLAGS];
     bool node_data_enabled = overlay_enabled(emphasis_flags.y);
     int node_count = overlay_int(emphasis_flags.z);
-    int node_idx = node_data_enabled ? read_int32(transform_indices, logical_idx) : -1;
-    int model_transform_idx = node_data_enabled ? node_idx : 0;
-    model_transform_idx = clamp(model_transform_idx, 0, int(max(model_transform_count, 1u)) - 1);
+    // Without per-splat indices the scene has one model, so every splat is node 0.
+    int node_idx = node_data_enabled ? read_int32(transform_indices, logical_idx) : 0;
+    int model_transform_idx = clamp(node_idx, 0, int(max(model_transform_count, 1u)) - 1);
     uint model_transform_base = uint(model_transform_idx) * 4u;
     bool model_transform_enabled = model_transform_count > 0u;
     float3 mean_ws = model_transform_enabled
@@ -279,7 +277,7 @@ SplatActiveState compute_splat_active_state(
         float4 crop_flags = overlay_params[OVERLAY_PARAM_CROP_FLAGS];
         if (overlay_enabled(crop_flags.x)) {
             apply_crop_box_filter(overlay_params, OVERLAY_PARAM_CROP_FLAGS, crop_flags,
-                                  node_data_enabled, node_idx, mean_ws,
+                                  node_idx, mean_ws,
                                   active, overlay_flags);
             for (uint crop_i = 0u; crop_i < OVERLAY_PARAM_CROP_EXTRA_COUNT; ++crop_i) {
                 const uint flags_idx =
@@ -288,7 +286,7 @@ SplatActiveState compute_splat_active_state(
                 if (!overlay_enabled(extra_flags.x))
                     break;
                 apply_crop_box_filter(overlay_params, flags_idx, extra_flags,
-                                      node_data_enabled, node_idx, mean_ws,
+                                      node_idx, mean_ws,
                                       active, overlay_flags);
             }
         }
@@ -298,7 +296,7 @@ SplatActiveState compute_splat_active_state(
         float4 ellipsoid_flags = overlay_params[OVERLAY_PARAM_ELLIPSOID_FLAGS];
         if (overlay_enabled(ellipsoid_flags.x)) {
             apply_ellipsoid_filter(overlay_params, OVERLAY_PARAM_ELLIPSOID_FLAGS, ellipsoid_flags,
-                                   node_data_enabled, node_idx, mean_ws,
+                                   node_idx, mean_ws,
                                    active, overlay_flags);
             for (uint ellipsoid_i = 0u; ellipsoid_i < OVERLAY_PARAM_ELLIPSOID_EXTRA_COUNT; ++ellipsoid_i) {
                 const uint flags_idx =
@@ -307,7 +305,7 @@ SplatActiveState compute_splat_active_state(
                 if (!overlay_enabled(extra_flags.x))
                     break;
                 apply_ellipsoid_filter(overlay_params, flags_idx, extra_flags,
-                                       node_data_enabled, node_idx, mean_ws,
+                                       node_idx, mean_ws,
                                        active, overlay_flags);
             }
         }
@@ -374,20 +372,14 @@ SplatActiveState compute_splat_active_state(
     }
 
     if (active && overlay_enabled(emphasis_flags.x) && node_data_enabled && node_idx >= 0 && node_idx < node_count) {
-        if (read_byte(node_mask, uint(node_idx)) == 0) {
+        if ((read_byte(node_mask, uint(node_idx)) & 1u) == 0u) {
             overlay_flags |= (OVERLAY_FLAG_DIM | OVERLAY_FLAG_NONSELECTABLE);
         }
     }
 
-    if (active && emphasis_flags.w > 0.0f && node_data_enabled && node_idx >= 0 && node_idx < node_count) {
-        if (read_byte(node_mask, uint(node_idx)) != 0) {
-            overlay_flags |= OVERLAY_FLAG_FLASH;
-        }
-    }
-
     float4 visibility_flags = overlay_params[OVERLAY_PARAM_VISIBILITY_FLAGS];
-    if (active && overlay_enabled(visibility_flags.x) && node_data_enabled && node_idx >= 0 && node_idx < node_count) {
-        if (read_byte(node_mask, uint(node_idx)) == 0) {
+    if (active && overlay_enabled(visibility_flags.x) && node_idx >= 0 && node_idx < node_count) {
+        if ((read_byte(node_mask, uint(node_idx)) & 2u) == 0u) {
             active = false;
         }
     }
@@ -477,6 +469,63 @@ float3 rotation_column(float3x3 rotation, uint column) {
     if (column == 1u)
         return float3(rotation[0][1], rotation[1][1], rotation[2][1]);
     return float3(rotation[0][2], rotation[1][2], rotation[2][2]);
+}
+
+// Conservative projection of the actual 3D alpha-support ellipsoid.
+// Keep UT centers/conics for shading overlays, but never use their approximate
+// ellipse to discard a tile containing a valid 3D ray contribution.
+[ForceInline]
+void gut_support_pixel_bounds(Gaussian_3D g, Camera cam, float3 mean_ws,
+                              StructuredBuffer<float4> model_rows, uint model_base,
+                              bool transformed, out float2 lo, out float2 hi) {
+    const float3x3 rotation = quat_to_rotmat(safe_quat_normalize(g.rotations));
+    const float3 scale = max(g.scales, float3(1e-8f));
+    float3 axes[3];
+    for (uint i = 0u; i < 3u; ++i) {
+        float3 axis = rotation_column(rotation, i) * scale[i];
+        if (transformed) {
+            axis = float3(dot(model_rows[model_base].xyz, axis),
+                          dot(model_rows[model_base + 1u].xyz, axis),
+                          dot(model_rows[model_base + 2u].xyz, axis));
+        }
+        axes[i] = mul(float3x3(cam.world_view_transform), axis);
+    }
+    const float3 mean = geom_transform_points(mean_ws, cam.world_view_transform);
+    const float3 row_x = float3(axes[0].x, axes[1].x, axes[2].x);
+    const float3 row_y = float3(axes[0].y, axes[1].y, axes[2].y);
+    const float3 row_z = float3(axes[0].z, axes[1].z, axes[2].z);
+    const float radius2 = 2.0f * (power_threshold_for_opacity(g.opacities) + 1e-4f);
+    float2 center, extent;
+    if (cam.model == int(CameraModel::ORTHO)) {
+        center = mean.xy;
+        extent = sqrt(radius2 * float2(dot(row_x, row_x), dot(row_y, row_y)));
+    } else {
+        const float zz = dot(row_z, row_z);
+        // Ellipsoids crossing the near plane have unbounded pinhole support.
+        // Preserve them conservatively rather than divide by a small/negative
+        // tangent denominator or let a non-finite bound drop the primitive.
+        const float denominator = mean.z * mean.z - radius2 * zz;
+        if (!(mean.z > sqrt(radius2 * zz) * 1.001f + NEAR_CLIP) ||
+            !isfinite(denominator) || denominator <= 0.0f) {
+            lo = float2(0.0f); hi = float2(cam.W, cam.H);
+            return;
+        }
+        center = (mean.xy * mean.z - radius2 *
+                  float2(dot(row_x, row_z), dot(row_y, row_z))) / denominator;
+        const float3 x_tangent = mean.z * row_x - mean.x * row_z;
+        const float3 y_tangent = mean.z * row_y - mean.y * row_z;
+        // Dropping the non-negative covariance-minor term from the exact
+        // discriminant enlarges the bound and avoids subtractive cancellation.
+        extent = sqrt(radius2 * float2(dot(x_tangent, x_tangent),
+                                       dot(y_tangent, y_tangent))) / denominator;
+    }
+    center = center * float2(cam.fx, cam.fy) + float2(cam.cx, cam.cy) - 0.5f;
+    extent = extent * float2(cam.fx, cam.fy) * 1.001f + 1.0f;
+    if (!all(isfinite(center)) || !all(isfinite(extent))) {
+        lo = float2(0.0f); hi = float2(cam.W, cam.H);
+        return;
+    }
+    lo = center - extent; hi = center + extent;
 }
 
 [ForceInline]
@@ -718,7 +767,7 @@ layout(binding=28) RWStructuredBuffer<int32_t> out_orig_ids;
 #endif
 #if LFS_QUANT_POOL
 // Per-page dequant frames (core/rad_pool_quant.hpp PageFrame), bound after every
-// variant-specific binding so the C++ buffer list just appends it last.
+// variant-specific binding except the deleted mask that follows it.
 #if LFS_PROJECTION_SURVIVORS
 layout(binding=29) StructuredBuffer<float4> page_frames;
 #else
@@ -727,12 +776,26 @@ layout(binding=24) StructuredBuffer<float4> page_frames;
 #endif
 #if LFS_SHN_Q16
 // Per-256-splat float2 (min,max) bounds for pad-dropped q16 SH rest.
-// Appended last like page_frames so the C++ buffer list just appends it.
+// Appended before the deleted-mask binding like page_frames.
 #if LFS_PROJECTION_SURVIVORS
 layout(binding=29) StructuredBuffer<float2> shN_bounds;
 #else
 layout(binding=24) StructuredBuffer<float2> shN_bounds;
 #endif
+#endif
+
+#if LFS_PROJECTION_SURVIVORS
+  #if LFS_QUANT_POOL || LFS_SHN_Q16
+layout(binding=30) ByteAddressBuffer deleted_mask;
+  #else
+layout(binding=29) ByteAddressBuffer deleted_mask;
+  #endif
+#else
+  #if LFS_QUANT_POOL || LFS_SHN_Q16
+layout(binding=25) ByteAddressBuffer deleted_mask;
+  #else
+layout(binding=24) ByteAddressBuffer deleted_mask;
+  #endif
 #endif
 
 #if !LFS_PROJECTION_SURVIVORS
@@ -819,6 +882,14 @@ void main(
             : g_idx;
     }
 
+  #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
+    if ((uniforms.lod_enabled & 128u) != 0u && read_byte(deleted_mask, g_idx) != 0u) {
+      #if !LFS_PROJECTION_SURVIVORS
+        clear_forward_projection_output(out_idx, 0u, uniforms.lod_enabled);
+      #endif
+        return;
+    }
+  #endif
 
     // load stuff
     Camera cam = no_diff load_camera(world_view_transform,
@@ -1000,6 +1071,22 @@ void main(
     rectangle rect_tile_space = equirectangular_camera
         ? get_wrapped_rectangle_tile_space(splat_dist.xyz_vs.xy, radii, grid_height, grid_width)
         : get_rectangle_tile_space(splat_dist.xyz_vs.xy, radii, bin_grid_height, bin_grid_width);
+#if LFS_3DGUT_PROJECTION && EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
+    if (gut_rectilinear_bounds(uniforms.camera_model, uniforms.splat_render_profile, uniforms.lod_enabled)) {
+        float2 lo, hi;
+        gut_support_pixel_bounds(gauss, cam, mean_ws, model_transforms,
+                                 model_transform_base, model_transform_enabled, lo, hi);
+        if (!full_frame_binning(uniforms)) {
+            const float2 origin = float2(uniforms.render_origin_x, uniforms.render_origin_y);
+            lo -= origin; hi -= origin;
+        }
+        // Union with the existing UT rectangle also preserves overlay support.
+        rect_tile_space.min_x = min(rect_tile_space.min_x, uint16_t(floor(clamp(lo.x / TILE_WIDTH, 0.0f, float(bin_grid_width)))));
+        rect_tile_space.min_y = min(rect_tile_space.min_y, uint16_t(floor(clamp(lo.y / TILE_HEIGHT, 0.0f, float(bin_grid_height)))));
+        rect_tile_space.max_x = max(rect_tile_space.max_x, uint16_t(ceil(clamp(hi.x / TILE_WIDTH, 0.0f, float(bin_grid_width)))));
+        rect_tile_space.max_y = max(rect_tile_space.max_y, uint16_t(ceil(clamp(hi.y / TILE_HEIGHT, 0.0f, float(bin_grid_height)))));
+    }
+#endif
     const rectangle render_rect = banded_gut ? clip_to_render_grid(rect_tile_space, uniforms) : rect_tile_space;
 
     int32_t n_tiles = int32_t(render_rect.max_x - render_rect.min_x) * int32_t(render_rect.max_y - render_rect.min_y);
@@ -1011,7 +1098,7 @@ void main(
     }
 
   #if TILE_CULLING_MODE == 2
-    if (!equirectangular_camera) {
+    if (!equirectangular_camera && !gut_rectilinear_bounds(uniforms.camera_model, uniforms.splat_render_profile, uniforms.lod_enabled)) {
         n_tiles = no_diff count_ellipse_grid_overlaps(
             splat_dist.xyz_vs.xy, splat_dist.inv_cov_vs_opac.xyz/(extend*extend),
             render_rect,

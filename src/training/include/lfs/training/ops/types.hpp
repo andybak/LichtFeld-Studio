@@ -19,4 +19,20 @@ namespace lfs::gpu_ops {
     };
     using State = std::unique_ptr<BackendState>;
 
+    struct HW {
+        int h = 0;
+        int w = 0;
+    };
+
+    struct Intrinsics {
+        float fx = 0.f;
+        float fy = 0.f;
+        float cx = 0.f;
+        float cy = 0.f;
+    };
+
+    enum class ShStorage { Float32,
+                           IeeeFloat16,
+                           Q16 };
+
 } // namespace lfs::gpu_ops

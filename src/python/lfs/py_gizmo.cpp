@@ -9,6 +9,7 @@
 #include "gui/rotation_gizmo.hpp"
 #include "gui/scale_gizmo.hpp"
 #include "gui/translation_gizmo.hpp"
+#include "input/frame_input_buffer.hpp"
 #include "python/python_runtime.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
@@ -36,20 +37,7 @@ namespace lfs::python {
 
         std::atomic<int> g_next_transform_gizmo_id{100000};
 
-        [[nodiscard]] vis::gui::NativeGizmoInput native_gizmo_input_from_sdl() {
-            static bool previous_left_down = false;
-            float mouse_x = 0.0f;
-            float mouse_y = 0.0f;
-            const SDL_MouseButtonFlags buttons = lfs::vis::input::mouseStateInPixels(SDL_GetMouseFocus(), &mouse_x, &mouse_y);
-            const bool left_down = (buttons & SDL_BUTTON_LMASK) != 0;
-            const bool left_clicked = left_down && !previous_left_down;
-            previous_left_down = left_down;
-            return {
-                .mouse_pos = {mouse_x, mouse_y},
-                .mouse_left_down = left_down,
-                .mouse_left_clicked = left_clicked,
-            };
-        }
+        std::atomic<int> g_next_transform_view_gizmo_id{-1};
 
         [[nodiscard]] TransformGizmoOperation parse_transform_gizmo_operation(const std::string& operation) {
             if (operation == "translate" || operation == "translation" || operation == "move")
@@ -121,31 +109,31 @@ namespace lfs::python {
                 safe_normalize(glm::vec3(matrix[2]), {0.0f, 0.0f, 1.0f}));
         }
 
-        void mark_scene_transform_changed() {
-            if (auto* sm = get_scene_manager()) {
-                sm->getScene().notifyMutation(core::Scene::MutationType::MODEL_CHANGED);
-            }
-
-            auto* gm = get_gui_manager();
-            auto* viewer = gm ? gm->getViewer() : nullptr;
-            auto* rm = viewer ? viewer->getRenderingManager() : nullptr;
-            if (rm) {
-                rm->markDirty(vis::DirtyFlag::SPLATS | vis::DirtyFlag::MESH | vis::DirtyFlag::OVERLAY);
-            }
-        }
-
         [[nodiscard]] bool callable_or_none(const nb::object& object) {
             return !object.is_valid() || object.is_none() || PyCallable_Check(object.ptr());
         }
     } // namespace
 
+    void PyGizmoContext::set_camera_state(const glm::mat4& view, const glm::mat4& proj,
+                                          const glm::vec2& viewport_pos, const glm::vec2& viewport_size,
+                                          const glm::vec3& camera_pos, const glm::vec3& camera_fwd) {
+        viewport_context_.emplace();
+        viewport_context_->set_camera_state(view, proj, viewport_pos, viewport_size, camera_pos, camera_fwd);
+    }
+
     bool PyGizmoContext::has_selection() const { return false; }
 
     std::tuple<float, float, float> PyGizmoContext::selection_center() const { return {0.0f, 0.0f, 0.0f}; }
 
-    std::tuple<float, float, float> PyGizmoContext::camera_position() const { return {0.0f, 0.0f, DEFAULT_CAMERA_Z}; }
+    std::tuple<float, float, float> PyGizmoContext::camera_position() const {
+        return viewport_context_ ? viewport_context_->camera_position()
+                                 : std::make_tuple(0.0f, 0.0f, DEFAULT_CAMERA_Z);
+    }
 
-    std::tuple<float, float, float> PyGizmoContext::camera_forward() const { return {0.0f, 0.0f, -1.0f}; }
+    std::tuple<float, float, float> PyGizmoContext::camera_forward() const {
+        return viewport_context_ ? viewport_context_->camera_forward()
+                                 : std::make_tuple(0.0f, 0.0f, -1.0f);
+    }
 
     std::tuple<float, float> PyGizmoContext::selection_center_screen() const {
         if (const auto screen = world_to_screen(selection_center()))
@@ -154,6 +142,8 @@ namespace lfs::python {
     }
 
     std::optional<std::tuple<float, float>> PyGizmoContext::world_to_screen(std::tuple<float, float, float> pos) const {
+        if (viewport_context_)
+            return viewport_context_->world_to_screen(pos);
         const auto [wx, wy, wz] = pos;
 
         // Match the documented visualizer-world convention with a default camera
@@ -168,6 +158,8 @@ namespace lfs::python {
     }
 
     std::optional<std::tuple<float, float, float>> PyGizmoContext::screen_to_world_ray(std::tuple<float, float> pos) const {
+        if (viewport_context_)
+            return viewport_context_->screen_to_world_ray(pos);
         const auto [sx, sy] = pos;
         const float dx = (sx - DEFAULT_VIEWPORT_WIDTH / 2.0f) / (DEFAULT_VIEWPORT_WIDTH / 2.0f);
         const float dy = -(sy - DEFAULT_VIEWPORT_HEIGHT / 2.0f) / (DEFAULT_VIEWPORT_HEIGHT / 2.0f);
@@ -299,6 +291,7 @@ namespace lfs::python {
     }
 
     void PyGizmoRegistry::draw_all(PyGizmoContext& ctx) {
+        nb::gil_scoped_acquire gil;
         std::vector<PyGizmoInfo> gizmos_copy;
         {
             std::lock_guard lock(mutex_);
@@ -307,14 +300,21 @@ namespace lfs::python {
                 gizmos_copy.push_back(gizmo);
         }
 
-        nb::gil_scoped_acquire gil;
         for (auto& gizmo : gizmos_copy) {
             if (!gizmo.has_draw)
                 continue;
 
-            auto* inst = ensure_instance(gizmo);
-            if (!inst)
-                continue;
+            if (!gizmo.gizmo_instance.is_valid() || gizmo.gizmo_instance.is_none()) {
+                // Constructors may register or unregister gizmos. Run Python outside
+                // the lock, then retain the instance only for the same registration.
+                if (!ensure_instance(gizmo))
+                    continue;
+                std::lock_guard lock(mutex_);
+                auto it = gizmos_.find(gizmo.id);
+                if (it == gizmos_.end() || !it->second.gizmo_class.is(gizmo.gizmo_class))
+                    continue;
+                it->second.gizmo_instance = gizmo.gizmo_instance;
+            }
 
             if (gizmo.has_poll) {
                 try {
@@ -327,7 +327,7 @@ namespace lfs::python {
             }
 
             try {
-                gizmo.gizmo_instance.attr("draw")(ctx);
+                gizmo.gizmo_instance.attr("draw")(nb::cast(ctx, nb::rv_policy::reference));
             } catch (const std::exception& e) {
                 LOG_ERROR("Gizmo '{}' draw: {}", gizmo.id, e.what());
             }
@@ -576,12 +576,15 @@ namespace lfs::python {
                     const auto local_transform =
                         vis::scene_coords::nodeLocalTransformFromVisualizerWorld(
                             sm->getScene(), state_->target_node_name, state_->matrix);
-                    if (local_transform)
-                        sm->setNodeTransform(state_->target_node_name, *local_transform);
+                    if (!local_transform) {
+                        LOG_WARN("TransformGizmo '{}' rejected a target transform because its parent cannot preserve a finite world transform",
+                                 state_->id);
+                        return;
+                    }
+                    sm->setNodeTransform(state_->target_node_name, *local_transform);
                 } else {
                     sm->setNodeTransform(state_->target_node_name, state_->matrix);
                 }
-                mark_scene_transform_changed();
             }
         }
 
@@ -605,11 +608,23 @@ namespace lfs::python {
                                       const glm::vec2& viewport_pos,
                                       const glm::vec2& viewport_size,
                                       vis::gui::NativeOverlayDrawList* draw_list) {
-        state_->changed = false;
-        state_->hovered = false;
+        const auto context = get_overlay_draw_context();
+        const auto* frame = context.frame_input;
+        if (!frame)
+            return;
+        if (state_->input_frame != frame->serial) {
+            state_->input_frame = frame->serial;
+            state_->changed = false;
+            state_->hovered = false;
+        }
+        const bool owning_view = !state_->active || state_->drag_view == context.view;
+        auto [instance, inserted] = state_->view_instances.try_emplace(context.view, 0);
+        if (inserted)
+            instance->second = g_next_transform_view_gizmo_id.fetch_sub(1, std::memory_order_relaxed);
+        const int view_instance = instance->second;
 
         if (!state_->visible || !state_->enabled || !draw_list || viewport_size.x <= 1.0f || viewport_size.y <= 1.0f) {
-            if (state_->active) {
+            if (state_->active && owning_view) {
                 state_->active = false;
                 call_lifecycle_callback(state_->on_end);
             }
@@ -622,11 +637,14 @@ namespace lfs::python {
         bool active_now = false;
         bool changed_now = false;
         bool hovered_now = false;
-        const vis::gui::NativeGizmoInput gizmo_input = native_gizmo_input_from_sdl();
+        const vis::gui::NativeGizmoInput gizmo_input{
+            .mouse_pos = {frame->mouse_x, frame->mouse_y},
+            .mouse_left_down = owning_view && frame->mouse_down[0],
+            .mouse_left_clicked = owning_view && frame->mouse_clicked[0]};
 
         if (state_->operation == TransformGizmoOperation::Translate) {
             vis::gui::TranslationGizmoConfig config;
-            config.id = state_->instance_id;
+            config.id = view_instance;
             config.viewport_pos = viewport_pos;
             config.viewport_size = viewport_size;
             config.view = view;
@@ -635,7 +653,7 @@ namespace lfs::python {
             config.orientation_world = orientation_for_operation();
             config.draw_list = draw_list;
             config.input = gizmo_input;
-            config.input_enabled = state_->input_enabled;
+            config.input_enabled = state_->input_enabled && owning_view;
             config.snap = state_->snap;
             config.snap_units = state_->translate_snap;
 
@@ -648,7 +666,7 @@ namespace lfs::python {
             }
         } else if (state_->operation == TransformGizmoOperation::Rotate) {
             vis::gui::RotationGizmoConfig config;
-            config.id = state_->instance_id;
+            config.id = view_instance;
             config.viewport_pos = viewport_pos;
             config.viewport_size = viewport_size;
             config.view = view;
@@ -657,7 +675,7 @@ namespace lfs::python {
             config.orientation_world = orientation_for_operation();
             config.draw_list = draw_list;
             config.input = gizmo_input;
-            config.input_enabled = state_->input_enabled;
+            config.input_enabled = state_->input_enabled && owning_view;
             config.snap = state_->snap;
             config.snap_degrees = state_->rotate_snap_degrees;
 
@@ -674,7 +692,7 @@ namespace lfs::python {
             }
         } else {
             vis::gui::ScaleGizmoConfig config;
-            config.id = state_->instance_id;
+            config.id = view_instance;
             config.viewport_pos = viewport_pos;
             config.viewport_size = viewport_size;
             config.view = view;
@@ -683,7 +701,7 @@ namespace lfs::python {
             config.orientation_world = orientation_for_operation();
             config.draw_list = draw_list;
             config.input = gizmo_input;
-            config.input_enabled = state_->input_enabled;
+            config.input_enabled = state_->input_enabled && owning_view;
             config.snap = state_->snap;
             config.snap_ratio = state_->scale_snap_ratio;
 
@@ -706,17 +724,21 @@ namespace lfs::python {
             }
         }
 
+        state_->hovered |= hovered_now;
+        if (!owning_view)
+            return;
+
         if ((hovered_now || active_now) && state_->input_enabled) {
             vis::gui::guiFocusState().want_capture_mouse = true;
         }
 
         if (active_now && !was_active) {
             state_->active = true;
+            state_->drag_view = context.view;
             call_lifecycle_callback(state_->on_begin);
         }
 
-        state_->hovered = hovered_now;
-        state_->changed = changed_now;
+        state_->changed |= changed_now;
 
         if (changed_now) {
             apply_to_target();

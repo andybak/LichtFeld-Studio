@@ -14,6 +14,49 @@ def _rule_body(rcss: str, selector: str) -> str:
     return rcss.split(f"{selector} {{", 1)[1].split("}", 1)[0]
 
 
+def _theme_size_values(node, key):
+    if isinstance(node, dict):
+        for name, value in node.items():
+            if name == key:
+                yield value
+            else:
+                yield from _theme_size_values(value, key)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _theme_size_values(value, key)
+
+
+def test_every_scrollbar_uses_the_theme_size():
+    # Catches a panel or theme drifting back to its own scrollbar width.
+    themes_dir = PROJECT_ROOT / "src" / "visualizer" / "gui" / "assets" / "themes"
+    for theme_path in themes_dir.glob("*.json"):
+        theme = json.loads(theme_path.read_text(encoding="utf-8"))
+        assert set(_theme_size_values(theme, "scrollbar_size")) <= {4.0}, theme_path.name
+        assert set(_theme_size_values(theme, "grab_min_size")) <= {12.0}, theme_path.name
+
+    resources_dir = PROJECT_ROOT / "src" / "visualizer" / "gui" / "rmlui" / "resources"
+    rule = re.compile(r"([^{}]*scrollbar(?:vertical|horizontal)[^{}]*)\{([^}]*)\}")
+    for rcss_path in resources_dir.glob("*.rcss"):
+        if rcss_path.name.startswith("components"):
+            continue
+        for selector, body in rule.findall(rcss_path.read_text(encoding="utf-8")):
+            assert not re.search(r"\b(?:width|height|min-width|min-height):", body), (
+                f"{rcss_path.name}: {selector.strip()}"
+            )
+
+
+def test_narrow_tab_and_tool_bars_wrap_instead_of_clipping():
+    # Catches the HUD tabs overlapping and the console toolbar cutting off actions at large UI scales.
+    resources_dir = PROJECT_ROOT / "src" / "visualizer" / "gui" / "rmlui" / "resources"
+    overlay_rcss = (resources_dir / "viewport_overlay.rcss").read_text(encoding="utf-8")
+    assert "flex-wrap: wrap;" in _rule_body(overlay_rcss, ".vram-hud-tabs")
+    assert "flex: 1 0 auto;" in _rule_body(overlay_rcss, ".vram-hud-tab")
+
+    console_rcss = (resources_dir / "python_console_panel.rcss").read_text(encoding="utf-8")
+    assert "flex-wrap: wrap;" in _rule_body(console_rcss, ".toolbar-actions")
+    assert not re.search(r"(?<![-\w])height:", _rule_body(console_rcss, "#python-console-toolbar"))
+
+
 def test_menubar_submenus_are_stacked_above_overlay_and_hit_testable():
     rml = (
         PROJECT_ROOT
@@ -87,12 +130,9 @@ def test_menubar_submenus_are_stacked_above_overlay_and_hit_testable():
     assert 'id="menu-window-toggle-ui"' in rml
     assert 'data-action="window_toggle_ui"' in rml
     assert rml.count('data-for="button : menu_camera_buttons"') == 1
-    assert rml.count('data-for="button : menu_render_buttons"') == 1
+    assert rml.count('data-for="button : menu_snap_buttons"') == 1
     assert rml.index('data-for="button : menu_camera_buttons"') < rml.index(
-        'data-for="button : menu_render_buttons"'
-    )
-    assert rml.index('data-for="button : menu_render_buttons"') < rml.index(
-        'data-for="button : menu_projection_buttons"'
+        'data-for="button : menu_snap_buttons"'
     )
     toolbar_button_rule = _rule_body(rcss, ".menu-toolbar-btn")
     assert "transition: none;" in toolbar_button_rule
@@ -178,9 +218,6 @@ def test_optional_gradients_style_the_primary_application_chrome():
     consumers = {
         "chrome.menu_decor": ("shell.theme.rcss", "menubar.theme.rcss"),
         "chrome.status_decor": ("shell.theme.rcss", "statusbar.theme.rcss"),
-        "chrome.right_panel_decor": ("right_panel.theme.rcss",),
-        "chrome.right_panel_edge_shape": ("right_panel.theme.rcss",),
-        "chrome.right_panel_separator_decor": ("right_panel.theme.rcss",),
         "chrome.toolbar_decor": ("viewport_overlay.theme.rcss",),
         "controls.selected_decor": ("viewport_overlay.theme.rcss",),
         "controls.selected_icon": ("viewport_overlay.theme.rcss",),
@@ -197,7 +234,6 @@ def test_optional_gradients_style_the_primary_application_chrome():
     assert '{"panel.host_body_decor"' in rml_theme_cpp
     assert '"decorator: none; background-color: transparent"' in rml_theme_cpp
     assert "@{panel.host_body_decor}" in panel_host_theme
-    assert '"width: 1dp; height: 100%' in rml_theme_cpp
 
 
 def test_rml_tooltips_request_only_pending_animation_frames():
@@ -369,7 +405,7 @@ def test_all_optional_theme_gradients_reach_rml_consumers():
 
     gradient_tokens = {
         "window_body": ("window.body_decor", "components.theme.rcss"),
-        "panel_body": ("panel.body_decor", "shell.theme.rcss"),
+        "panel_body": ("panel.body_decor", "screen_chrome.theme.rcss"),
         "window_title": ("window.title_decor", "components.theme.rcss"),
         "section_header": ("components.header_decor", "components.theme.rcss"),
         "section_header_hover": (
@@ -641,21 +677,8 @@ def test_menu_pointer_input_is_not_replayed_into_underlay_panels():
     )[1].split("PanelInputState maskInputForBlockedUi", 1)[0]
     assert "input.key_ctrl" not in pointer_mask
     assert "input.keys_pressed" not in pointer_mask
-    assert "input.text_inputs" not in pointer_mask
+    assert "input.input_events" not in pointer_mask
 
-
-def test_viewport_overlay_toolbar_origin_tracks_viewport_content_offset():
-    gui_manager_cpp = (
-        PROJECT_ROOT
-        / "src"
-        / "visualizer"
-        / "gui"
-        / "gui_manager.cpp"
-    ).read_text(encoding="utf-8")
-
-    assert "const float viewport_content_offset = viewport_layout_.pos.x - screen.work_pos.x;" in gui_manager_cpp
-    assert "float primary_toolbar_x = viewport_content_offset;" in gui_manager_cpp
-    assert "rml_viewport_overlay_.setViewportContentOffset(viewport_content_offset);" in gui_manager_cpp
 
 
 def test_asset_manager_launcher_is_not_duplicated_in_scene_header():
@@ -792,13 +815,12 @@ def test_scene_tree_removes_models_header_space_and_confirms_all_node_deletes():
     assert "removeNodesByIdsWithResult(live_ids" in scene_graph_cpp
     assert "live_names" not in scene_graph_cpp
     request_body = scene_graph_cpp.split("void SceneGraphElement::requestDeleteNodes", 1)[1].split(
-        "void SceneGraphElement::deleteSelectedNodes", 1
+        "void SceneGraphElement::toggleChildrenTraining", 1
     )[0]
     assert "the complete selection is no longer removable" in request_body
     assert "Scene node deletion request aborted" in request_body
     assert "continue;" not in request_body
     assert scene_graph_cpp.count("requestDeleteNodes({node_id})") == 2
-    assert "requestDeleteNodes(ids);" in scene_graph_cpp
     assert "deleteEnabledSelectedNodeIds" not in scene_graph_cpp
     bulk_delete = scene_graph_cpp.split('kind == "delete_selected"', 1)[1].split(
         '} else if (kind == "set_easing"', 1
@@ -985,10 +1007,7 @@ def test_scene_tree_multi_selection_actions_are_fixed_below_the_scroll_view():
     assert "justify-content: center;" in button_rule
     assert "box-sizing: border-box;" in button_rule
     assert "padding: 0;" in button_rule
-    tree_scrollbar_rule = _rule_body(scene_rcss, "scene-graph scrollbarvertical")
-    assert "width: 4dp;" in tree_scrollbar_rule
-    tree_slider_rule = _rule_body(scene_rcss, "scene-graph scrollbarvertical sliderbar")
-    assert "min-height: 12dp;" in tree_slider_rule
+    assert "scene-graph scrollbarvertical" not in scene_rcss
     assert "state.count > 0" in scene_panel
     assert "!state.all_training_compatible" in scene_panel
     assert "!state.all_delete_enabled" in scene_panel

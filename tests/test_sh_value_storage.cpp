@@ -12,6 +12,7 @@
 #include "core/tensor_cuda_interop.hpp"
 #include "core/tensor_upload.hpp"
 #include "cuda_backend_test.hpp"
+#include "fast_raster_test_helpers.hpp"
 #include "io/exporter.hpp"
 #include "io/formats/ply.hpp"
 #include "io/loader.hpp"
@@ -20,7 +21,6 @@
 #include "lfs/training/sh_value_storage.hpp"
 #include "lfs/training/vram_ledger.hpp"
 #include "training/optimizer/adam_optimizer.hpp"
-#include "training/rasterization/fast_rasterizer.hpp"
 #include "training/rasterization/fastgs/rasterization/include/rasterization_config.h"
 #include "training/strategies/mcmc.hpp"
 #include "training/strategies/strategy_utils.hpp"
@@ -208,10 +208,8 @@ TEST_F(ShValueStorageTest, GpuEncodeDecodeRoundtripLowMse) {
 // grew it: growing it after that stream is destroyed freed on a dead handle, which
 // segfaults or reports cudaErrorContextIsDestroyed after switching projects.
 TEST_F(ShValueStorageTest, Q16WorkspaceGrowthAfterReleasedStreamDoesNotReportCudaFailure) {
-    auto loaded = lfs::io::load_ply(
-        std::filesystem::path(TEST_DATA_DIR) / "kerstbol-isolated-rotated_137502.ply");
-    ASSERT_TRUE(loaded.has_value()) << lfs::format_for_developer(loaded.error());
-    SplatData& splat = loaded->value;
+    // Grow across many quantization blocks, including a partial final block.
+    auto splat = make_random_sh3(512 * kN + 17);
     const auto rows = static_cast<size_t>(splat.size());
     const Tensor canonical = splat.shN_canonical();
     ASSERT_EQ(canonical.ndim(), 3u);
@@ -377,7 +375,8 @@ TEST_F(ShValueStorageTest, ViewerExternalBindRehomesDegradedQ16BoundsAsPair) {
         splat, counting_viewer_allocator(allocation_calls));
 
     ASSERT_TRUE(result.has_value()) << result.error().format();
-    EXPECT_EQ(allocation_calls, 7);
+    // Attributes already in renderer storage stay; the codes and bounds move together.
+    EXPECT_EQ(allocation_calls, 2);
     ASSERT_TRUE(splat.shN_value_quantized());
     EXPECT_EQ(splat.shN_raw().external_storage_kind(), "vulkan_external_buffer");
     EXPECT_EQ(splat.shN_value_bounds().external_storage_kind(), "vulkan_external_buffer");
@@ -397,7 +396,8 @@ TEST_F(ShValueStorageTest, ViewerExternalBindRehomesDegradedQ16CodesAsPair) {
         splat, counting_viewer_allocator(allocation_calls));
 
     ASSERT_TRUE(result.has_value()) << result.error().format();
-    EXPECT_EQ(allocation_calls, 7);
+    // Attributes already in renderer storage stay; the codes and bounds move together.
+    EXPECT_EQ(allocation_calls, 2);
     ASSERT_TRUE(splat.shN_value_quantized());
     EXPECT_EQ(splat.shN_raw().external_storage_kind(), "vulkan_external_buffer");
     EXPECT_EQ(splat.shN_value_bounds().external_storage_kind(), "vulkan_external_buffer");

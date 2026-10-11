@@ -13,8 +13,8 @@
 #include "core/scene.hpp"
 #include "gui/editor/python_editor.hpp"
 #include "gui/error_event_bridge.hpp"
+#include "gui/gui_input.hpp"
 #include "gui/gui_manager.hpp"
-#include "gui/panel_layout.hpp"
 #include "gui/panel_registry.hpp"
 #include "gui/panels/python_console_panel.hpp"
 #include "gui/panels/windows_console_utils.hpp"
@@ -25,9 +25,13 @@
 #include "io/video/video_export_options.hpp"
 #include "rendering/render_constants.hpp"
 #include "rendering/rendering_manager.hpp"
+#include "scene/scene_manager.hpp"
+#include "screen/screen.hpp"
+#include "screen/view3d_space.hpp"
 #include "sequencer/sequencer_controller.hpp"
 #include "tools/selection_tool.hpp"
 #include "tools/unified_tool_registry.hpp"
+#include "visualizer/nodes/modifier_manager.hpp"
 #include "visualizer_impl.hpp"
 
 #include <algorithm>
@@ -301,65 +305,94 @@ namespace lfs::vis::project {
 
         template <typename Owner>
         struct JsonField {
-            std::string_view name;
-            std::function<Json(const Owner&)> write;
-            std::function<lfs::Result<void>(
+            using Writer = std::function<Json(const Owner&)>;
+            using Reader = std::function<lfs::Result<void>(
                 const Json&,
                 Owner&,
                 std::string_view,
-                std::string_view)>
-                read;
+                std::string_view)>;
+
+            JsonField(const std::string_view field_name, Writer writer, Reader reader)
+                : name(field_name),
+                  write(std::move(writer)),
+                  read(std::move(reader)) {}
+
+            // A field of a base struct, e.g. ViewSettings, is a field of the
+            // derived RenderSettings too.
+            template <typename Base>
+                requires(!std::same_as<Base, Owner> && std::derived_from<Owner, Base>)
+            JsonField(JsonField<Base> base)
+                : name(base.name),
+                  write([w = std::move(base.write)](const Owner& source) { return w(source); }),
+                  read([r = std::move(base.read)](const Json& json, Owner& destination,
+                                                  const std::string_view prefix,
+                                                  const std::string_view field) {
+                      return r(json, destination, prefix, field);
+                  }) {}
+
+            std::string_view name;
+            Writer write;
+            Reader read;
         };
 
         template <typename Owner, typename Member>
         JsonField<Owner> required_field(
             const std::string_view name,
             Member Owner::*member) {
-            return {
-                .name = name,
-                .write = [member](const Owner& source) { return Json(source.*member); },
-                .read = [member](
-                            const Json& json,
-                            Owner& destination,
-                            const std::string_view prefix,
-                            const std::string_view field) { return assign_required(
-                                                                json,
-                                                                field,
-                                                                destination.*member,
-                                                                prefix); },
-            };
+            return JsonField<Owner>(
+                name,
+                [member](const Owner& source) { return Json(source.*member); },
+                [member](
+                    const Json& json,
+                    Owner& destination,
+                    const std::string_view prefix,
+                    const std::string_view field) { return assign_required(
+                                                        json,
+                                                        field,
+                                                        destination.*member,
+                                                        prefix); });
         }
 
         template <typename Owner, typename Member>
         JsonField<Owner> optional_field(
             const std::string_view name,
             Member Owner::*member) {
-            return {
-                .name = name,
-                .write = [member](const Owner& source) { return Json(source.*member); },
-                .read = [member](
-                            const Json& json,
-                            Owner& destination,
-                            std::string_view,
-                            const std::string_view field) {
+            return JsonField<Owner>(
+                name,
+                [member](const Owner& source) { return Json(source.*member); },
+                [member](
+                    const Json& json,
+                    Owner& destination,
+                    std::string_view,
+                    const std::string_view field) {
                     (void)assign_optional(
                         json, field, destination.*member);
-                    return lfs::Result<void>{}; },
-            };
+                    return lfs::Result<void>{}; });
+        }
+
+        // Written for earlier readers, which require the key; ignored when reading.
+        template <typename Owner>
+        JsonField<Owner> legacy_vec3_field(
+            const std::string_view name,
+            const glm::vec3 value) {
+            return JsonField<Owner>(
+                name,
+                [value](const Owner&) { return vec3_json(value); },
+                [](const Json&, Owner&, std::string_view, std::string_view) { return lfs::Result<void>{}; });
         }
 
         template <typename Owner>
         JsonField<Owner> vec3_field(
             const std::string_view name,
             glm::vec3 Owner::*member) {
-            return {
-                .name = name,
-                .write = [member](const Owner& source) { return vec3_json(source.*member); },
-                .read = [member](
-                            const Json& json,
-                            Owner& destination,
-                            const std::string_view prefix,
-                            const std::string_view field) {
+            return JsonField<Owner>(
+                name,
+                [member](const Owner& source) { return vec3_json(source.*member); },
+                [member](
+                    const Json& json,
+                    Owner& destination,
+                    const std::string_view prefix,
+                    const std::string_view field) {
                     auto value = required_vec3(
                         json, field, prefix);
                     if (!value) {
@@ -367,8 +400,7 @@ namespace lfs::vis::project {
                             std::move(value).error());
                     }
                     destination.*member = *value;
-                    return lfs::Result<void>{}; },
-            };
+                    return lfs::Result<void>{}; });
         }
 
         template <typename Owner, typename Enum,
@@ -380,14 +412,14 @@ namespace lfs::vis::project {
             const int maximum,
             const std::string_view invalid_detail,
             AfterAssign after_assign = nullptr) {
-            return {
-                .name = name,
-                .write = [member](const Owner& source) { return Json(static_cast<int>(source.*member)); },
-                .read = [=](
-                            const Json& json,
-                            Owner& destination,
-                            const std::string_view prefix,
-                            const std::string_view field) {
+            return JsonField<Owner>(
+                name,
+                [member](const Owner& source) { return Json(static_cast<int>(source.*member)); },
+                [=](
+                    const Json& json,
+                    Owner& destination,
+                    const std::string_view prefix,
+                    const std::string_view field) {
                     int value = 0;
                     if (auto status = assign_required(
                             json, field, value, prefix);
@@ -406,8 +438,7 @@ namespace lfs::vis::project {
                                       AfterAssign,
                                       std::nullptr_t>)
                         after_assign(destination);
-                    return lfs::Result<void>{}; },
-            };
+                    return lfs::Result<void>{}; });
         }
 
         template <typename Owner, typename Writer, typename Reader>
@@ -415,11 +446,22 @@ namespace lfs::vis::project {
             const std::string_view name,
             Writer write,
             Reader read) {
-            return {
-                .name = name,
-                .write = std::move(write),
-                .read = std::move(read),
+            return JsonField<Owner>(name, std::move(write), std::move(read));
+        }
+
+        // Present-but-invalid values still fail the read; missing keys keep the
+        // destination unchanged. Used for VIEW fields that moved onto the screen.
+        template <typename Owner>
+        JsonField<Owner> skip_if_missing(JsonField<Owner> field) {
+            auto read = std::move(field.read);
+            field.read = [read](const Json& json, Owner& destination,
+                                const std::string_view prefix,
+                                const std::string_view name) {
+                if (!json.contains(std::string(name)))
+                    return lfs::Result<void>{};
+                return read(json, destination, prefix, name);
             };
+            return field;
         }
 
         template <typename Owner>
@@ -602,7 +644,7 @@ namespace lfs::vis::project {
 
         const auto& render_settings_fields() {
             static const std::vector<JsonField<RenderSettings>> fields{
-                required_field("focal_length_mm", &RenderSettings::focal_length_mm),
+                skip_if_missing(required_field("focal_length_mm", &RenderSettings::focal_length_mm)),
                 required_field("scaling_modifier", &RenderSettings::scaling_modifier),
                 required_field("antialiasing", &RenderSettings::antialiasing),
                 required_field("mip_filter", &RenderSettings::mip_filter),
@@ -616,7 +658,7 @@ namespace lfs::vis::project {
                 required_field("use_ellipsoid", &RenderSettings::use_ellipsoid),
                 required_field("desaturate_unselected", &RenderSettings::desaturate_unselected),
                 required_field("desaturate_cropping", &RenderSettings::desaturate_cropping),
-                custom_field<RenderSettings>(
+                skip_if_missing(custom_field<RenderSettings>(
                     "hide_outside_depth_box",
                     [](const RenderSettings& settings) {
                         return Json(settings.depth_filter_viz_mode == 2);
@@ -632,8 +674,8 @@ namespace lfs::vis::project {
                         }
                         settings.depth_filter_viz_mode = value ? 2 : 0;
                         return lfs::Result<void>{};
-                    }),
-                custom_field<RenderSettings>(
+                    })),
+                skip_if_missing(custom_field<RenderSettings>(
                     "depth_filter_viz_mode",
                     [](const RenderSettings& settings) {
                         return Json(settings.depth_filter_viz_mode);
@@ -661,7 +703,7 @@ namespace lfs::vis::project {
                         }
                         settings.depth_filter_viz_mode = value;
                         return lfs::Result<void>{};
-                    }),
+                    })),
                 required_field("crop_filter_for_selection", &RenderSettings::crop_filter_for_selection),
                 required_field("apply_appearance_correction", &RenderSettings::apply_appearance_correction),
                 enum_field("ppisp_mode", &RenderSettings::ppisp_mode,
@@ -713,9 +755,9 @@ namespace lfs::vis::project {
                 optional_field("splat_render_profile", &RenderSettings::splat_render_profile),
                 required_field("environment_exposure", &RenderSettings::environment_exposure),
                 required_field("environment_rotation_degrees", &RenderSettings::environment_rotation_degrees),
-                required_field("show_coord_axes", &RenderSettings::show_coord_axes),
-                required_field("axes_size", &RenderSettings::axes_size),
-                custom_field<RenderSettings>(
+                skip_if_missing(required_field("show_coord_axes", &RenderSettings::show_coord_axes)),
+                skip_if_missing(required_field("axes_size", &RenderSettings::axes_size)),
+                skip_if_missing(custom_field<RenderSettings>(
                     "axes_visibility",
                     [](const RenderSettings& settings) {
                         return Json::array({settings.axes_visibility[0],
@@ -737,31 +779,31 @@ namespace lfs::vis::project {
                         for (std::size_t index = 0; index < 3; ++index)
                             settings.axes_visibility[index] = (*found)[index].get<bool>();
                         return lfs::Result<void>{};
-                    }),
-                required_field("show_grid", &RenderSettings::show_grid),
-                required_field("grid_plane", &RenderSettings::grid_plane),
-                required_field("grid_opacity", &RenderSettings::grid_opacity),
-                required_field("point_cloud_mode", &RenderSettings::point_cloud_mode),
-                required_field("voxel_size", &RenderSettings::voxel_size),
-                required_field("show_rings", &RenderSettings::show_rings),
-                required_field("ring_width", &RenderSettings::ring_width),
-                required_field("show_center_markers", &RenderSettings::show_center_markers),
-                required_field("show_camera_frustums", &RenderSettings::show_camera_frustums),
-                required_field("camera_frustum_scale", &RenderSettings::camera_frustum_scale),
+                    })),
+                skip_if_missing(required_field("show_grid", &RenderSettings::show_grid)),
+                skip_if_missing(required_field("grid_plane", &RenderSettings::grid_plane)),
+                skip_if_missing(required_field("grid_opacity", &RenderSettings::grid_opacity)),
+                skip_if_missing(required_field("point_cloud_mode", &RenderSettings::point_cloud_mode)),
+                skip_if_missing(required_field("voxel_size", &RenderSettings::voxel_size)),
+                skip_if_missing(required_field("show_rings", &RenderSettings::show_rings)),
+                skip_if_missing(required_field("ring_width", &RenderSettings::ring_width)),
+                skip_if_missing(required_field("show_center_markers", &RenderSettings::show_center_markers)),
+                skip_if_missing(required_field("show_camera_frustums", &RenderSettings::show_camera_frustums)),
+                skip_if_missing(required_field("camera_frustum_scale", &RenderSettings::camera_frustum_scale)),
                 vec3_field("train_camera_color", &RenderSettings::train_camera_color),
                 vec3_field("eval_camera_color", &RenderSettings::eval_camera_color),
-                required_field("show_pivot", &RenderSettings::show_pivot),
-                enum_field("split_view_mode", &RenderSettings::split_view_mode,
-                           0, 3, "Unsupported split-view mode"),
-                enum_field("gt_comparison_mode", &RenderSettings::gt_comparison_mode,
-                           std::numeric_limits<int>::min(),
-                           std::numeric_limits<int>::max(),
-                           "Unsupported GT comparison mode",
-                           [](RenderSettings& settings) {
-                               sanitizeGTComparisonSettings(settings);
-                           }),
-                required_field("split_position", &RenderSettings::split_position),
-                required_field("split_view_offset", &RenderSettings::split_view_offset),
+                skip_if_missing(required_field("show_pivot", &RenderSettings::show_pivot)),
+                skip_if_missing(enum_field("split_view_mode", &RenderSettings::split_view_mode,
+                                           0, 3, "Unsupported split-view mode")),
+                skip_if_missing(enum_field("gt_comparison_mode", &RenderSettings::gt_comparison_mode,
+                                           std::numeric_limits<int>::min(),
+                                           std::numeric_limits<int>::max(),
+                                           "Unsupported GT comparison mode",
+                                           [](ViewSettings& settings) {
+                                               sanitizeGTComparisonSettings(settings);
+                                           })),
+                skip_if_missing(required_field("split_position", &RenderSettings::split_position)),
+                skip_if_missing(required_field("split_view_offset", &RenderSettings::split_view_offset)),
                 custom_field<RenderSettings>(
                     "raster_backend",
                     [](const RenderSettings& settings) {
@@ -785,20 +827,20 @@ namespace lfs::vis::project {
                             settings.raster_backend);
                         return lfs::Result<void>{};
                     }),
-                required_field("equirectangular", &RenderSettings::equirectangular),
-                required_field("orthographic", &RenderSettings::orthographic),
-                required_field("ortho_scale", &RenderSettings::ortho_scale),
-                required_field("depth_view", &RenderSettings::depth_view),
-                required_field("depth_view_min", &RenderSettings::depth_view_min),
-                required_field("depth_view_max", &RenderSettings::depth_view_max),
-                enum_field("depth_visualization_mode", &RenderSettings::depth_visualization_mode,
-                           std::numeric_limits<int>::min(),
-                           std::numeric_limits<int>::max(),
-                           "Unsupported depth visualization mode",
-                           [](RenderSettings& settings) {
-                               sanitizeDepthViewSettings(settings);
-                           }),
-                vec3_field("selection_color_committed", &RenderSettings::selection_color_committed),
+                skip_if_missing(required_field("equirectangular", &RenderSettings::equirectangular)),
+                skip_if_missing(required_field("orthographic", &RenderSettings::orthographic)),
+                skip_if_missing(required_field("ortho_scale", &RenderSettings::ortho_scale)),
+                skip_if_missing(required_field("depth_view", &RenderSettings::depth_view)),
+                skip_if_missing(required_field("depth_view_min", &RenderSettings::depth_view_min)),
+                skip_if_missing(required_field("depth_view_max", &RenderSettings::depth_view_max)),
+                skip_if_missing(enum_field("depth_visualization_mode", &RenderSettings::depth_visualization_mode,
+                                           std::numeric_limits<int>::min(),
+                                           std::numeric_limits<int>::max(),
+                                           "Unsupported depth visualization mode",
+                                           [](ViewSettings& settings) {
+                                               sanitizeDepthViewSettings(settings);
+                                           })),
+                legacy_vec3_field<RenderSettings>("selection_color_committed", {0.859f, 0.325f, 0.325f}),
                 vec3_field("selection_color_preview", &RenderSettings::selection_color_preview),
                 vec3_field("selection_color_center_marker", &RenderSettings::selection_color_center_marker),
                 required_field("depth_clip_enabled", &RenderSettings::depth_clip_enabled),
@@ -812,10 +854,10 @@ namespace lfs::vis::project {
                 required_field("mesh_backface_culling", &RenderSettings::mesh_backface_culling),
                 required_field("mesh_shadow_enabled", &RenderSettings::mesh_shadow_enabled),
                 required_field("mesh_shadow_resolution", &RenderSettings::mesh_shadow_resolution),
-                required_field("depth_filter_enabled", &RenderSettings::depth_filter_enabled),
-                vec3_field("depth_filter_min", &RenderSettings::depth_filter_min),
-                vec3_field("depth_filter_max", &RenderSettings::depth_filter_max),
-                custom_field<RenderSettings>(
+                skip_if_missing(required_field("depth_filter_enabled", &RenderSettings::depth_filter_enabled)),
+                skip_if_missing(vec3_field("depth_filter_min", &RenderSettings::depth_filter_min)),
+                skip_if_missing(vec3_field("depth_filter_max", &RenderSettings::depth_filter_max)),
+                skip_if_missing(custom_field<RenderSettings>(
                     "depth_filter_transform",
                     [](const RenderSettings& settings) {
                         return Json{{"rotation", json_array(matrix_array(
@@ -852,7 +894,7 @@ namespace lfs::vis::project {
                             lfs::geometry::EuclideanTransform(
                                 glm::quat_cast(array_matrix(*rotation)), *translation);
                         return lfs::Result<void>{};
-                    }),
+                    })),
                 required_field("lod_enabled", &RenderSettings::lod_enabled),
                 required_field("lod_auto_enable_rad", &RenderSettings::lod_auto_enable_rad),
                 required_field("lod_max_splats", &RenderSettings::lod_max_splats),
@@ -898,8 +940,9 @@ namespace lfs::vis::project {
 
     SessionJson renderSettingsToProjectJson(
         const RenderSettings& settings) {
-        return fields_to_json(
-            settings, render_settings_fields());
+        // Earlier readers require the view-owned keys here. The screen chapter
+        // also stores independent settings for each view.
+        return fields_to_json(settings, render_settings_fields());
     }
 
     lfs::Result<RenderSettings>
@@ -920,6 +963,8 @@ namespace lfs::vis::project {
         }
 
         RenderSettings settings = base;
+        // Native-size comparison is temporary inspection state, never project state.
+        settings.gt_comparison_actual_size = false;
         if (auto status = read_fields(
                 json,
                 settings,
@@ -940,16 +985,9 @@ namespace lfs::vis::project {
         const Viewport& viewport,
         const std::optional<float> fallback_ortho_scale) {
         const auto& camera = viewport.camera;
-        // Same effective scale the renderer uses: per-viewport override, else
-        // RenderSettings.ortho_scale (lf.set_orthographic writes the latter).
-        std::optional<float> scale = viewport.ortho_scale_override;
-        if (!scale || !std::isfinite(*scale) || *scale <= 0.0f) {
-            if (fallback_ortho_scale && std::isfinite(*fallback_ortho_scale) &&
-                *fallback_ortho_scale > 0.0f)
-                scale = fallback_ortho_scale;
-            else
-                scale.reset();
-        }
+        std::optional<float> scale = fallback_ortho_scale;
+        if (scale && (!std::isfinite(*scale) || *scale <= 0.0f))
+            scale.reset();
         std::optional<float> extent;
         if (scale && viewport.windowSize.y > 0)
             extent = static_cast<float>(viewport.windowSize.y) / *scale;
@@ -975,13 +1013,14 @@ namespace lfs::vis::project {
             .wasd_speed = camera.wasdSpeed,
             .max_wasd_speed = camera.maxWasdSpeed,
             .ortho_scale =
-                viewport.ortho_scale_override,
+                scale,
             .ortho_extent_world = extent,
         };
     }
 
     void applyPanelCameraProjectState(
         Viewport& viewport,
+        ViewSettings& settings,
         const PanelCameraProjectState& state) {
         viewport.setViewMatrix(
             array_matrix(state.rotation),
@@ -1006,10 +1045,10 @@ namespace lfs::vis::project {
         camera.wasdSpeed = state.wasd_speed;
         camera.maxWasdSpeed =
             state.max_wasd_speed;
-        viewport.ortho_scale_override =
-            state.ortho_scale;
+        if (state.ortho_scale)
+            settings.ortho_scale = *state.ortho_scale;
         if (state.ortho_extent_world && viewport.windowSize.y > 0)
-            viewport.ortho_scale_override = static_cast<float>(viewport.windowSize.y) / *state.ortho_extent_world;
+            settings.ortho_scale = static_cast<float>(viewport.windowSize.y) / *state.ortho_extent_world;
         camera.clearTransientMotion();
     }
 
@@ -1168,9 +1207,11 @@ namespace lfs::vis::project {
                     lfs::ErrorCode::DataLoss,
                     "GUIL layouts are missing",
                     "GUIL.layouts");
+            bool has_screen = false;
             bool has_fixed = false;
             bool has_registry = false;
             bool has_console = false;
+            Json screen_payload;
             for (const auto& layout : *layouts) {
                 const auto areas =
                     find_required_array(
@@ -1190,6 +1231,8 @@ namespace lfs::vis::project {
                                 space, "type");
                         if (!type)
                             continue;
+                        has_screen |=
+                            *type == "screen";
                         has_fixed |=
                             *type ==
                             "fixed_arrangement";
@@ -1199,15 +1242,31 @@ namespace lfs::vis::project {
                         has_console |=
                             *type ==
                             "python_console";
+                        if (*type == "screen") {
+                            const auto payload =
+                                space.find("opaque_payload");
+                            if (payload != space.end())
+                                screen_payload = *payload;
+                        }
                     }
                 }
             }
-            if (!has_fixed || !has_registry ||
+            if ((!has_screen && !has_fixed) || !has_registry ||
                 !has_console) {
                 return fail<void>(
                     lfs::ErrorCode::DataLoss,
-                    "GUIL v1 requires fixed_arrangement, panel_registry, and python_console spaces",
+                    "GUIL v1 requires a screen or fixed_arrangement space, plus panel_registry and python_console",
                     "GUIL.layouts.areas.spaces");
+            }
+            if (has_screen) {
+                screen::EditorTypeRegistry registry;
+                screen::registerBuiltinEditorTypes(registry);
+                if (!screen::Screen::load(screen_payload, registry)) {
+                    return fail<void>(
+                        lfs::ErrorCode::DataLoss,
+                        "GUIL screen JSON is malformed",
+                        "GUIL.layouts.areas.spaces.screen");
+                }
             }
             return {};
         }
@@ -1283,23 +1342,20 @@ namespace lfs::vis::project {
                 return lfs::Status::failure(
                     std::move(settings).error());
 
-            const auto cameras =
-                find_required_array(
-                    root, "panel_cameras");
-            if (cameras == root.end() ||
-                cameras->size() != 2) {
-                return fail<void>(
-                    lfs::ErrorCode::DataLoss,
-                    "VIEW must contain two panel cameras",
-                    "VIEW.panel_cameras");
-            }
-            for (const auto& camera : *cameras) {
-                auto parsed =
-                    panelCameraProjectStateFromJson(
-                        camera);
-                if (!parsed)
-                    return lfs::Status::failure(
-                        std::move(parsed).error());
+            // Camera state in GUIL owns independent views. VIEW also retains
+            // the legacy two-panel fallback for earlier readers.
+            if (const auto cameras = root.find("panel_cameras");
+                cameras != root.end()) {
+                if (!cameras->is_array() || cameras->empty() || cameras->size() > 2) {
+                    return fail<void>(lfs::ErrorCode::DataLoss,
+                                      "VIEW legacy panel cameras are malformed",
+                                      "VIEW.panel_cameras");
+                }
+                for (const auto& camera : *cameras) {
+                    auto parsed = panelCameraProjectStateFromJson(camera);
+                    if (!parsed)
+                        return lfs::Status::failure(std::move(parsed).error());
+                }
             }
 
             const auto bookmarks =
@@ -1450,6 +1506,8 @@ namespace lfs::vis::project {
         if (auto valid =
                 chapters.sequencer.validate();
             !valid)
+            return std::move(valid).error();
+        if (auto valid = chapters.nodes.validate(); !valid)
             return std::move(valid).error();
         if (auto valid = chapters.metrics.validate();
             !valid)
@@ -1635,9 +1693,9 @@ namespace lfs::vis::project {
                 return "main_panel_tab";
             case gui::PanelSpace::SceneHeader:
                 return "scene_header";
-            case gui::PanelSpace::BottomDock:
+            case gui::PanelSpace::BottomArea:
                 return "bottom_dock";
-            case gui::PanelSpace::LeftDock:
+            case gui::PanelSpace::LeftArea:
                 return "left_dock";
             case gui::PanelSpace::StatusBar:
                 return "status_bar";
@@ -1659,9 +1717,9 @@ namespace lfs::vis::project {
             if (name == "scene_header")
                 return gui::PanelSpace::SceneHeader;
             if (name == "bottom_dock")
-                return gui::PanelSpace::BottomDock;
+                return gui::PanelSpace::BottomArea;
             if (name == "left_dock")
-                return gui::PanelSpace::LeftDock;
+                return gui::PanelSpace::LeftArea;
             if (name == "status_bar")
                 return gui::PanelSpace::StatusBar;
             return std::nullopt;
@@ -1673,18 +1731,16 @@ namespace lfs::vis::project {
                        : Json(nullptr);
         }
 
+        struct LegacyLayoutState {
+            bool show_sequencer = false;
+            std::string active_tab_id;
+        };
+
         const auto& fixed_layout_fields() {
             static const std::vector<
-                JsonField<gui::PanelLayoutProjectState>>
+                JsonField<LegacyLayoutState>>
                 fields{
-                    optional_field("right_panel_width", &gui::PanelLayoutProjectState::right_panel_width),
-                    optional_field("scene_panel_ratio", &gui::PanelLayoutProjectState::scene_panel_ratio),
-                    optional_field("python_console_width", &gui::PanelLayoutProjectState::python_console_width),
-                    optional_field("bottom_dock_height", &gui::PanelLayoutProjectState::bottom_dock_height),
-                    optional_field("left_dock_width", &gui::PanelLayoutProjectState::left_dock_width),
-                    optional_field("sequencer_visible", &gui::PanelLayoutProjectState::show_sequencer),
-                    optional_field("bottom_dock_active_tab", &gui::PanelLayoutProjectState::bottom_dock_active_tab_id),
-                    optional_field("tab_scroll_offset", &gui::PanelLayoutProjectState::tab_scroll_offset),
+                    optional_field("sequencer_visible", &LegacyLayoutState::show_sequencer),
                 };
             return fields;
         }
@@ -2028,24 +2084,17 @@ namespace lfs::vis::project {
             omit_filter(
                 viewer.getScene(), omit_node_uuids);
 
-        const auto layout =
-            gui_manager->panelLayout()
-                .captureProjectState();
         const auto& window_states =
             gui_manager->getWindowStates();
-        const auto console_visible =
-            window_states.contains(
-                "python_console") &&
-            window_states.at("python_console");
-        Json fixed_payload =
-            fields_to_json(layout, fixed_layout_fields());
-        fixed_payload["python_console_visible"] =
-            console_visible;
-        fixed_payload["system_console_visible"] =
+        Json screen_payload =
+            viewer.screens().read([](const screen::Screen& s) { return s.save(); });
+        screen_payload["properties"] = Json{
+            {"active_tab", gui_manager->screenHost().properties().activeTab()},
+            {"scroll", gui_manager->screenHost().properties().scroll()},
+        };
+        screen_payload["system_console_visible"] =
             window_states.contains("system_console") &&
             window_states.at("system_console");
-        fixed_payload["tab_strip_scroll"] =
-            gui_manager->tabStripScroll();
         {
             const auto tree =
                 gui_manager->captureSceneTreeChrome(
@@ -2059,12 +2108,31 @@ namespace lfs::vis::project {
                 }
                 collapsed.push_back(uuid);
             }
-            fixed_payload["scene_tree"] = Json{
+            screen_payload["scene_tree"] = Json{
                 {"collapsed_uuids", std::move(collapsed)},
                 {"models_collapsed", tree.models_collapsed},
                 {"filter_text", tree.filter_text},
             };
         }
+        // Keep the legacy layout space required by earlier readers alongside
+        // the authoritative independent screen layout.
+        auto retained_gui = chapter_root(result.gui_layout.dom(), "GUIL");
+        if (!retained_gui)
+            return std::move(retained_gui).error();
+        Json fixed_payload = find_space_payload(*retained_gui, "fixed_arrangement");
+        if (fixed_payload.empty()) {
+            auto default_gui = chapter_root(
+                lfs::io::project::default_session_chapter_dom(lfs::io::project::SessionJsonChapterKind::GuiLayout),
+                "GUIL");
+            if (!default_gui)
+                return std::move(default_gui).error();
+            fixed_payload = find_space_payload(*default_gui, "fixed_arrangement");
+        }
+        fixed_payload["sequencer_visible"] = gui_manager->isSequencerVisible();
+        fixed_payload["python_console_visible"] =
+            window_states.contains("python_console") && window_states.at("python_console");
+        fixed_payload["system_console_visible"] = screen_payload["system_console_visible"];
+        fixed_payload["scene_tree"] = screen_payload["scene_tree"];
         Json panels = Json::array();
         for (const auto& panel :
              gui::PanelRegistry::instance()
@@ -2088,7 +2156,7 @@ namespace lfs::vis::project {
             {"active_tabs",
              {
                  {"main_panel",
-                  layout.active_tab_id},
+                  std::string{}},
                  {"scene_panel",
                   gui_manager
                       ->scenePanelActiveTab()},
@@ -2139,11 +2207,16 @@ namespace lfs::vis::project {
                               {"spaces",
                                Json::array({
                                    {
+                                       {"type", "fixed_arrangement"},
+                                       {"version", 1},
+                                       {"opaque_payload", fixed_payload},
+                                   },
+                                   {
                                        {"type",
-                                        "fixed_arrangement"},
+                                        "screen"},
                                        {"version", 1},
                                        {"opaque_payload",
-                                        fixed_payload},
+                                        screen_payload},
                                    },
                                    {
                                        {"type",
@@ -2172,7 +2245,6 @@ namespace lfs::vis::project {
             !merged) {
             return std::move(merged).error();
         }
-
         if (const auto* console =
                 gui::panels::PythonConsoleState::
                     tryGetInstance()) {
@@ -2308,14 +2380,6 @@ namespace lfs::vis::project {
                 std::move(item));
         }
 
-        const auto primary =
-            capturePanelCameraProjectState(
-                viewer.getViewport(), settings.ortho_scale);
-        const auto secondary =
-            capturePanelCameraProjectState(
-                rendering_manager
-                    ->projectSecondaryViewport(),
-                settings.ortho_scale);
         const auto& tool_registry =
             UnifiedToolRegistry::instance();
         const auto& gizmo =
@@ -2375,6 +2439,19 @@ namespace lfs::vis::project {
                         retained_uuid->to_string();
             }
         }
+        // Earlier readers require both panel cameras. GUIL retains every
+        // independent view; these entries provide their two-panel fallback.
+        const auto legacy_cameras = viewer.screens().read([](const screen::Screen& screen) {
+            const auto views = screen.views();
+            const auto* primary = screen.view(views.front());
+            const auto* secondary = screen.view(views.size() > 1 ? views[1] : views.front());
+            return Json::array({
+                panelCameraProjectStateToJson(
+                    "primary", capturePanelCameraProjectState(primary->camera, primary->settings.ortho_scale)),
+                panelCameraProjectStateToJson(
+                    "secondary", capturePanelCameraProjectState(secondary->camera, secondary->settings.ortho_scale)),
+            });
+        });
         const Json view_known{
             {"version", 1},
             // Opening a browser-authored camera resolves its long-axis FOV
@@ -2382,13 +2459,7 @@ namespace lfs::vis::project {
             {"long_axis_fov_degrees", nullptr},
             {"render_settings",
              std::move(project_render_settings)},
-            {"panel_cameras",
-             Json::array({
-                 panelCameraProjectStateToJson(
-                     "primary", primary),
-                 panelCameraProjectStateToJson(
-                     "secondary", secondary),
-             })},
+            {"panel_cameras", legacy_cameras},
             {"navigation",
              {
                  {"mode",
@@ -2402,12 +2473,6 @@ namespace lfs::vis::project {
              }},
             {"split",
              {
-                 {"focused_panel",
-                  rendering_manager
-                              ->getFocusedSplitPanel() ==
-                          SplitViewPanelId::Right
-                      ? "right"
-                      : "left"},
                  {"gt_camera_id",
                   rendering_manager
                               ->getCurrentCameraId() >=
@@ -2416,17 +2481,6 @@ namespace lfs::vis::project {
                             rendering_manager
                                 ->getCurrentCameraId())
                       : Json(nullptr)},
-                 {"panel_grid_planes",
-                  Json::array({
-                      rendering_manager
-                          ->getGridPlaneForPanel(
-                              SplitViewPanelId::
-                                  Left),
-                      rendering_manager
-                          ->getGridPlaneForPanel(
-                              SplitViewPanelId::
-                                  Right),
-                  })},
              }},
             {"camera_bookmarks",
              std::move(bookmarks_json)},
@@ -2701,6 +2755,17 @@ namespace lfs::vis::project {
             !merged) {
             return std::move(merged).error();
         }
+        // The live timeline owns the key list. The additive merge preserves
+        // extension fields on surviving keys, but must not retain removed tails.
+        const auto keyframe_count = sequencer_known["timeline"]["keyframes"].size();
+        if (const auto* merged_keys = result.sequencer.dom().get_json_ref("timeline.keyframes");
+            merged_keys && merged_keys->is_array() && merged_keys->size() > keyframe_count) {
+            Json current_keys(merged_keys->begin(), merged_keys->begin() + keyframe_count);
+            if (auto set = result.sequencer.dom().set_json("timeline.keyframes", std::move(current_keys));
+                !set) {
+                return std::move(set).error();
+            }
+        }
         if (auto merged_clips =
                 result.sequencer.dom()
                     .get_json(
@@ -2742,6 +2807,13 @@ namespace lfs::vis::project {
             result.metrics =
                 trainer_manager
                     ->captureProjectMetrics();
+        }
+        if (const auto* scene_manager = viewer.getSceneManager()) {
+            auto dom = lfs::io::JsonChapterDom::parse(
+                scene_manager->modifierManager().toJson(true).dump(2));
+            if (!dom)
+                return std::move(dom).error();
+            result.nodes = lfs::io::project::NodesSessionChapter(std::move(*dom));
         }
 
         auto prepared =
@@ -2934,27 +3006,56 @@ namespace lfs::vis::project {
                 Json(*found)};
         }
 
-        void apply_guil(
+        enum class GuilApply : std::uint8_t { Failed,
+                                              Screen,
+                                              Legacy };
+
+        GuilApply apply_guil(
             VisualizerImpl& viewer,
             const Json& root) {
             auto* gui_manager =
                 viewer.getGuiManager();
             if (!gui_manager)
-                return;
+                return GuilApply::Failed;
 
+            const Json screen_payload =
+                find_space_payload(root, "screen");
             const Json fixed =
                 find_space_payload(
                     root, "fixed_arrangement");
-            gui::PanelLayoutProjectState layout =
-                gui_manager->panelLayout()
-                    .captureProjectState();
-            (void)read_fields(
-                fixed,
-                layout,
-                "GUIL.fixed_arrangement",
-                fixed_layout_fields());
-            if (!fixed.contains("tab_scroll_offset"))
-                layout.tab_scroll_offset = 0.0f;
+            const bool has_screen =
+                screen_payload.contains("layout") &&
+                screen_payload.contains("areas");
+            if (has_screen) {
+                auto loaded = screen::Screen::load(
+                    screen_payload,
+                    viewer.screens().editorTypes());
+                if (!loaded)
+                    return GuilApply::Failed;
+                viewer.screens().replace(std::move(*loaded));
+                if (const auto properties = find_required_object(screen_payload, "properties");
+                    properties != screen_payload.end()) {
+                    auto& editor = gui_manager->screenHost().properties();
+                    if (const auto active_tab = scalar<std::string>(*properties, "active_tab"))
+                        editor.setActiveTab(*active_tab);
+                    if (const auto scroll = scalar<float>(*properties, "scroll"))
+                        editor.setScroll(*scroll);
+                }
+            } else {
+                viewer.screens().resetToDefault();
+            }
+            if (auto* rendering =
+                    viewer.getRenderingManager())
+                rendering->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
+
+            LegacyLayoutState layout{.show_sequencer = gui_manager->isSequencerVisible()};
+            if (!has_screen) {
+                (void)read_fields(
+                    fixed,
+                    layout,
+                    "GUIL.fixed_arrangement",
+                    fixed_layout_fields());
+            }
 
             const Json registry =
                 find_space_payload(
@@ -2975,10 +3076,12 @@ namespace lfs::vis::project {
                             *scene_tab);
                 }
             }
+            const Json& chrome_root =
+                has_screen ? screen_payload : fixed;
             if (const auto tree_json =
                     find_required_object(
-                        fixed, "scene_tree");
-                tree_json != fixed.end()) {
+                        chrome_root, "scene_tree");
+                tree_json != chrome_root.end()) {
                 gui::SceneTreeSessionChrome tree;
                 if (const auto uuids =
                         find_required_array(
@@ -3002,16 +3105,19 @@ namespace lfs::vis::project {
                 gui_manager->resetSceneTreeChrome();
             }
 
-            if (const auto tab_strip =
-                    scalar<float>(
-                        fixed, "tab_strip_scroll")) {
-                gui_manager->setTabStripScroll(*tab_strip);
-            } else {
-                gui_manager->setTabStripScroll(0.0f);
+            if (!has_screen) {
+                if (const auto tab_strip =
+                        scalar<float>(
+                            fixed, "tab_strip_scroll")) {
+                    gui_manager->setTabStripScroll(*tab_strip);
+                } else {
+                    gui_manager->setTabStripScroll(0.0f);
+                }
             }
 
-            gui_manager->panelLayout()
-                .applyProjectState(layout);
+            if (!has_screen) {
+                gui_manager->setSequencerVisible(layout.show_sequencer);
+            }
 
             std::vector<gui::PanelProjectState>
                 panels;
@@ -3073,16 +3179,18 @@ namespace lfs::vis::project {
                         "python_console") &&
                     window_states->at(
                         "python_console");
-                assign_optional(
-                    fixed,
-                    "python_console_visible",
-                    console_visible);
-                (*window_states)
-                    ["python_console"] =
-                        console_visible;
+                if (!has_screen) {
+                    assign_optional(
+                        fixed,
+                        "python_console_visible",
+                        console_visible);
+                    (*window_states)
+                        ["python_console"] =
+                            console_visible;
+                }
                 bool system_console_visible = false;
                 assign_optional(
-                    fixed,
+                    chrome_root,
                     "system_console_visible",
                     system_console_visible);
 #ifdef WIN32
@@ -3143,6 +3251,7 @@ namespace lfs::vis::project {
                 gui::panels::PythonConsoleState::
                     setSplitterRatio(0.6f);
             }
+            return has_screen ? GuilApply::Screen : GuilApply::Legacy;
         }
 
         void apply_editor(
@@ -3273,7 +3382,8 @@ namespace lfs::vis::project {
                 bookmarks,
             const std::optional<
                 std::filesystem::path>&
-                environment_map_path) {
+                environment_map_path,
+            const bool loaded_screen) {
             auto* rendering =
                 viewer.getRenderingManager();
             auto* input =
@@ -3295,8 +3405,9 @@ namespace lfs::vis::project {
                     rendering->getSettings());
             if (!restored)
                 return;
+            auto* view3d = viewer.screens().view3D(viewer.screens().screen().activeView().value);
             if (const auto fov = scalar<float>(root, "long_axis_fov_degrees")) {
-                const auto& viewport = viewer.getViewport();
+                const auto& viewport = view3d ? view3d->camera : viewer.getViewport();
                 const auto aspect = std::max(1.0f, static_cast<float>(viewport.windowSize.x) /
                                                        std::max(1.0f, static_cast<float>(viewport.windowSize.y)));
                 const float vertical = glm::degrees(2.0f * std::atan(std::tan(glm::radians(*fov) / 2.0f) / aspect));
@@ -3308,29 +3419,24 @@ namespace lfs::vis::project {
                     lfs::core::path_to_utf8(
                         *environment_map_path);
             }
-            const auto desired_split =
-                restored->split_view_mode;
-            const auto saved_split_offset =
-                restored->split_view_offset;
-            restored->split_view_mode =
-                rendering->getSettings()
-                    .split_view_mode;
             restored->gut =
                 lfs::rendering::isGutBackend(
                     restored->raster_backend);
-            rendering->updateSettings(*restored);
+            if (!loaded_screen && view3d) {
+                view3d->settings = restored->view();
+                if (const auto primary_json =
+                        panel_camera_json(root, "primary")) {
+                    if (auto camera =
+                            panelCameraProjectStateFromJson(*primary_json);
+                        camera) {
+                        applyPanelCameraProjectState(view3d->camera, view3d->settings, *camera);
+                    }
+                }
+            }
+            const ViewSettings view_settings =
+                view3d ? view3d->settings : restored->view();
+            rendering->updateSettings(RenderSettings(restored->scene(), view_settings));
 
-            // The service transition creates/copies secondary panel state;
-            // saved cameras therefore apply only after this call.
-            rendering->restoreSplitViewMode(
-                desired_split,
-                viewer.getViewport());
-            auto split_settings =
-                rendering->getSettings();
-            split_settings.split_view_offset =
-                saved_split_offset;
-            rendering->updateSettings(
-                split_settings);
             if (auto* selection_tool =
                     viewer.getSelectionTool()) {
                 selection_tool
@@ -3341,72 +3447,11 @@ namespace lfs::vis::project {
                     find_required_object(
                         root, "split");
                 split != root.end()) {
-                if (const auto planes =
-                        find_required_array(
-                            *split,
-                            "panel_grid_planes");
-                    planes != split->end() &&
-                    planes->size() == 2) {
-                    if (planes->at(0)
-                            .is_number_integer()) {
-                        rendering
-                            ->setGridPlaneForPanel(
-                                SplitViewPanelId::
-                                    Left,
-                                planes->at(0)
-                                    .get<int>());
-                    }
-                    if (planes->at(1)
-                            .is_number_integer()) {
-                        rendering
-                            ->setGridPlaneForPanel(
-                                SplitViewPanelId::
-                                    Right,
-                                planes->at(1)
-                                    .get<int>());
-                    }
-                }
-                const auto focused =
-                    scalar<std::string>(
-                        *split,
-                        "focused_panel");
-                rendering->setFocusedSplitPanel(
-                    focused &&
-                            *focused == "right"
-                        ? SplitViewPanelId::Right
-                        : SplitViewPanelId::Left);
-                const auto camera_id =
-                    scalar<int>(
-                        *split,
-                        "gt_camera_id");
-                rendering->setCurrentCameraId(
-                    camera_id.value_or(-1));
-            }
-
-            if (const auto primary_json =
-                    panel_camera_json(
-                        root, "primary")) {
-                if (auto camera =
-                        panelCameraProjectStateFromJson(
-                            *primary_json);
-                    camera) {
-                    applyPanelCameraProjectState(
-                        viewer.getViewport(),
-                        *camera);
-                }
-            }
-            if (const auto secondary_json =
-                    panel_camera_json(
-                        root, "secondary")) {
-                if (auto camera =
-                        panelCameraProjectStateFromJson(
-                            *secondary_json);
-                    camera) {
-                    applyPanelCameraProjectState(
-                        rendering
-                            ->projectSecondaryViewport(),
-                        *camera);
-                }
+                const auto camera_id = scalar<int>(
+                    *split, "gt_camera_id");
+                rendering
+                    ->setCurrentCameraId(
+                        camera_id.value_or(-1));
             }
 
             if (const auto navigation =
@@ -3474,7 +3519,7 @@ namespace lfs::vis::project {
                         ->getSequencerUIState()
                         .show_camera_path);
             }
-            rendering->markDirty(DirtyFlag::ALL);
+            rendering->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
         }
 
         std::optional<ToolType> builtin_tool_type(
@@ -3517,16 +3562,14 @@ namespace lfs::vis::project {
                 return;
             }
             const bool sequencer_visible =
-                gui_manager->panelLayout().isShowSequencer();
+                gui_manager->isSequencerVisible();
             const auto finish = [&] {
-                // Seed both slots from final restored tool values with sync off on every exit.
                 rendering
                     ->restoreDepthWindowStateFromProject();
                 viewer.getEditorContext()
                     .armToolRestoreGuard();
-                gui_manager->panelLayout()
-                    .setShowSequencer(sequencer_visible);
-                rendering->markDirty(DirtyFlag::ALL);
+                gui_manager->setSequencerVisible(sequencer_visible);
+                rendering->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
             };
 
             const auto tools =
@@ -3946,14 +3989,31 @@ namespace lfs::vis::project {
 
         // VIEW (except tools), GUIL, EDTR, and SEQR apply at the panels-ready
         // boundary. Functional tool activation waits for hydration + SELM.
+        const auto guil = apply_guil(viewer, *gui);
+        if (guil == GuilApply::Failed)
+            return;
         apply_view(
             viewer, *view, bookmarks,
-            prepared.environment_map_path);
-        apply_guil(viewer, *gui);
+            prepared.environment_map_path,
+            guil == GuilApply::Screen);
         apply_editor(viewer, *editor);
         apply_sequencer(
             viewer, *sequencer,
             prepared.ply_sequence_directory);
+        if (auto* scene_manager = viewer.getSceneManager()) {
+            const auto bytes = prepared.chapters.nodes.to_bytes();
+            try {
+                const auto json = Json::parse(
+                    reinterpret_cast<const char*>(bytes.data()),
+                    reinterpret_cast<const char*>(bytes.data()) + bytes.size());
+                if (const auto restored = scene_manager->modifierManager().restoreJson(json);
+                    !restored) {
+                    LOG_WARN("Could not restore NODE chapter: {}", restored.error().message);
+                }
+            } catch (const nlohmann::json::exception& error) {
+                LOG_WARN("Could not parse NODE chapter: {}", error.what());
+            }
+        }
         if (auto* trainer =
                 viewer.getTrainerManager()) {
             trainer->restoreProjectMetrics(
@@ -3961,7 +4021,7 @@ namespace lfs::vis::project {
         }
         if (auto* rendering =
                 viewer.getRenderingManager()) {
-            rendering->markDirty(DirtyFlag::ALL);
+            rendering->markDirty(DirtyFlag::ALL, lfs::vis::FrameReason::SceneChange);
         }
     }
 
@@ -3971,14 +4031,13 @@ namespace lfs::vis::project {
         auto* gui_manager = viewer.getGuiManager();
         const bool sequencer_visible =
             gui_manager &&
-            gui_manager->panelLayout().isShowSequencer();
+            gui_manager->isSequencerVisible();
         auto view = chapter_root(
             prepared.chapters.view.dom(), "VIEW");
         if (!view) {
             deactivate_tool(viewer);
             if (gui_manager) {
-                gui_manager->panelLayout()
-                    .setShowSequencer(sequencer_visible);
+                gui_manager->setSequencerVisible(sequencer_visible);
             }
             return;
         }

@@ -3,32 +3,11 @@
 
 #pragma once
 
-#include <cstddef>
+#include "lfs/training/ops/geometry_types.hpp"
+
 #include <cuda_runtime.h>
 
 namespace lfs::training::kernels {
-
-    // Final/diagnostic slots at the front of the partials buffer. kSlotCount
-    // must stay even: the double-precision block partials start right after
-    // the float slots and need 8-byte alignment.
-    namespace normal_consistency_slots {
-        constexpr int kValid = 0;
-        constexpr int kSumAlpha = 1;
-        constexpr int kCount = 2;
-        constexpr int kMeanCos = 3;
-        constexpr int kInvNorm = 4;
-        constexpr int kSlotCount = 6;
-    } // namespace normal_consistency_slots
-
-    // A pixel participates only when the surface is solid and locally smooth:
-    // expected depth is meaningless at low alpha, and tangents straddling a
-    // depth discontinuity produce garbage normals that would dominate the loss.
-    constexpr float kNormalConsistencyMinAlpha = 0.5f;
-    constexpr float kNormalConsistencyMaxRelDepthJump = 0.05f;
-    constexpr float kNormalConsistencyMinValidCount = 64.0f;
-    constexpr float kNormalConsistencyMinValidWeight = 16.0f;
-
-    [[nodiscard]] size_t normal_consistency_partial_count(size_t num_pixels);
 
     // Depth-normal consistency: alpha-weighted cosine between the rendered
     // normal map and the normal derived from the rendered expected depth
@@ -58,7 +37,9 @@ namespace lfs::training::kernels {
         float cy,
         float weight,
         cudaStream_t stream = nullptr,
-        const float* pixel_weight = nullptr);
+        const float* pixel_weight = nullptr,
+        const float* camera_rays = nullptr, // optional [H,W,3], Z or radial convention
+        bool wrap_horizontal = false);
 
     // Prior-supervised depth normals: alpha-weighted cosine between the prior
     // normal map and the normal derived from rendered expected depth. Gradients
@@ -80,6 +61,8 @@ namespace lfs::training::kernels {
         float cy,
         float weight,
         cudaStream_t stream = nullptr,
-        const float* pixel_weight = nullptr);
+        const float* pixel_weight = nullptr,
+        const float* camera_rays = nullptr, // optional [H,W,3], Z or radial convention
+        bool wrap_horizontal = false);
 
 } // namespace lfs::training::kernels

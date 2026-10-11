@@ -8,6 +8,8 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <utility>
 
 namespace lfs::core {
     enum class PointRegion2DKind : uint32_t { Disk,
@@ -68,12 +70,142 @@ namespace lfs::core {
                                        const Tensor* indices = nullptr,
                                        const Tensor* visibility = nullptr);
 
+    enum class PointRasterCrop : uint32_t {
+        None,
+        Box,
+        Ellipsoid,
+    };
+
+    struct PointRaster {
+        // Column-major matrices, as glm stores them.
+        std::array<float, 16> view{};
+        std::array<float, 16> view_projection{};
+        int32_t width = 1;
+        int32_t height = 1;
+        bool orthographic = false;
+        bool equirectangular = false;
+        bool transparent_background = false;
+        float ortho_scale = 1;
+        float focal_y = 1;
+        // World-space splat size, already scaled.
+        float voxel_size = 0;
+        float far_plane = 0;
+        std::array<float, 3> background{};
+        // Points outside the crop (inside with crop_inverse) are dropped, or
+        // with crop_desaturate drawn mostly gray. crop_to_local is column-major;
+        // an ellipsoid takes its radii from crop_min.
+        PointRasterCrop crop = PointRasterCrop::None;
+        std::array<float, 16> crop_to_local{};
+        std::array<float, 3> crop_min{};
+        std::array<float, 3> crop_max{};
+        bool crop_inverse = false;
+        bool crop_desaturate = false;
+    };
+
+    // Splat Float32 [N,3] points with Float32 [N,3] colors in [0,1] as
+    // depth-tested disks whose pixel radius follows voxel_size and depth, into
+    // a Float32 [3 or 4 with transparent_background, H, W] image and a
+    // [1, H, W] depth, which is far_plane where nothing lands. Of the points
+    // at a pixel's nearest depth, the one with the smallest 8-bit color wins.
+    // Optional column-major Float32 [T,16] transforms apply per Int32 [N]
+    // index (clamped to [0,T-1], zero without indices); a Bool/UInt8 [T]
+    // visibility table hides points by that index, and a Bool/UInt8 [N]
+    // deleted mask hides points. Runs on the
+    // Vulkan and Metal backends; CUDA builds rasterize in the renderer.
+    LFS_CORE_API std::pair<Tensor, Tensor> rasterize_points(const Tensor& points, const Tensor& colors,
+                                                            const PointRaster& raster,
+                                                            const Tensor* transforms = nullptr,
+                                                            const Tensor* indices = nullptr,
+                                                            const Tensor* visibility = nullptr,
+                                                            const Tensor* deleted = nullptr);
+
     // For each Float32 [N,3] point, return whether a reference point is within
     // the inclusive radius. references is a Bool or UInt8 [N] mask; nonzero
-    // entries participate, including the point itself. Nonfinite points never
+    // entries participate, including the point itself unless exclude_self is set.
+    // Distinct points at identical positions still match. Nonfinite points never
     // match. Inputs share a device/backend; the Bool [N] result preserves it.
     // Radius must be positive, finite and normal (GPU subnormal arithmetic can
     // flush to zero). Scratch space is O(N), independent
     // of scene extent. Dense neighborhoods can still require quadratic work.
-    LFS_CORE_API Tensor radius_neighbors(const Tensor& points, const Tensor& references, float radius);
+    // An optional Bool/UInt8 [N] query mask skips unused queries (false output)
+    // without removing those points from the reference set.
+    LFS_CORE_API Tensor radius_neighbors(const Tensor& points, const Tensor& references, float radius,
+                                         bool exclude_self = false, const Tensor* queries = nullptr);
+
+    // Exact reference counts within radius, excluding the query point itself.
+    // Int32 [N], saturated at max_count (> 0). Same input/device contract as
+    // radius_neighbors; an optional query mask leaves unused counts at zero.
+    LFS_CORE_API Tensor radius_neighbor_counts(const Tensor& points, const Tensor& references, float radius,
+                                               int32_t max_count, const Tensor* queries = nullptr);
+
+    // radius_neighbor_counts with a radius per query point: Float32 [N] radii
+    // on the points' device. A query whose radius is not positive and finite
+    // counts nothing. Work follows the distance to surrounding clusters, not
+    // their size, so mixed small and very large radii stay cheap.
+    LFS_CORE_API Tensor radius_neighbor_counts(const Tensor& points, const Tensor& references, const Tensor& radii,
+                                               int32_t max_count, const Tensor* queries = nullptr);
+
+    // Minimum value among all points in the inclusive radius, including the
+    // query point itself. values is Int32 or Float32 [N]; the result has the
+    // same dtype, shape, device and backend. Nonfinite query points retain
+    // their own value. Scratch space is O(N), independent of scene extent.
+    // Optional Float32 [N] local radii use mutual (symmetric) connectivity:
+    // distance(i,j) <= min(radius, radii[i], radii[j]). Only points with local
+    // radius > radius/2 participate; others retain their value. Taking the
+    // minimum over octave-wide calls covers every mutual edge while excluding
+    // dense points from coarse grids. radii must be finite and positive.
+    LFS_CORE_API Tensor radius_neighbor_min(const Tensor& points, const Tensor& values, float radius,
+                                            const Tensor* radii = nullptr);
+
+    // Connected components of the inclusive radius graph over Float32 [N,3]
+    // points. Int32 [N] labels; each label is the smallest index in its
+    // component. Points outside the optional Bool [N] selection, and
+    // nonfinite points, are their own component and connect nothing.
+    LFS_CORE_API Tensor radius_connected_components(const Tensor& points, float radius);
+    LFS_CORE_API Tensor radius_connected_components(const Tensor& points, float radius, const Tensor& selected);
+
+    // Connected components where two points join when their distance is within
+    // both of their radii (Float32 [N] on the points' device), i.e. within the
+    // smaller one. Int32 [N] labels, each the smallest index in its component.
+    // Nonfinite points and points whose radius is not positive and finite are
+    // their own component. One pass over a point tree; no iteration cap.
+    LFS_CORE_API Tensor mutual_radius_components(const Tensor& points, const Tensor& radii);
+
+    // Triangles prepared for inside tests: a ray from a point along one fixed direction crosses a closed
+    // surface an odd number of times exactly when the point is inside it. A tree over the triangles'
+    // bounds across the ray means each query tests only the triangles its ray can reach. Build once per
+    // mesh and query in any number of batches.
+    class LFS_CORE_API TriangleRayIndex {
+    public:
+        // Float32 [V,3] vertices and Int32 [F,3] indices on one device; triangles with a nonfinite
+        // vertex are left out.
+        TriangleRayIndex(const Tensor& vertices, const Tensor& indices);
+        // Bool [N] on the points' device: whether the ray from each Float32 [N,3] point crosses an odd
+        // number of triangles. Nonfinite points are outside. Points must be on the index's device.
+        [[nodiscard]] Tensor odd_crossings(const Tensor& points) const;
+
+    private:
+        struct Tree;
+        std::shared_ptr<const Tree> tree_;
+    };
+
+    // Exact nearest target for each Float32 [N,3] query. Int32 [N] indices,
+    // ties choose the first target; empty targets/nonfinite queries return -1.
+    // A sparse grid searches expanding shells and falls back to an exact scan
+    // for sparse/distant queries. No pairwise matrix; O(N+M) scratch.
+    LFS_CORE_API Tensor nearest_point_indices(const Tensor& queries, const Tensor& targets);
+
+    // Count pinhole frusta containing each Float32 [N,3] world position.
+    // cameras is Float32 [C,16]: normalized world-to-image 3x4 rows, followed
+    // by the world camera centre and padding. +Z is forward. Image bounds
+    // are inclusive; max_distance=0 disables the distance limit. Int32 [N].
+    // All cameras are uploaded together and processed in one dispatch.
+    LFS_CORE_API Tensor camera_frustum_counts(const Tensor& points, const Tensor& cameras, float max_distance = 0);
+
+    // Approximate mean distance to the nearest three other points. Search 27
+    // cells, expanding once to 125 when fewer than three are found. Each cell
+    // inspects every candidate, independently of hash insertion order.
+    // Float32 [N,3] -> Float32 [N], same device/backend. A point with no local
+    // neighbours uses four times cell_width. Nonfinite points produce zero.
+    LFS_CORE_API Tensor point_neighbor_spacing(const Tensor& points, float cell_width);
 } // namespace lfs::core

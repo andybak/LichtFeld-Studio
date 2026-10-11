@@ -35,6 +35,9 @@ namespace lfs::vis {
         std::optional<SplitViewPanelId> panel;
         int focused_gaussian_id = -1;
         SelectionPreviewMode selection_mode{};
+        // A preview that does not re-render on pointer motion must not tint
+        // splats, or the tint stays wherever the last unrelated frame put it.
+        bool highlight_splats = true;
     };
 
     struct GizmoState {
@@ -48,6 +51,14 @@ namespace lfs::vis {
         glm::mat4 ellipsoid_transform{1};
         bool ellipsoid_affects_render = true;
         int ellipsoid_parent_node_index = -1;
+        bool node_box_active = false;
+        glm::mat4 node_box_transform{1};
+        glm::mat4 node_box_falloff_transform{1};
+        bool node_box_has_falloff = false;
+        bool node_ellipsoid_active = false;
+        glm::mat4 node_ellipsoid_transform{1};
+        glm::mat4 node_ellipsoid_falloff_transform{1};
+        bool node_ellipsoid_has_falloff = false;
     };
 
     struct FrameViewPanel {
@@ -79,25 +90,15 @@ namespace lfs::vis {
         DirtyMask frame_dirty = 0;
         bool training_active = false;
         bool depth_window_drag_preview = false;
+        bool gaussian_selection_visible = true;
 
         CursorPreviewState cursor_preview;
         GizmoState gizmo;
         int hovered_camera_id = -1;
         int current_camera_id = -1;
         int hovered_gaussian_id = -1;
-        float selection_flash_intensity = 0;
         std::vector<FrameViewPanel> view_panels;
         glm::vec2 scene_jitter_pixels{0.0f};
-        std::array<DepthWindowState, 2> panel_depth_windows{};
-
-        [[nodiscard]] const FrameViewPanel* findViewPanel(const SplitViewPanelId panel_id) const {
-            for (const auto& panel : view_panels) {
-                if (panel.panel == panel_id && panel.valid()) {
-                    return &panel;
-                }
-            }
-            return nullptr;
-        }
 
         [[nodiscard]] lfs::rendering::FrameView makeFrameView(const Viewport& source,
                                                               const glm::ivec2 size) const {
@@ -122,7 +123,7 @@ namespace lfs::vis {
                     .far_plane = settings.depth_clip_enabled ? settings.depth_clip_far
                                                              : lfs::rendering::DEFAULT_FAR_PLANE,
                     .orthographic = settings.orthographic,
-                    .ortho_scale = source.ortho_scale_override.value_or(settings.ortho_scale),
+                    .ortho_scale = settings.ortho_scale,
                     .background_color = settings.background_color};
         }
 
@@ -165,6 +166,7 @@ namespace lfs::vis {
     };
 
     struct CachedRenderMetadata {
+        std::optional<lfs::rendering::ViewerBackend> viewer_backend;
         std::array<CachedRenderPanelMetadata, 2> depth_panels{};
         size_t depth_panel_count = 0;
         bool valid = false;
@@ -180,6 +182,7 @@ namespace lfs::vis {
 
     [[nodiscard]] inline CachedRenderMetadata makeCachedRenderMetadata(const lfs::rendering::FrameMetadata& result) {
         CachedRenderMetadata metadata{
+            .viewer_backend = result.viewer_backend,
             .depth_panel_count = result.depth_panel_count,
             .valid = result.valid,
             .depth_is_ndc = result.depth_is_ndc,
@@ -198,9 +201,6 @@ namespace lfs::vis {
     }
 
     struct FrameResources {
-        CachedRenderMetadata cached_metadata;
-        std::optional<lfs::rendering::GpuFrame> cached_gpu_frame;
-        glm::ivec2 cached_result_size{0};
         bool splats_presented = false;
         bool split_view_executed = false;
         bool splat_pre_rendered = false;

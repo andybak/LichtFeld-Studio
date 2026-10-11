@@ -62,6 +62,7 @@ def test_library_rechecks_identity_at_json_replacement(monkeypatch, tmp_path, op
         "verify_batch": lambda: index.verify_projects_batch([project.id]),
         "clean_missing": lambda: index.clean_missing_entries(project.folder_id),
     }
+    monkeypatch.setattr(AssetIndex, "_inspected_file_identity", staticmethod(lambda _project: None))
     actions[operation]()
     assert "changed" in index.last_error
     assert index.library_path.read_bytes() == before
@@ -115,7 +116,7 @@ def test_reconciliation_refuses_an_alias_redirected_after_observation(monkeypatc
     assert "path changed" in index.last_error and index.library_path.read_bytes() == before
 
 
-@pytest.mark.parametrize("operation", ["verify", "verify_batch", "reconcile_all", "scan_batch"])
+@pytest.mark.parametrize("operation", ["verify", "verify_batch", "scan_batch"])
 def test_library_keeps_path_identity_from_before_inspection(monkeypatch, tmp_path, operation):
     from lfs_plugins import asset_watch
 
@@ -143,9 +144,8 @@ def test_library_keeps_path_identity_from_before_inspection(monkeypatch, tmp_pat
     if operation == "verify":
         index.verify_asset(project.id)
     elif operation == "verify_batch":
+        monkeypatch.setattr(AssetIndex, "_inspected_file_identity", staticmethod(lambda _project: None))
         index.verify_projects_batch([project.id])
-    elif operation == "reconcile_all":
-        index.reconcile_all()
     else:
         monkeypatch.setattr(asset_watch, "_known_path_is_unchanged", lambda *args: False)
         asset_watch._commit_registration_batch(index, [(str(alias), "default")], None)
@@ -154,7 +154,7 @@ def test_library_keeps_path_identity_from_before_inspection(monkeypatch, tmp_pat
     assert index.library_path.read_bytes() == before
 
 
-@pytest.mark.parametrize("operation", ["verify", "verify_batch", "reconcile_all", "reconcile_observations"])
+@pytest.mark.parametrize("operation", ["verify", "verify_batch", "reconcile_observations"])
 @pytest.mark.parametrize("health", ["missing", "unreadable"])
 def test_library_health_write_refuses_a_replaced_project(monkeypatch, tmp_path, operation, health):
     from lfs_plugins import asset_index
@@ -185,9 +185,8 @@ def test_library_health_write_refuses_a_replaced_project(monkeypatch, tmp_path, 
     if operation == "verify":
         index.verify_asset(project.id)
     elif operation == "verify_batch":
+        monkeypatch.setattr(AssetIndex, "_inspected_file_identity", staticmethod(lambda _project: None))
         index.verify_projects_batch([project.id])
-    elif operation == "reconcile_all":
-        index.reconcile_all()
     else:
         index.reconcile_observations([observation])
     assert "identity or path changed" in index.last_error

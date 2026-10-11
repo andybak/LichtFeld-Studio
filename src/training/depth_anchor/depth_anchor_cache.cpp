@@ -9,7 +9,6 @@
 #include "core/tensor.hpp"
 #include "io/atomic_output.hpp"
 
-#include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -28,7 +27,7 @@
 namespace lfs::training {
     namespace {
 
-        constexpr int kSchemaVersion = 1;
+        constexpr int kSchemaVersion = 2;
 
         void hash_bytes(std::uint64_t& hash, const void* data, const std::size_t size) {
             const auto* bytes = static_cast<const unsigned char*>(data);
@@ -91,7 +90,27 @@ namespace lfs::training {
 
     } // namespace
 
+    kernels::DepthCameraProjection depth_camera_projection(const lfs::core::Camera& cam) {
+        kernels::DepthCameraProjection p;
+        if (cam.is_undistort_prepared())
+            return p;
+        p.model = static_cast<int>(cam.camera_model_type());
+        auto copy = [](const lfs::core::Tensor& tensor, float* out, size_t count) {
+            if (!tensor.is_valid() || !tensor.numel())
+                return;
+            const auto host = tensor.cpu().contiguous();
+            std::copy_n(host.ptr<float>(), std::min(count, host.numel()), out);
+        };
+        copy(cam.radial_distortion(), p.radial, 6);
+        if (cam.camera_model_type() == lfs::core::CameraModelType::THIN_PRISM_FISHEYE)
+            copy(cam.tangential_distortion(), p.thin_prism, 4);
+        else
+            copy(cam.tangential_distortion(), p.tangential, 2);
+        return p;
+    }
+
     RawDepthAnchorMap computeRawDepthAnchors(
+        const lfs::gpu_ops::GeometryLossOps& geometry,
         const lfs::core::Tensor& means_in,
         const std::vector<std::shared_ptr<lfs::core::Camera>>& cameras,
         const int resize_factor,
@@ -154,7 +173,7 @@ namespace lfs::training {
         // next camera's depth decode.
         struct AnchorJob {
             std::string image_name;
-            std::vector<float2> samples;
+            std::vector<lfs::gpu_ops::AnchorSample> samples;
         };
 
         std::mutex queue_mutex;
@@ -234,22 +253,16 @@ namespace lfs::training {
             // The prior's lazy ops materialize on their own stream; the collect
             // kernel reads raw pointers, so settle the device first (startup only).
             prior.ptr<float>();
-            lfs::core::gpu_device_barrier(lfs::core::GpuBackend::CUDA);
+            if (const auto backend = lfs::core::gpu_backend_of(prior))
+                lfs::core::gpu_device_barrier(*backend);
 
-            auto samples = lfs::training::kernels::collect_depth_anchor_samples(
-                means.ptr<float>(),
-                num_points,
-                cam->world_view_transform_ptr(),
-                cam->focal_x() * sx,
-                cam->focal_y() * sy,
-                cam->center_x() * sx,
-                cam->center_y() * sy,
-                prior.ptr<float>(),
-                prior_w,
-                prior_h,
-                0.01f,
-                aabb_lo,
-                aabb_hi);
+            auto samples = geometry.collect_anchor_samples(
+                means, cam->world_view_transform(), prior,
+                {{cam->focal_x() * sx, cam->focal_y() * sy, cam->center_x() * sx, cam->center_y() * sy},
+                 0.01f,
+                 {aabb_lo[0], aabb_lo[1], aabb_lo[2]},
+                 {aabb_hi[0], aabb_hi[1], aabb_hi[2]},
+                 depth_camera_projection(*cam)});
             cam->release_depth_cache();
 
             if (samples.empty()) {
@@ -305,6 +318,14 @@ namespace lfs::training {
             hash_scalar(hash, cam->center_y());
             hash_scalar(hash, cam->camera_width());
             hash_scalar(hash, cam->camera_height());
+            const auto projection = depth_camera_projection(*cam);
+            hash_scalar(hash, projection.model);
+            for (float v : projection.radial)
+                hash_scalar(hash, v);
+            for (float v : projection.tangential)
+                hash_scalar(hash, v);
+            for (float v : projection.thin_prism)
+                hash_scalar(hash, v);
 
             const auto pose = cam->world_view_transform().cpu().contiguous();
             if (pose.is_valid() && pose.numel() >= 16) {

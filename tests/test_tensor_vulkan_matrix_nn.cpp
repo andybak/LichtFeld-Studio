@@ -1,7 +1,9 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/nn/ops.hpp"
 #include "core/tensor.hpp"
+#include "core/tensor/backend/gpu_backend_ops.hpp"
 #include "core/tensor/backend/vulkan/vk_context.hpp"
 #include "core/tensor_backend.hpp"
 
@@ -151,6 +153,52 @@ namespace {
         }
         x.linear_bias_relu_out(w, b, output);
         expect_matrix(output, rectified, in_features, "linear_bias_relu_out");
+    }
+
+    TEST_F(TensorVulkanMatrixNn, SmallDepthAndWidthCoverEveryGemmLayout) {
+        // k and n of at most 16 take the element-per-thread path: catches a
+        // transposed B read as [k][n], a bias on the wrong axis, and the edges
+        // of its shared B table.
+        struct Case {
+            size_t m, k, n;
+        };
+        const std::array cases{Case{1000, 3, 3}, Case{257, 16, 16}, Case{33, 16, 1}, Case{5, 1, 16}};
+        for (const Case& test : cases) {
+            const std::string label = std::to_string(test.m) + "x" + std::to_string(test.k) + "x" + std::to_string(test.n);
+            const std::vector<float> input = signed_pattern(test.m * test.k, 10);
+            const std::vector<float> weight = positive_pattern(test.k * test.n, 11);
+            const std::vector<float> bias = signed_pattern(test.n, 12);
+            const Tensor x = upload(input, {test.m, test.k});
+            expect_matrix(x.mm(upload(weight, {test.k, test.n})),
+                          matmul_reference(input, weight, test.m, test.k, test.n, false), test.k, "mm " + label);
+            const Tensor w = upload(weight, {test.n, test.k});
+            const std::vector<double> plain = matmul_reference(input, weight, test.m, test.k, test.n, true);
+            expect_matrix(x.linear(w), plain, test.k, "linear " + label);
+            std::vector<double> rectified(plain);
+            for (size_t i = 0; i < test.m; ++i)
+                for (size_t j = 0; j < test.n; ++j)
+                    rectified[i * test.n + j] = std::max(0.0, plain[i * test.n + j] + bias[j]);
+            Tensor output;
+            {
+                GpuBackendScope scope(GpuBackend::Vulkan);
+                output = Tensor::zeros({test.m, test.n}, Device::GPU);
+            }
+            x.linear_bias_relu_out(w, upload(bias, {test.n}), output);
+            expect_matrix(output, rectified, test.k, "linear_bias_relu_out " + label);
+            // The fused epilogue adds one bias per output row.
+            const std::vector<float> row_bias = signed_pattern(test.m, 13);
+            const Tensor b = upload(weight, {test.k, test.n});
+            const Tensor r = upload(row_bias, {test.m});
+            std::vector<double> fused = matmul_reference(input, weight, test.m, test.k, test.n, false);
+            for (size_t i = 0; i < test.m; ++i)
+                for (size_t j = 0; j < test.n; ++j)
+                    fused[i * test.n + j] = std::max(0.0, fused[i * test.n + j] + row_bias[i]);
+            internal::backend_ops(GpuBackend::Vulkan)
+                .sgemm_bias_relu(internal::storage_ref(x), internal::storage_ref(b), internal::storage_ref(r),
+                                 internal::storage_ref(output),
+                                 internal::GemmProgram{.m = test.m, .n = test.n, .k = test.k}, {});
+            expect_matrix(output, fused, test.k, "sgemm_bias_relu " + label);
+        }
     }
 
     TEST_F(TensorVulkanMatrixNn, BatchedMatmulStridesEveryBatch) {
@@ -402,6 +450,35 @@ namespace {
         for (size_t i = 0; i < values.size(); ++i) {
             const float expected = values[i] > 0.0f ? values[i] : 0.0f;
             ASSERT_EQ(result[i], expected) << "index=" << i;
+        }
+    }
+
+    TEST_F(TensorVulkanMatrixNn, FullyMaskedRowsAttendToNothingLikeCuda) {
+        // Rows masked out entirely come back zero, as from the CUDA kernels,
+        // instead of NaN; the other rows stay normalized.
+        constexpr float kMasked = -std::numeric_limits<float>::infinity();
+        std::vector<float> mask(5 * 40, 0.0f);
+        std::fill(mask.begin() + 2 * 40, mask.begin() + 3 * 40, kMasked);
+        const Tensor gpu_mask = upload(mask, {1, 1, 5, 40});
+        const Tensor q = upload(signed_pattern(5 * 16, 1), {1, 1, 5, 16});
+        const Tensor k = upload(signed_pattern(40 * 16, 2), {1, 1, 40, 16});
+        const Tensor v = upload(positive_pattern(40 * 16, 3), {1, 1, 40, 16});
+        const std::vector<float> attended = lfs::core::nn::attention(q, k, v, &gpu_mask).cpu().to_vector();
+        for (size_t i = 0; i < attended.size(); ++i) {
+            if (i / 16 == 2)
+                ASSERT_EQ(attended[i], 0.0f) << "index=" << i;
+            else
+                ASSERT_GT(attended[i], 0.0f) << "index=" << i;
+        }
+
+        const Tensor logits = upload(signed_pattern(5 * 40, 4), {5, 40});
+        const Tensor row_mask = upload(mask, {5, 40});
+        const std::vector<float> weights = lfs::core::nn::softmax(logits, &row_mask).cpu().to_vector();
+        for (size_t row = 0; row < 5; ++row) {
+            double sum = 0.0;
+            for (size_t column = 0; column < 40; ++column)
+                sum += weights[row * 40 + column];
+            ASSERT_NEAR(sum, row == 2 ? 0.0 : 1.0, 1.0e-5) << "row=" << row;
         }
     }
 

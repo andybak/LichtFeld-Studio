@@ -5,6 +5,7 @@
 #include "core/error.hpp"
 #include "core/export.hpp"
 #include "core/nn/activation_arena.hpp"
+#include "core/nn/lpips_dispatch.hpp"
 #include "core/nn/ops.hpp"
 #include "core/nn/weight_file.hpp"
 #include "core/tensor.hpp"
@@ -17,6 +18,8 @@
 #include <unordered_map>
 
 namespace lfs::core::nn::models {
+
+    [[nodiscard]] LFS_CORE_API std::size_t default_lpips_activation_budget();
 
     enum class InputScaling {
         Identity,
@@ -40,6 +43,11 @@ namespace lfs::core::nn::models {
         lfs::Result<float> forward(const Tensor& pred, const Tensor& target,
                                    std::optional<InputScaling> scaling = std::nullopt);
 
+        // Mean over the masked area only: every layer's distance map is weighted by the mask
+        // area-pooled to that layer's resolution. mask is CUDA [H,W] with values in [0,1].
+        lfs::Result<float> forward(const Tensor& pred, const Tensor& target, const Tensor& mask,
+                                   std::optional<InputScaling> scaling = std::nullopt);
+
         lfs::Result<LpipsTaps> forward_with_taps(const Tensor& pred, const Tensor& target,
                                                  std::optional<InputScaling> scaling = std::nullopt);
 
@@ -51,20 +59,33 @@ namespace lfs::core::nn::models {
         [[nodiscard]] std::size_t activation_budget_bytes() const { return activation_budget_bytes_; }
         [[nodiscard]] std::size_t tile_size_for(int height, int width) const;
         // Extra free VRAM needed for the next call; includes allocator rounding.
-        [[nodiscard]] std::size_t estimated_peak_bytes(int height, int width) const;
+        [[nodiscard]] std::size_t estimated_peak_bytes(int height, int width, bool masked = false) const;
+        [[nodiscard]] bool prefers_independent_queue() const {
+            return dispatch_ && dispatch_->prefer_independent_queue;
+        }
         void release_activations();
+        // The binding must outlive this model; training tables have static lifetime.
+        void set_dispatch(const LpipsDispatch& dispatch) { dispatch_ = &dispatch; }
 
     private:
+        struct MaskWeights {
+            std::array<Tensor, 5> maps;
+            std::array<double, 5> sums{};
+        };
+
         lfs::Result<float> run(const Tensor& pred, const Tensor& target, InputScaling scaling,
-                               LpipsTaps* taps);
+                               LpipsTaps* taps, const MaskWeights* mask = nullptr);
         lfs::Result<float> run_untiled(const Tensor& pred, const Tensor& target,
-                                       InputScaling scaling, LpipsTaps* taps);
+                                       InputScaling scaling, LpipsTaps* taps,
+                                       const MaskWeights* mask);
         lfs::Result<float> run_tiled(const Tensor& pred, const Tensor& target,
-                                     InputScaling scaling);
+                                     InputScaling scaling, const MaskWeights* mask);
+        lfs::Result<std::array<Tensor, 5>> extract_normalized_features(
+            const Tensor& input, InputScaling scaling);
         // Fast mode without taps: fused kernels writing ping-pong feature buffers,
         // no activation arena, no intermediate copies.
         lfs::Result<float> run_fast(const Tensor& pred, const Tensor& target,
-                                    InputScaling scaling);
+                                    InputScaling scaling, const MaskWeights* mask);
         std::optional<lfs::Error> validate_pair(const Tensor& pred, const Tensor& target) const;
         void bind_weights_to_stream(cudaStream_t stream);
         const Tensor& w(std::string_view name) const;
@@ -82,6 +103,7 @@ namespace lfs::core::nn::models {
         std::array<Tensor, 4> fast_features_;
         Tensor fast_scores_;
         Tensor fast_weight_taps_;
+        const LpipsDispatch* dispatch_ = nullptr;
         std::array<std::size_t, 13> fast_weight_tap_offsets_{};
         std::array<float, 3> scaling_shift_{};
         std::array<float, 3> scaling_scale_{};

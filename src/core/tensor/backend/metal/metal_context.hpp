@@ -41,6 +41,9 @@ namespace lfs::core::internal {
 
     // Completion for TensorCompletion: work is submitted in batches numbered by
     // serial, and StorageMeta::pending_value holds the batch that last used it.
+    // Capacity of the block the Metal allocator hands out for `bytes`.
+    size_t metal_allocation_bytes(size_t bytes);
+
     uint64_t metal_flush();
     uint64_t metal_completed_serial();
     void metal_wait(uint64_t serial);
@@ -76,6 +79,8 @@ namespace lfs::core::internal::metal {
         // Threads to run, or threadgroups when group_size is set.
         MTLSize grid;
         MTLSize group_size{};
+        // GPU address of three uint32 threadgroup counts; replaces grid.
+        uint64_t indirect = 0;
     };
 
     template <class Params>
@@ -116,11 +121,23 @@ namespace lfs::core::internal::metal {
         // reaches `value`. The host does not wait. Returns the serial of an
         // empty batch that completes once the wait is over.
         uint64_t queue_wait(id<MTLSharedEvent> event, uint64_t value);
+        // Completion-handler safe: no allocation, recording lock or callback.
+        void record_external_write_failure() noexcept;
+        // Writes a GPU timestamp after all earlier work; returns its batch serial.
+        uint64_t write_timestamp(id<MTL4CounterHeap> heap, NSUInteger index);
         void wait(uint64_t serial);
+        // Commits the batch of serial if it is still open; never blocks.
+        bool ready(uint64_t serial);
+        // Waits without raising batch failures or device faults, for threads
+        // that only observe completion and must leave errors to the owner.
+        void wait_completed(uint64_t serial);
         uint64_t completed() const;
+        // No batch is open or running, so the host may touch any storage.
+        bool idle() const { return newest_serial_.load(std::memory_order_acquire) <= completed(); }
         void wait_idle();
 
-        StorageRef allocate(size_t bytes);
+        // host_writable skips cached blocks that a running batch may still use.
+        StorageRef allocate(size_t bytes, bool host_writable = false);
         void release(const StorageRef& storage) noexcept;
         void trim();
         size_t cached_bytes();
@@ -155,6 +172,7 @@ namespace lfs::core::internal::metal {
         struct Block {
             id<MTLBuffer> buffer;
             uint64_t address = 0;
+            size_t requested = 0;
             size_t capacity = 0;
             uint64_t guard = 0;
             std::unique_ptr<StorageMeta> meta;
@@ -175,6 +193,7 @@ namespace lfs::core::internal::metal {
         struct Failure {
             std::mutex mutex;
             std::string message;
+            std::atomic_bool external_write_failed{false};
         };
 
         struct PipelineKey {
@@ -198,6 +217,7 @@ namespace lfs::core::internal::metal {
         size_t acquire_frame_locked();
         void commit_locked();
         void wait_signaled(uint64_t serial);
+        void check_external_write_failure() const;
         void check_failures() const;
         void check_fault();
         void consume_fault_locked(size_t slot);
@@ -246,10 +266,22 @@ namespace lfs::core::internal::metal {
         std::map<size_t, std::vector<Block>> free_;
         size_t cached_bytes_ = 0;
         size_t cache_limit_ = 0;
+        bool trim_requested_ = false;
+        size_t live_requested_bytes_ = 0;
+        size_t live_capacity_bytes_ = 0;
+        size_t peak_live_capacity_bytes_ = 0;
+        size_t peak_reserved_bytes_ = 0;
     };
 
     std::shared_ptr<Context> acquire_context();
     std::shared_ptr<Context> live_context();
+
+    // Storage is shared with the CPU: one thread copies about 40 GB/s, and
+    // several together about 180 GB/s on an M5 Max.
+    void host_copy(std::byte* destination, const std::byte* source, size_t bytes);
+    // A GPU round trip costs ~150 us while the host copies 4 MiB in ~30 us, so
+    // copies up to this size run on the host while the GPU is idle.
+    inline constexpr size_t kHostCopyBytes = size_t{4} << 20;
 
     API_AVAILABLE_END
 

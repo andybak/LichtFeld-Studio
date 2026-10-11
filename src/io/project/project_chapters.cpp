@@ -5,6 +5,7 @@
 
 #include "io/project_chapters.hpp"
 
+#include "core/camera_types.h"
 #include "core/path_utils.hpp"
 
 #include <xxhash.h>
@@ -1991,21 +1992,6 @@ namespace lfs::io::project {
             return absolute.lexically_normal();
         }
 
-        bool path_is_under(
-            const std::filesystem::path& root,
-            const std::filesystem::path& candidate) {
-            if (root.empty()) {
-                return false;
-            }
-            const auto relative =
-                candidate.lexically_relative(root);
-            if (relative.empty() || relative == ".") {
-                return true;
-            }
-            const auto first = relative.begin();
-            return first == relative.end() || *first != std::filesystem::path("..");
-        }
-
         bool fingerprint_content_matches(
             const ReferenceFingerprint& expected,
             const ReferenceFingerprint& observed) {
@@ -2096,14 +2082,12 @@ namespace lfs::io::project {
         };
         if (!project_root.empty()) {
             const auto root = absolute_lexically(project_root);
-            if (path_is_under(root, absolute)) {
-                const auto relative = absolute.lexically_relative(root);
-                const auto first = relative.begin();
-                if (!relative.empty() && relative != "." &&
-                    (first == relative.end() || *first != std::filesystem::path(".."))) {
-                    locator.preferred = lfs::core::path_to_generic_utf8(relative);
-                    locator.base = LocatorBase::Project;
-                }
+            const auto relative = absolute.lexically_relative(root);
+            if (!relative.empty() && relative != "." &&
+                relative.is_relative()) {
+                locator.preferred =
+                    lfs::core::path_to_generic_utf8(relative);
+                locator.base = LocatorBase::Project;
             }
         }
 
@@ -2396,6 +2380,157 @@ namespace lfs::io::project {
             return value;
         }
 
+        lfs::Result<std::int32_t> calibration_dimension(
+            const Json& object, const std::string_view key, const std::string_view prefix) {
+            const std::string field = std::format("{}.{}", prefix, key);
+            const auto found = object.find(std::string(key));
+            if (found == object.end()) {
+                return fail<std::int32_t>(
+                    lfs::ErrorCode::DataLoss, "The project chapter is missing a required field.",
+                    std::format("SCNG.{} is missing", field), "SCNG", field);
+            }
+            constexpr auto maximum = std::numeric_limits<std::int32_t>::max();
+            // Check the JSON type and its full-width value before narrowing. JSON
+            // integers may be unsigned, including values beyond INT64_MAX.
+            if (found->is_number_unsigned()) {
+                const auto value = found->get<Json::number_unsigned_t>();
+                if (value >= 1 && value <= static_cast<Json::number_unsigned_t>(maximum))
+                    return static_cast<std::int32_t>(value);
+            } else if (found->is_number_integer()) {
+                const auto value = found->get<Json::number_integer_t>();
+                if (value >= 1 && value <= maximum)
+                    return static_cast<std::int32_t>(value);
+            }
+            return fail<std::int32_t>(
+                lfs::ErrorCode::DataLoss, "A saved camera calibration dimension is invalid.",
+                std::format("SCNG.{} must be an integer in [1, {}]", field, maximum),
+                "SCNG", field);
+        }
+
+        lfs::Result<std::int32_t> camera_dimension(
+            const Json& object, const std::string_view key,
+            const std::string_view prefix) {
+            const std::string field = std::format("{}.{}", prefix, key);
+            const auto found = object.find(std::string(key));
+            if (found == object.end()) {
+                return fail<std::int32_t>(
+                    lfs::ErrorCode::DataLoss,
+                    "The project chapter is missing a required field.",
+                    std::format("SCNG.{} is missing", field), "SCNG", field);
+            }
+            constexpr auto maximum = std::numeric_limits<std::int32_t>::max();
+            if (found->is_number_unsigned()) {
+                const auto value = found->get<Json::number_unsigned_t>();
+                if (value <= static_cast<Json::number_unsigned_t>(maximum))
+                    return static_cast<std::int32_t>(value);
+            } else if (found->is_number_integer()) {
+                const auto value = found->get<Json::number_integer_t>();
+                if (value >= 0 && value <= maximum)
+                    return static_cast<std::int32_t>(value);
+            }
+            return fail<std::int32_t>(
+                lfs::ErrorCode::DataLoss, "A saved camera dimension is invalid.",
+                std::format("SCNG.{} must be an integer in [0, {}]", field,
+                            maximum),
+                "SCNG", field);
+        }
+
+        lfs::Result<CameraCalibrationRecord> parse_camera_calibration(
+            const Json& value, const std::string_view field) {
+            if (auto valid = require_object(value, "SCNG", field); !valid) {
+                return std::move(valid).error();
+            }
+            auto focal_x = required<float>(value, "focal_x", "SCNG", field);
+            auto focal_y = required<float>(value, "focal_y", "SCNG", field);
+            auto center_x = required<float>(value, "center_x", "SCNG", field);
+            auto center_y = required<float>(value, "center_y", "SCNG", field);
+            auto width = calibration_dimension(value, "width", field);
+            auto height = calibration_dimension(value, "height", field);
+            if (auto error = first_error(
+                    focal_x, focal_y, center_x, center_y, width, height)) {
+                return std::move(*error);
+            }
+            if (!std::isfinite(*focal_x) || *focal_x <= 0.0f ||
+                !std::isfinite(*focal_y) || *focal_y <= 0.0f ||
+                !std::isfinite(*center_x) || !std::isfinite(*center_y) ||
+                *width <= 0 || *height <= 0) {
+                return fail<CameraCalibrationRecord>(
+                    lfs::ErrorCode::DataLoss,
+                    "A saved camera undistortion calibration is invalid.",
+                    std::format("SCNG.{} contains non-finite or non-positive values", field),
+                    "SCNG", field);
+            }
+            return CameraCalibrationRecord{
+                .focal_x = *focal_x,
+                .focal_y = *focal_y,
+                .center_x = *center_x,
+                .center_y = *center_y,
+                .width = *width,
+                .height = *height,
+            };
+        }
+
+        lfs::Result<std::optional<CameraUndistortionRecord>>
+        parse_camera_undistortion(const Json& camera, const std::string_view field) {
+            const auto found = camera.find("undistortion");
+            if (found == camera.end()) {
+                return std::optional<CameraUndistortionRecord>{};
+            }
+            const std::string nested_field = std::format("{}.undistortion", field);
+            if (auto valid = require_object(*found, "SCNG", nested_field); !valid) {
+                return std::move(valid).error();
+            }
+            const auto source = found->find("source");
+            const auto destination = found->find("destination");
+            if (source == found->end() || destination == found->end()) {
+                return fail<std::optional<CameraUndistortionRecord>>(
+                    lfs::ErrorCode::DataLoss,
+                    "A saved camera undistortion record is incomplete.",
+                    std::format("SCNG.{} is missing source or destination", nested_field),
+                    "SCNG", nested_field);
+            }
+            auto parsed_source = parse_camera_calibration(
+                *source, std::format("{}.source", nested_field));
+            auto parsed_destination = parse_camera_calibration(
+                *destination, std::format("{}.destination", nested_field));
+            auto prepared = required<bool>(*found, "prepared", "SCNG", nested_field);
+            lfs::Result<bool> crop_solve_failed = false;
+            if (found->contains("crop_solve_failed")) {
+                crop_solve_failed = required<bool>(
+                    *found, "crop_solve_failed", "SCNG", nested_field);
+            }
+            if (!parsed_source) {
+                return std::move(parsed_source).error();
+            }
+            if (!parsed_destination) {
+                return std::move(parsed_destination).error();
+            }
+            if (!prepared) {
+                return std::move(prepared).error();
+            }
+            if (!crop_solve_failed) {
+                return std::move(crop_solve_failed).error();
+            }
+            return std::optional<CameraUndistortionRecord>(
+                CameraUndistortionRecord{
+                    .source = *parsed_source,
+                    .destination = *parsed_destination,
+                    .prepared = *prepared,
+                    .crop_solve_failed = *crop_solve_failed,
+                });
+        }
+
+        Json camera_calibration_json(const CameraCalibrationRecord& value) {
+            return Json{
+                {"focal_x", value.focal_x},
+                {"focal_y", value.focal_y},
+                {"center_x", value.center_x},
+                {"center_y", value.center_y},
+                {"width", value.width},
+                {"height", value.height},
+            };
+        }
+
         lfs::Result<CameraRecord> parse_camera(const Json& value,
                                                const std::string_view field) {
             if (auto valid = require_object(value, "SCNG", field); !valid) {
@@ -2427,13 +2562,13 @@ namespace lfs::io::project {
             auto model = required<std::int32_t>(
                 value, "camera_model_type", "SCNG", field);
             auto camera_width =
-                required<std::int32_t>(value, "camera_width", "SCNG", field);
+                camera_dimension(value, "camera_width", field);
             auto camera_height =
-                required<std::int32_t>(value, "camera_height", "SCNG", field);
+                camera_dimension(value, "camera_height", field);
             auto image_width =
-                required<std::int32_t>(value, "image_width", "SCNG", field);
+                camera_dimension(value, "image_width", field);
             auto image_height =
-                required<std::int32_t>(value, "image_height", "SCNG", field);
+                camera_dimension(value, "image_height", field);
             auto image_name =
                 required<std::string>(value, "image_name", "SCNG", field);
             auto image_path =
@@ -2448,6 +2583,17 @@ namespace lfs::io::project {
             auto has_image =
                 optional<bool>(value, "has_image", "SCNG", field);
             auto split = required<std::string>(value, "split", "SCNG", field);
+            auto undistortion = parse_camera_undistortion(value, field);
+            std::uint64_t sfm_observation_count = 0;
+            if (const auto found = value.find("sfm_observations"); found != value.end()) {
+                if (!found->is_number_unsigned()) {
+                    return fail<CameraRecord>(
+                        lfs::ErrorCode::DataLoss, "A scene camera record is invalid.",
+                        std::format("SCNG.{}.sfm_observations must be an unsigned integer", field),
+                        "SCNG", field);
+                }
+                sfm_observation_count = found->get<std::uint64_t>();
+            }
             if (!rotation) {
                 return std::move(rotation).error();
             }
@@ -2465,7 +2611,7 @@ namespace lfs::io::project {
                                 model, camera_width, camera_height, image_width,
                                 image_height, image_name, image_path, mask_path,
                                 depth_path, normal_path, has_alpha, has_image,
-                                split)) {
+                                split, undistortion)) {
                 return std::move(*error);
             }
             if (*camera_width < 0 || *camera_height < 0 || *image_width < 0 ||
@@ -2477,6 +2623,41 @@ namespace lfs::io::project {
                     std::format("SCNG.{} contains invalid dimensions, split, or intrinsics",
                                 field),
                     "SCNG", field);
+            }
+
+            if (*undistortion) {
+                const bool model_supported =
+                    *model == static_cast<std::int32_t>(
+                                  lfs::core::CameraModelType::PINHOLE) ||
+                    *model == static_cast<std::int32_t>(
+                                  lfs::core::CameraModelType::FISHEYE) ||
+                    *model == static_cast<std::int32_t>(
+                                  lfs::core::CameraModelType::THIN_PRISM_FISHEYE);
+                const bool has_distortion =
+                    *model != static_cast<std::int32_t>(
+                                  lfs::core::CameraModelType::PINHOLE) ||
+                    !radial->empty() || !tangential->empty();
+                const auto nearly_equal = [](const float lhs, const float rhs) {
+                    const float scale = std::max({1.0f, std::fabs(lhs), std::fabs(rhs)});
+                    return std::fabs(lhs - rhs) <= 1.0e-5f * scale;
+                };
+                const CameraCalibrationRecord& source = (*undistortion)->source;
+                const bool calibration_matches =
+                    nearly_equal(*focal_x, source.focal_x) &&
+                    nearly_equal(*focal_y, source.focal_y) &&
+                    nearly_equal(*center_x, source.center_x) &&
+                    nearly_equal(*center_y, source.center_y) &&
+                    *camera_width == source.width &&
+                    *camera_height == source.height;
+                if (!model_supported || !has_distortion || !calibration_matches) {
+                    return fail<CameraRecord>(
+                        lfs::ErrorCode::DataLoss,
+                        "A saved camera undistortion record is inconsistent.",
+                        std::format(
+                            "SCNG.{}.undistortion is incompatible with the camera model or outer calibration",
+                            field),
+                        "SCNG", std::format("{}.undistortion", field));
+                }
             }
             return CameraRecord{
                 .uid = *uid,
@@ -2502,11 +2683,13 @@ namespace lfs::io::project {
                 .has_alpha = *has_alpha,
                 .has_image = has_image->value_or(true),
                 .split = std::move(*split),
+                .undistortion = std::move(*undistortion),
+                .sfm_observation_count = sfm_observation_count,
             };
         }
 
         Json camera_json(const CameraRecord& value) {
-            return Json{
+            Json result{
                 {"uid", value.uid},
                 {"camera_id", value.camera_id},
                 {"rotation", json_array(value.rotation)},
@@ -2531,6 +2714,19 @@ namespace lfs::io::project {
                 {"has_image", value.has_image},
                 {"split", value.split},
             };
+            if (value.undistortion) {
+                result["undistortion"] = Json{
+                    {"source", camera_calibration_json(value.undistortion->source)},
+                    {"destination", camera_calibration_json(value.undistortion->destination)},
+                    {"prepared", value.undistortion->prepared},
+                };
+                if (value.undistortion->crop_solve_failed) {
+                    result["undistortion"]["crop_solve_failed"] = true;
+                }
+            }
+            if (value.sfm_observation_count > 0)
+                result["sfm_observations"] = value.sfm_observation_count;
+            return result;
         }
 
         lfs::Result<SceneNodeRecord> parse_scene_node(
@@ -3027,14 +3223,44 @@ namespace lfs::io::project {
                 adapted.erase("ppisp_sidecar_path");
                 adapted.erase("config_file");
                 adapted["headless"] = false;
-                auto result =
-                    lfs::core::param::OptimizationParameters::from_json(
-                        nlohmann::json::parse(adapted.dump()));
-                result.headless = false;
-                result.config_file.clear();
-                result.bg_image_path.clear();
-                result.ppisp_sidecar_path.clear();
-                if (const std::string invalid = result.validate(); !invalid.empty()) {
+                const auto decode = [](const nlohmann::json& json) {
+                    auto parameters =
+                        lfs::core::param::OptimizationParameters::from_json(json);
+                    parameters.headless = false;
+                    parameters.config_file.clear();
+                    parameters.bg_image_path.clear();
+                    parameters.ppisp_sidecar_path.clear();
+                    return parameters;
+                };
+                auto stored = nlohmann::json::parse(adapted.dump());
+                auto result = decode(stored);
+                std::string invalid = result.validate();
+                // Another version can store values this one rejects, such as an automatic
+                // setting it does not have. Keep every accepted value and default the rest.
+                const auto defaults =
+                    lfs::core::param::OptimizationParameters::defaults_for_strategy(
+                        result.strategy)
+                        .to_json();
+                for (bool defaulted = true; defaulted && !invalid.empty();) {
+                    defaulted = false;
+                    for (auto fallback = defaults.begin();
+                         !invalid.empty() && fallback != defaults.end(); ++fallback) {
+                        const auto current = stored.find(fallback.key());
+                        if (current == stored.end() || *current == *fallback)
+                            continue;
+                        auto trial = stored;
+                        trial[fallback.key()] = *fallback;
+                        auto candidate = decode(trial);
+                        if (std::string candidate_invalid = candidate.validate();
+                            candidate_invalid != invalid) {
+                            stored = std::move(trial);
+                            result = std::move(candidate);
+                            invalid = std::move(candidate_invalid);
+                            defaulted = true;
+                        }
+                    }
+                }
+                if (!invalid.empty()) {
                     return fail<ParsedParameterPreset>(
                         lfs::ErrorCode::DataLoss,
                         "A pending parameter preset is invalid.",
@@ -3293,6 +3519,7 @@ namespace lfs::io::project {
                 "PRMS", "presets");
         }
         cached_snapshot_ = ParameterManagerSnapshot{
+            .cli_step_locked_strategy = std::nullopt,
             .active_strategy = *active,
             .mcmc_session = std::move(mcmc_session->parameters),
             .mrnf_session = std::move(mrnf_session->parameters),

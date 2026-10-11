@@ -4,6 +4,8 @@
 
 import lichtfeld as lf
 
+from .rml_widgets import request_model_update
+
 
 class KeymapBindingsSection:
     """Retained key-binding editor bound onto the Preferences data model."""
@@ -41,6 +43,14 @@ class KeymapBindingsSection:
             lf.keymap.Action.CAMERA_SET_HOME,
             lf.keymap.Action.CAMERA_NEXT_VIEW,
             lf.keymap.Action.CAMERA_PREV_VIEW,
+            lf.keymap.Action.VIEW_AXIS_TOP,
+            lf.keymap.Action.VIEW_AXIS_BOTTOM,
+            lf.keymap.Action.VIEW_AXIS_FRONT,
+            lf.keymap.Action.VIEW_AXIS_BACK,
+            lf.keymap.Action.VIEW_AXIS_RIGHT,
+            lf.keymap.Action.VIEW_AXIS_LEFT,
+            lf.keymap.Action.VIEW_TOGGLE_PERSPECTIVE,
+            lf.keymap.Action.VIEW_FRAME_ALL,
         ],
         "selection": [
             lf.keymap.Action.SELECTION_REPLACE,
@@ -88,7 +98,9 @@ class KeymapBindingsSection:
         ],
         "view_global": [
             lf.keymap.Action.TOGGLE_SPLIT_VIEW,
-            lf.keymap.Action.TOGGLE_INDEPENDENT_SPLIT_VIEW,
+            lf.keymap.Action.TOGGLE_SPLIT_VIEWPORT,
+            lf.keymap.Action.TOGGLE_QUAD_VIEW,
+            lf.keymap.Action.TOGGLE_MAXIMIZE_AREA,
             lf.keymap.Action.TOGGLE_GT_COMPARISON,
             lf.keymap.Action.TOGGLE_CAMERA_FRUSTUMS,
             lf.keymap.Action.TOGGLE_GRID,
@@ -189,7 +201,7 @@ class KeymapBindingsSection:
         except (ValueError, TypeError):
             return
         profiles = lf.keymap.get_available_profiles()
-        if 0 <= idx < len(profiles):
+        if 0 <= idx < len(profiles) and profiles[idx] != lf.keymap.get_current_profile():
             self._clear_pending_conflict()
             lf.keymap.load_profile(profiles[idx])
             self._last_state_key = None
@@ -342,6 +354,10 @@ class KeymapBindingsSection:
         if is_capturing != self._last_capturing:
             self._last_capturing = is_capturing
             self._dirty_model("is_capturing")
+
+        # The native capture ends without notifying dirty-policy panels, so keep polling until it does.
+        if self._rebinding_action is not None and self._handle:
+            request_model_update(self._handle)
 
     # ── Retained model updates ────────────────────────────────
 

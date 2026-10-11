@@ -11,7 +11,6 @@
 #include "core/pinned_memory_allocator.hpp"
 #include "core/tensor/internal/allocation_profiler.hpp"
 #include "core/tensor_cuda_interop.hpp"
-#include "core/training_churn_metrics.hpp"
 #include "cuda_event_pool.hpp"
 #include "diagnostics/vram_profiler.hpp"
 #include "gpu_slab_allocator.hpp"
@@ -21,6 +20,7 @@
 #include <chrono>
 #include <cuda_runtime.h>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -29,6 +29,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+namespace lfs::core::tensor_ops {
+    LFS_CORE_API bool release_nan_check_thread_buffers() noexcept;
+} // namespace lfs::core::tensor_ops
 
 namespace lfs::core {
 
@@ -80,7 +84,6 @@ namespace lfs::core {
             bool expected = false;
             if (!shutdown_.compare_exchange_strong(expected, true))
                 return;
-            LOG_INFO("Shutting down CudaMemoryPool...");
             if (suspend_deallocations_.load(std::memory_order_acquire)) {
                 return;
             }
@@ -92,7 +95,7 @@ namespace lfs::core {
             const cudaError_t sync_status = cudaDeviceSynchronize();
             if (sync_status == cudaSuccess) {
                 GPUSlabAllocator::instance().merge_all_streams_into_virgin();
-                SizeBucketedPool::instance().retag_all_streams(nullptr);
+                SizeBucketedPool::instance().retag_all_streams(reclaim_stream_);
             } else {
                 ensure_cuda_success(
                     sync_status, "cudaDeviceSynchronize(memory-pool shutdown)", {},
@@ -100,6 +103,16 @@ namespace lfs::core {
             }
             SizeBucketedPool::instance().shutdown();
             GPUSlabAllocator::instance().shutdown();
+            if (reclaim_stream_) {
+                // The pool shutdowns above queue their frees on this stream.
+                ensure_cuda_success(
+                    cudaStreamSynchronize(reclaim_stream_), "cudaStreamSynchronize(memory-pool reclaim stream)", {},
+                    LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnly);
+                ensure_cuda_success(
+                    cudaStreamDestroy(reclaim_stream_), "cudaStreamDestroy(memory-pool reclaim stream)", {},
+                    LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnlyNoLatch);
+                reclaim_stream_ = nullptr;
+            }
             CudaEventPool::instance().shutdown();
         }
 
@@ -335,12 +348,12 @@ namespace lfs::core {
                     auto& info = entry.second;
                     std::erase(info.extra_streams, stream);
                     if (info.home_stream == stream) {
-                        info.home_stream = nullptr;
+                        info.home_stream = reclaim_stream_;
                     }
                 }
             }
             GPUSlabAllocator::instance().merge_stream_into_virgin(stream);
-            SizeBucketedPool::instance().retag_stream(stream, nullptr);
+            SizeBucketedPool::instance().retag_stream(stream, reclaim_stream_);
             PinnedMemoryAllocator::instance().release_stream(stream);
             // The teardown calls above log-and-continue on CUDA errors; drop any
             // latched error so LFS_CUDA_LAUNCH_CHECK does not blame a later launch.
@@ -438,6 +451,32 @@ namespace lfs::core {
             }
         }
 
+        // Work that frees and reallocates large buffers between synchronizations would otherwise hand
+        // them back to the system at every synchronization and map them again. While held, the driver
+        // pool keeps freed memory; the last release trims back to the normal threshold.
+        void hold_freed_memory(const bool hold) {
+#if CUDART_VERSION >= 12080
+            std::lock_guard lock(hold_mutex_);
+            if (hold ? freed_memory_holds_++ != 0 : (freed_memory_holds_ == 0 || --freed_memory_holds_ != 0))
+                return;
+            int device = 0;
+            cudaMemPool_t pool = nullptr;
+            if (cudaGetDevice(&device) != cudaSuccess || cudaDeviceGetDefaultMemPool(&pool, device) != cudaSuccess) {
+                (void)cudaGetLastError();
+                return;
+            }
+            uint64_t threshold = hold ? std::numeric_limits<uint64_t>::max() : kReleaseThreshold;
+            ensure_cuda_success(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold),
+                                "cudaMemPoolSetAttribute(release threshold)", {}, LFS_SOURCE_SITE_CURRENT(),
+                                CudaFailureDisposition::LogOnly);
+            if (!hold)
+                ensure_cuda_success(cudaMemPoolTrimTo(pool, kReleaseThreshold), "cudaMemPoolTrimTo(released hold)", {},
+                                    LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnly);
+#else
+            (void)hold;
+#endif
+        }
+
         void configure() {
 #if CUDART_VERSION >= 12080
             const auto pre_call_state = sample_cuda_pre_call_state();
@@ -465,7 +504,7 @@ namespace lfs::core {
             // pool-resident) while letting the driver reclaim memory beyond peak
             // densification spikes. UINT64_MAX hoards indefinitely and inflates
             // cuda.pool.overhead at higher gaussian counts.
-            uint64_t threshold = std::uint64_t(64) << 20;
+            uint64_t threshold = kReleaseThreshold;
             const cudaError_t attribute_status =
                 cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
             if (attribute_status != cudaSuccess) {
@@ -544,15 +583,7 @@ namespace lfs::core {
         }
 
         void trim_cached_memory() {
-            const auto trim_start = std::chrono::steady_clock::now();
-            const auto record_trim = [&trim_start]() noexcept {
-                TrainingChurnMetrics::instance().record_trim(static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - trim_start)
-                        .count()));
-            };
             if (suspend_deallocations_.load(std::memory_order_acquire)) {
-                record_trim();
                 return;
             }
             const cudaError_t sync_status = cudaDeviceSynchronize();
@@ -560,9 +591,11 @@ namespace lfs::core {
                 ensure_cuda_success(
                     sync_status, "cudaDeviceSynchronize(memory-pool trim)", {},
                     LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnly);
-                record_trim();
                 return;
             }
+            // The calling thread's finite-check cache owns a live slab block.
+            // Release it before reclaiming empty slabs; later checks recreate it.
+            (void)tensor_ops::release_nan_check_thread_buffers();
             {
                 std::lock_guard<std::mutex> lock(map_mutex_);
                 for (auto& entry : allocation_map_) {
@@ -574,13 +607,12 @@ namespace lfs::core {
             // Return fully-empty slabs to the driver (steady-state VRAM hygiene).
             // Device is synchronized above; free lists are stream-merged into virgin.
             GPUSlabAllocator::instance().reclaim_empty_slabs();
-            SizeBucketedPool::instance().retag_all_streams(nullptr);
+            SizeBucketedPool::instance().retag_all_streams(reclaim_stream_);
             SizeBucketedPool::instance().trim_cache();
 
 #if CUDART_VERSION >= 12080
             trim_default_pool("cached-memory trim");
 #endif
-            record_trim();
         }
 
         // Used by the Morton reorder path: preserve the post-reorder trim when
@@ -634,6 +666,16 @@ namespace lfs::core {
         };
 
         CudaMemoryPool() {
+            // Cached blocks are retagged onto this stream after a trim or stream
+            // release so later reuse orders against a non-blocking stream instead
+            // of the legacy default stream. Without it they stay on nullptr.
+            if (const cudaError_t status = cudaStreamCreateWithFlags(&reclaim_stream_, cudaStreamNonBlocking);
+                status != cudaSuccess) {
+                reclaim_stream_ = nullptr;
+                ensure_cuda_success(
+                    status, "cudaStreamCreateWithFlags(memory-pool reclaim stream)", {},
+                    LFS_SOURCE_SITE_CURRENT(), CudaFailureDisposition::LogOnly);
+            }
             configure();
         }
 
@@ -702,10 +744,11 @@ namespace lfs::core {
         // the edges — no host sync, no deferred retention.
         void free_routed(void* ptr, const AllocationInfo& info) {
             for (cudaStream_t extra : info.extra_streams) {
-                // Skip null / home-equal extras. Bridging a destroyed capture stream
-                // can SIGSEGV inside the driver — callers should rehome first,
-                // but free must stay best-effort.
-                if (extra == nullptr || extra == info.home_stream || is_stream_retired(extra))
+                // The legacy stream is bridged too: a non-blocking home stream has
+                // no implicit ordering against it. Bridging a destroyed capture
+                // stream can SIGSEGV inside the driver; callers should rehome
+                // first, but free must stay best-effort.
+                if (extra == info.home_stream || is_stream_retired(extra))
                     continue;
                 bridgeStreams(extra, info.home_stream);
             }
@@ -844,10 +887,15 @@ namespace lfs::core {
         }
 #endif
 
+        cudaStream_t reclaim_stream_ = nullptr;
         std::unordered_map<void*, AllocationInfo> allocation_map_;
         mutable std::mutex map_mutex_;
         std::shared_mutex stream_routing_mutex_;
         std::atomic<size_t> direct_alloc_count_{0};
+        // 64 MiB headroom; see configure().
+        static constexpr uint64_t kReleaseThreshold = std::uint64_t(64) << 20;
+        std::mutex hold_mutex_;
+        size_t freed_memory_holds_ = 0;
         bool slab_enabled_{false};
         std::atomic<bool> shutdown_{false};
         std::atomic<bool> suspend_deallocations_{false};

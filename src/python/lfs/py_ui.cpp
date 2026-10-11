@@ -19,9 +19,9 @@
 #include "gui/global_context_menu.hpp"
 #include "gui/gui_focus_state.hpp"
 #include "gui/rml_menu_bar.hpp"
+#include "gui/ui_texture.hpp"
 #include "gui/utils/file_association.hpp"
 #include "gui/utils/native_file_dialog.hpp"
-#include "gui/vulkan_ui_texture.hpp"
 #include "input/input_controller.hpp"
 #include "internal/resource_paths.hpp"
 #include "io/exporter.hpp"
@@ -33,10 +33,12 @@
 #include "py_params.hpp"
 #include "py_prop_registry.hpp"
 #include "py_rml.hpp"
+#include "py_screen.hpp"
 #include "py_signals.hpp"
 #include "py_store.hpp"
 #include "py_tensor.hpp"
 #include "py_uilist.hpp"
+#include "py_viewer_dispatch.hpp"
 #include "py_viewport.hpp"
 #include "python/gil.hpp"
 #include "python/python_runtime.hpp"
@@ -49,6 +51,7 @@
 #include "visualizer/core/editor_context.hpp"
 #include "visualizer/core/services.hpp"
 #include "visualizer/core/training_manager.hpp"
+#include "visualizer/gui/gizmo_manager.hpp"
 #include "visualizer/gui/gui_manager.hpp"
 #include "visualizer/gui/panel_registry.hpp"
 #include "visualizer/gui/sequencer_ui_state.hpp"
@@ -65,6 +68,7 @@
 #include "visualizer/tools/unified_tool_registry.hpp"
 #include "visualizer/visualizer.hpp"
 #include <RmlUi/Core/Core.h>
+#include <stdexcept>
 #include <typeinfo>
 
 #include "config.h"
@@ -112,43 +116,6 @@ namespace lfs::python {
     using lfs::training::CommandCenter;
 
     namespace {
-
-        template <typename F>
-            requires(!std::is_void_v<std::invoke_result_t<F>>)
-        auto invoke_on_viewer(F&& fn, std::invoke_result_t<F> fallback) {
-            auto* const viewer = get_visualizer();
-            if (!viewer || viewer->isOnViewerThread())
-                return std::invoke(std::forward<F>(fn));
-            if (!viewer->acceptsPostedWork())
-                return fallback;
-
-            nb::gil_scoped_release release;
-            return lfs::vis::post_work_and_wait(
-                [viewer](lfs::vis::Visualizer::WorkItem work) {
-                    return viewer->postWork(std::move(work));
-                },
-                std::forward<F>(fn),
-                [fallback]() { return fallback; });
-        }
-
-        template <typename F>
-            requires(std::is_void_v<std::invoke_result_t<F>>)
-        void invoke_on_viewer(F&& fn) {
-            auto* const viewer = get_visualizer();
-            if (!viewer || viewer->isOnViewerThread()) {
-                std::invoke(std::forward<F>(fn));
-                return;
-            }
-            if (!viewer->acceptsPostedWork())
-                return;
-
-            nb::gil_scoped_release release;
-            lfs::vis::post_work_and_wait(
-                [viewer](lfs::vis::Visualizer::WorkItem work) {
-                    return viewer->postWork(std::move(work));
-                },
-                std::forward<F>(fn), [] {});
-        }
 
         std::string get_class_id(nb::object cls) {
             auto mod = nb::cast<std::string>(cls.attr("__module__"));
@@ -254,7 +221,7 @@ namespace lfs::python {
                                                : normalized;
 
                 if (!texture_) {
-                    texture_ = std::make_unique<lfs::vis::gui::VulkanUiTexture>();
+                    texture_ = std::make_unique<lfs::vis::gui::UiTexture>();
                 }
 
                 if (!texture_->upload(upload_tensor, w, h) || !texture_->valid())
@@ -277,7 +244,7 @@ namespace lfs::python {
                 width_ = height_ = 0;
             }
 
-            std::unique_ptr<lfs::vis::gui::VulkanUiTexture> release_texture() {
+            std::unique_ptr<lfs::vis::gui::UiTexture> release_texture() {
                 width_ = height_ = 0;
                 return std::move(texture_);
             }
@@ -309,7 +276,7 @@ namespace lfs::python {
         private:
             const uint64_t registry_id_ =
                 g_next_dynamic_texture_id.fetch_add(1, std::memory_order_relaxed);
-            std::unique_ptr<lfs::vis::gui::VulkanUiTexture> texture_;
+            std::unique_ptr<lfs::vis::gui::UiTexture> texture_;
             std::string plugin_name_;
             int width_ = 0;
             int height_ = 0;
@@ -331,6 +298,38 @@ namespace lfs::python {
             g_project_switch_confirmation_callback;
         nb::object
             g_show_load_file_confirmation_callback;
+        lfs::event::HandlerId g_show_load_file_confirmation_handler_id = 0;
+        bool g_show_load_file_confirmation_with_batch = false;
+
+        void register_load_file_confirmation(nb::object callback, bool with_batch) {
+            using lfs::core::events::cmd::ShowLoadFileConfirmation;
+            if (g_show_load_file_confirmation_handler_id != 0) {
+                lfs::event::EventBridge::instance().unsubscribe(
+                    typeid(ShowLoadFileConfirmation), g_show_load_file_confirmation_handler_id);
+                g_show_load_file_confirmation_handler_id = 0;
+            }
+            g_show_load_file_confirmation_callback = std::move(callback);
+            g_show_load_file_confirmation_with_batch = with_batch;
+            if (!g_show_load_file_confirmation_callback || g_show_load_file_confirmation_callback.is_none())
+                return;
+            g_show_load_file_confirmation_handler_id = ShowLoadFileConfirmation::when([](const auto& event) {
+                nb::gil_scoped_acquire guard;
+                if (!g_show_load_file_confirmation_callback || g_show_load_file_confirmation_callback.is_none())
+                    return;
+                try {
+                    nb::list paths;
+                    for (const auto& path : event.paths)
+                        paths.append(lfs::core::path_to_utf8(path));
+                    if (g_show_load_file_confirmation_with_batch)
+                        g_show_load_file_confirmation_callback(paths, event.is_dataset, event.replace, event.user_batch);
+                    else
+                        g_show_load_file_confirmation_callback(paths, event.is_dataset, event.replace);
+                } catch (const std::exception& error) {
+                    LOG_ERROR("Load-file confirmation callback error: {}", error.what());
+                }
+            });
+        }
+
         nb::object
             g_stop_training_confirmation_callback;
         nb::object g_open_camera_preview_callback;
@@ -600,7 +599,7 @@ namespace lfs::python {
 
         void free_plugin_textures(const std::string& plugin_name) {
             const bool graphics_thread = lfs::python::on_graphics_thread();
-            std::vector<lfs::vis::gui::VulkanUiTexture*> deferred;
+            std::vector<lfs::vis::gui::UiTexture*> deferred;
             {
                 std::lock_guard lock(g_dynamic_textures_mutex);
                 auto it = g_plugin_textures.find(plugin_name);
@@ -2782,6 +2781,7 @@ namespace lfs::python {
         register_ui_context(m);
         register_ui_theme(m);
         register_ui_panels(m);
+        register_ui_screen(m);
         register_rml_im_mode_layout(m);
         register_ui_hooks(m);
         register_ui_menus(m);
@@ -2793,18 +2793,13 @@ namespace lfs::python {
         m.def(
             "get_panel_object",
             [](const std::string& panel_id) {
-                return invoke_on_viewer(
-                    [panel_id]() -> nb::object {
-                        const nb::gil_scoped_acquire acquire;
+                const auto retained_panel = invoke_on_viewer(
+                    [panel_id]() {
                         const auto panel = vis::gui::PanelRegistry::instance().get_panel_instance(panel_id);
-                        const auto retained_panel =
-                            std::dynamic_pointer_cast<vis::gui::RmlPythonPanelAdapter>(panel);
-                        if (!retained_panel)
-                            return nb::none();
-
-                        return retained_panel->panelInstance();
+                        return std::dynamic_pointer_cast<vis::gui::RmlPythonPanelAdapter>(panel);
                     },
-                    nb::none());
+                    std::shared_ptr<vis::gui::RmlPythonPanelAdapter>{});
+                return retained_panel ? retained_panel->panelInstance() : nb::object(nb::none());
             },
             nb::arg("panel_id"),
             "Get the Python object for a retained Python panel, or None if unavailable");
@@ -3363,6 +3358,10 @@ namespace lfs::python {
             nb::arg("default_name") = "project.licht", nb::arg("start_dir") = "",
             "Choose a destination for a new LichtFeld project. Returns empty string if cancelled.");
 
+        m.def("open_image_file_dialog", [](const std::string& start_dir) {
+            const auto path = lfs::vis::gui::OpenReframePhotoFileDialog(lfs::core::utf8_to_path(start_dir));
+            return path.empty() ? std::string{} : lfs::core::path_to_utf8(path); }, nb::arg("start_dir") = "", "Select a still photo; returns empty if cancelled");
+
         m.def(
             "open_ply_file_dialog",
             [](const std::string& start_dir) -> std::string {
@@ -3897,7 +3896,8 @@ namespace lfs::python {
                                                 event.path),
                                         event.keep_asset_manager_open,
                                         lfs::core::path_to_utf8(event.create_path),
-                                        event.allow_existing_destination_replacement);
+                                        event.allow_existing_destination_replacement,
+                                        event.stop_training);
                                 } catch (
                                     const std::
                                         exception& error) {
@@ -3913,43 +3913,18 @@ namespace lfs::python {
 
         m.def(
             "on_show_load_file_confirmation",
-            [](nb::object callback) {
-                g_show_load_file_confirmation_callback =
-                    callback;
-                lfs::core::events::cmd::
-                    ShowLoadFileConfirmation::
-                        when([](const auto& event) {
-                            if (g_show_load_file_confirmation_callback &&
-                                !g_show_load_file_confirmation_callback
-                                     .is_none()) {
-                                nb::gil_scoped_acquire
-                                    guard;
-                                try {
-                                    nb::list paths;
-                                    for (const auto& path :
-                                         event.paths) {
-                                        paths.append(
-                                            lfs::core::
-                                                path_to_utf8(
-                                                    path));
-                                    }
-                                    g_show_load_file_confirmation_callback(
-                                        paths,
-                                        event.is_dataset,
-                                        event.replace);
-                                } catch (
-                                    const std::
-                                        exception& error) {
-                                    LOG_ERROR(
-                                        "Load-file confirmation callback error: {}",
-                                        error.what());
-                                }
-                            }
-                        });
-            },
+            [](nb::object callback) { register_load_file_confirmation(std::move(callback), false); },
             nb::arg("callback"),
             "Register callback for a load-file wipe confirmation "
             "(receives paths: list[str], is_dataset: bool, replace: bool)");
+
+        m.def(
+            "on_show_load_file_confirmation_with_batch",
+            [](nb::object callback) { register_load_file_confirmation(std::move(callback), true); },
+            nb::arg("callback"),
+            "Register a load-file confirmation callback with batch provenance "
+            "(receives paths: list[str], is_dataset: bool, replace: bool, user_batch: bool). "
+            "Replaces the callback registered through either load-file confirmation API.");
 
         m.def(
             "on_stop_training_confirmation",
@@ -4008,7 +3983,6 @@ namespace lfs::python {
         m.def(
             "set_exit_popup_open",
             [](bool open) {
-                set_exit_popup_open(open);
                 if (auto* gui = get_gui_manager()) {
                     gui->noteExitPopupMirror(open);
                 }
@@ -4135,6 +4109,21 @@ namespace lfs::python {
                 return editor && editor->canSelectGaussians();
             },
             "Return true when Gaussian selection editing is available");
+
+        m.def(
+            "is_splat_editing_blocked", []() -> bool {
+                const auto* editor = get_editor_context();
+                return editor && editor->isSplatEditingBlocked();
+            },
+            "Return true while a visible streamed model blocks splat-level selection and edits");
+
+        m.def(
+            "is_node_streamed", [](const std::string& name) -> bool {
+                const auto* sm = get_scene_manager();
+                const auto* node = sm ? sm->getScene().getNode(name) : nullptr;
+                return node && node->model_streamed;
+            },
+            nb::arg("name"), "Return true when the named node shows a streamed, read-only model");
 
         m.def(
             "has_gaussian_selection", []() -> bool {
@@ -4273,7 +4262,9 @@ namespace lfs::python {
         // Scene panel context menu actions
         m.def(
             "go_to_camera_view",
-            [](int cam_uid) { lfs::core::events::cmd::GoToCamView{.cam_id = cam_uid}.emit(); },
+            [](int cam_uid) {
+                invoke_on_viewer([cam_uid] { lfs::core::events::cmd::GoToCamView{.cam_id = cam_uid}.emit(); });
+            },
             nb::arg("cam_uid"), "Go to camera view by UID");
 
         m.def(
@@ -4283,7 +4274,13 @@ namespace lfs::python {
 
         m.def(
             "toggle_gt_comparison",
-            []() { lfs::core::events::cmd::ToggleGTComparison{}.emit(); },
+            []() {
+                auto* const rendering = lfs::python::get_rendering_manager();
+                if (!rendering || (!rendering->isGTComparisonActive() && !rendering->hasGTComparisonAvailable())) {
+                    throw std::runtime_error("GT comparison requires a loaded dataset with source images");
+                }
+                invoke_on_viewer([] { lfs::core::events::cmd::ToggleGTComparison{}.emit(); });
+            },
             "Toggle ground-truth comparison split view");
 
         m.def(
@@ -4313,55 +4310,135 @@ namespace lfs::python {
         m.def(
             "set_gt_comparison_mode",
             [](const std::string& mode) {
-                auto* rm = lfs::python::get_rendering_manager();
-                if (!rm)
-                    return;
-                auto settings = rm->getSettings();
-                if (mode == "rgb" || mode == "color" || mode == "image") {
-                    settings.gt_comparison_mode = vis::GTComparisonMode::RGB;
-                } else if (mode == "normal" || mode == "normals") {
-                    settings.gt_comparison_mode = vis::GTComparisonMode::Normal;
-                } else if (mode == "depth") {
-                    settings.gt_comparison_mode = vis::GTComparisonMode::Depth;
-                } else if (mode == "loss") {
-                    settings.gt_comparison_mode = vis::GTComparisonMode::Loss;
-                } else {
-                    throw nb::value_error("GT comparison mode must be 'rgb', 'normal', 'depth', or 'loss'");
-                }
-                rm->updateSettings(settings, vis::DirtyFlag::ALL);
+                invoke_on_viewer([mode] {
+                    auto* rm = lfs::python::get_rendering_manager();
+                    if (!rm)
+                        return;
+                    auto settings = rm->getSettings();
+                    if (mode == "rgb" || mode == "color" || mode == "image") {
+                        settings.gt_comparison_mode = vis::GTComparisonMode::RGB;
+                    } else if (mode == "normal" || mode == "normals") {
+                        settings.gt_comparison_mode = vis::GTComparisonMode::Normal;
+                    } else if (mode == "depth") {
+                        settings.gt_comparison_mode = vis::GTComparisonMode::Depth;
+                    } else if (mode == "loss") {
+                        settings.gt_comparison_mode = vis::GTComparisonMode::Loss;
+                    } else {
+                        throw nb::value_error("GT comparison mode must be 'rgb', 'normal', 'depth', or 'loss'");
+                    }
+                    rm->updateSettings(settings, vis::DirtyFlag::ALL);
+                });
             },
             nb::arg("mode"), "Set ground-truth comparison mode.");
 
         m.def(
+            "get_gt_comparison_actual_size",
+            []() {
+                auto* rm = lfs::python::get_rendering_manager();
+                return rm && rm->getSettings().gt_comparison_actual_size;
+            },
+            "Return whether GT comparison 1:1 pixel mode is requested.");
+
+        m.def(
+            "set_gt_comparison_actual_size",
+            [](const bool enabled) {
+                invoke_on_viewer([enabled] {
+                    auto* rm = lfs::python::get_rendering_manager();
+                    if (!rm)
+                        return;
+                    auto settings = rm->getSettings();
+                    settings.gt_comparison_actual_size = enabled;
+                    rm->updateSettings(settings, vis::DirtyFlag::SPLIT_VIEW);
+                });
+            },
+            nb::arg("enabled"),
+            "Enable or disable GT comparison 1:1 pixel mode.");
+
+        m.def(
+            "is_gt_comparison_actual_size_available",
+            []() {
+                return invoke_on_viewer(
+                    []() {
+                        auto* rm = lfs::python::get_rendering_manager();
+                        return rm && rm->isGTComparisonActualSizeAvailable(
+                                         lfs::python::get_scene_manager());
+                    },
+                    false);
+            },
+            "Return whether the selected GT camera supports RGB perspective 1:1 pixel mode, "
+            "including usable saved undistortion calibration when distortion is present. "
+            "Legacy projects may require dataset reimport and resave.");
+
+        m.def(
+            "is_gt_comparison_actual_size_active",
+            []() {
+                return invoke_on_viewer(
+                    []() {
+                        auto* rm = lfs::python::get_rendering_manager();
+                        return rm && rm->isGTComparisonActualSizeActive();
+                    },
+                    false);
+            },
+            "Return whether the currently published viewport frame uses GT comparison "
+            "1:1 pixel mode.");
+
+        m.def(
+            "get_gt_comparison_actual_size_error",
+            []() {
+                return invoke_on_viewer(
+                    []() -> std::string {
+                        auto* rm = lfs::python::get_rendering_manager();
+                        return rm ? rm->getGTComparisonActualSizeError() : std::string{};
+                    },
+                    std::string{});
+            },
+            "Return the current GT 1:1 preparation error, retained during automatic recovery.");
+
+        m.def(
+            "retry_gt_comparison_actual_size",
+            []() {
+                invoke_on_viewer([] {
+                    if (auto* rm = lfs::python::get_rendering_manager()) {
+                        rm->retryGTComparisonActualSize();
+                    }
+                });
+            },
+            "Retry requested GT 1:1 preparation immediately, reusing any valid source or active load.");
+
+        m.def(
             "cycle_gt_comparison_mode",
             []() -> const char* {
-                auto* rm = lfs::python::get_rendering_manager();
-                if (!rm)
-                    return "rgb";
-                auto settings = rm->getSettings();
-                switch (settings.gt_comparison_mode) {
-                case vis::GTComparisonMode::RGB:
-                    settings.gt_comparison_mode = vis::GTComparisonMode::Normal;
-                    break;
-                case vis::GTComparisonMode::Normal:
-                    settings.gt_comparison_mode = vis::GTComparisonMode::Depth;
-                    break;
-                case vis::GTComparisonMode::Depth:
-                    settings.gt_comparison_mode = vis::GTComparisonMode::Loss;
-                    break;
-                case vis::GTComparisonMode::Loss:
-                default:
-                    settings.gt_comparison_mode = vis::GTComparisonMode::RGB;
-                    break;
-                }
-                rm->updateSettings(settings, vis::DirtyFlag::ALL);
-                switch (settings.gt_comparison_mode) {
-                case vis::GTComparisonMode::Normal: return "normal";
-                case vis::GTComparisonMode::Depth: return "depth";
-                case vis::GTComparisonMode::Loss: return "loss";
-                case vis::GTComparisonMode::RGB:
-                default: return "rgb";
-                }
+                return invoke_on_viewer(
+                    []() -> const char* {
+                        auto* rm = lfs::python::get_rendering_manager();
+                        if (!rm)
+                            return "rgb";
+                        auto settings = rm->getSettings();
+                        switch (settings.gt_comparison_mode) {
+                        case vis::GTComparisonMode::RGB:
+                            settings.gt_comparison_mode = vis::GTComparisonMode::Normal;
+                            break;
+                        case vis::GTComparisonMode::Normal:
+                            settings.gt_comparison_mode = vis::GTComparisonMode::Depth;
+                            break;
+                        case vis::GTComparisonMode::Depth:
+                            settings.gt_comparison_mode = vis::GTComparisonMode::Loss;
+                            break;
+                        case vis::GTComparisonMode::Loss:
+                        default:
+                            settings.gt_comparison_mode = vis::GTComparisonMode::RGB;
+                            break;
+                        }
+                        rm->updateSettings(settings, vis::DirtyFlag::ALL);
+                        switch (settings.gt_comparison_mode) {
+                        case vis::GTComparisonMode::Normal: return "normal";
+                        case vis::GTComparisonMode::Depth: return "depth";
+                        case vis::GTComparisonMode::Loss: return "loss";
+                        case vis::GTComparisonMode::RGB:
+                        default: return "rgb";
+                        }
+                    },
+                    "rgb");
             },
             "Cycle ground-truth comparison mode: rgb -> normal -> depth -> loss -> rgb.");
 
@@ -4495,7 +4572,7 @@ namespace lfs::python {
                     lfs::vis::op::operators().dispatchModalEvent(event);
                 }
                 if (auto* const rm = lfs::vis::services().renderingOrNull()) {
-                    rm->markDirty(lfs::vis::DirtyFlag::OVERLAY);
+                    rm->markDirty(lfs::vis::DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
                 }
             },
             nb::arg("enabled"),
@@ -4516,7 +4593,7 @@ namespace lfs::python {
                     lfs::vis::op::operators().dispatchModalEvent(event);
                 }
                 if (auto* const rm = lfs::vis::services().renderingOrNull()) {
-                    rm->markDirty(lfs::vis::DirtyFlag::OVERLAY);
+                    rm->markDirty(lfs::vis::DirtyFlag::OVERLAY, lfs::vis::FrameReason::Overlay);
                 }
             },
             nb::arg("enabled"),
@@ -5079,9 +5156,13 @@ namespace lfs::python {
 
         m.def(
             "delete_keyframe",
-            [](size_t index) { lfs::core::events::cmd::SequencerDeleteKeyframe{.keyframe_index = index}.emit(); },
+            [](size_t index) {
+                if (index == 0)
+                    throw nb::value_error("The first keyframe cannot be deleted");
+                lfs::core::events::cmd::SequencerDeleteKeyframe{.keyframe_index = index}.emit();
+            },
             nb::arg("index"),
-            "Delete keyframe by index");
+            "Delete keyframe by index; raises ValueError for the protected first keyframe");
 
         m.def(
             "set_keyframe_easing",
@@ -5156,6 +5237,11 @@ namespace lfs::python {
         m.def("get_multi_transform_mode", &get_multi_transform_mode, "Get multi-transform mode (0=Group, 1=Individual)");
 
         m.def("set_multi_transform_mode", &set_multi_transform_mode, nb::arg("mode"), "Set multi-transform mode (0=Group, 1=Individual)");
+
+        m.attr("MULTI_TRANSFORM_MODE_SELECTION") =
+            static_cast<int>(lfs::vis::gui::MultiTransformMode::Selection);
+        m.attr("MULTI_TRANSFORM_MODE_INDIVIDUAL") =
+            static_cast<int>(lfs::vis::gui::MultiTransformMode::Individual);
 
         // Thumbnail system (for Getting Started window)
         m.def("request_thumbnail", &request_thumbnail, nb::arg("video_id"),
@@ -5433,6 +5519,7 @@ namespace lfs::python {
                     nb::dict backend;
                     backend["id"] = std::string(descriptor.id);
                     backend["label_key"] = std::string(descriptor.label_key);
+                    backend["display_name"] = descriptor.display_name;
                     nb::list presets;
                     for (const auto& preset : descriptor.presets) {
                         nb::dict item;
@@ -5500,6 +5587,11 @@ namespace lfs::python {
             result["force_no_atomic_float"] = state.options.force_no_atomic_float;
             result["cuda_available"] = static_cast<bool>(LFS_HAS_CUDA);
             result["metal_available"] = core::gpu_backend_available(core::GpuBackend::Metal);
+#ifdef LFS_TENSOR_VULKAN
+            result["vulkan_available"] = true;
+#else
+            result["vulkan_available"] = false;
+#endif
             return result; }, "Get saved tensor backend preferences; changes apply after restart");
 
         m.def("set_tensor_backend_preferences", [](const std::string& backend, const std::string& device, int validation, bool fp32_half, bool no_atomic_float) {
@@ -5511,6 +5603,10 @@ namespace lfs::python {
                   }
                   if (backend == "metal" && !core::gpu_backend_available(core::GpuBackend::Metal))
                       throw nb::value_error("Metal needs macOS 26 and a Metal 4 GPU");
+#ifndef LFS_TENSOR_VULKAN
+                  if (backend == "vulkan")
+                      throw nb::value_error("Vulkan is not compiled into this Metal-only build");
+#endif
                   if (validation < 0 || validation > 2)
                       throw nb::value_error("Validation must be 0, 1, or 2");
                   const vis::TensorPreferenceState state{
@@ -5521,7 +5617,16 @@ namespace lfs::python {
                       .options = {.vulkan_device = device, .vulkan_validation = validation,
                                   .force_fp32_half = fp32_half, .force_no_atomic_float = no_atomic_float},
                   };
-                  vis::UserPreferences::instance().setTensorBackend(state); }, nb::arg("backend") = "auto", nb::arg("vulkan_device") = "", nb::arg("vulkan_validation") = 0, nb::arg("force_fp32_half") = false, nb::arg("force_no_atomic_float") = false, "Save tensor backend preferences for the next application start");
+                  const auto previous = vis::UserPreferences::instance().tensorBackend();
+                  vis::UserPreferences::instance().setTensorBackend(state);
+                  if (previous.backend != state.backend ||
+                      previous.options.vulkan_device != state.options.vulkan_device ||
+                      previous.options.vulkan_validation != state.options.vulkan_validation ||
+                      previous.options.force_fp32_half != state.options.force_fp32_half ||
+                      previous.options.force_no_atomic_float != state.options.force_no_atomic_float) {
+                      LOG_INFO("Tensor GPU backend preferences saved: requested={}; changes apply after restart; current={}",
+                               backend, core::gpu_backend_name(core::configured_gpu_backend()));
+                  } }, nb::arg("backend") = "auto", nb::arg("vulkan_device") = "", nb::arg("vulkan_validation") = 0, nb::arg("force_fp32_half") = false, nb::arg("force_no_atomic_float") = false, "Save tensor backend preferences for the next application start");
 
         m.def(
             "get_mcp_preferences",
@@ -5564,13 +5669,21 @@ namespace lfs::python {
                 return mcp::applyActiveMcpHttpConfig({
                     .enabled = state.enabled,
                     .expose_network = state.expose_network,
-                    .port = state.port,
+                    .port = vis::mcpPortOverride().value_or(state.port),
                     .request_logging = state.request_logging,
                 });
             },
             nb::arg("enabled"), nb::arg("expose_network"), nb::arg("port"),
             nb::arg("request_logging") = false,
             "Persist and immediately apply MCP HTTP server preferences");
+
+        m.def(
+            "get_mcp_port_override",
+            []() -> std::optional<int> {
+                nb::gil_scoped_release release;
+                return vis::mcpPortOverride();
+            },
+            "Get the MCP port set on the command line for this session, or None");
 
         m.def(
             "get_project_location",
@@ -5832,17 +5945,11 @@ namespace lfs::python {
         PyBridge bridge;
         bridge.begin_ui_frame = []() { begin_keyboard_ui_frame(); };
         bridge.prepare_ui = []() {};
-        bridge.draw_menus = [](MenuLocation loc) { PyMenuRegistry::instance().draw_menu_items(loc); };
-        bridge.has_menus = [](MenuLocation loc) { return PyMenuRegistry::instance().has_items(loc); };
         bridge.get_menu_bar_entries = [](MenuBarEntryVisitor visitor, void* ctx) {
             auto entries = PyMenuRegistry::instance().get_menu_bar_entries();
             for (auto* entry : entries) {
                 visitor(entry->idname.c_str(), entry->label.c_str(), entry->order, ctx);
             }
-        };
-        bridge.draw_menu_bar_entry = [](const char* idname) {
-            if (idname)
-                PyMenuRegistry::instance().draw_menu_bar_entry(idname);
         };
         bridge.collect_menu_content = [](const char* idname, MenuItemVisitor visitor, void* ctx) {
             if (!idname)
@@ -5897,8 +6004,7 @@ namespace lfs::python {
             }
             g_project_switch_confirmation_callback =
                 nb::object();
-            g_show_load_file_confirmation_callback =
-                nb::object();
+            register_load_file_confirmation(nb::object(), false);
             g_stop_training_confirmation_callback =
                 nb::object();
             g_open_camera_preview_callback = nb::object();
@@ -6112,7 +6218,14 @@ namespace lfs::python {
                 }
                 return rm->getAverageFPS();
             },
-            "Get current FPS");
+            "Get viewport renders in the trailing second (cached and deferred results excluded)");
+
+        m.def(
+            "get_ui_fps", []() -> float {
+                auto* rm = get_rendering_manager();
+                return rm ? rm->getPresentedAverageFPS() : 0.0f;
+            },
+            "Get successful GUI presents in the trailing second (idle-clear frame excluded)");
 
         m.def(
             "get_content_type", []() -> const char* {
@@ -6148,120 +6261,16 @@ namespace lfs::python {
             "Get split view info");
 
         m.def(
-            "get_focused_split_panel", []() -> const char* {
-                // Read unprotected, main-thread-owned focused_panel_ on the viewer thread.
-                const bool right = invoke_on_viewer(
-                    [] {
-                        auto* const rm = get_rendering_manager();
-                        return rm && rm->getFocusedSplitPanel() == vis::SplitViewPanelId::Right;
-                    },
-                    false);
-                return right ? "right" : "left";
-            },
-            "Get the focused split-view panel ('left' or 'right').\n"
-            "Outside independent-dual split this reports the panel the depth\n"
-            "toolbar would address; it is 'left' with no rendering manager.");
-
-        m.def(
-            "get_depth_window_sync", []() -> bool {
-                auto* rm = get_rendering_manager();
-                return rm ? rm->getDepthWindowSync() : false;
-            },
-            "Is the per-panel depth-window sync flag on? While on, a depth-window\n"
-            "edit in either split panel writes both panels.");
-
-        m.def(
-            "get_depth_window_collapse_source", []() -> const char* {
-                // The getter holds settings_mutex_, so no viewer-thread marshal is needed.
-                auto* rm = get_rendering_manager();
-                return rm && rm->getDepthWindowCollapseSource() == vis::SplitViewPanelId::Right
-                           ? "right"
-                           : "left";
-            },
-            "Which panel the last LINEAGE EVENT took its surviving window from\n"
-            "('left' or 'right') -- not only a collapse. Leaving independent-dual\n"
-            "copies the PRE-transition focused panel's depth window into the\n"
-            "single remaining one, and the split service resets the observable\n"
-            "focus to Left in the same transition, so a poller cannot recover\n"
-            "that panel from get_focused_split_panel(). A sync-ON copy and a\n"
-            "project or sync-undo restore overwrite this field too, so it names\n"
-            "the source of whichever write stamped LAST; use\n"
-            "get_depth_window_collapse_record() to learn which kind that was.\n"
-            "Only meaningful once such a write has happened; it reports 'left'\n"
-            "before the first one and with no rendering manager.");
-
-        m.def(
-            "get_depth_window_collapse_record", []() -> nb::tuple {
-                // Read source, generation and kind together under the manager's settings lock.
-                auto* rm = get_rendering_manager();
-                if (!rm) {
-                    return nb::make_tuple("left", static_cast<uint64_t>(0), "leave_collapse");
-                }
-                const auto record = rm->getDepthWindowCollapseRecord();
-                const char* kind = "leave_collapse";
-                switch (record.kind) {
-                case vis::RenderingManager::DepthWindowLineageKind::SyncCopy:
-                    kind = "sync_copy";
-                    break;
-                case vis::RenderingManager::DepthWindowLineageKind::ProjectRestore:
-                    kind = "project_restore";
-                    break;
-                case vis::RenderingManager::DepthWindowLineageKind::RetainedPairDiscard:
-                    kind = "retained_pair_discard";
-                    break;
-                case vis::RenderingManager::DepthWindowLineageKind::LeaveCollapse:
-                    break;
-                }
-                return nb::make_tuple(
-                    record.source == vis::SplitViewPanelId::Right ? "right" : "left",
-                    record.generation,
-                    kind);
-            },
-            "The last depth-window reference-lineage stamp, as\n"
-            "('left'|'right', generation, kind).\n"
-            "kind is 'leave_collapse', 'sync_copy', 'project_restore' or\n"
-            "'retained_pair_discard'. These invalidate slot-derived references;\n"
-            "sync undo/redo also reports 'project_restore'. A retained-pair discard\n"
-            "requires fresh baselines from live windows, not from source. The\n"
-            "generation counts them, so a poller whose delta exceeds the\n"
-            "transitions it observed slept through boundaries and cannot replay\n"
-            "anything it cached; the kind says how to recover from the ones it\n"
-            "missed. 'leave_collapse' and 'sync_copy' leave ONE window, so every\n"
-            "cached reference recovers from it; 'project_restore' means\n"
-            "'fresh-baseline required' and can leave the two panel windows\n"
-            "DIFFERING, so a per-panel consumer must re-read each panel with\n"
-            "selection.get_depth_filter_window(panel=...) rather than reuse the\n"
-            "projection. source is the panel the surviving window came from and\n"
-            "is meaningful for 'leave_collapse' (the PRE-transition focus, which\n"
-            "get_focused_split_panel() can no longer report) and for 'sync_copy'\n"
-            "(the panel copied FROM); a 'project_restore' takes its windows from\n"
-            "the restored state, not from a panel. The generation is 0 before\n"
-            "the first such write and with no rendering manager.");
-
-        m.def(
-            "set_depth_window_sync", [](bool sync) -> bool {
-                auto* rm = get_rendering_manager();
-                if (!rm)
-                    return false;
-                rm->setDepthWindowSync(sync);
-                // Refused drag/parked-GT requests return the actual flag.
-                return rm->getDepthWindowSync();
-            },
-            nb::arg("sync"), "Set the per-panel depth-window sync flag. Turning it on with\n"
-                             "differing panels copies the focused panel's window to the other as\n"
-                             "one undo step. Both ON and OFF changes are silently ignored while a\n"
-                             "depth-window drag owns a panel, including subthreshold presses, or\n"
-                             "while an independent pair is parked in GT. GT without a parked pair\n"
-                             "is unaffected. In a retained Disabled interval an actual flag change\n"
-                             "discards the pair before applying; a same-value request preserves it.\n"
-                             "Returns the flag's actual state after the call, not the requested one.");
-
-        m.def(
             "get_current_camera_id", []() -> int {
                 auto* rm = get_rendering_manager();
                 return rm ? rm->getCurrentCameraId() : -1;
             },
             "Get current camera ID for GT comparison");
+
+        m.def("get_active_view_id", []() {
+            auto* rendering = lfs::vis::services().renderingOrNull();
+            return rendering ? rendering->activeViewId() : lfs::vis::kNoView;
+        });
 
         m.def(
             "get_split_view_mode", []() -> const char* {
@@ -6271,11 +6280,10 @@ namespace lfs::python {
                 switch (rm->getSplitViewMode()) {
                 case vis::SplitViewMode::GTComparison: return "gt_comparison";
                 case vis::SplitViewMode::PLYComparison: return "ply_comparison";
-                case vis::SplitViewMode::IndependentDual: return "independent_dual";
                 default: return "none";
                 }
             },
-            "Get split view mode (none, gt_comparison, ply_comparison, independent_dual)");
+            "Get split view mode (none, gt_comparison, ply_comparison)");
 
         m.def(
             "get_speed_overlay", []() -> std::tuple<float, float, float, float> {

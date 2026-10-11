@@ -21,11 +21,14 @@
 #include "io/exporter.hpp"
 #include "io/loader.hpp"
 #include "io/project_document.hpp"
+#include "io/splat_tile_source.hpp"
 #include "lfs/training/ops/registry.hpp"
 #include "lfs/training/sh_value_storage.hpp"
 #include "normal_auto_generate.hpp"
+#include "strategies/strategy_utils.hpp"
 #include "trainer.hpp"
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -118,16 +121,9 @@ namespace lfs::training {
                      *scene_scale);
         }
 
-        std::optional<std::filesystem::path> gaussianSplatInitPath(
-            const lfs::core::param::TrainingParameters& params) {
-            if (!params.init_path.has_value() || params.init_path->empty()) {
-                return std::nullopt;
-            }
-            const std::filesystem::path init_file = lfs::core::utf8_to_path(*params.init_path);
-            if (isPlainPointCloudPly(init_file)) {
-                return std::nullopt;
-            }
-            return init_file;
+        bool evalMaskNeedsInitialPoints(const lfs::core::param::TrainingParameters& params) {
+            return params.optimization.enable_eval &&
+                   lfs::core::param::is_eval_mask_points(params.optimization.eval_mask);
         }
 
         TrainingModelGraphInstall makeGraphInstall(const TrainingModelGraphCapture& context,
@@ -166,6 +162,18 @@ namespace lfs::training {
                                                        .user_message()));
             }
 
+            if (init_result->tile_source) {
+                // Too large to load at full detail: the loader returned only the coarsest
+                // cut it would start streaming from. Training starts from that cut.
+                const auto everything = [](std::uint32_t) { return true; };
+                const auto full = lfs::io::select_splat_tiles(
+                    *init_result->tile_source, {.sse_per_error = 1.0f, .max_sse = 0.0f}, everything);
+                LOG_WARN("Streamed model '{}' is too large to load at full detail; training starts from its "
+                         "coarsest level ({} of {} splats)",
+                         lfs::core::path_to_utf8(init_file.filename()), (*splat_ptr)->size(),
+                         full.render_splats);
+            }
+
             auto model = std::make_unique<lfs::core::SplatData>(std::move(**splat_ptr));
             centerInitializationMeans(model->means(), graph_capture
                                                           ? graph_capture->training_data_origin
@@ -181,10 +189,8 @@ namespace lfs::training {
                      lfs::core::path_to_utf8(init_file.filename()),
                      model->get_max_sh_degree());
 
-            TrainingModelGraphCapture context =
-                graph_capture ? *graph_capture : captureTrainingModelGraph(scene);
-            context.has_preserved_cropbox = false;
-            return makeGraphInstall(context, std::move(model));
+            return makeGraphInstall(graph_capture ? *graph_capture : captureTrainingModelGraph(scene),
+                                    std::move(model));
         }
 
         std::expected<std::unique_ptr<lfs::core::SplatData>, std::string> loadAddedSplat(
@@ -217,7 +223,7 @@ namespace lfs::training {
             const lfs::core::param::TrainingParameters& params,
             lfs::core::SplatData& model,
             const glm::vec3& dataset_origin) {
-            if (params.add_splat_paths.empty()) {
+            if (params.add_splat_paths.empty() || params.add_splats_applied) {
                 return {};
             }
 
@@ -298,6 +304,18 @@ namespace lfs::training {
         }
 
     } // namespace
+
+    std::optional<std::filesystem::path> gaussianSplatInitPath(
+        const lfs::core::param::TrainingParameters& params) {
+        if (!params.init_path.has_value() || params.init_path->empty()) {
+            return std::nullopt;
+        }
+        const std::filesystem::path init_file = lfs::core::utf8_to_path(*params.init_path);
+        if (isPlainPointCloudPly(init_file)) {
+            return std::nullopt;
+        }
+        return init_file;
+    }
 
     TrainingModelGraphCapture captureTrainingModelGraph(lfs::core::Scene& scene) {
         TrainingModelGraphCapture context;
@@ -384,6 +402,7 @@ namespace lfs::training {
                     !result) {
                     return std::unexpected(std::move(result.error()));
                 }
+                loaded->keep_initial_point_cloud = evalMaskNeedsInitialPoints(params);
                 return std::optional<TrainingModelGraphInstall>{std::move(*loaded)};
             }
         }
@@ -479,8 +498,9 @@ namespace lfs::training {
         } else {
             LOG_INFO("Created training model with {} gaussians", model->size());
         }
-        return std::optional<TrainingModelGraphInstall>{
-            makeGraphInstall(context, std::move(model))};
+        auto install = makeGraphInstall(context, std::move(model));
+        install.keep_initial_point_cloud = evalMaskNeedsInitialPoints(params);
+        return std::optional<TrainingModelGraphInstall>{std::move(install)};
     }
 
     std::expected<void, std::string> installTrainingModel(
@@ -492,7 +512,10 @@ namespace lfs::training {
 
         if (install.point_cloud_node_id != lfs::core::NULL_NODE) {
             if (const auto* pc_node = scene.getNodeById(install.point_cloud_node_id)) {
+                auto initial_point_cloud = install.keep_initial_point_cloud ? scene.getInitialPointCloud() : nullptr;
                 scene.removeNode(pc_node->name, false);
+                if (initial_point_cloud)
+                    scene.setInitialPointCloud(std::move(initial_point_cloud));
             }
         }
 
@@ -557,6 +580,21 @@ namespace lfs::training {
         }
 
         auto trainer = std::make_unique<Trainer>(scene);
+        auto source_nodes = document.scene_graph().nodes();
+        if (!source_nodes) {
+            return std::unexpected(std::format(
+                "Failed to read project scene graph for snapshot bindings: {}",
+                lfs::format_for_developer(source_nodes.error())));
+        }
+        lfs::io::project::ScenePayloadBindings snapshot_bindings;
+        const auto training_uuid = scene.getTrainingModelNodeUuid();
+        for (const auto& node : *source_nodes) {
+            if (node.uuid != training_uuid && node.payload) {
+                snapshot_bindings.emplace(node.uuid, *node.payload);
+            }
+        }
+        trainer->set_project_snapshot_payload_bindings(
+            std::move(snapshot_bindings));
         if (recovery_session) {
             trainer->set_recovery_session(*recovery_session);
         }
@@ -639,7 +677,7 @@ namespace lfs::training {
         }
         trainer.set_live_project_snapshot(
             destination.empty()
-                ? params.dataset.output_path / "project.licht"
+                ? params.dataset.project_file()
                 : destination,
             {}, std::move(source_path));
         trainer.set_trainer_project_save_policy({
@@ -704,16 +742,46 @@ namespace lfs::training {
         }
     } // namespace
 
-    void export_final_splats(const Trainer& trainer,
-                             const lfs::core::param::TrainingParameters& params) {
-        if (params.export_formats.empty()) {
-            return;
+    lfs::Result<std::optional<lfs::core::SplatData>> exclude_frozen_rows(const lfs::core::SplatData& model) {
+        if (!model.has_frozen_ranges())
+            return std::optional<lfs::core::SplatData>{};
+        const auto rows = static_cast<size_t>(model.size());
+        auto keep = make_frozen_mask(model, rows, model.means().device()).logical_not();
+        assert(keep.ndim() == 1 && keep.numel() == rows);
+        if (model.deleted_mask_matches_size())
+            keep = keep.logical_and(model.deleted().logical_not());
+        auto kept = lfs::core::extract_by_mask(model, keep);
+        if (kept.size() == 0) {
+            return lfs::make_error(lfs::ErrorInit{
+                .code = lfs::ErrorCode::FailedPrecondition,
+                .domain = lfs::ErrorDomain::Training,
+                .user_message = "Final export failed: every row is a frozen added splat.",
+                .detail = "--exclude-export leaves no rows to export",
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+            });
         }
-        const auto& model = trainer.get_strategy().get_model();
+        return std::optional<lfs::core::SplatData>{std::move(kept)};
+    }
+
+    lfs::Status export_final_splats(const Trainer& trainer,
+                                    const lfs::core::param::TrainingParameters& params) {
+        if (params.export_formats.empty()) {
+            return {};
+        }
+        const auto& trained = trainer.get_strategy().get_model();
+        std::optional<lfs::core::SplatData> without_frozen;
+        if (params.exclude_frozen_add_splats_from_export ||
+            trainer.getParams().exclude_frozen_add_splats_from_export) {
+            auto kept = exclude_frozen_rows(trained);
+            if (!kept)
+                return lfs::Status::failure(std::move(kept).error());
+            without_frozen = std::move(*kept);
+        }
+        const auto& model = without_frozen ? *without_frozen : trained;
         const std::filesystem::path out_dir = params.dataset.output_path;
         const std::string stem = params.dataset.output_name.empty()
                                      ? std::format("splat_{}", trainer.get_current_iteration())
-                                     : params.dataset.output_name;
+                                     : params.dataset.output_stem();
 
         lfs::core::ProvenanceStamp stamp = params.include_provenance
                                                ? lfs::core::make_provenance_stamp()
@@ -723,15 +791,34 @@ namespace lfs::training {
             stamp.strategy = params.optimization.strategy;
         }
 
+        std::string failed;
         for (const auto format : params.export_formats) {
             const std::filesystem::path path = out_dir / (stem + final_export_extension(format));
-            if (const auto result = save_final_splat(model, path, format, stamp, params); !result) {
-                LOG_ERROR("Failed to export final splat to {}: {}",
-                          lfs::core::path_to_utf8(path), result.error().message);
-            } else {
-                LOG_INFO("Exported final splat: {}", lfs::core::path_to_utf8(path));
+            const std::string file = lfs::core::path_to_utf8(path);
+            try {
+                if (const auto result = save_final_splat(model, path, format, stamp, params); !result) {
+                    LOG_ERROR("Failed to export final splat to {}: {}", file, result.error().message);
+                    failed += failed.empty() ? file : ", " + file;
+                    continue;
+                }
+                LOG_INFO("Exported final splat: {}", file);
+            } catch (const std::exception& e) {
+                // A lost GPU device throws from tensor readbacks; keep it from
+                // escaping past the remaining formats.
+                LOG_ERROR("Failed to export final splat to {}: {}", file, e.what());
+                failed += failed.empty() ? file : ", " + file;
             }
         }
+        if (failed.empty()) {
+            return {};
+        }
+        return lfs::Status::failure(lfs::make_error(lfs::ErrorInit{
+            .code = lfs::ErrorCode::Internal,
+            .domain = lfs::ErrorDomain::IO,
+            .user_message = "Final export failed.",
+            .detail = std::format("Final export failed for {}", failed),
+            .detection = LFS_SOURCE_SITE_CURRENT(),
+        }));
     }
 
 } // namespace lfs::training

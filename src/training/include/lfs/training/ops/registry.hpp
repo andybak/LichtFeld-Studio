@@ -4,9 +4,26 @@
 #pragma once
 
 #include "core/gpu_backend_fwd.hpp"
+#include "core/shared_image_ops.hpp"
 #include "lfs/training/ops/adam.hpp"
+#include "lfs/training/ops/bilateral.hpp"
+#include "lfs/training/ops/blob.hpp"
+#include "lfs/training/ops/extra_loss.hpp"
+#include "lfs/training/ops/geometry.hpp"
+#include "lfs/training/ops/gsplat.hpp"
 #include "lfs/training/ops/loss.hpp"
+#include "lfs/training/ops/lpips.hpp"
+#include "lfs/training/ops/masks.hpp"
 #include "lfs/training/ops/mcmc.hpp"
+#include "lfs/training/ops/morton.hpp"
+#include "lfs/training/ops/mrnf.hpp"
+#include "lfs/training/ops/ppisp.hpp"
+#include "lfs/training/ops/raster.hpp"
+#include "lfs/training/ops/refine.hpp"
+#include "lfs/training/ops/session.hpp"
+#include "lfs/training/ops/sh.hpp"
+#include "lfs/training/ops/structure.hpp"
+#include "lfs/training/ops/training_image.hpp"
 
 #include <bitset>
 #include <optional>
@@ -27,6 +44,24 @@ namespace lfs::training {
         const ops::PhotometricOps* photometric = nullptr;
         const ops::AdamOps* adam = nullptr;
         const ops::McmcOps* mcmc = nullptr;
+        const ops::MrnfOps* mrnf = nullptr;
+        const ops::GeometryLossOps* geometry = nullptr;
+        const ops::FastRasterOps* fast = nullptr;
+        const ops::MortonOps* morton = nullptr;
+        const ops::MaskOps* masks = nullptr;
+        const ops::ExtraLossOps* extra_loss = nullptr;
+        const ops::BilateralOps* bilateral = nullptr;
+        const ops::TrainingImageOps* training_image = nullptr;
+        const ops::ShOps* sh = nullptr;
+        const ops::PPISPOps* ppisp = nullptr;
+        const ops::ControllerOps* controller = nullptr;
+        const ops::GsplatRasterOps* gsplat = nullptr;
+        const ops::RefineOps* refine = nullptr;
+        const ops::SessionOps* session = nullptr;
+        const ops::SharedImageOps* shared_image = nullptr;
+        const ops::LpipsOps* lpips = nullptr;
+        const ops::StructureOps* structure = nullptr;
+        const ops::BlobOps* blob = nullptr;
     };
 
     enum class Family {
@@ -49,12 +84,19 @@ namespace lfs::training {
         TrainingImage,
         SharedImage,
         Lpips,
+        Blob,
+        Structure,
         Count
     };
 
     using FamilySet = std::bitset<static_cast<size_t>(Family::Count)>;
 
     const TrainingOps& training_ops(core::GpuBackend backend);
+
+    // Throws the missing-family message when this backend has no Sh table.
+    const ops::ShOps& training_sh_ops();
+    const ops::SessionOps& training_session_ops();
+    const ops::MortonOps& training_morton_ops();
 
     // Called after configuration defaults and input-dependent options are resolved.
     // input_dependencies covers the selected loader and preprocessing path.

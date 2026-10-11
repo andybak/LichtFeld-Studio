@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "core/atomic_file.hpp"
 #include "core/error.hpp"
 #include "core/export.hpp"
 
@@ -13,11 +14,6 @@
 #include <vector>
 
 namespace lfs::core {
-
-    /** Durably replace a user-owned text file without exposing a partial write. */
-    [[nodiscard]] LFS_CORE_API lfs::Status
-    writeTextFileAtomically(const std::filesystem::path& destination,
-                            const std::string& contents);
 
     /**
      * Per-invocation overrides for the user-owned storage tree.
@@ -90,6 +86,8 @@ namespace lfs::core {
         [[nodiscard]] std::filesystem::path keymapDir() const;
         [[nodiscard]] std::filesystem::path presetDir() const;
         [[nodiscard]] std::filesystem::path assetLibraryDir() const;
+        /** Durable plugin-owned data: `<data>/plugin_data/<plugin name>/`. */
+        [[nodiscard]] std::filesystem::path pluginDataDir() const;
         [[nodiscard]] std::filesystem::path backupDir() const;
         /** Legacy untitled crash files: `<root>/recovery`. Kept for startup scan. */
         [[nodiscard]] std::filesystem::path recoveryDir() const;

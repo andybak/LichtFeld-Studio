@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Sequence
 import enum
-from typing import TypeAlias, overload
+from typing import Annotated, TypeAlias, overload
 
 from numpy.typing import NDArray
 import typing_extensions
@@ -16,8 +16,10 @@ from . import (
     keymap as keymap,
     log as log,
     mcp as mcp,
+    media as media,
     mesh as mesh,
     nn as nn,
+    nodes as nodes,
     ops as ops,
     packages as packages,
     pipeline as pipeline,
@@ -298,6 +300,9 @@ def project_save(wait: bool = False, regenerate_preview: bool = True) -> bool:
 def project_save_as(path: str = '', wait: bool = False) -> bool:
     """Save the active project to a new .licht path"""
 
+def project_save_as_for_training_start(path: str = '', wait: bool = False) -> bool:
+    """Save a clean project for a new training run"""
+
 def project_get_license() -> dict | None:
     """Return the license metadata for the active project, or None"""
 
@@ -331,6 +336,12 @@ def project_is_dirty() -> bool:
 
 def project_has_path() -> bool:
     """Return whether the active project has a bound .licht path"""
+
+def project_path() -> str | None:
+    """Return the active project's bound .licht path, or None"""
+
+def project_uuid() -> str | None:
+    """Return the active project UUID (kept across saves), or None"""
 
 def project_can_embed_dataset() -> bool:
     """Return whether the active project can embed its external dataset"""
@@ -380,8 +391,14 @@ def clear_scene() -> None:
 def switch_to_edit_mode() -> None:
     """Switch from training to edit mode"""
 
+def apple_reframe_available() -> bool:
+    """Whether Apple photo reconstruction is ready on this Mac"""
+
 def load_file(path: str, is_dataset: bool = False, output_path: str = '', init_path: str = '', centralize_dataset: str = 'off', max_width: int | None = None, apply_auto_crop: bool = False, min_track_length: int | None = None, stop_training: bool = False, discard_changes: bool = False, replace: bool = False) -> None:
     """Load a file (PLY, checkpoint) or dataset into the scene."""
+
+def load_files(paths: Sequence[str], stop_training: bool = False, discard_changes: bool = False, replace: bool = False, _user_batch: bool = False) -> None:
+    """Import splat and mesh files as one ordered batch."""
 
 def load_config_file(path: str) -> None:
     """Load a JSON configuration file."""
@@ -426,9 +443,9 @@ def prepare_gallery_project(source_path: str, destination: str, payload_format: 
     Prepare a saved .licht project on the managed export worker without opening it in the editor. Destination must be a fresh staging directory. Poll ui.get_export_state() for progress, errors and commit_uuid.
     """
 
-def export_scene(format: int, path: str, node_names: Sequence[str], sh_degree: int, rad_flip_y: bool = False, rad_streamable: bool = True, spz_version: int = 4, include_provenance: bool = True, *, lod_levels: int = 4, lod_ratio: float = 0.5, chunk_count_k: int = 512, chunk_extent: float = 16.0, chunk_min_k: int = 8, kmeans_iterations: int = 10) -> None:
+def export_scene(format: int, path: str, node_names: Sequence[str], sh_degree: int, rad_flip_y: bool = False, rad_streamable: bool = True, spz_version: int = 4, include_provenance: bool = True, *, apply_modifiers: bool = True, lod_levels: int = 4, lod_ratio: float = 0.5, chunk_count_k: int = 512, chunk_extent: float = 16.0, chunk_min_k: int = 8, kmeans_iterations: int = 10) -> None:
     """
-    Export scene nodes to file or directory. Format: 0=PLY, 1=SOG, 2=SPZ, 3=HTML, 4=USD, 5=USDZ NuRec, 6=RAD, 7=COLMAP, 8=SSOG, 13=GLB. For SSOG, path names a .ssog bundle or directory; lod_levels, lod_ratio, chunk_count_k, chunk_extent, chunk_min_k and kmeans_iterations control its LODs and chunks. spz_version is 3 (legacy gzip) or 4 (zstd, default) and is only used for SPZ. include_provenance (default true) writes a full provenance stamp into the format metadata slot; when false, a minimal build stamp is still embedded. Ignored for COLMAP and SPZ v3.
+    Export scene nodes to file or directory. Format: 0=PLY, 1=SOG, 2=SPZ, 3=HTML, 4=USD, 5=USDZ NuRec, 6=RAD, 7=COLMAP, 8=SSOG, 13=GLB. For SSOG, path names a .ssog bundle or directory; lod_levels, lod_ratio, chunk_count_k, chunk_extent, chunk_min_k and kmeans_iterations control its LODs and chunks. spz_version is 3 (legacy gzip) or 4 (zstd, default) and is only used for SPZ. include_provenance (default true) writes a full provenance stamp into the format metadata slot; when false, a minimal build stamp is still embedded. apply_modifiers (default true) exports the evaluated Node Editor result; false exports the stored payload. Ignored for COLMAP and SPZ v3.
     """
 
 def save_config_file(path: str) -> None:
@@ -481,6 +498,9 @@ def set_vram_profiler_enabled(enabled: bool) -> None:
 
 def get_vram_profiler_enabled() -> bool:
     """Return whether the live VRAM diagnostics profiler is enabled"""
+
+def vram_owner_breakdown() -> dict:
+    """Return a sampled process VRAM breakdown by owner category"""
 
 def set_node_visibility(name: str, visible: bool) -> None:
     """Set visibility of a scene node by name"""
@@ -559,11 +579,20 @@ def get_colmap_sparse_source_path() -> str | None:
 def get_node_visualizer_world_transform(name: str) -> list[float] | None:
     """Get node visualizer-world transform matrix (16 floats, column-major)"""
 
-def set_node_transform(name: str, matrix: Sequence[float]) -> None:
-    """Set node transform matrix (16 floats, column-major)"""
+def commit_node_transforms(node_names: Sequence[str], old_transforms: Sequence[Sequence[float]]) -> None:
+    """
+    Record a completed preview edit as one undo step using its original local transforms
+    """
 
-def set_node_visualizer_world_transform(name: str, matrix: Sequence[float]) -> None:
-    """Set node visualizer-world transform matrix (16 floats, column-major)"""
+def set_node_transform(name: str, matrix: Sequence[float], *, record_history: bool = True) -> None:
+    """
+    Set node transform matrix (16 floats, column-major). Disable record_history for previews committed with commit_node_transforms.
+    """
+
+def set_node_visualizer_world_transform(name: str, matrix: Sequence[float], *, record_history: bool = True) -> None:
+    """
+    Set node visualizer-world transform matrix (16 floats, column-major). Disable record_history for previews committed with commit_node_transforms.
+    """
 
 def bake_selected_node_transforms() -> int:
     """
@@ -589,35 +618,11 @@ def load_icon(name: str) -> int:
 def free_icon(texture_id: int) -> None:
     """Free an icon texture"""
 
-def reset_camera(*, panel: str | None = None) -> None:
-    """
-    Reset the primary camera by default, even when another panel has focus.
-    Use panel="main" to reset the focused camera. Reset restores the camera's
-    default position and orientation.
+def reset_camera() -> None:
+    """Reset the active view's camera."""
 
-    Unlike focus_selection(), omitting panel (or passing None) does not follow focus.
-
-    panel (keyword-only):
-    - None (default): primary camera.
-    - 'main': focused camera.
-    - 'left' / 'right': named panel's camera.
-
-    Outside independent-dual split, all choices target the primary camera.
-    Addressing a panel never changes focus.
-    """
-
-def focus_selection(*, panel: str | None = None) -> bool:
-    """
-    Focus the active viewport on the selection, or the whole scene when nothing is selected.
-
-    panel (keyword-only) selects which split panel's camera is moved:
-    - None (default): the focused panel, exactly as before.
-    - 'main': the panel that currently has focus, requested explicitly.
-      Same panel as None here, reached through the panel-addressed path.
-    - 'left' / 'right': that panel's own camera. Outside independent-dual
-      split every token resolves to the primary camera, because there is
-      only one. Addressing a panel never changes which panel has focus.
-    """
+def focus_selection() -> bool:
+    """Frame the selection or the whole scene in the active view."""
 
 def get_camera_navigation_mode() -> str:
     """
@@ -649,8 +654,11 @@ def toggle_fullscreen() -> None:
 def is_fullscreen() -> bool:
     """Check if the window is in fullscreen mode"""
 
+def get_graphics_capabilities() -> dict:
+    """Return graphics capabilities used to gate rendering controls"""
+
 def get_vulkan_capabilities() -> dict:
-    """Return Vulkan device capabilities used to gate rendering controls"""
+    """Deprecated alias for get_graphics_capabilities"""
 
 def toggle_ui() -> None:
     """Toggle UI overlay visibility"""
@@ -660,11 +668,16 @@ def toggle_vram_hud() -> None:
     Toggle the VRAM diagnostics HUD overlay (requires vram profiler enabled)
     """
 
+def toggle_perf_hud_expanded() -> None:
+    """Toggle the performance HUD between its full and compact views"""
+
 def is_perf_hud_visible() -> bool:
     """True when the performance HUD is currently shown"""
 
-def toggle_independent_split_view() -> None:
-    """Toggle independent split view"""
+def toggle_split_viewport() -> None:
+    """
+    Open a second 3D viewport beside the one under the pointer, or close it again
+    """
 
 def get_render_mode() -> RenderMode:
     """Get current render mode (Splats, Points, Rings, Centers)"""
@@ -717,6 +730,33 @@ def tensor_backend_selftest(backend: str) -> None:
     """
     Allocate, dispatch a small corpus, read back, shut the backend down, and reinitialize
     """
+
+class ReduceOp(enum.Enum):
+    SUM = 0
+
+    MEAN = 1
+
+    MAX = 2
+
+    MIN = 3
+
+    PROD = 4
+
+    ANY = 5
+
+    ALL = 6
+
+    STD = 7
+
+    VAR = 8
+
+    ARGMAX = 9
+
+    ARGMIN = 10
+
+    COUNT_NONZERO = 11
+
+    NORM = 12
 
 class Tensor:
     def __init__(self) -> None: ...
@@ -781,6 +821,15 @@ class Tensor:
     def item(self) -> float:
         """Extract scalar value"""
 
+    def float_(self) -> float:
+        """Extract as float"""
+
+    def int_(self) -> int:
+        """Extract as int"""
+
+    def bool_(self) -> bool:
+        """Extract as bool"""
+
     def numpy(self, copy: bool = True) -> object:
         """Convert to NumPy array"""
 
@@ -791,7 +840,7 @@ class Tensor:
         """Count non-zero elements"""
 
     @staticmethod
-    def from_numpy(arr: NDArray, copy: bool = True) -> Tensor:
+    def from_numpy(arr: Annotated[NDArray, dict(device='cpu')], copy: bool = True) -> Tensor:
         """Create tensor from NumPy array"""
 
     @staticmethod
@@ -840,10 +889,10 @@ class Tensor:
     def from_dlpack(obj: object) -> Tensor:
         """Create tensor from DLPack capsule or object"""
 
-    def __getitem__(self, arg: object, /) -> Tensor:
+    def __getitem__(self, key: object | None) -> Tensor:
         """Get item/slice"""
 
-    def __setitem__(self, arg0: object, arg1: object, /) -> None:
+    def __setitem__(self, key: object | None, value: object) -> None:
         """Set item/slice"""
 
     @overload
@@ -921,6 +970,12 @@ class Tensor:
     @overload
     def __itruediv__(self, arg: float, /) -> Tensor:
         """In-place divide scalar"""
+
+    def fill_(self, arg: float, /) -> Tensor:
+        """Fill tensor with value in-place"""
+
+    def zero_(self) -> Tensor:
+        """Zero tensor in-place"""
 
     def __neg__(self) -> Tensor:
         """Negate"""
@@ -1188,8 +1243,14 @@ class Tensor:
     def masked_fill(self, mask: Tensor, value: float) -> Tensor:
         """Fill elements where mask is true"""
 
+    def masked_fill_(self, mask: Tensor, value: float) -> Tensor:
+        """In-place fill elements where mask is true"""
+
     def nonzero(self) -> Tensor:
         """Indices of non-zero elements"""
+
+    def index_add_(self, dim: int, indices: Tensor, src: Tensor) -> Tensor:
+        """Add src into this tensor at indices along a dimension"""
 
     def matmul(self, other: Tensor) -> Tensor:
         """Matrix multiplication"""
@@ -1269,6 +1330,90 @@ class Tensor:
     @staticmethod
     def where(condition: Tensor, x: Tensor, y: Tensor) -> Tensor:
         """Conditional select"""
+
+    @staticmethod
+    def normal(shape: Sequence[int], mean: float = 0.0, std: float = 1.0, device: str = 'cuda', dtype: str = 'float32') -> Tensor:
+        """
+        Create Float32 normal random values with given mean and standard deviation
+        """
+
+    @staticmethod
+    def bernoulli(shape: Sequence[int], p: float = 0.5, device: str = 'cuda', dtype: str = 'float32') -> Tensor:
+        """Create random zeros and ones with probability p of one"""
+
+    @staticmethod
+    def multinomial(weights: Tensor, num_samples: int, replacement: bool = False, seed: int | None = None) -> Tensor:
+        """
+        Sample indices from 1D weights; an explicit seed leaves the global RNG unchanged
+        """
+
+    @staticmethod
+    def diag(diagonal: Tensor) -> Tensor:
+        """Create a square matrix from a 1D diagonal"""
+
+    def cdist(self, other: Tensor, p: float = 2.0) -> Tensor:
+        """Pairwise p-norm distances between rows"""
+
+    def normalize(self, dim: int = -1, eps: float = 9.999999960041972e-13) -> Tensor:
+        """
+        Standardize by mean and population std plus eps; dim=-1 reduces all elements
+        """
+
+    def mod(self, other: Tensor) -> Tensor:
+        """Element-wise fmod with a tensor divisor (sign follows dividend)"""
+
+    def clamp_(self, min: float, max: float) -> Tensor:
+        """In-place clamp values to range"""
+
+    def clamp_min_(self, min: float) -> Tensor:
+        """In-place clamp to a lower bound"""
+
+    def reduce(self, op: ReduceOp, dim: int | None = None, keepdim: bool = False) -> Tensor:
+        """Reduce using ReduceOp; dim=None reduces all elements"""
+
+    def all_close(self, other: Tensor, rtol: float = 9.999999747378752e-06, atol: float = 9.99999993922529e-09) -> bool:
+        """Whether all values are close within absolute and relative tolerance"""
+
+    def allclose(self, other: Tensor, rtol: float = 9.999999747378752e-06, atol: float = 9.99999993922529e-09) -> bool:
+        """Alias for all_close"""
+
+    def nonzero_split(self) -> list[Tensor]:
+        """Nonzero indices as one tensor per dimension"""
+
+    def linear(self, weight: Tensor, bias: Tensor | None = None) -> Tensor:
+        """
+        Linear transform with optional bias; weight is [out_features, in_features]
+        """
+
+    def conv1x1(self, weight: Tensor, bias: Tensor | None = None) -> Tensor:
+        """
+        NCHW 1x1 convolution with optional bias; weight is [out_channels, in_channels]
+        """
+
+    def where_into_(self, condition: Tensor, value: float, source: Tensor) -> Tensor:
+        """
+        Write value where condition is true and source elsewhere into this tensor
+        """
+
+    def gather_lazy(self, indices: Tensor) -> Tensor:
+        """
+        Gather flat Int32 indices and return the evaluated tensor on the source backend
+        """
+
+    @property
+    def reserved_allocation_bytes(self) -> int | None:
+        """Reserved backing storage size in bytes, or None when unknown"""
+
+    def validate(self) -> dict:
+        """Inspect NaN/Inf counts and finite min/max/mean; returns a dict"""
+
+    def diff(self, other: Tensor, tolerance: float = 9.999999747378752e-06) -> dict:
+        """
+        Compare shape, dtype and values; returns a dict of difference statistics
+        """
+
+    def stats(self) -> dict:
+        """Return a dict of min/max/mean/population std and tensor metadata"""
 
     def __repr__(self) -> str:
         """String representation"""
@@ -1498,6 +1643,18 @@ def render_view(rotation: Tensor, translation: Tensor, width: int, height: int, 
         or None if no active visualizer scene is available
     """
 
+def render_linear_image(width: int, height: int, transparent: bool = True) -> Tensor:
+    """
+    Render the current Gaussian view before byte quantization.
+
+    Returns CPU Float32 [H,W,4], relative linear BT709 RGB and straight alpha.
+    Uses the current raster tone settings before PPISP and environment export
+    post-processing. This is display-referred SDR linear color, not scene HDR.
+    The returned tensor owns its samples and remains valid after later renders.
+    Use io.save_exr_image with explicit matching color and EXR options.
+    Raises an error if no active renderable viewer is available.
+    """
+
 def render_view_u8(rotation: Tensor, translation: Tensor, width: int, height: int, fov: float = 60.0, bg_color: Tensor | None = None, orthographic: bool | None = None, ortho_scale: float | None = None) -> Tensor | None:
     """
     Render scene from arbitrary camera parameters as an 8-bit RGB image.
@@ -1531,15 +1688,8 @@ def compute_screen_positions(rotation: Tensor, translation: Tensor, width: int, 
         Tensor [N, 2] with (x, y) pixel coordinates for each Gaussian
     """
 
-def get_current_view(panel: str = 'main') -> ViewInfo | None:
-    """
-    Get current viewport camera pose (None if not available).
-
-    Args:
-        panel: 'main' (default) returns the focused viewport, 'left'/'right' returns the
-            per-panel camera. In independent split-view mode, the right panel has its own
-            camera; otherwise both panels share the main camera.
-    """
+def get_current_view() -> ViewInfo | None:
+    """Get current viewport camera pose (None if not available)."""
 
 class CameraState:
     @property
@@ -1554,16 +1704,12 @@ class CameraState:
     @property
     def fov(self) -> float: ...
 
-def get_camera(panel: str = 'main') -> CameraState | None:
+def get_camera() -> CameraState | None:
     """
     Get current viewport camera state (eye, target, up, fov) or None if unavailable.
-
-    Args:
-        panel: 'main' (default), 'left', or 'right'. 'left'/'right' return the per-panel
-            camera in independent split-view mode; otherwise both panels share the main camera.
     """
 
-def set_camera(eye: tuple[float, float, float], target: tuple[float, float, float], up: tuple[float, float, float] = (0.0, 1.0, 0.0), panel: str = 'main') -> None:
+def set_camera(eye: tuple[float, float, float], target: tuple[float, float, float], up: tuple[float, float, float] = (0.0, 1.0, 0.0)) -> None:
     """
     Move the viewport camera to look from eye toward target.
 
@@ -1571,8 +1717,6 @@ def set_camera(eye: tuple[float, float, float], target: tuple[float, float, floa
         eye: camera position (x, y, z).
         target: look-at target (x, y, z).
         up: world up vector (default (0, 1, 0)).
-        panel: 'main' (default), 'left', or 'right'. In independent split-view mode the right
-            panel can be moved independently; otherwise this falls back to the main camera.
     """
 
 def set_camera_fov(fov: float) -> None:
@@ -1627,6 +1771,26 @@ def get_render_settings() -> RenderSettings | None: ...
 def get_lod_stats() -> dict:
     """
     Get LOD statistics: {enabled, selected, budget, levels:[{level, count}, ...]}
+    """
+
+def get_tiles_settings() -> dict:
+    """
+    Get tile streaming settings: {cache_fraction, max_sse, cull, freeze, num_load_workers, lod_base_distance, lod_multiplier}
+    """
+
+def set_tiles_settings(cache_fraction: float | None = None, max_sse: float | None = None, cull: bool | None = None, freeze: bool | None = None, num_load_workers: int | None = None, lod_base_distance: float | None = None, lod_multiplier: float | None = None) -> None:
+    """
+    Update tile streaming settings (3D Tiles, streamed SOG); omitted values keep their current setting. lod_base_distance and lod_multiplier set the distances at which streamed SOG levels switch, like PlayCanvas lodBaseDistance / lodMultiplier
+    """
+
+def get_tiles_stats() -> dict | None:
+    """
+    Get statistics (incl. max_sse in use) of the streamed model (3D Tiles, streamed SOG), or None when none streams
+    """
+
+def get_tiles_mode() -> str | None:
+    """
+    'stream' when a model streams (3D Tiles, streamed SOG), 'flat' when a 3D Tiles tileset loaded fully, or None
     """
 
 def register_class(cls: object) -> None:
@@ -1999,6 +2163,20 @@ class MaskMode(enum.Enum):
 
     ALPHA_CONSISTENT = 4
 
+class EvalSpace(enum.Enum):
+    DISTORTED = 0
+
+    UNDISTORTED = 1
+
+class EvalBitDepth(enum.Enum):
+    AUTO = 0
+
+    EIGHT = 1
+
+    SIXTEEN = 2
+
+    FLOAT = 3
+
 class DensifyErrorMap(enum.Enum):
     SSIM = 0
 
@@ -2194,54 +2372,38 @@ class OptimizationParams:
     def eval_all(self, arg: bool, /) -> None: ...
 
     @property
-    def background_improvements(self) -> bool:
+    def eval_flip(self) -> bool:
         """
-        Improve distant background reconstruction (MRNF): far-field seeding and splits, decay relief, growth cap, per-splat position steps, visibility-ratio growth ranking, paced capacity fill
+        Also compute FLIP per evaluated image and save its error map next to the evaluation images
         """
 
-    @background_improvements.setter
-    def background_improvements(self, arg: bool, /) -> None: ...
+    @eval_flip.setter
+    def eval_flip(self, arg: bool, /) -> None: ...
 
     @property
-    def far_scene_min_fraction(self) -> float:
+    def eval_mask(self) -> str:
         """
-        Minimum deep-far splat fraction that activates far-field features (0 = always on)
+        Scores only part of each evaluated image (a mesh, a box, the crop box, a mask folder, a depth range, points or a splat); training is not affected
         """
 
-    @far_scene_min_fraction.setter
-    def far_scene_min_fraction(self, arg: float, /) -> None: ...
+    @eval_mask.setter
+    def eval_mask(self, arg: str, /) -> None: ...
 
     @property
-    def growth_ratio_rank(self) -> bool:
-        """
-        Rank MRNF growth by visibility-normalized error (err/vis^p) instead of raw window error
-        """
+    def eval_mask_invert(self) -> bool:
+        """Scores the pixels outside the evaluation mask instead"""
 
-    @growth_ratio_rank.setter
-    def growth_ratio_rank(self, arg: bool, /) -> None: ...
+    @eval_mask_invert.setter
+    def eval_mask_invert(self, arg: bool, /) -> None: ...
 
     @property
-    def growth_ratio_pow(self) -> float:
-        """Visibility exponent p for the err/vis^p growth rank"""
-
-    @growth_ratio_pow.setter
-    def growth_ratio_pow(self, arg: float, /) -> None: ...
-
-    @property
-    def fill_pacing_iter(self) -> int:
-        """Pace MRNF cap fill until this iteration (0 = fill as fast as possible)"""
-
-    @fill_pacing_iter.setter
-    def fill_pacing_iter(self, arg: int, /) -> None: ...
-
-    @property
-    def far_seed_dose(self) -> int:
+    def eval_mask_opacity(self) -> float:
         """
-        Far-field seeds injected per refine window (0 = starvation-scaled default)
+        Rendered opacity a pixel needs to count as covered by a splat mask; lower widens the mask past the outline, higher pulls it in
         """
 
-    @far_seed_dose.setter
-    def far_seed_dose(self, arg: int, /) -> None: ...
+    @eval_mask_opacity.setter
+    def eval_mask_opacity(self, arg: float, /) -> None: ...
 
     @property
     def densify_error_map(self) -> DensifyErrorMap:
@@ -2265,15 +2427,6 @@ class OptimizationParams:
 
     @screen_share_penalty.setter
     def screen_share_penalty(self, arg: float, /) -> None: ...
-
-    @property
-    def oversize_split_fraction(self) -> float:
-        """
-        Fraction of MRNF growth budget used to split Gaussians over the screen-share cap; 0 disables
-        """
-
-    @oversize_split_fraction.setter
-    def oversize_split_fraction(self, arg: float, /) -> None: ...
 
     @property
     def steps_scaler(self) -> float:
@@ -2472,6 +2625,15 @@ class OptimizationParams:
     def depth_loss_mode(self, arg: str, /) -> None: ...
 
     @property
+    def depth_auto_generate(self) -> bool:
+        """
+        Generate missing or size-mismatched depth maps with MoGe-2 from the full-resolution images/ folder
+        """
+
+    @depth_auto_generate.setter
+    def depth_auto_generate(self, arg: bool, /) -> None: ...
+
+    @property
     def use_normal_loss(self) -> bool:
         """Load normal maps and use normal-map supervision during training"""
 
@@ -2535,10 +2697,30 @@ class OptimizationParams:
 
     @property
     def undistort(self) -> bool:
-        """Undistort images on-the-fly before training"""
+        """
+        Remove lens distortion before training: each image and its mask, depth and normal map are resampled once from full resolution into a distortion-free pinhole camera, which training then uses. Alternative to --gut for distorted or non-pinhole cameras
+        """
 
     @undistort.setter
     def undistort(self, arg: bool, /) -> None: ...
+
+    @property
+    def eval_space(self) -> EvalSpace:
+        """
+        Reference images for evaluation with --undistort: distorted = the original images, with the render warped into the original lens; undistorted = the undistorted training images
+        """
+
+    @eval_space.setter
+    def eval_space(self, arg: EvalSpace, /) -> None: ...
+
+    @property
+    def eval_bit_depth(self) -> EvalBitDepth:
+        """
+        Grid the render is quantized to before evaluation metrics: auto = each reference image's own encoding (8-bit, 16-bit or float)
+        """
+
+    @eval_bit_depth.setter
+    def eval_bit_depth(self, arg: EvalBitDepth, /) -> None: ...
 
     @property
     def save_steps(self) -> list[int]:
@@ -2694,8 +2876,15 @@ def run(path: str) -> None:
 def list_scene() -> None:
     """Print the scene graph tree"""
 
-def on_frame(callback: Callable) -> None:
-    """Register a callback to be called each frame with delta time (seconds)"""
+def on_frame(callback: Callable, duration_s: object | None = None) -> None:
+    """
+    Register a frame callback with an optional positive lifetime in seconds (defaults to 10 seconds).
+    """
+
+def set_frame_callback(callback: Callable, duration_s: object | None = None) -> None:
+    """
+    Register a frame callback with an optional positive lifetime in seconds (defaults to 10 seconds).
+    """
 
 def stop_animation() -> None:
     """Stop any running animation (clears frame callback)"""
@@ -2806,4 +2995,4 @@ class CheckpointParams:
 def read_checkpoint_params(path: str) -> CheckpointParams | None:
     """Read training parameters from a checkpoint (None if failed)"""
 
-__all__: tuple = ('context', 'gaussians', 'session', 'get_scene', 'Tensor', 'Hook', 'ScopedHandler', 'SplatSimplifyResult', 'SplatSimplifyMergeTree', 'on_training_start', 'on_iteration_start', 'on_post_step', 'on_pre_optimizer_step', 'on_training_end', 'mesh_to_splat', 'is_mesh2splat_active', 'get_mesh2splat_progress', 'get_mesh2splat_stage', 'get_mesh2splat_error', 'simplify_splats', 'simplify_splat_data_with_history', 'build_splat_lod_hierarchy', 'cancel_splat_simplify', 'is_splat_simplify_active', 'get_splat_simplify_progress', 'get_splat_simplify_stage', 'get_splat_simplify_error', 'on_frame', 'stop_animation', 'on_scene_time', 'clear_scene_time', 'run', 'list_scene', 'mat4', 'colormap', 'help', 'scene', 'io', 'packages', 'mcp')
+__all__: tuple = ('context', 'gaussians', 'session', 'get_scene', 'Tensor', 'Hook', 'ScopedHandler', 'SplatSimplifyResult', 'SplatSimplifyMergeTree', 'on_training_start', 'on_iteration_start', 'on_post_step', 'on_pre_optimizer_step', 'on_training_end', 'mesh_to_splat', 'is_mesh2splat_active', 'get_mesh2splat_progress', 'get_mesh2splat_stage', 'get_mesh2splat_error', 'simplify_splats', 'simplify_splat_data_with_history', 'build_splat_lod_hierarchy', 'cancel_splat_simplify', 'is_splat_simplify_active', 'get_splat_simplify_progress', 'get_splat_simplify_stage', 'get_splat_simplify_error', 'on_frame', 'stop_animation', 'on_scene_time', 'clear_scene_time', 'run', 'list_scene', 'mat4', 'colormap', 'help', 'scene', 'io', 'media', 'packages', 'mcp')

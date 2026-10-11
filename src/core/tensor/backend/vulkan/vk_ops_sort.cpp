@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <span>
 
 namespace lfs::core::internal {
@@ -33,7 +34,6 @@ namespace lfs::core::internal {
         // Phases of radix.slang.
         constexpr uint32_t kExtractPhase = 0;
         constexpr uint32_t kHistogramPhase = 1;
-        constexpr uint32_t kScanPhase = 2;
         constexpr uint32_t kScatterPhase = 3;
         constexpr uint32_t kGatherPhase = 4;
         constexpr uint32_t kWritePhase = 5;
@@ -87,10 +87,16 @@ namespace lfs::core::internal {
                 .inner = checked_u32(lines.inner, "Vulkan sort inner size exceeds uint32"),
                 .descending = lines.descending ? 1u : 0u,
             };
+            // Short lines pack side by side, each running a network of its
+            // own power-of-two width.
+            const size_t width = std::bit_ceil(std::max<size_t>(lines.dim_size, 1));
+            const size_t lines_per_group = kBitonicCapacity / width;
+            const std::array constants{static_cast<uint32_t>(width)};
             const VulkanPipeline& pipeline =
-                context.pipelines().specialized("sort", sizeof(SortPush), {});
+                context.pipelines().specialized("sort", sizeof(SortPush), constants);
             const uint32_t groups = static_cast<uint32_t>(
-                std::min<size_t>(lines.count, context.caps().max_workgroup_count[0]));
+                std::min<size_t>((lines.count + lines_per_group - 1) / lines_per_group,
+                                 context.caps().max_workgroup_count[0]));
             const std::array reads{values};
             const std::array writes{values, indices};
             context.recorders().record(
@@ -147,8 +153,6 @@ namespace lfs::core::internal {
             const uint32_t element_groups = dispatch_groups(context, total);
             const uint32_t block_groups = static_cast<uint32_t>(
                 std::min<size_t>(blocks, context.caps().max_workgroup_count[0]));
-            const uint32_t line_groups = static_cast<uint32_t>(
-                std::min<size_t>(lines.count, context.caps().max_workgroup_count[0]));
             {
                 const std::array reads{values};
                 const std::array writes{keys_a, positions_a};
@@ -166,11 +170,7 @@ namespace lfs::core::internal {
                     const std::array writes{histogram};
                     dispatch(kHistogramPhase, block_groups, reads, writes);
                 }
-                {
-                    const std::array reads{histogram};
-                    const std::array writes{histogram};
-                    dispatch(kScanPhase, line_groups, reads, writes);
-                }
+                vk::scan_radix_histogram(histogram, lines.count, kRadixDigits * blocks_per_line);
                 {
                     const std::array reads{source_keys, source_positions, histogram};
                     const std::array writes{target_keys, target_positions};

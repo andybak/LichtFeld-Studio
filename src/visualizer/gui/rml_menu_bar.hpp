@@ -5,7 +5,7 @@
 #pragma once
 
 #include "core/export.hpp"
-#include "gui/panel_layout.hpp"
+#include "gui/gui_input.hpp"
 #include "gui/rmlui/rml_tooltip.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 
@@ -164,6 +164,7 @@ namespace lfs::vis::gui {
         void dispatchToolbarAction(const std::string& action, const std::string& value);
         Rml::Element* toolbarButtonAtPoint(float x, float y) const;
         bool projectTitleAtPoint(float x, float y) const;
+        void updateCompactLayout(int screen_w, float dp_ratio);
         void updateProjectTitleLayout(int screen_w, float dp_ratio);
         void updateTitlebarDragRegion(int bar_height_px);
         void clearTitlebarDragRegion();
@@ -182,8 +183,7 @@ namespace lfs::vis::gui {
         std::vector<MenuLabelView> menu_labels_;
         std::vector<MenuDropdownRootView> dropdown_items_;
         std::vector<MenuToolbarButtonView> camera_buttons_;
-        std::vector<MenuToolbarButtonView> render_buttons_;
-        std::vector<MenuToolbarButtonView> projection_buttons_;
+        std::vector<MenuToolbarButtonView> snap_buttons_;
         std::array<std::string, 4> navigation_tooltips_;
         std::uint64_t navigation_tooltip_language_generation_ = 0;
         bool has_navigation_tooltip_language_generation_ = false;
@@ -212,7 +212,6 @@ namespace lfs::vis::gui {
         Rml::Element* project_title_el_ = nullptr;
         Rml::Element* menu_toolbar_ = nullptr;
         Rml::Element* menu_window_controls_ = nullptr;
-        Rml::Element* menu_window_split_view_ = nullptr;
         Rml::Element* menu_window_toggle_ui_ = nullptr;
         Rml::Element* menu_window_maximize_ = nullptr;
         Rml::Element* body_el_ = nullptr;
@@ -224,7 +223,6 @@ namespace lfs::vis::gui {
         bool project_title_has_room_ = false;
         bool toolbar_fits_ = true;
         bool ui_hidden_ = false;
-        bool last_window_split_view_ = false;
         bool last_ui_hidden_ = false;
         bool last_window_maximized_ = false;
 
@@ -239,10 +237,11 @@ namespace lfs::vis::gui {
         int last_mouse_y_ = 0;
         int last_hovered_label_ = -1;
         bool last_toolbar_hovered_ = false;
+        float last_dp_ratio_ = 0.0f;
         int last_ctx_w_ = 0;
         int last_ctx_h_ = 0;
         int last_document_h_ = 0;
-        CachedVulkanContextRender direct_cache_;
+        CachedUiContextRender direct_cache_;
 
         float bar_height_ = 30.0f;
     };

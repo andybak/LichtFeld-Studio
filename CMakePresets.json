@@ -101,7 +101,19 @@
         "VCPKG_TARGET_TRIPLET": "arm64-osx",
         "VCPKG_HOST_TRIPLET": "arm64-osx",
         "LFS_VCPKG_MAX_CONCURRENCY": "2",
-        "BUILD_TESTS": "OFF"
+        "BUILD_TESTS": "OFF",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "26.0"
+      }
+    },
+    {
+      "name": "macos-portable",
+      "displayName": "macOS arm64 portable .app",
+      "description": "Relocatable Apple Silicon app bundle with Python and MoltenVK",
+      "inherits": "macos-release",
+      "binaryDir": "${sourceDir}/build-macos-portable",
+      "cacheVariables": {
+        "BUILD_PORTABLE": "ON",
+        "LFS_MACOS_PORTABLE_APP": "ON"
       }
     },
     {
@@ -163,6 +175,16 @@
     {
       "name": "macos-release",
       "configurePreset": "macos-release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "jobs": 2
+    },
+    {
+      "name": "macos-portable",
+      "configurePreset": "macos-portable",
       "condition": {
         "type": "equals",
         "lhs": "${hostSystemName}",

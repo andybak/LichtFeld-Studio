@@ -2,8 +2,13 @@
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/assert.hpp"
 #include "core/cuda_error.hpp"
+#include "core/tensor.hpp"
+#include "core/tensor_cuda_interop.hpp"
+#include "densification_kernels.hpp"
 #include "image_kernels.hpp"
+#include "mask_preprocess.hpp"
 
 #include "cuda.h"
 #include <algorithm>
@@ -207,6 +212,46 @@ namespace lfs::training::kernels {
         launch_fused_canny_edge_filter_chw_impl(d_input_chw, d_output_hw, height, width, stream);
     }
 
+    void compute_edge_weight_map(
+        const lfs::core::Tensor& image,
+        const lfs::core::Tensor& photometric_mask,
+        const lfs::gpu_ops::MaskPhotoMode mask_mode,
+        lfs::core::Tensor& edges,
+        cudaStream_t stream) {
+        LFS_ASSERT_MSG(image.is_valid() && image.device() == lfs::core::Device::GPU && image.ndim() == 3 &&
+                           image.shape()[0] >= 3,
+                       "edge-weight input must be CUDA CHW image data");
+        const size_t height = image.shape()[1];
+        const size_t width = image.shape()[2];
+        LFS_ASSERT_MSG(edges.is_valid() && edges.dtype() == lfs::core::DataType::Float32 && edges.ndim() == 2 &&
+                           edges.shape()[0] == height && edges.shape()[1] == width,
+                       "edge-weight output must be a Float32 [H,W] map");
+        const int h = static_cast<int>(height);
+        const int w = static_cast<int>(width);
+
+        if (image.dtype() == lfs::core::DataType::UInt8) {
+            launch_fused_canny_edge_filter_chw(image.ptr<uint8_t>(), edges.ptr<float>(), h, w, stream);
+        } else {
+            LFS_ASSERT_MSG(image.dtype() == lfs::core::DataType::Float32, "edge-weight input must be float32 or uint8");
+            launch_fused_canny_edge_filter_chw(image.ptr<float>(), edges.ptr<float>(), h, w, stream);
+        }
+
+        if (photometric_mask.is_valid() && photometric_mask.numel() > 0) {
+            const lfs::core::Tensor mask = photometric_mask.ndim() == 3 ? photometric_mask.squeeze(0) : photometric_mask;
+            LFS_ASSERT_MSG(mask.ndim() == 2 && mask.shape()[0] == height && mask.shape()[1] == width &&
+                               mask.device() == lfs::core::Device::GPU,
+                           "edge-weight mask must be a CUDA [H,W] map matching the image");
+            mask.sync_to_stream(stream);
+            if (mask.dtype() == lfs::core::DataType::Float32) {
+                launch_zero_where_photometric_weight_is_zero_f32(edges.ptr<float>(), mask.ptr<float>(), h, w, mask_mode, stream);
+            } else {
+                launch_zero_where_photometric_weight_is_zero_u8(edges.ptr<float>(), mask.ptr<uint8_t>(), h, w, mask_mode, stream);
+            }
+        }
+
+        launch_normalize_by_positive_median(edges.ptr<float>(), height * width, stream);
+    }
+
     void launch_normalize_by_device_scalar(
         float* d_data,
         const std::size_t n,
@@ -223,4 +268,40 @@ namespace lfs::training::kernels {
         normalize_by_device_scalar_kernel<<<grid_size, block_size, 0, stream>>>(d_data, n, d_scalar, skip_below);
         LFS_CUDA_LAUNCH_CHECK(stream, "training.image.normalize_by_scalar");
     }
+    namespace {
+        // levels arrives at run time so the division compiles exactly like the tensor library's scalar division,
+        // which the saved and evaluated images have always used.
+        __global__ void quantize_to_grid_kernel(const float* __restrict__ input, float* __restrict__ output,
+                                                const std::size_t n, const float levels) {
+            for (std::size_t i = blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x; i < n;
+                 i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+                const float clamped = fminf(fmaxf(input[i], 0.0f), 1.0f);
+                output[i] = truncf(__fadd_rn(__fmul_rn(clamped, levels), 0.5f)) / levels;
+            }
+        }
+    } // namespace
+
+    lfs::core::Tensor quantize_to_8bit_grid(const lfs::core::Tensor& image) {
+        return quantize_to_grid(image, 255.0f);
+    }
+
+    lfs::core::Tensor quantize_to_grid(const lfs::core::Tensor& image, const float levels) {
+        assert(image.device() == lfs::core::Device::GPU && image.dtype() == lfs::core::DataType::Float32);
+        assert(levels >= 1.0f);
+        const cudaStream_t stream = resolve_stream(image.stream());
+        const auto source = image.contiguous();
+        source.sync_to_stream(stream);
+        auto out = lfs::core::Tensor::empty(source.shape(), lfs::core::Device::GPU, lfs::core::DataType::Float32);
+        out.set_stream(stream);
+        const std::size_t n = source.numel();
+        if (n == 0)
+            return out;
+        constexpr int block_size = 256;
+        const int grid_size = static_cast<int>(std::min<std::size_t>((n + block_size - 1) / block_size, 4096));
+        quantize_to_grid_kernel<<<grid_size, block_size, 0, stream>>>(source.ptr<float>(), out.ptr<float>(), n,
+                                                                      levels);
+        LFS_CUDA_LAUNCH_CHECK(stream, "training.image.quantize_to_grid");
+        return out;
+    }
+
 } // namespace lfs::training::kernels

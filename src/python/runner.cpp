@@ -376,7 +376,6 @@ _add_dll_dirs()
                     Py_DECREF(py_path);
                     return false;
                 }
-                LOG_INFO("Added {} to Python path: {}", label, path_utf8);
             }
 
             Py_DECREF(py_path);
@@ -429,7 +428,6 @@ _add_dll_dirs()
             }
 
             Py_DECREF(result);
-            LOG_INFO("Python dev hot reload watcher started");
         }
 #endif
 
@@ -612,13 +610,6 @@ _add_dll_dirs()
                 LOG_ERROR("lfs_plugins.register_builtin_panels not found");
             }
 
-#ifdef LFS_DEV_PYTHON_SOURCE_DIR
-            if (builtin_panels_registered) {
-                start_dev_python_watcher(lfs_plugins);
-            } else {
-                LOG_INFO("Python dev hot reload watcher skipped because builtin panels were not registered");
-            }
-#endif
             Py_DECREF(lfs_plugins);
 
             if (builtin_panels_registered) {
@@ -635,12 +626,10 @@ _add_dll_dirs()
 
             add_dll_directories();
 
-            LOG_INFO("Attempting to import lichtfeld module...");
             PyObject* lf = import_lichtfeld_module("Failed to import lichtfeld", true);
             if (!lf) {
                 return false;
             }
-            LOG_INFO("lichtfeld module imported successfully");
 
             ensure_builtin_ui_ready_locked();
 
@@ -921,6 +910,20 @@ _add_dll_dirs()
                     const GilAcquire gil;
                     std::lock_guard lock(g_plugin_init_mutex);
                     bridge_ready = ensure_python_bridge_ready_locked();
+#ifdef LFS_DEV_PYTHON_SOURCE_DIR
+                    if (bridge_ready && g_builtin_ui_ready.load(std::memory_order_acquire)) {
+                        PyObject* const lfs_plugins = PyImport_ImportModule("lfs_plugins");
+                        if (lfs_plugins) {
+                            start_dev_python_watcher(lfs_plugins);
+                            Py_DECREF(lfs_plugins);
+                        } else {
+                            PyErr_Print();
+                            LOG_WARN("Python dev hot reload: failed to import lfs_plugins");
+                        }
+                    } else {
+                        LOG_INFO("Python dev hot reload watcher skipped because builtin panels were not registered");
+                    }
+#endif
                     already_loaded = are_plugins_loaded();
                     if (bridge_ready && !already_loaded)
                         to_load = discover_enabled_plugins_locked();
@@ -949,8 +952,6 @@ _add_dll_dirs()
                     g_plugin_preload.state.store(PluginPreloadState::Loading,
                                                  std::memory_order_release);
                 }
-                LOG_INFO("Plugin autoload: {} plugin(s) enabled for startup",
-                         to_load.size());
                 publish_plugin_preload_status();
 
                 if (to_load.empty()) {
@@ -1187,6 +1188,9 @@ _add_dll_dirs()
                 PyConfig config;
                 PyConfig_InitPythonConfig(&config);
                 config.user_site_directory = 0;
+#ifdef LFS_MACOS_PORTABLE_APP
+                config.write_bytecode = 0;
+#endif
 
                 const auto python_home = lfs::core::getPythonHome();
                 if (!python_home.empty()) {
@@ -1198,7 +1202,6 @@ _add_dll_dirs()
                         latch_init_failure(make_init_status_error(st));
                         return;
                     }
-                    LOG_INFO("Set Python home: {}", lfs::core::path_to_utf8(python_home));
                 }
 
                 PyStatus status = Py_InitializeFromConfig(&config);
@@ -1211,7 +1214,6 @@ _add_dll_dirs()
                 }
 
                 g_we_initialized_python = true;
-                LOG_INFO("Python interpreter initialized by application");
             } else {
                 LOG_WARN("Python already initialized by external code (e.g., .pyd loading)");
                 g_we_initialized_python = false;
@@ -1264,7 +1266,6 @@ _add_dll_dirs()
 
             g_py_real_init_succeeded.store(true, std::memory_order_release);
             g_py_init_state.store(PyInitState::Ready, std::memory_order_release);
-            LOG_INFO("python-init state=Ready");
         }
     } // namespace
 
@@ -1859,7 +1860,7 @@ _repl_out.close()
         const GilAcquire gil;
 
         static constexpr const char* FORMAT_CODE = R"(
-def _lfs_format_code(code):
+def _lfs_format_code(code, comment_preamble):
     import importlib
     import re
     import textwrap
@@ -1885,7 +1886,7 @@ def _lfs_format_code(code):
             return True
         if stripped[:1] in ('"', "'", '(', '[', '{'):
             return True
-        if re.match(r'[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*\\s*[:=([{.]', stripped):
+        if re.match(r'[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\s*[:=([{.]', stripped):
             return True
         return False
 
@@ -2022,7 +2023,8 @@ def _lfs_format_code(code):
 
     # Convert tabs to spaces consistently
     cleaned = '\n'.join(line.replace('\t', '    ') for line in lines)
-    cleaned, _ = _comment_leading_preamble(cleaned)
+    if comment_preamble:
+        cleaned, _ = _comment_leading_preamble(cleaned)
 
     try:
         return (black.format_str(cleaned, mode=black.Mode()), None)
@@ -2067,7 +2069,9 @@ def _lfs_format_code(code):
             result.error = consume_python_error_detailed();
             return result;
         }
-        PyObject* const py_result = PyObject_CallFunctionObjArgs(format_func, py_code, nullptr);
+        // Strict input already compiled, so a leading line is code even when the preamble heuristic misses it.
+        PyObject* const comment_preamble = mode == PythonFormatMode::Cleanup ? Py_True : Py_False;
+        PyObject* const py_result = PyObject_CallFunctionObjArgs(format_func, py_code, comment_preamble, nullptr);
         Py_DECREF(py_code);
 
         if (!py_result) {
@@ -2116,19 +2120,38 @@ def _lfs_format_code(code):
     // Frame callback for animations
     static std::function<void(float)> g_frame_callback;
     static std::mutex g_frame_mutex;
+    static std::chrono::steady_clock::time_point g_frame_callback_deadline{};
+    static bool g_frame_callback_warn_on_expiry = false;
+    static bool g_frame_callback_deprecation_logged = false;
 
-    void set_frame_callback(std::function<void(float)> callback) {
+    void set_frame_callback(std::function<void(float)> callback, const std::optional<double> duration_s) {
         std::lock_guard lock(g_frame_mutex);
         g_frame_callback = std::move(callback);
+        g_frame_callback_warn_on_expiry = !duration_s.has_value();
+        const auto duration = std::chrono::duration<double>(duration_s.value_or(10.0));
+        g_frame_callback_deadline = std::chrono::steady_clock::now() +
+                                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(duration);
     }
 
     void clear_frame_callback() {
         std::lock_guard lock(g_frame_mutex);
         g_frame_callback = nullptr;
+        g_frame_callback_deadline = {};
+        g_frame_callback_warn_on_expiry = false;
     }
 
     bool has_frame_callback() {
         std::lock_guard lock(g_frame_mutex);
+        if (g_frame_callback && g_frame_callback_deadline != std::chrono::steady_clock::time_point{} &&
+            std::chrono::steady_clock::now() >= g_frame_callback_deadline) {
+            g_frame_callback = nullptr;
+            g_frame_callback_deadline = {};
+            if (g_frame_callback_warn_on_expiry && !g_frame_callback_deprecation_logged) {
+                g_frame_callback_deprecation_logged = true;
+                LOG_WARN("Python frame callback expired after 10 seconds; pass duration_s to set_frame_callback");
+            }
+            g_frame_callback_warn_on_expiry = false;
+        }
         return g_frame_callback != nullptr;
     }
 
@@ -2265,40 +2288,6 @@ def _lfs_format_code(code):
         Py_DECREF(json_module);
         Py_DECREF(registry);
         Py_DECREF(lfs_plugins);
-        return result;
-    }
-
-    bool has_capability(const std::string& name) {
-        (void)ensure_initialized();
-        if (!ensure_plugins_loaded())
-            return false;
-        const GilAcquire gil;
-        bool result = false;
-
-        PyObject* lfs_plugins = PyImport_ImportModule("lfs_plugins");
-        if (lfs_plugins) {
-            PyObject* registry_class = PyObject_GetAttrString(lfs_plugins, "CapabilityRegistry");
-            if (registry_class) {
-                PyObject* instance_method = PyObject_GetAttrString(registry_class, "instance");
-                PyObject* registry = PyObject_CallNoArgs(instance_method);
-                if (registry) {
-                    PyObject* has_method = PyObject_GetAttrString(registry, "has");
-                    PyObject* py_name = PyUnicode_FromString(name.c_str());
-                    PyObject* py_result = PyObject_CallOneArg(has_method, py_name);
-                    if (py_result) {
-                        result = PyObject_IsTrue(py_result);
-                        Py_DECREF(py_result);
-                    }
-                    Py_DECREF(py_name);
-                    Py_DECREF(has_method);
-                    Py_DECREF(registry);
-                }
-                Py_DECREF(instance_method);
-                Py_DECREF(registry_class);
-            }
-            Py_DECREF(lfs_plugins);
-        }
-
         return result;
     }
 

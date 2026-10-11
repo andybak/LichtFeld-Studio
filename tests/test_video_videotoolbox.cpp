@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "io/video/video_encoder.hpp"
-#include "io/video_frame_extractor.hpp"
+#include "media/video_frame_extractor.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -13,6 +13,7 @@ extern "C" {
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
+#include <stb_image.h>
 
 #include <chrono>
 #include <cstdint>
@@ -54,6 +55,11 @@ namespace {
         lfs::io::video::VideoEncoder encoder;
         if (const auto opened = encoder.open(path, options); !opened) {
             std::cerr << "H.264 fixture open: " << opened.error() << '\n';
+            return false;
+        }
+
+        if (encoder.backend() != lfs::media::VideoEncodeBackend::VideoToolbox) {
+            std::cerr << "H.264 fixture silently fell back from VideoToolbox\n";
             return false;
         }
 
@@ -194,10 +200,33 @@ TEST(VideoToolboxExtractor, HardwareH264) {
                                 "videotoolbox", 6, 0.5));
 }
 
+// The export encoder (VideoToolbox on Macs) keeps the fixture's solid red.
+TEST(VideoToolboxEncoder, EncodedFramesDecodeToTheirColor) {
+    TempDir temp;
+    const auto h264 = temp.path / "red.mp4";
+    ASSERT_TRUE(writeH264(h264));
+    ASSERT_TRUE(extractAndCheck(h264, temp.path / "red_frames", "videotoolbox", 6, 0.5));
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path / "red_frames")) {
+        if (entry.path().extension() != ".png")
+            continue;
+        int width = 0, height = 0, channels = 0;
+        stbi_uc* const pixels = stbi_load(entry.path().string().c_str(), &width, &height, &channels, 3);
+        ASSERT_NE(pixels, nullptr) << entry.path();
+        EXPECT_EQ(width, WIDTH);
+        EXPECT_EQ(height, HEIGHT);
+        const stbi_uc* const center = pixels + ((HEIGHT / 2) * WIDTH + WIDTH / 2) * 3;
+        EXPECT_GT(center[0], 230) << entry.path();
+        EXPECT_LT(center[1], 25) << entry.path();
+        EXPECT_LT(center[2], 25) << entry.path();
+        stbi_image_free(pixels);
+    }
+}
+
 TEST(VideoToolboxExtractor, SoftwareFallback) {
     TempDir temp;
     const auto raw = temp.path / "software.nut";
     ASSERT_TRUE(writeRawVideo(raw));
+    // writeRawVideo writes two frames and the extractor keeps the last one.
     EXPECT_TRUE(extractAndCheck(raw, temp.path / "software_frames",
-                                "ffmpeg_software", 1, -1.0));
+                                "ffmpeg_software", 2, -1.0));
 }

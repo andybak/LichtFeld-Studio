@@ -31,6 +31,8 @@ namespace lfs::core {
 
 namespace lfs::io {
 
+    class SplatTileSource;
+
     // Import types from lfs::core for convenience
     using lfs::core::MeshData;
     using lfs::core::PointCloud;
@@ -71,10 +73,13 @@ namespace lfs::io {
         bool load_masks = false;
         bool load_depths = false;
         bool load_normals = false;
+        bool mesh_geometry_only = false;
         // When true, a normal map that fails the size contract is ignored (one
         // warning naming the file) so auto-generate can overwrite it. When false,
         // the load fails with NORMAL_SIZE_MISMATCH as before.
         bool normal_auto_generate = false;
+        // Same contract for depth maps when depth auto-generate is on.
+        bool depth_auto_generate = false;
         CentralizeDataset centralize = CentralizeDataset::Off;
         ProgressCallback progress = nullptr;
         CancelCallback cancel_requested = nullptr;
@@ -94,8 +99,11 @@ namespace lfs::io {
     // The loader runs this for file imports; in-memory callers (e.g. the Python API) must too.
     [[nodiscard]] LFS_IO_API bool splatTensorsRendererReady(const SplatData& model);
 
+    // trim_pool returns the replaced storage to the driver; repeated callers keep it pooled.
+    // propagate_out_of_memory rethrows core::MemoryAllocationError for callers that free memory and retry.
     [[nodiscard]] LFS_IO_API Result<void> migrateSplatTensorsToAllocator(
-        SplatData& model, const SplatTensorAllocator& allocator);
+        SplatData& model, const SplatTensorAllocator& allocator, bool trim_pool = true,
+        bool propagate_out_of_memory = false);
 
     [[nodiscard]] inline bool is_load_cancel_requested(const LoadOptions& options) {
         return options.cancel_requested && options.cancel_requested();
@@ -129,6 +137,12 @@ namespace lfs::io {
             ImportWorldOriginProvenance::None;
     };
 
+    struct PhotoReconstructionView {
+        float source_aspect = 1.0f;
+        std::array<float, 3> bounds_min{-1.0f, -1.0f, 0.0f};
+        std::array<float, 3> bounds_max{1.0f, 1.0f, 2.0f};
+    };
+
     struct LoadResult {
         std::variant<std::shared_ptr<SplatData>, LoadedScene, std::shared_ptr<MeshData>> data;
         Tensor scene_center;
@@ -138,6 +152,11 @@ namespace lfs::io {
         std::vector<std::string> warnings;
         std::optional<ImportGeoreference> georeference;
         std::optional<std::vector<std::uint8_t>> license_bytes;
+        // Set when `data` is only the current cut of a view-dependent LOD source.
+        std::shared_ptr<SplatTileSource> tile_source;
+        // Set when the source is a 3D Tiles tileset, whether it streams or loaded flat.
+        bool is_tileset = false;
+        std::optional<PhotoReconstructionView> photo_view;
     };
 
     /**

@@ -307,12 +307,13 @@ namespace lfs::python {
             return state;
         }
 
-        // Include the committed panel so Size rebases that panel's reference,
-        // regardless of which window the toolbar currently displays.
+        // Carry the reference values so undo can rebase a view while it is hidden.
         nb::dict depth_window_draw_commit_to_dict(const lfs::vis::AppStore::DepthWindowDrawCommit& value) {
             nb::dict state;
             state["generation"] = value.generation;
-            state["panel"] = value.panel == lfs::vis::SplitViewPanelId::Right ? "right" : "left";
+            state["view"] = value.view;
+            state["scale_x"] = value.scale_x;
+            state["scale_y"] = value.scale_y;
             return state;
         }
         lfs::vis::AppStore::DepthWindowDrawCommit depth_window_draw_commit_from_object(const nb::object& value) {
@@ -324,9 +325,9 @@ namespace lfs::python {
             const nb::dict dict = nb::cast<nb::dict>(value);
             lfs::vis::AppStore::DepthWindowDrawCommit state;
             state.generation = dict_value(dict, "generation", std::uint64_t{0});
-            state.panel = dict_value(dict, "panel", std::string{"left"}) == "right"
-                              ? lfs::vis::SplitViewPanelId::Right
-                              : lfs::vis::SplitViewPanelId::Left;
+            state.view = dict_value(dict, "view", lfs::vis::kNoView);
+            state.scale_x = dict_value(dict, "scale_x", 0.35f);
+            state.scale_y = dict_value(dict, "scale_y", 0.35f);
             return state;
         }
         lfs::vis::AppStore::TaskProgressState task_progress_state_from_object(const nb::object& value) {
@@ -377,8 +378,6 @@ namespace lfs::python {
                 store.scene_generation.set(nb::cast<std::uint64_t>(value));
             else if (field == "selection_generation")
                 store.selection_generation.set(nb::cast<std::uint64_t>(value));
-            else if (field == "fps")
-                store.fps.set(nb::cast<float>(value));
             else if (field == "mode_text")
                 store.mode_text.set(nb::cast<std::string>(value));
             else if (field == "active_tool")
@@ -447,8 +446,6 @@ namespace lfs::python {
                 return nb::cast(store.scene_generation.get());
             if (field == "selection_generation")
                 return nb::cast(store.selection_generation.get());
-            if (field == "fps")
-                return nb::cast(store.fps.get());
             if (field == "mode_text")
                 return nb::cast(store.mode_text.get());
             if (field == "active_tool")
@@ -516,8 +513,6 @@ namespace lfs::python {
                 return subscribe_observable(store.scene_generation, std::move(callback));
             if (field == "selection_generation")
                 return subscribe_observable(store.selection_generation, std::move(callback));
-            if (field == "fps")
-                return subscribe_observable(store.fps, std::move(callback));
             if (field == "mode_text")
                 return subscribe_observable(store.mode_text, std::move(callback));
             if (field == "active_tool")

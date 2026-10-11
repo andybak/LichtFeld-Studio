@@ -93,12 +93,16 @@ static float accurate_log1p(float value) {
 }
 
 static float accurate_asin(float value) {
-    const float bounded = clamp(value, -1.0f, 1.0f);
+    if ((as_type<uint>(value) & 0x7fffffffu) > 0x3f800000u)
+        return as_type<float>(0x7fc00000u);
+    const float bounded = value;
     return atan2(bounded, sqrt(max(0.0f, 1.0f - bounded * bounded)));
 }
 
 static float accurate_acos(float value) {
-    const float bounded = clamp(value, -1.0f, 1.0f);
+    if ((as_type<uint>(value) & 0x7fffffffu) > 0x3f800000u)
+        return as_type<float>(0x7fc00000u);
+    const float bounded = value;
     return atan2(sqrt(max(0.0f, 1.0f - bounded * bounded)), bounded);
 }
 
@@ -186,7 +190,7 @@ static float float_unary(float value, float scalar, bool scalar_on_right) {
     if (kOp == LFS_OP_Square) return value * value;
     if (kOp == LFS_OP_Tanh) return tanh(value);
     if (kOp == LFS_OP_Rsqrt) return rsqrt(value);
-    if (kOp == LFS_OP_Sign) return float(int(value > 0.0f) - int(value < 0.0f));
+    if (kOp == LFS_OP_Sign) return isnan(value) ? value : float(int(value > 0.0f) - int(value < 0.0f));
     if (kOp == LFS_OP_Reciprocal) return 1.0f / value;
     if (kOp == LFS_OP_Floor) return floor(value);
     if (kOp == LFS_OP_Ceil) return ceil(value);
@@ -436,6 +440,10 @@ kernel void clamp_values(device const uchar* input_buffer [[buffer(0)]],
         const float value = ((device const float*)(input_buffer + params.input_offset))[index];
         ((device float*)(output_buffer + params.output_offset))[index] =
             isnan(value) ? value : min(max(value, params.float_minimum), params.float_maximum);
+    } else if (kInputDType == LFS_DT_Float16) {
+        const float value = float(((device const half*)(input_buffer + params.input_offset))[index]);
+        ((device half*)(output_buffer + params.output_offset))[index] =
+            half(isnan(value) ? value : min(max(value, params.float_minimum), params.float_maximum));
     } else {
         const int value = ((device const int*)(input_buffer + params.input_offset))[index];
         ((device int*)(output_buffer + params.output_offset))[index] =
@@ -485,7 +493,7 @@ static float chain_unary(float value, uint kind) {
     case 17: return value * value;
     case 18: return tanh(value);
     case 19: return rsqrt(value);
-    case 20: return float(int(value > 0.0f) - int(value < 0.0f));
+    case 20: return isnan(value) ? value : float(int(value > 0.0f) - int(value < 0.0f));
     case 21: return 1.0f / value;
     case 22: return floor(value);
     case 23: return ceil(value);
@@ -574,6 +582,18 @@ static uint torch_uint8_cast(float value) {
     return uint(wrapped);
 }
 
+// Float to integer like CUDA's cvt.rzi: truncate, NaN to 0, saturate out of range.
+constant bool kConvertFromFloat = kInputDType == LFS_DT_Float32 || kInputDType == LFS_DT_Float16;
+static int saturate_int32(float v) {
+    return isnan(v) ? 0 : v >= 2147483648.0f ? 2147483647 : v <= -2147483648.0f ? int(0x80000000u) : int(v);
+}
+static long saturate_int64(float v) {
+    return isnan(v) ? 0 : v >= 9223372036854775808.0f ? long(0x7fffffffffffffffUL) : v <= -9223372036854775808.0f ? long(0x8000000000000000UL) : long(v);
+}
+static uint saturate_uint32(float v) {
+    return isnan(v) || v <= 0.0f ? 0u : v >= 4294967296.0f ? 0xffffffffu : uint(v);
+}
+
 kernel void convert(device const uchar* input_buffer [[buffer(0)]],
                     device uchar* output_buffer [[buffer(1)]],
                     constant ConvertParams& params [[buffer(2)]],
@@ -601,11 +621,14 @@ kernel void convert(device const uchar* input_buffer [[buffer(0)]],
         ((device half*)output)[index] = kInputDType == LFS_DT_Float16 ? ((device const half*)input)[index]
                                                                      : half(load_as_float(input, index));
     else if (kOutputDType == LFS_DT_Int32)
-        ((device int*)output)[index] = int(load_as_int64(input, index));
+        ((device int*)output)[index] = kConvertFromFloat ? saturate_int32(load_as_float(input, index))
+                                                   : int(load_as_int64(input, index));
     else if (kOutputDType == LFS_DT_Int64)
-        ((device long*)output)[index] = load_as_int64(input, index);
+        ((device long*)output)[index] = kConvertFromFloat ? saturate_int64(load_as_float(input, index))
+                                                    : load_as_int64(input, index);
     else
-        ((device uint*)output)[index] = uint(load_as_int64(input, index));
+        ((device uint*)output)[index] = kConvertFromFloat ? saturate_uint32(load_as_float(input, index))
+                                                    : uint(load_as_int64(input, index));
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,6 +1171,114 @@ kernel void reduce(device const uchar* input_buffer [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
+// Indexed extrema along the middle axis of an (outer, reduce, inner) view.
+// Each candidate becomes a 64-bit key whose largest value is the CPU loop's
+// choice: the high word orders values (inverted for the minimum), a NaN at
+// position 0 sits above every number and later NaNs above that; the low word
+// is the inverted position, so ties keep the first. kOp bit 0 picks the
+// maximum; kOp >> 1 picks the pass: 0 a thread folds a chunk of one output's
+// line, 1 a SIMD group folds a chunk of one contiguous line, 2 a SIMD group
+// folds one output's chunk keys. With one chunk the first passes finish the output themselves.
+
+struct ArgExtremeParams {
+    uint outer;
+    uint reduce;
+    uint inner;
+    uint chunk;
+    uint chunks;
+    uint padding[3];
+};
+
+static ulong arg_extreme_key(float value, uint position) {
+    uint bits = as_type<uint>(value);
+    uint order;
+    if ((bits & 0x7fffffffu) > 0x7f800000u) {
+        order = 0xffffffffu;
+    } else {
+        if ((bits & 0x7fffffffu) == 0u)
+            bits = 0u; // -0 ties +0, as the CPU's strict comparison does.
+        order = (bits & 0x80000000u) != 0u ? ~bits : bits | 0x80000000u;
+        if ((kOp & 1u) == 0u)
+            order = ~order;
+    }
+    return (ulong(order) << 32) | ulong(~position);
+}
+
+static ulong arg_extreme_simdgroup(ulong key) {
+    for (ushort offset = 16; offset > 0; offset /= 2) {
+        const uint2 halves = as_type<uint2>(key);
+        key = max(key, as_type<ulong>(uint2(simd_shuffle_down(halves.x, offset), simd_shuffle_down(halves.y, offset))));
+    }
+    return key;
+}
+
+static void arg_extreme_finish(device const float* input, device float* values, device long* indices,
+                               constant ArgExtremeParams& params, uint output, ulong key) {
+    const uint position = ~uint(key);
+    const uint outer_index = output / params.inner;
+    const ulong base = ulong(outer_index) * params.reduce * params.inner + (output - outer_index * params.inner);
+    values[output] = input[base + ulong(position) * params.inner];
+    indices[output] = long(position);
+}
+
+kernel void arg_extreme(device const float* input [[buffer(0)]],
+                        device ulong* keys [[buffer(1)]],
+                        device float* values [[buffer(2)]],
+                        device long* indices [[buffer(3)]],
+                        constant ArgExtremeParams& params [[buffer(4)]],
+                        uint thread_index [[thread_index_in_threadgroup]],
+                        uint2 group [[threadgroup_position_in_grid]],
+                        ushort lane [[thread_index_in_simdgroup]],
+                        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint pass = kOp >> 1;
+    const uint outputs = params.outer * params.inner;
+    if (pass == 1) {
+        const uint row = group.x * (kReduceThreads / 32) + simdgroup;
+        if (row >= params.outer)
+            return;
+        const ulong base = ulong(row) * params.reduce;
+        const uint end = min(params.reduce, (group.y + 1) * params.chunk);
+        ulong best = 0;
+        for (uint position = group.y * params.chunk + lane; position < end; position += 32)
+            best = max(best, arg_extreme_key(input[base + position], position));
+        best = arg_extreme_simdgroup(best);
+        if (lane != 0)
+            return;
+        if (params.chunks == 1)
+            arg_extreme_finish(input, values, indices, params, row, best);
+        else
+            keys[ulong(group.y) * outputs + row] = best;
+        return;
+    }
+    if (pass == 2) {
+        const uint output = group.x * (kReduceThreads / 32) + simdgroup;
+        if (output >= outputs)
+            return;
+        ulong best = 0;
+        for (uint chunk = lane; chunk < params.chunks; chunk += 32)
+            best = max(best, keys[ulong(chunk) * outputs + output]);
+        best = arg_extreme_simdgroup(best);
+        if (lane == 0)
+            arg_extreme_finish(input, values, indices, params, output, best);
+        return;
+    }
+    const uint output = group.x * kReduceThreads + thread_index;
+    if (output >= outputs)
+        return;
+    ulong best = 0;
+    const uint outer_index = output / params.inner;
+    const ulong base = ulong(outer_index) * params.reduce * params.inner + (output - outer_index * params.inner);
+    const uint end = min(params.reduce, (group.y + 1) * params.chunk);
+#pragma unroll(8)
+    for (uint position = group.y * params.chunk; position < end; ++position)
+        best = max(best, arg_extreme_key(input[base + ulong(position) * params.inner], position));
+    if (params.chunks == 1)
+        arg_extreme_finish(input, values, indices, params, output, best);
+    else
+        keys[ulong(group.y) * outputs + output] = best;
+}
+
+// ---------------------------------------------------------------------------
 // Counts over a threadgroup grid-stride, ported from count.slang. kOp picks
 // the match: 0 nonzero bytes, 1 nonzero floats, 2 NaN (flag), 3 infinity
 // (flag). Threadgroups add their tallies to one zeroed counter.
@@ -1621,27 +1752,39 @@ static ulong sort_line_base(uint line, constant SortParams& params) {
     return ulong(outer_index) * params.dim_size * params.inner + (line - outer_index * params.inner);
 }
 
-// One threadgroup sorts one line of at most kSortCapacity elements with a
-// bitonic network in threadgroup memory.
+// One threadgroup sorts kSortCapacity / kSortWidth lines of at most
+// kSortWidth (a power of two) elements each with bitonic networks in
+// threadgroup memory; a network's partners never leave its line's segment,
+// and the final merge of every line runs ascending.
+constant uint kSortWidth [[function_constant(29)]];
+
 kernel void sort_shared(device uchar* values_buffer [[buffer(0)]],
                         device uchar* indices_buffer [[buffer(1)]],
                         constant SortParams& params [[buffer(2)]],
                         uint thread_index [[thread_index_in_threadgroup]],
-                        uint line [[threadgroup_position_in_grid]]) {
+                        uint group [[threadgroup_position_in_grid]]) {
     threadgroup uint keys[kSortCapacity];
     threadgroup uint positions[kSortCapacity];
     device float* values = (device float*)(values_buffer + params.values_offset);
     device long* indices = (device long*)(indices_buffer + params.indices_offset);
-    const ulong base = sort_line_base(line, params);
     constexpr uint per_thread = kSortCapacity / kReduceThreads;
+    const uint first_line = group * (kSortCapacity / kSortWidth);
+    // Element e holds position e % kSortWidth of line first_line + e / kSortWidth.
+    const auto live = [&](const uint element) {
+        return first_line + element / kSortWidth < params.lines && element % kSortWidth < params.dim_size;
+    };
+    const auto address = [&](const uint element, const uint position) {
+        return sort_line_base(first_line + element / kSortWidth, params) + ulong(position) * params.inner;
+    };
     for (uint slot = 0; slot < per_thread; ++slot) {
         const uint element = thread_index + slot * kReduceThreads;
-        const bool live = element < params.dim_size;
-        keys[element] = live ? sortable_key(values[base + ulong(element) * params.inner], params.descending != 0) : 0xffffffffu;
-        positions[element] = live ? element : 0xffffffffu;
+        const bool present = live(element);
+        keys[element] = present ? sortable_key(values[address(element, element % kSortWidth)], params.descending != 0)
+                                : 0xffffffffu;
+        positions[element] = present ? element % kSortWidth : 0xffffffffu;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint size = 2; size <= kSortCapacity; size <<= 1) {
+    for (uint size = 2; size <= kSortWidth; size <<= 1) {
         for (uint span = size >> 1; span > 0; span >>= 1) {
             for (uint slot = 0; slot < per_thread; ++slot) {
                 const uint element = thread_index + slot * kReduceThreads;
@@ -1651,7 +1794,8 @@ kernel void sort_shared(device uchar* values_buffer [[buffer(0)]],
                 const uint key_a = keys[element], key_b = keys[partner];
                 const uint position_a = positions[element], position_b = positions[partner];
                 const bool greater = key_a > key_b || (key_a == key_b && position_a > position_b);
-                if (greater == ((element & size) == 0u)) {
+                // The direction follows the position within the line.
+                if (greater == ((element % kSortWidth & size) == 0u)) {
                     keys[element] = key_b;
                     keys[partner] = key_a;
                     positions[element] = position_b;
@@ -1661,20 +1805,20 @@ kernel void sort_shared(device uchar* values_buffer [[buffer(0)]],
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
-    // Values permute through threadgroup memory, so the line is never read
+    // Values permute through threadgroup memory, so a line is never read
     // after it was partly overwritten.
     for (uint slot = 0; slot < per_thread; ++slot) {
         const uint element = thread_index + slot * kReduceThreads;
-        if (element < params.dim_size) {
-            indices[base + ulong(element) * params.inner] = long(positions[element]);
-            keys[element] = as_type<uint>(values[base + ulong(positions[element]) * params.inner]);
+        if (live(element)) {
+            indices[address(element, element % kSortWidth)] = long(positions[element]);
+            keys[element] = as_type<uint>(values[address(element, positions[element])]);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint slot = 0; slot < per_thread; ++slot) {
         const uint element = thread_index + slot * kReduceThreads;
-        if (element < params.dim_size)
-            values[base + ulong(element) * params.inner] = as_type<float>(keys[element]);
+        if (live(element))
+            values[address(element, element % kSortWidth)] = as_type<float>(keys[element]);
     }
 }
 
@@ -1807,9 +1951,12 @@ kernel void radix_sort(device uchar* values_buffer [[buffer(0)]],
 // counter i and the seed as key, so every element draws an independent,
 // reproducible 128-bit block. kOp: 0 uniform [first, second), 1
 // bernoulli(first), 2 randint [low, high), 3 normal(first, second), 4
-// multinomial with replacement, 5 Gumbel keys for sampling without
-// replacement, 6 rank selection of the sample_count largest keys, 7 weight
-// statistics (scaled sum, invalid flag, scale) in one threadgroup.
+// multinomial with replacement over the running sums of kOp 8 and 9, 5 Gumbel
+// keys for sampling without replacement (the host sorts them), 7 weight
+// statistics (maximum, invalid flag) in one threadgroup, 8 running sums of the
+// scaled weights within blocks of kSumBlock, a thread per block, 9 the blocks'
+// offsets and the total, in one thread. Vulkan's random.slang adds the same
+// sums in the same order, so both draw the same samples.
 
 struct RandomParams {
     ulong output_offset;
@@ -1827,6 +1974,7 @@ struct RandomParams {
 };
 
 constant float kUnitScale = 1.0f / 16777216.0f;
+constant uint kSumBlock = 1024;
 constant float kTwoPi = 6.28318530717958647692f;
 
 static uint4 philox_draw(ulong index, ulong seed) {
@@ -1881,38 +2029,42 @@ kernel void random_op(device uchar* output_buffer [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
         maximum = simd_max(lane < kReduceThreads / 32 ? shared_values[lane] : 0.0f);
         invalid = simd_or(lane < kReduceThreads / 32 ? shared_flags[lane] : 0u);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        // Scale the weights so their maximum sits near 2^0 before summing.
-        const uint exponent = min(max((as_type<uint>(maximum) >> 23) & 255u, 1u), 253u);
-        const float scale = as_type<float>((254u - exponent) << 23);
-        float sum = 0.0f;
-        for (uint i = thread_index; i < params.count; i += kReduceThreads)
-            sum += weights[i] * scale;
-        sum = simd_sum(sum);
-        if (lane == 0)
-            shared_values[simdgroup] = sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        sum = simd_sum(lane < kReduceThreads / 32 ? shared_values[lane] : 0.0f);
         if (thread_index == 0) {
-            ((device float*)output)[0] = sum;
+            ((device float*)output)[0] = maximum;
             ((device uint*)output)[1] = invalid;
-            ((device float*)output)[2] = scale;
         }
+        return;
+    }
+    const uint blocks = (params.count + kSumBlock - 1) / kSumBlock;
+    if (kOp == 8) {
+        // The weights, scaled by a power of two (exact), summed in order
+        // within the block.
+        if (index >= blocks)
+            return;
+        const uint end = min(params.count, (index + 1) * kSumBlock);
+        float running = 0.0f;
+        for (uint i = index * kSumBlock; i < end; ++i) {
+            running += weights[i] * params.first;
+            keys[i] = running;
+        }
+        return;
+    }
+    if (kOp == 9) {
+        // Each block's offset is the running sum of the block totals before
+        // it; the running sum of category i is its block's offset plus its
+        // sum within the block, which never decreases along the categories.
+        if (index != 0)
+            return;
+        float offset = 0.0f;
+        for (uint block = 0; block < blocks; ++block) {
+            keys[params.count + block] = offset;
+            offset += keys[min(params.count, (block + 1) * kSumBlock) - 1];
+        }
+        keys[params.count + blocks] = offset;
         return;
     }
     if (index >= (kOp == 4 ? params.sample_count : params.count))
         return;
-    if (kOp == 6) {
-        const float key = keys[index];
-        uint rank = 0;
-        for (uint other = 0; other < params.count; ++other) {
-            const float candidate = keys[other];
-            rank += candidate > key || (candidate == key && other < index) ? 1u : 0u;
-        }
-        if (rank < params.sample_count)
-            ((device long*)output)[rank] = long(index);
-        return;
-    }
     const uint4 words = philox_draw(index, params.seed);
     if (kOp == 0) {
         float value = params.first;
@@ -1931,20 +2083,35 @@ kernel void random_op(device uchar* output_buffer [[buffer(0)]],
         const float radius = sqrt(-2.0f * log(float((words.x >> 8) + 1u) * kUnitScale));
         ((device float*)output)[index] = params.first + params.second * (radius * cos(kTwoPi * unit_interval(words.y)));
     } else if (kOp == 4) {
-        const float u = unit_interval(words.x) * params.total;
-        float cumulative = 0.0f;
-        long sample = long(params.count - 1);
-        for (uint category = 0; category < params.count; ++category) {
-            cumulative += weights[category] * params.first;
-            if (u < cumulative) {
-                sample = long(category);
-                break;
-            }
+        // The first category whose running sum exceeds the draw: a binary
+        // search over the blocks' last sums, then within the block.
+        device const float* offsets = keys + params.count;
+        const float u = unit_interval(words.x) * offsets[blocks];
+        uint low = 0, high = blocks;
+        while (low < high) {
+            const uint middle = (low + high) / 2;
+            if (u < offsets[middle] + keys[min(params.count, (middle + 1) * kSumBlock) - 1])
+                high = middle;
+            else
+                low = middle + 1;
         }
-        ((device long*)output)[index] = sample;
+        uint sample = params.count - 1;
+        if (low < blocks) {
+            const float offset = offsets[low];
+            uint first = low * kSumBlock, last = min(params.count, (low + 1) * kSumBlock);
+            while (first < last) {
+                const uint middle = (first + last) / 2;
+                if (u < offset + keys[middle])
+                    last = middle;
+                else
+                    first = middle + 1;
+            }
+            sample = min(first, params.count - 1);
+        }
+        ((device long*)output)[index] = long(sample);
     } else {
-        const float u = min(max(unit_interval(words.x), 1e-10f), 1.0f - 1e-10f);
-        keys[index] = log(max(weights[index], 1e-10f)) - log(-log(u));
+        const float u = min(max(unit_interval(words.x), 1e-10f), 0.9999999403953552f);
+        keys[index] = (weights[index] > 0.0f ? log(weights[index]) : -INFINITY) - log(-log(u));
     }
 }
 
@@ -1958,18 +2125,23 @@ static float dot_rounded(float3 a, float3 b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
-// kOp 0 links reference points into hashed cells, 1 marks the points within
-// the radius of a reference.
+// kOp 0 builds hashed cells, 1 marks radius matches, 2 counts other references,
+// 3 estimates nearest-neighbour spacing, 4/5 find Int32/Float32 minima.
 struct RadiusParams {
     device const float* points;
     device const uchar* references;
     device int* heads;
     device int* next;
     device uchar* output;
+    device const uchar* queries;
+    device const uchar* values;
+    device const float* radii;
     uint count;
     uint bucket_mask;
     float radius;
-    uint padding;
+    uint exclude_self; // Mode 1: boolean; mode 2: positive count saturation limit.
+    uint query_begin;
+    uint query_end;
 };
 
 static float3 radius_point(constant RadiusParams& params, uint i) {
@@ -1977,7 +2149,7 @@ static float3 radius_point(constant RadiusParams& params, uint i) {
 }
 
 static int3 radius_cell(float3 point, float radius) {
-    return int3(clamp(floor(point / radius * 0.5f), -268435456.0f, 268435456.0f));
+    return int3(clamp(floor(point / radius), -268435456.0f, 268435456.0f));
 }
 
 static uint radius_bucket(int3 cell, uint mask) {
@@ -1994,9 +2166,121 @@ static bool within_radius(float3 a, float3 b, float radius) {
     return dot_rounded(d, d) <= r2;
 }
 
+static int radius_count(constant RadiusParams& params, uint i) {
+    if (params.queries && params.queries[i] == 0)
+        return 0;
+    const float3 point = radius_point(params, i);
+    if (!all(isfinite(point)))
+        return 0;
+    const int3 center = radius_cell(point, params.radius);
+    int count = 0;
+    for (int slot = 0; slot < 27; ++slot) {
+        const int neighbor = slot == 0 ? 13 : (slot <= 13 ? slot - 1 : slot);
+        const int x = neighbor % 3 - 1;
+        const int y = neighbor / 3 % 3 - 1;
+        const int z = neighbor / 9 - 1;
+        const int3 target = center + int3(x, y, z);
+        for (int j = params.heads[radius_bucket(target, params.bucket_mask)]; j >= 0; j = params.next[j]) {
+            const float3 other = radius_point(params, uint(j));
+            if (uint(j) != i && all(radius_cell(other, params.radius) == target) && within_radius(point, other, params.radius)) {
+                if (++count == int(params.exclude_self))
+                    return count;
+            }
+        }
+    }
+    return count;
+}
+
+static float radius_spacing(constant RadiusParams& p, uint i) {
+    const float3 point = radius_point(p, i);
+    if (!all(isfinite(point)))
+        return 0;
+    const int3 center = radius_cell(point, p.radius);
+    float3 best = float3(INFINITY);
+    int found = 0;
+
+    for (int extent = 1; extent <= 2; ++extent) {
+        for (int z = -extent; z <= extent; ++z) {
+            for (int y = -extent; y <= extent; ++y) {
+                for (int x = -extent; x <= extent; ++x) {
+                    if (extent == 2 && abs(x) <= 1 && abs(y) <= 1 && abs(z) <= 1)
+                        continue;
+                    const int3 target = center + int3(x, y, z);
+                    // Every candidate participates, independent of atomic insertion order.
+                    for (int j = p.heads[radius_bucket(target, p.bucket_mask)]; j >= 0; j = p.next[j]) {
+                        const float3 other = radius_point(p, uint(j));
+                        if (uint(j) == i || !all(radius_cell(other, p.radius) == target))
+                            continue;
+                        const float3 delta = point - other;
+                        const float distance = dot_rounded(delta, delta);
+                        if (distance < best.z) {
+                            best.z = max(best.y, distance);
+                            best.y = max(best.x, min(best.y, distance));
+                            best.x = min(best.x, distance);
+                        }
+                        found = min(found + 1, 3);
+                    }
+                }
+            }
+        }
+        if (found == 3)
+            break;
+    }
+    float sum = 0;
+    for (int k = 0; k < found; ++k)
+        sum += sqrt(best[k]);
+    return found ? sum / found : p.radius * 4;
+}
+template <typename T>
+static T radius_minimum(constant RadiusParams& p, uint i, device const T* values) {
+    T result = values[i];
+    if (p.radii && !(p.radii[i] > p.radius * 0.5f))
+        return result;
+    const float3 point = radius_point(p, i);
+    if (!all(isfinite(point)))
+        return result;
+    const int3 center = radius_cell(point, p.radius);
+    for (int z = -1; z <= 1; ++z) {
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                const int3 target = center + int3(x, y, z);
+                for (int j = p.heads[radius_bucket(target, p.bucket_mask)]; j >= 0; j = p.next[j]) {
+                    const float3 other = radius_point(p, uint(j));
+                    if (all(radius_cell(other, p.radius) == target) &&
+                        within_radius(point, other, p.radii ? min(p.radius, min(p.radii[i], p.radii[j])) : p.radius))
+                        result = min(result, values[j]);
+                }
+            }
+        }
+    }
+    return result;
+}
 kernel void radius_neighbors(constant RadiusParams& params [[buffer(0)]], uint i [[thread_position_in_grid]]) {
+    i += params.query_begin;
+    if (i >= params.query_end)
+        return;
     if (i >= params.count)
         return;
+    if (kOp == 5) {
+        ((device float*)params.output)[i] = radius_minimum(params, i, (device const float*)params.values);
+        return;
+    }
+    if (kOp == 4) {
+        ((device int*)params.output)[i] = radius_minimum(params, i, (device const int*)params.values);
+        return;
+    }
+    if (kOp == 3) {
+        ((device float*)params.output)[i] = radius_spacing(params, i);
+        return;
+    }
+    if (kOp == 2) {
+        ((device int*)params.output)[i] = radius_count(params, i);
+        return;
+    }
+    if (kOp == 1 && params.queries && params.queries[i] == 0) {
+        params.output[i] = 0;
+        return;
+    }
     const float3 point = radius_point(params, i);
     const bool finite = all(isfinite(point));
     if (kOp == 0) {
@@ -2006,14 +2290,19 @@ kernel void radius_neighbors(constant RadiusParams& params [[buffer(0)]], uint i
         }
         return;
     }
-    bool found = finite && params.references[i] != 0;
+    bool found = finite && params.exclude_self == 0 && params.references[i] != 0;
     const int3 center = radius_cell(point, params.radius);
+    for (int j = finite ? params.heads[radius_bucket(center, params.bucket_mask)] : -1; j >= 0 && !found; j = params.next[j])
+        found = (params.exclude_self == 0 || uint(j) != i) && within_radius(point, radius_point(params, uint(j)), params.radius);
     for (int z = -1; finite && !found && z <= 1; ++z) {
         for (int y = -1; !found && y <= 1; ++y) {
             for (int x = -1; !found && x <= 1; ++x) {
+                if (x == 0 && y == 0 && z == 0)
+                    continue;
                 for (int j = params.heads[radius_bucket(center + int3(x, y, z), params.bucket_mask)]; j >= 0 && !found;
                      j = params.next[j])
-                    found = within_radius(point, radius_point(params, uint(j)), params.radius);
+                    found = (params.exclude_self == 0 || uint(j) != i) &&
+                            within_radius(point, radius_point(params, uint(j)), params.radius);
             }
         }
     }
@@ -2333,6 +2622,8 @@ struct PpispParams {
     float crf[15];
     int y_offset;
     int full_height;
+    int x_offset;
+    int full_width;
 };
 
 struct PpispApplyParams {
@@ -2349,8 +2640,9 @@ kernel void ppisp_apply(constant PpispApplyParams& args [[buffer(0)]], uint i [[
     if (i >= uint(plane))
         return;
     const int full_height = p.full_height > 0 ? p.full_height : height;
-    const float resolution = float(max(width, full_height));
-    const float x = (float(i % uint(width)) + 0.5f - width * 0.5f) / resolution;
+    const int full_width = p.full_width > 0 ? p.full_width : width;
+    const float resolution = float(max(full_width, full_height));
+    const float x = (float(int(i % uint(width)) + p.x_offset) + 0.5f - full_width * 0.5f) / resolution;
     const float y = (float(int(i / uint(width)) + p.y_offset) + 0.5f - full_height * 0.5f) / resolution;
     float3 rgb;
     for (int c = 0; c < 3; ++c) {
@@ -2461,6 +2753,7 @@ struct AffineSplatParams {
     device float* out_rotations;
     float linear[9];
     uint count;
+    device const float* matrices;
 };
 
 static float2 two_sum(float a, float b) {
@@ -2559,6 +2852,8 @@ static void sort_axes(thread float3& a, thread float3& b, thread float& la, thre
 kernel void affine_splat_geometry(constant AffineSplatParams& p [[buffer(0)]], uint i [[thread_position_in_grid]]) {
     if (i >= p.count)
         return;
+    float linear[9];
+    for(int k=0;k<9;++k) linear[k]=p.matrices ? p.matrices[9*i+k] : p.linear[k];
     device float* const out_scale = p.out_scales + 3 * i;
     device float* const out_rotation = p.out_rotations + 4 * i;
     const float3 log_scale(p.scales[3 * i], p.scales[3 * i + 1], p.scales[3 * i + 2]);
@@ -2573,7 +2868,7 @@ kernel void affine_splat_geometry(constant AffineSplatParams& p [[buffer(0)]], u
     const float largest_log = max(log_scale.x, max(log_scale.y, log_scale.z));
     float linear_scale = 0;
     for (int k = 0; k < 9; ++k)
-        linear_scale = max(linear_scale, abs(p.linear[k]));
+        linear_scale = max(linear_scale, abs(linear[k]));
     if (linear_scale == 0 || largest_log == -INFINITY) {
         for (int k = 0; k < 3; ++k)
             out_scale[k] = -INFINITY;
@@ -2582,9 +2877,9 @@ kernel void affine_splat_geometry(constant AffineSplatParams& p [[buffer(0)]], u
         return;
     }
     // Common scale factors leave singular vectors unchanged and bound matrix entries.
-    const float3 a0 = float3(p.linear[0], p.linear[1], p.linear[2]) / linear_scale;
-    const float3 a1 = float3(p.linear[3], p.linear[4], p.linear[5]) / linear_scale;
-    const float3 a2 = float3(p.linear[6], p.linear[7], p.linear[8]) / linear_scale;
+    const float3 a0 = float3(linear[0], linear[1], linear[2]) / linear_scale;
+    const float3 a1 = float3(linear[3], linear[4], linear[5]) / linear_scale;
+    const float3 a2 = float3(linear[6], linear[7], linear[8]) / linear_scale;
     float3 b0 = float3(dot(a0, r0), dot(a1, r0), dot(a2, r0)) * exp_difference(log_scale.x, largest_log);
     float3 b1 = float3(dot(a0, r1), dot(a1, r1), dot(a2, r1)) * exp_difference(log_scale.y, largest_log);
     float3 b2 = float3(dot(a0, r2), dot(a1, r2), dot(a2, r2)) * exp_difference(log_scale.z, largest_log);
@@ -2673,18 +2968,21 @@ static float2 distort_fisheye(float x, float y, constant float* dist, int n) {
 }
 
 static float2 distort_thin_prism_fisheye(float x, float y, constant float* dist, int n) {
-    if (sqrt(x * x + y * y) < 1e-8f)
+    const float r = sqrt(x * x + y * y);
+    if (r < 1e-8f)
         return float2(x, y);
-    const float2 fisheye = distort_fisheye(x, y, dist, n);
-    float xd = fisheye.x, yd = fisheye.y;
+    const float scale = atan(r) / r;
+    const float uu = x * scale, vv = y * scale;
+    const float u2 = uu * uu, uv = uu * vv, v2 = vv * vv;
+    const float r2 = u2 + v2, r4 = r2 * r2, r6 = r4 * r2, r8 = r4 * r4;
+    const float k1 = n > 0 ? dist[0] : 0.0f, k2 = n > 1 ? dist[1] : 0.0f;
+    const float k3 = n > 2 ? dist[2] : 0.0f, k4 = n > 3 ? dist[3] : 0.0f;
     const float p1 = n > 4 ? dist[4] : 0.0f, p2 = n > 5 ? dist[5] : 0.0f;
-    const float r2 = xd * xd + yd * yd;
-    xd += 2.0f * p1 * xd * yd + p2 * (r2 + 2.0f * xd * xd);
-    yd += p1 * (r2 + 2.0f * yd * yd) + 2.0f * p2 * xd * yd;
-    const float s1 = n > 6 ? dist[6] : 0.0f, s2 = n > 7 ? dist[7] : 0.0f, s3 = n > 8 ? dist[8] : 0.0f,
-                s4 = n > 9 ? dist[9] : 0.0f;
-    const float r2d = xd * xd + yd * yd, r4d = r2d * r2d;
-    return float2(xd + (s1 * r2d + s2 * r4d), yd + (s3 * r2d + s4 * r4d));
+    const float sx1 = n > 6 ? dist[6] : 0.0f, sx2 = n > 7 ? dist[7] : 0.0f;
+    const float sy1 = n > 8 ? dist[8] : 0.0f, sy2 = n > 9 ? dist[9] : 0.0f;
+    const float radial = k1 * r2 + k2 * r4 + k3 * r6 + k4 * r8;
+    return float2(uu + uu * radial + 2.0f * p1 * uv + p2 * (r2 + 2.0f * u2) + sx1 * r2 + sx2 * r4,
+                  vv + vv * radial + 2.0f * p2 * uv + p1 * (r2 + 2.0f * v2) + sy1 * r2 + sy2 * r4);
 }
 
 static float resample_tap(constant ResampleParams& p, int base, int x, int y) {
@@ -3571,9 +3869,9 @@ kernel void cdist(device const uchar* lhs_buffer [[buffer(0)]],
         else if (p == 1.0f)
             distance += abs(difference);
         else if (p == 0.0f)
-            distance += difference != 0.0f ? 1.0f : 0.0f;
+            distance += a[d] != b[d] ? 1.0f : 0.0f;
         else if (isinf(p))
-            distance = max(distance, abs(difference));
+            distance = isnan(distance) || isnan(difference) ? distance + difference : max(distance, abs(difference));
         else
             distance += pow(abs(difference), p);
     }
@@ -3582,4 +3880,72 @@ kernel void cdist(device const uchar* lhs_buffer [[buffer(0)]],
     else if (p != 1.0f && p != 0.0f && !isinf(p))
         distance = pow(distance, 1.0f / p);
     ((device float*)(output_buffer + params.output_offset))[index] = distance;
+}
+
+struct ProximityParams {
+    device const float* queries;
+    device const float* targets;
+    device atomic_int* heads;
+    device int* next;
+    device int* output;
+    uint nq,nt,mask; float width,maximum; uint padding;
+};
+float3 proximityPoint(device const float* address,uint i) {
+    device const float* data=address;
+    return float3(data[3*i],data[3*i+1],data[3*i+2]);
+}
+int3 gridCell(float3 p,float width) { return int3(clamp(floor(p/width),-268435456.0f,268435456.0f)); }
+uint gridHash(int3 c,uint mask) { return ((uint(c.x)*73856093u)^(uint(c.y)*19349663u)^(uint(c.z)*83492791u))&mask; }
+int proximityNearest(ProximityParams p,float3 point) {
+    if(!all(isfinite(point))) return -1;
+    device const int* heads=(device const int*)p.heads; device const int* next=p.next;
+    int3 centre=gridCell(point,p.width);
+    float best=1.0f/0.0f; int index=-1;
+    for(int shell=0;shell<8;++shell) {
+        for(int z=-shell;z<=shell;++z) for(int y=-shell;y<=shell;++y) for(int x=-shell;x<=shell;++x) {
+            if(shell!=0 && abs(x)!=shell && abs(y)!=shell && abs(z)!=shell) continue;
+            int3 target=centre+int3(x,y,z);
+            for(int j=heads[gridHash(target,p.mask)];j>=0;j=next[j]) {
+                float3 q=proximityPoint(p.targets,uint(j));
+                if(any(gridCell(q,p.width)!=target)) continue;
+                float3 delta=point-q; float d=dot(delta,delta);
+                if(d<best || (d==best && (index<0 || j<index))) { best=d;index=j; }
+            }
+        }
+        float3 lower=point-float3(centre-shell)*p.width;
+        float3 upper=float3(centre+shell+1)*p.width-point;
+        float3 bounds=min(lower,upper); float bound=min(bounds.x,min(bounds.y,bounds.z));
+        if(index>=0 && bound>0 && best<bound*bound) return index;
+    }
+    for(uint j=0;j<p.nt;++j) {
+        float3 delta=point-proximityPoint(p.targets,j); float d=dot(delta,delta);
+        if(d<best || (d==best && (index<0 || int(j)<index))) { best=d;index=int(j); }
+    }
+    return index;
+}
+int proximityCoverage(ProximityParams p,float3 point) {
+    device const float* cameras=p.targets;
+    int count=0;
+    for(uint c=0;c<p.nt;++c) {
+        uint b=16*c;
+        float x=dot(float3(cameras[b],cameras[b+1],cameras[b+2]),point)+cameras[b+3];
+        float y=dot(float3(cameras[b+4],cameras[b+5],cameras[b+6]),point)+cameras[b+7];
+        float z=dot(float3(cameras[b+8],cameras[b+9],cameras[b+10]),point)+cameras[b+11];
+        float3 delta=point-float3(cameras[b+12],cameras[b+13],cameras[b+14]);
+        count+=int(z>1e-6f && x>=0 && y>=0 && x<=z && y<=z && (p.maximum<=0 || dot(delta,delta)<=p.maximum*p.maximum));
+    }
+    return count;
+}
+
+kernel void proximity_build(constant ProximityParams& p [[buffer(0)]],uint i [[thread_position_in_grid]]) {
+    if(i>=p.nt) return;
+    float3 q=proximityPoint(p.targets,i); if(!all(isfinite(q))) return;
+    uint bucket=gridHash(gridCell(q,p.width),p.mask);
+    p.next[i]=atomic_exchange_explicit(p.heads+bucket,int(i),memory_order_relaxed);
+}
+kernel void proximity_query(constant ProximityParams& p [[buffer(0)]],uint i [[thread_position_in_grid]]) {
+    if(i<p.nq) p.output[i]=proximityNearest(p,proximityPoint(p.queries,i));
+}
+kernel void camera_coverage(constant ProximityParams& p [[buffer(0)]],uint i [[thread_position_in_grid]]) {
+    if(i<p.nq) p.output[i]=proximityCoverage(p,proximityPoint(p.queries,i));
 }

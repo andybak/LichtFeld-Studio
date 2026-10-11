@@ -8,6 +8,7 @@
 #include "python/python_runtime.hpp"
 #include "visualizer/app_store.hpp"
 #include "visualizer/visualizer.hpp"
+#include <algorithm>
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/ElementDocument.h>
@@ -28,10 +29,14 @@ namespace lfs::vis::gui {
         static void bind(RmlMenuBar& bar, Rml::Context* context) {
             bar.rml_context_ = context;
             bar.bindModel();
-            bar.camera_buttons_.resize(3);
-            bar.render_buttons_.resize(3);
-            bar.projection_buttons_.resize(2);
-            for (const auto* name : {"menu_camera_buttons", "menu_render_buttons", "menu_projection_buttons"})
+            bar.camera_buttons_ = {
+                {"menu-camera-orbit", "set_camera_navigation_mode", "orbit"},
+                {"menu-camera-trackball", "set_camera_navigation_mode", "trackball"},
+                {"menu-camera-fpv", "set_camera_navigation_mode", "fpv"},
+                {"menu-camera-drone", "set_camera_navigation_mode", "drone"},
+            };
+            bar.snap_buttons_ = {{"menu-view-snap", "toggle_camera_view_snap"}};
+            for (const auto* name : {"menu_camera_buttons", "menu_snap_buttons"})
                 bar.menu_model_.DirtyVariable(name);
         }
         static void attach(RmlMenuBar& bar, Rml::ElementDocument* doc, RmlUIManager& manager) {
@@ -50,6 +55,8 @@ namespace lfs::vis::gui {
         }
         static void rebuildPortalStatus(RmlMenuBar& bar) { bar.rebuildPortalStatus(); }
         static void layout(RmlMenuBar& bar, int width, float dp) {
+            bar.updateCompactLayout(width, dp);
+            bar.rml_context_->Update();
             bar.updateProjectTitleLayout(width, dp);
         }
         static bool hit(const RmlMenuBar& bar, float x, float y) {
@@ -142,7 +149,8 @@ namespace {
             resize(1600);
         }
         void TearDown() override {
-            // RmlMenuBar owns no context in this fixture; remove it before Rml shutdown.
+            // Release input registrations before destroying the externally owned context.
+            manager_.shutdown();
             ASSERT_TRUE(Rml::RemoveContext("menu_bar_title_test"));
         }
         Rml::Element* el(const char* id) { return document_->GetElementById(id); }
@@ -163,6 +171,80 @@ namespace {
         lfs::vis::gui::RmlUIManager manager_;
         lfs::vis::gui::RmlMenuBar bar_;
     };
+
+    TEST_F(MenuBarTitleTest, ContextMenuFitsShortcutColumns) {
+        auto* doc = context_->LoadDocumentFromMemory(
+            "<rml><body><div id='menu' class='context-menu visible has-shortcuts'>"
+            "<div><button class='context-menu-item has-shortcut'><span class='context-menu-text'>"
+            "Perspective</span><span class='context-menu-shortcut'>Numpad 5</span></button></div>"
+            "<div><button class='context-menu-item has-shortcut submenu-item active'>"
+            "<span class='context-menu-check'>&#x2713;</span><span class='context-menu-text'>"
+            "Bottom</span><span class='context-menu-shortcut'>Ctrl Numpad 7</span></button></div>"
+            "<div><button class='context-menu-item has-shortcut'><span class='context-menu-text'>"
+            "Maximize Area</span><span class='context-menu-shortcut'>Ctrl Space</span></button></div>"
+            "<div><button class='context-menu-item'>Split Horizontally</button></div>"
+            "</div></body></rml>");
+        ASSERT_NE(doc, nullptr);
+        doc->SetStyleSheetContainer(Rml::Factory::InstanceStyleSheetString(
+            resource("components.rcss") + "\n" + resource("global_context_menu.rcss")));
+        doc->Show();
+        auto* menu = doc->GetElementById("menu");
+        for (const float dp : {1.0f, 1.5f}) {
+            context_->SetDensityIndependentPixelRatio(dp);
+            for (const int width : {850, 1600}) {
+                context_->SetDimensions({width, 900});
+                menu->SetProperty("max-width", std::to_string(width - 8 * dp) + "px");
+                for (const int left : {20, width - 40}) {
+                    SCOPED_TRACE(::testing::Message() << width << " dp=" << dp << " left=" << left);
+                    menu->SetProperty("left", std::to_string(left) + "px");
+                    context_->Update();
+                    const auto menu_width = bounds(menu).right - bounds(menu).left;
+                    EXPECT_LE(menu_width, width - 8 * dp);
+                    Rml::ElementList rows;
+                    menu->GetElementsByClassName(rows, "context-menu-item");
+                    for (auto* row : rows) {
+                        EXPECT_LE(bounds(row).right, bounds(menu).right);
+                        auto* label = row->QuerySelector(".context-menu-text");
+                        auto* shortcut = row->QuerySelector(".context-menu-shortcut");
+                        if (!shortcut)
+                            continue;
+                        EXPECT_LE(bounds(label).right + 8 * dp, bounds(shortcut).left);
+                        EXPECT_LE(bounds(shortcut).right + 12 * dp, bounds(menu).right);
+                        EXPECT_LT(bounds(label).bottom - bounds(label).top, 20 * dp);
+                        EXPECT_LT(bounds(shortcut).bottom - bounds(shortcut).top, 20 * dp);
+                    }
+                }
+            }
+        }
+        // Equal byte counts with different glyph widths must size differently.
+        context_->SetDensityIndependentPixelRatio(1);
+        menu->SetProperty("left", "20px");
+        auto* label = menu->QuerySelector(".context-menu-text");
+        label->SetInnerRML("WWWWWWWWWWWWWWWWWWWW");
+        context_->Update();
+        const auto wide = bounds(menu).right - bounds(menu).left;
+        label->SetInnerRML("iiiiiiiiiiiiiiiiiiii");
+        context_->Update();
+        EXPECT_LT(bounds(menu).right - bounds(menu).left, wide);
+        doc->Close();
+    }
+
+    TEST_F(MenuBarTitleTest, HiddenToolbarKeepsItsWidthAcrossScaleChanges) {
+        resize(1600, 1.0f, true);
+        const float base_width = el("menu-toolbar")->GetOffsetWidth();
+        ASSERT_GT(base_width, 0);
+        RmlMenuBarTestAccess::toolbar(bar_, false, 400);
+        context_->Update();
+        for (float dp : {2.0f, 1.5f, 1.0f}) {
+            context_->SetDensityIndependentPixelRatio(dp);
+            context_->Update();
+            EXPECT_FALSE(el("menu-toolbar")->IsVisible());
+            EXPECT_NEAR(el("menu-toolbar")->GetOffsetWidth(), base_width * dp, 1.0f);
+        }
+        resize(1600, 1.0f, true);
+        EXPECT_TRUE(el("menu-toolbar")->IsVisible());
+        EXPECT_FLOAT_EQ(el("menu-toolbar")->GetOffsetWidth(), base_width);
+    }
 
     TEST_F(MenuBarTitleTest, ConstrainsAndCentersTitleBetweenMenusAndControls) {
         for (float dp : {1.0f, 1.5f}) {
@@ -195,7 +277,7 @@ namespace {
             // The narrowest window SDL allows, and a little wider.
             for (int width : {640, 720}) {
                 SCOPED_TRACE(::testing::Message() << width << " dp=" << dp);
-                resize(static_cast<int>(width * dp), dp, false);
+                resize(width, dp, false);
                 const auto controls = bounds(el("menu-window-controls"));
                 Rml::ElementList labels;
                 document_->GetElementsByClassName(labels, "menu-label");
@@ -203,9 +285,33 @@ namespace {
                 ASSERT_EQ(labels.size(), 6u);
                 for (auto* label : labels)
                     EXPECT_LE(bounds(label).right, controls.left + 0.5f);
-                EXPECT_LE(bounds(el("menu-window-close")).right, width * dp + 0.5f);
+                EXPECT_LE(bounds(el("menu-window-close")).right, width + 0.5f);
             }
         }
+    }
+
+    TEST_F(MenuBarTitleTest, ToolbarKeepsNavigationAndViewSnapOnly) {
+        context_->Update();
+        for (const auto* id : {"menu-camera-orbit", "menu-camera-trackball", "menu-camera-fpv",
+                               "menu-camera-drone", "menu-view-snap"})
+            EXPECT_NE(el(id), nullptr) << id;
+
+        Rml::ElementList buttons;
+        document_->GetElementsByClassName(buttons, "menu-toolbar-btn");
+        std::vector<Rml::Element*> rendered_buttons;
+        for (auto* button : buttons) {
+            if (button->GetAttribute<Rml::String>("id", "").empty())
+                continue; // Rml keeps the two data-for templates in the tree.
+            rendered_buttons.push_back(button);
+            const auto action = button->GetAttribute<Rml::String>("data-action", "");
+            EXPECT_NE(action, "set_render_mode");
+            EXPECT_NE(action, "set_projection");
+            EXPECT_NE(action, "toggle_depth_view");
+        }
+        EXPECT_EQ(rendered_buttons.size(), 5u);
+        for (const auto* id : {"menu-render-mode", "menu-projection-perspective", "menu-projection-orthographic",
+                               "menu-depth-view"})
+            EXPECT_EQ(el(id), nullptr) << id;
     }
 
     TEST_F(MenuBarTitleTest, ClippingStyleContractForThePaintBackend) {

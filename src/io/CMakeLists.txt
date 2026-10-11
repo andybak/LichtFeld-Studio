@@ -2,54 +2,6 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# CUDA library for dataset image conversion. Export kernels live in the tensor library.
-if(LFS_HAS_CUDA)
-add_library(lfs_io_cuda STATIC
-        cuda/image_format_kernels.cuh
-        cuda/image_format_kernels.cu
-)
-
-target_include_directories(lfs_io_cuda
-        PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        PRIVATE
-        ${CMAKE_SOURCE_DIR}/src/core/include
-        ${CMAKE_SOURCE_DIR}/src
-)
-
-target_link_libraries(lfs_io_cuda
-        INTERFACE
-        lfs_core      # Propagate to consumers, not linked during device linking
-        PRIVATE
-        lfs_diagnostics
-        CUDA::cudart
-)
-
-set_target_properties(lfs_io_cuda PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-        POSITION_INDEPENDENT_CODE ON
-)
-
-# CUDA compiler options for lfs_io_cuda
-target_compile_options(lfs_io_cuda PRIVATE
-        # CUDA device code + MSVC host compiler flags (Windows only)
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Debug>>:-O0 -g --extended-lambda --expt-relaxed-constexpr -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr -Xcompiler=/DNDEBUG -Xcompiler=/utf-8 -Xcompiler=/D_CRT_SECURE_NO_WARNINGS --diag-suppress=27>
-
-        # CUDA device code for non-Windows
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Debug>>:-O0 -g --extended-lambda --expt-relaxed-constexpr>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<NOT:$<CXX_COMPILER_ID:MSVC>>,$<CONFIG:Release>>:-O3 -use_fast_math --extended-lambda --expt-relaxed-constexpr>
-)
-
-if(MSVC)
-    target_compile_definitions(lfs_io_cuda PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:FMT_UNICODE=0>
-    )
-endif()
-endif()
-
 # SPZ library (Niantic compressed format) - MIT licensed
 add_library(spz_lib STATIC
         ${CMAKE_SOURCE_DIR}/external/spz/load-spz.cc
@@ -71,43 +23,40 @@ target_compile_definitions(spz_lib PUBLIC SPZ_BUILD_EXTENSIONS)
 target_compile_features(spz_lib PUBLIC cxx_std_17)
 set_target_properties(spz_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Video encoding library (FFmpeg + CUDA for GPU-accelerated encoding)
+# Video host adapters use the single FFmpeg provider in lfs_media.
 find_package(PkgConfig REQUIRED)
-# vcpkg swaps FFmpeg's codec between master (x264) and dev (openh264); do not reuse FindPkgConfig's cached library list.
-unset(__pkg_config_checked_FFMPEG CACHE)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-        libavcodec
-        libavformat
-        libswscale
-        libavutil
-)
-pkg_check_modules(LIBPLACEBO REQUIRED IMPORTED_TARGET libplacebo)
+if(LFS_USE_VULKAN)
+    pkg_check_modules(LIBPLACEBO REQUIRED IMPORTED_TARGET libplacebo)
+endif()
 
 add_library(lfs_video STATIC
         include/io/video/video_encoder_interface.hpp
         include/io/video/video_export_options.hpp
         include/io/video/video_extensions.hpp
-        include/io/video/video_output_extent.hpp
         include/io/video/video_reconstruction.hpp
         video/video_encoder.hpp
         video/video_encoder.cpp
         video/video_reconstruction.cpp
-        video_frame_extractor.hpp
-        video_frame_extractor.cpp
-        hdr_tonemap.hpp
-        hdr_tonemap.cpp
-        hdr_libplacebo.hpp
-        hdr_libplacebo.cpp
-        hdr_libplacebo_av.c
-        video_player.hpp
-        video_player.cpp
+        media_studio_backends.cpp
+        hdr_tonemap_tensor.hpp
+        hdr_tonemap_tensor.cpp
+        linear_video_tensor.cpp
+        image_output.cpp
 )
+if(LFS_USE_VULKAN)
+    target_sources(lfs_video PRIVATE hdr_libplacebo.cpp)
+else()
+    target_sources(lfs_video PRIVATE hdr_libplacebo_unavailable.cpp)
+endif()
+lfs_add_gpu_program(lfs_video hdr_tonemap_program SOURCE hdr_tonemap.slang COMPUTE chroma_vertical decode measure resample gamut render
+    DEPENDS "${CMAKE_SOURCE_DIR}/src/core/tensor/programs/video_sampling.slangh" "${CMAKE_SOURCE_DIR}/src/core/include/core/video_color_math.h" "${CMAKE_SOURCE_DIR}/src/core/include/core/color_transfer.h")
 if(LFS_HAS_CUDA)
     target_sources(lfs_video PRIVATE
         video/color_convert.cuh
         video/color_convert.cu
         video/cuda_frame_handoff.hpp
-        video/cuda_frame_handoff.cpp)
+        video/cuda_frame_handoff.cpp
+        media_cuda_backend.cpp)
 endif()
 
 target_include_directories(lfs_video
@@ -124,8 +73,10 @@ target_include_directories(lfs_video SYSTEM PRIVATE
 )
 
 target_link_libraries(lfs_video
+        PUBLIC
+        lfs_core
+        lfs_media
         PRIVATE
-        PkgConfig::FFMPEG
         spdlog::spdlog
         nlohmann_json::nlohmann_json
         $<$<BOOL:${LFS_HAS_CUDA}>:CUDA::cudart>
@@ -135,13 +86,13 @@ target_link_libraries(lfs_video
 # libplacebo's static pkg-config dependency chain includes shaderc and
 # SPIR-V Tools. GNU ld resolves static archives left-to-right, so rescan the
 # complete chain on ELF platforms.
-if(UNIX AND NOT APPLE)
+if(LFS_USE_VULKAN AND UNIX AND NOT APPLE)
     target_link_libraries(lfs_video PRIVATE
             "-Wl,--start-group"
             PkgConfig::LIBPLACEBO
             "-Wl,--end-group"
     )
-else()
+elseif(LFS_USE_VULKAN)
     target_link_libraries(lfs_video PRIVATE PkgConfig::LIBPLACEBO)
 endif()
 
@@ -236,6 +187,8 @@ add_library(lfs_io STATIC
         ply_to_rad_lod.cpp
         formats/spz.hpp
         formats/spz.cpp
+        formats/tiles3d.cpp
+        splat_tile_source.cpp
         formats/usd.hpp
         formats/usd.cpp
         formats/usd_flat/crate.hpp
@@ -266,6 +219,10 @@ add_library(lfs_io STATIC
         loaders/ssog_loader.cpp
         loaders/spz_loader.hpp
         loaders/spz_loader.cpp
+        loaders/tiles3d_loader.hpp
+        loaders/tiles3d_loader.cpp
+        loaders/tile_source_load.hpp
+        loaders/tile_source_load.cpp
         loaders/usd_loader.hpp
         loaders/usd_loader.cpp
         loaders/rad_loader.hpp
@@ -274,8 +231,6 @@ add_library(lfs_io STATIC
         loaders/checkpoint_loader.cpp
         loaders/mesh_loader.hpp
         loaders/mesh_loader.cpp
-        mesh/openmesh_bridge.hpp
-        mesh/openmesh_bridge.cpp
         mesh/texture_loader.hpp
         mesh/texture_loader.cpp
         cache_image_loader.cpp
@@ -296,6 +251,7 @@ add_library(lfs_io STATIC
         project/project_chapters.cpp
         project/session_chapters.cpp
         project/project_document.cpp
+        project/sfm_observation_chapter.cpp
         project/project_preview.cpp
         project/project_recovery.cpp
         project/project_inspector.cpp
@@ -308,12 +264,16 @@ add_library(lfs_io STATIC
 
 )
 target_sources(lfs_io PRIVATE splat_decimate.cpp)
+target_sources(lfs_io PRIVATE
+    pipelined_image_loader.cpp
+    pipelined_image_loader_portable.cpp)
 if(LFS_HAS_CUDA)
     target_sources(lfs_io PRIVATE
         nvcodec_image_loader.hpp
         nvcodec_image_loader.cpp
-        pipelined_image_loader.cpp
-        pipelined_image_loader_portable.cpp)
+        pipelined_image_loader_cuda.cpp)
+else()
+    target_sources(lfs_io PRIVATE pipelined_image_loader_host.cpp)
 endif()
 
 # Set include directories
@@ -370,10 +330,6 @@ else()
     set(ARCHIVE_LIB ${ARCHIVE_LIBRARY})
 endif()
 
-if(LFS_HAS_CUDA)
-    add_dependencies(lfs_io lfs_io_cuda)
-endif()
-
 # Link dependencies
 target_link_libraries(lfs_io
         PUBLIC
@@ -387,13 +343,12 @@ target_link_libraries(lfs_io
         ${WEBP_DECODE_LIB}     # WebP for SOG decompression
         ${WEBP_ENCODE_LIB}     # WebP for SOG/HTML export
         ${ARCHIVE_LIB}         # LibArchive for SOG bundle support
-        ZLIB::ZLIB             # gzip/msgpack payloads inside NuRec USDZ
+        ZLIB::ZLIB             # gzip/msgpack payloads inside NuRec USDZ, deflated SSOG members
         $<IF:$<TARGET_EXISTS:libdeflate::libdeflate_shared>,libdeflate::libdeflate_shared,libdeflate::libdeflate_static> # fast DEFLATE for RAD
         zstd::libzstd          # .licht project container chunk compression
         OpenSSL::Crypto
         xxHash::xxhash         # REFS fingerprints and embedded-payload provenance
         $<$<BOOL:${LFS_HAS_CUDA}>:CUDA::cudart> # CUDA runtime for nvImageCodec
-        $<$<BOOL:${LFS_HAS_CUDA}>:lfs_io_cuda>  # IO-specific CUDA kernels (morton, k-means)
         $<$<BOOL:${LFS_HAS_CUDA}>:lfs_core_cuda> # Core CUDA utilities (lanczos_resize for nvcodec)
         assimp::assimp         # Multi-format mesh import
         lfs_tinyusdz           # USDA parser for flat Gaussian ParticleField interchange
@@ -426,6 +381,17 @@ endif()
 
 # Set C++ standard
 target_compile_features(lfs_io PUBLIC cxx_std_23)
+
+if(LFS_ENABLE_APPLE_REFRAME)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/apple_reframe/BuildHelper.cmake)
+    target_sources(lfs_io PRIVATE apple_reframe.mm)
+    set_source_files_properties(apple_reframe.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_compile_definitions(lfs_io PUBLIC LFS_HAS_APPLE_REFRAME=1)
+    target_link_libraries(lfs_io PRIVATE "-framework Foundation")
+    add_dependencies(lfs_io lfs_reframe_helper)
+else()
+    target_sources(lfs_io PRIVATE apple_reframe_unavailable.cpp)
+endif()
 
 # Enable position-independent code for shared library linking (Python module)
 set_target_properties(lfs_io PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -460,7 +426,6 @@ if(NOT BUILD_PORTABLE)
 endif()
 
 message(STATUS "I/O module configured with SOG support")
-message(STATUS "  IO CUDA library: lfs_io_cuda (image conversion)")
 message(STATUS "  WebP decoder library: ${WEBP_DECODE_LIB}")
 message(STATUS "  Archive library: ${ARCHIVE_LIB}")
 

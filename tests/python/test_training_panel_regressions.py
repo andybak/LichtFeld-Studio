@@ -208,13 +208,13 @@ def test_toolbar_uses_short_primary_labels(training_panel_module, monkeypatch, i
     assert model.bindings["label_toolbar_edit"][0]() == "common.edit"
 
 
-def test_toolbar_starting_status_is_not_unknown(training_panel_module, monkeypatch):
+def test_toolbar_shows_starting_badge(training_panel_module, monkeypatch):
     module = training_panel_module
     monkeypatch.setattr(module, "_training_session_state", lambda: {})
     monkeypatch.setattr(module.RuntimeState.trainer_state, "value", "starting")
     model = _ModelStub()
-    module.TrainingPanel()._bind_status(model, lambda: None)
-    assert "runtime.task_starting" in model.bindings["status_mode"][0]()
+    module.TrainingPanel()._bind_visibility(model, lambda: None, lambda: None)
+    assert model.bindings["show_ctrl_starting"][0]()
 
 
 def test_restore_failure_keeps_detail_below_error_badge(training_panel_module, monkeypatch):
@@ -225,7 +225,6 @@ def test_restore_failure_keeps_detail_below_error_badge(training_panel_module, m
     panel = module.TrainingPanel()
     panel._bind_status(model, lambda: None)
     panel._bind_visibility(model, lambda: None, lambda: None)
-    assert "status.error" in model.bindings["status_mode"][0]()
     assert "bad checkpoint" in model.bindings["error_message"][0]()
     assert model.bindings["show_ctrl_error"][0]()
     assert not model.bindings["show_ctrl_paused"][0]()
@@ -241,7 +240,7 @@ def test_restore_failure_keeps_detail_below_error_badge(training_panel_module, m
 @pytest.mark.parametrize("scale", [1.0, 1.5, 2.0])
 @pytest.mark.parametrize("state,actions", [
     ("ready", ("start", "clear")),
-    ("completed", ("switch_edit", "reset", "clear")),
+    ("completed", ("start_new", "switch_edit", "reset", "clear")),
     ("paused", ("resume", "save_project", "reset", "stop")),
 ])
 def test_toolbar_fit_uses_measured_width_and_can_restore_captions(training_panel_module, monkeypatch, scale, state, actions):
@@ -689,10 +688,9 @@ def test_saving_badge_tracks_transition_without_restarting_training(training_pan
     assert not model.bindings["show_ctrl_saving"][0]()
     saving["value"] = True
     assert panel._sync_saving_status()
-    assert set(dirty) == {"status_mode", "show_ctrl_stopping", "show_ctrl_saving"}
+    assert set(dirty) == {"show_ctrl_stopping", "show_ctrl_saving"}
     assert model.bindings["show_ctrl_saving"][0]()
     assert not model.bindings["show_ctrl_stopping"][0]()
-    assert "training.status_saving" in model.bindings["status_mode"][0]()
     dirty.clear()
     assert not panel._sync_saving_status()
     assert not dirty
@@ -942,8 +940,6 @@ def test_redesigned_rml_preserves_locks_and_groups_all_controls():
 
     for run, condition in {
         "basic_mip_filter": "gut_mip_filter_disabled",
-        "basic_depth_toggle": "gut_depth_supervision_disabled",
-        "basic_normal_toggle": "gut_normal_supervision_disabled",
     }.items():
         rows = [node for node in document.iter("div")
                 if node.attrib.get("data-for") == f"row : pv_{run}_rows"]
@@ -990,6 +986,8 @@ class _ParamsStub:
         self.sh_degree_interval = 1000
         self.ppisp_controller_activation_step = 5678
         self.enable_eval = False
+        self.eval_mask = ""
+        self.eval_mask_invert = False
         self.save_steps = [7000]
         self.eval_steps = []
         self.bg_color = (0.0, 0.0, 0.0)
@@ -1137,19 +1135,11 @@ def test_backend_disabled_conditions_prevent_new_conflicts_but_allow_correction(
     def disabled(name):
         return model.bindings[name][0]()
 
-    assert disabled("gut_disabled") is False
-    assert disabled("gut_depth_supervision_disabled") is False
-    assert disabled("gut_normal_supervision_disabled") is True
+    assert "gut_depth_supervision_disabled" not in model.bindings
+    assert "gut_normal_supervision_disabled" not in model.bindings
     assert disabled("gut_mip_filter_disabled") is True
     assert "gut_undistort_disabled" not in model.bindings
 
-    params.gut = False
-    assert disabled("gut_disabled") is True
-    params.use_depth_loss = False
-    params.undistort = True
-    assert disabled("gut_disabled") is False
-    params.strategy = "igs+"
-    assert disabled("gut_disabled") is True
 
 
 def test_strategy_switch_resyncs_generated_rows_and_requests_panel_update(
@@ -1307,7 +1297,7 @@ def test_training_panel_progress_updates_bound_value(training_panel_module, monk
 
 def test_training_panel_uses_dirty_update_policy(training_panel_module):
     assert training_panel_module.TrainingPanel.update_policy == "dirty"
-    assert "update_interval_ms" not in training_panel_module.TrainingPanel.__dict__
+    assert training_panel_module.TrainingPanel.update_interval_ms is None
 
 
 def test_training_panel_store_update_requests_panel_update(training_panel_module):
@@ -1794,6 +1784,28 @@ def test_enabling_eval_clamps_existing_bad_test_every(training_panel_module, mon
     assert params.eval_steps == params.save_steps
 
 
+# Catches the panel replacing eval steps given with --eval-steps by the save steps.
+def test_enabling_eval_keeps_requested_eval_steps(training_panel_module, monkeypatch):
+    panel = training_panel_module.TrainingPanel()
+    panel._handle = _HandleStub()
+    params = _ParamsStub()
+    params.eval_steps = [300, 4000]
+    monkeypatch.setattr(
+        training_panel_module,
+        "lf",
+        SimpleNamespace(
+            optimization_params=lambda: params,
+            dataset_params=lambda: _DatasetStub(),
+            get_render_settings=lambda: None,
+            get_scene=lambda: SimpleNamespace(active_camera_count=5),
+        ),
+    )
+
+    panel._set_bool_prop("enable_eval", True)
+
+    assert params.eval_steps == [300, 4000, 7000]
+
+
 def test_enabling_eval_rejects_single_camera_split(training_panel_module, monkeypatch):
     panel = training_panel_module.TrainingPanel()
     params = _ParamsStub()
@@ -1849,7 +1861,7 @@ def test_training_panel_keeps_controls_and_search_outside_scroll_region():
     scroll_end = rml.index("<!-- /training-scroll-region -->")
     color_picker = rml.index('id="color-picker-popup"')
 
-    assert controls < search < telemetry < scroll_start < parameters < scroll_end < color_picker
+    assert controls < telemetry < search < scroll_start < parameters < scroll_end < color_picker
     assert 'class="section-gap training-telemetry" data-if="show_training_telemetry"' in rml
     assert 'id="training-search-icon" src="../icon/scene/search.png"' in rml
     assert 'id="training-search-input" type="text"' in rml
@@ -1861,9 +1873,8 @@ def test_training_panel_keeps_controls_and_search_outside_scroll_region():
     assert "background-color: transparent" in rcss
     assert "border-width: 0" in rcss
     assert "overflow-y: auto" in rcss
-    assert ".training-scroll-region scrollbarvertical" in rcss
+    assert ".training-scroll-region scrollbarvertical" not in rcss
     assert "padding-bottom: 6dp" in rcss
-    assert "width: 4dp" in rcss
     assert "height_mode = lf.ui.PanelHeightMode.FILL" in panel_source
 
 
@@ -1913,6 +1924,40 @@ def test_browse_background_image_uses_current_image_dialog(training_panel_module
     assert calls == [""]
     assert params.bg_image_path == selected_path
     assert panel._handle.dirty_all_count == 1
+
+
+# Catches a cleared path leaving inversion active or a browse action ignoring its start directory.
+def test_eval_mesh_browser_sets_path_and_clear_resets_invert(
+    training_panel_module, monkeypatch
+):
+    panel = training_panel_module.TrainingPanel()
+    panel._handle = _HandleStub()
+    params = _ParamsStub()
+    params.eval_mask = "/tmp/current/mask.obj"
+    params.eval_mask_invert = True
+    calls = []
+
+    def open_mesh_file_dialog(start_dir):
+        calls.append(start_dir)
+        return "/tmp/new/mask.ply"
+
+    monkeypatch.setattr(
+        training_panel_module,
+        "lf",
+        SimpleNamespace(
+            optimization_params=lambda: params,
+            ui=SimpleNamespace(open_mesh_file_dialog=open_mesh_file_dialog),
+        ),
+    )
+
+    panel._on_action(None, None, ["browse_eval_mask"])
+    assert calls == ["/tmp/current"]
+    assert params.eval_mask == "/tmp/new/mask.ply"
+
+    panel._on_action(None, None, ["clear_eval_mask"])
+    assert params.eval_mask == ""
+    assert params.eval_mask_invert is False
+    assert panel._handle.dirty_all_count == 2
 
 
 def test_training_panel_no_longer_uses_removed_image_dialog_alias():
@@ -1995,6 +2040,7 @@ def _overwrite_dialog_harness(training_panel_module, monkeypatch):
     dialogs = []
     starts = []
     save_as_calls = []
+    fresh_save_as_calls = []
     scheduled = []
     state = SimpleNamespace(has_path=False, save_as_result=True)
 
@@ -2002,6 +2048,11 @@ def _overwrite_dialog_harness(training_panel_module, monkeypatch):
         dialogs.append((title, message, list(buttons), callback))
 
     def project_save_as(path="", wait=False):
+        save_as_calls.append((path, wait))
+        return state.save_as_result
+
+    def project_save_as_for_training_start(path="", wait=False):
+        fresh_save_as_calls.append((path, wait))
         save_as_calls.append((path, wait))
         return state.save_as_result
 
@@ -2019,6 +2070,12 @@ def _overwrite_dialog_harness(training_panel_module, monkeypatch):
     )
     monkeypatch.setattr(
         training_panel_module.lf,
+        "project_save_as_for_training_start",
+        project_save_as_for_training_start,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        training_panel_module.lf,
         "project_has_path",
         lambda: state.has_path,
         raising=False,
@@ -2030,14 +2087,14 @@ def _overwrite_dialog_harness(training_panel_module, monkeypatch):
     monkeypatch.setattr(training_panel_module.lf, "get_scene", lambda: None)
 
     panel = training_panel_module.TrainingPanel()
-    return panel, dialogs, starts, save_as_calls, scheduled, state
+    return panel, dialogs, starts, save_as_calls, fresh_save_as_calls, scheduled, state
 
 
 @pytest.mark.parametrize("conflict", [7000, -1])
 def test_overwrite_dialog_offers_save_as_between_overwrite_and_cancel(
     training_panel_module, monkeypatch, conflict
 ):
-    panel, dialogs, _starts, _save_as_calls, _scheduled, _state = _overwrite_dialog_harness(
+    panel, dialogs, _starts, _save_as_calls, _fresh_save_as_calls, _scheduled, _state = _overwrite_dialog_harness(
         training_panel_module, monkeypatch
     )
 
@@ -2052,10 +2109,10 @@ def test_overwrite_dialog_offers_save_as_between_overwrite_and_cancel(
         assert title == "training.overwrite.existing_title"
 
 
-def test_overwrite_save_as_routes_through_project_save_as_and_starts_after_bind(
+def test_overwrite_save_as_uses_fresh_run_save_and_starts_after_bind(
     training_panel_module, monkeypatch
 ):
-    panel, dialogs, starts, save_as_calls, scheduled, state = _overwrite_dialog_harness(
+    panel, dialogs, starts, save_as_calls, fresh_save_as_calls, scheduled, state = _overwrite_dialog_harness(
         training_panel_module, monkeypatch
     )
     panel._show_overwrite_dialog(12)
@@ -2066,6 +2123,7 @@ def test_overwrite_save_as_routes_through_project_save_as_and_starts_after_bind(
     callback(SAVE_AS_BTN)
 
     assert save_as_calls == [("", True)]
+    assert fresh_save_as_calls == [("", True)]
     assert starts == [True]
     assert scheduled == []
 
@@ -2073,7 +2131,7 @@ def test_overwrite_save_as_routes_through_project_save_as_and_starts_after_bind(
 def test_overwrite_save_as_waits_for_fire_and_forget_save_to_bind(
     training_panel_module, monkeypatch
 ):
-    panel, dialogs, starts, save_as_calls, scheduled, state = _overwrite_dialog_harness(
+    panel, dialogs, starts, save_as_calls, _fresh_save_as_calls, scheduled, state = _overwrite_dialog_harness(
         training_panel_module, monkeypatch
     )
     panel._show_overwrite_dialog(-1)
@@ -2095,7 +2153,7 @@ def test_overwrite_save_as_waits_for_fire_and_forget_save_to_bind(
 def test_overwrite_save_as_native_dialog_cancel_starts_nothing(
     training_panel_module, monkeypatch
 ):
-    panel, dialogs, starts, save_as_calls, scheduled, state = _overwrite_dialog_harness(
+    panel, dialogs, starts, save_as_calls, _fresh_save_as_calls, scheduled, state = _overwrite_dialog_harness(
         training_panel_module, monkeypatch
     )
     panel._show_overwrite_dialog(3)
@@ -2113,7 +2171,7 @@ def test_overwrite_save_as_native_dialog_cancel_starts_nothing(
 def test_overwrite_save_as_native_cancel_on_titled_project_starts_nothing(
     training_panel_module, monkeypatch
 ):
-    panel, dialogs, starts, save_as_calls, scheduled, state = _overwrite_dialog_harness(
+    panel, dialogs, starts, save_as_calls, _fresh_save_as_calls, scheduled, state = _overwrite_dialog_harness(
         training_panel_module, monkeypatch
     )
     panel._show_overwrite_dialog(4000)
@@ -2131,7 +2189,7 @@ def test_overwrite_save_as_native_cancel_on_titled_project_starts_nothing(
 def test_overwrite_save_as_accepts_path_only_save_as_stub(
     training_panel_module, monkeypatch
 ):
-    panel, dialogs, starts, save_as_calls, _scheduled, state = _overwrite_dialog_harness(
+    panel, dialogs, starts, save_as_calls, _fresh_save_as_calls, _scheduled, state = _overwrite_dialog_harness(
         training_panel_module, monkeypatch
     )
     path_only_calls = []
@@ -2142,6 +2200,12 @@ def test_overwrite_save_as_accepts_path_only_save_as_stub(
 
     monkeypatch.setattr(
         training_panel_module.lf, "project_save_as", project_save_as, raising=False
+    )
+    monkeypatch.setattr(
+        training_panel_module.lf,
+        "project_save_as_for_training_start",
+        None,
+        raising=False,
     )
     panel._show_overwrite_dialog(-1)
     _title, _message, _buttons, callback = dialogs[0]
@@ -2157,7 +2221,7 @@ def test_overwrite_save_as_accepts_path_only_save_as_stub(
 def test_overwrite_dialog_cancel_button_starts_nothing(
     training_panel_module, monkeypatch
 ):
-    panel, dialogs, starts, save_as_calls, _scheduled, _state = _overwrite_dialog_harness(
+    panel, dialogs, starts, save_as_calls, _fresh_save_as_calls, _scheduled, _state = _overwrite_dialog_harness(
         training_panel_module, monkeypatch
     )
     panel._show_overwrite_dialog(-1)
@@ -2173,7 +2237,7 @@ def test_overwrite_dialog_cancel_button_starts_nothing(
 def test_overwrite_and_start_still_starts_without_save_as(
     training_panel_module, monkeypatch
 ):
-    panel, dialogs, starts, save_as_calls, _scheduled, _state = _overwrite_dialog_harness(
+    panel, dialogs, starts, save_as_calls, _fresh_save_as_calls, _scheduled, _state = _overwrite_dialog_harness(
         training_panel_module, monkeypatch
     )
     panel._show_overwrite_dialog(9)
@@ -2189,7 +2253,7 @@ def test_finished_run_overwrite_resets_before_the_new_run_starts(
     training_panel_module, monkeypatch
 ):
     """A completed run is a new training, so Overwrite must leave the finished trainer first."""
-    panel, dialogs, _starts, _save_as_calls, _scheduled, _state = _overwrite_dialog_harness(
+    panel, dialogs, _starts, _save_as_calls, _fresh_save_as_calls, _scheduled, _state = _overwrite_dialog_harness(
         training_panel_module, monkeypatch
     )
     runtime = training_panel_module.RuntimeState
@@ -2234,7 +2298,7 @@ def test_finished_run_overwrite_resets_before_the_new_run_starts(
 def test_action_start_opens_overwrite_dialog_instead_of_starting(
     training_panel_module, monkeypatch
 ):
-    panel, dialogs, starts, save_as_calls, _scheduled, _state = _overwrite_dialog_harness(
+    panel, dialogs, starts, save_as_calls, _fresh_save_as_calls, _scheduled, _state = _overwrite_dialog_harness(
         training_panel_module, monkeypatch
     )
     monkeypatch.setattr(
@@ -2427,7 +2491,7 @@ def _stub_stored_session(training_panel_module, monkeypatch, **overrides):
     return state
 
 
-def test_completed_stored_session_shows_complete_mode_and_buttons(
+def test_completed_stored_session_shows_completed_badge_and_buttons(
     training_panel_module, monkeypatch
 ):
     _stub_stored_session(
@@ -2454,9 +2518,7 @@ def test_completed_stored_session_shows_complete_mode_and_buttons(
         assert model.bindings["show_ctrl_completed"][0]() is True
         assert model.bindings["show_ctrl_paused"][0]() is False
         assert model.bindings["show_ctrl_ready"][0]() is False
-        assert "status.complete" in model.bindings["status_mode"][0]()
         assert "30,000/30,000" in model.bindings["progress_text"][0]()
-        assert "session_at_iteration" not in model.bindings["status_mode"][0]()
     finally:
         runtime.has_trainer._fallback = False
         runtime.training_state._fallback = "idle"
@@ -2464,7 +2526,7 @@ def test_completed_stored_session_shows_complete_mode_and_buttons(
         runtime.total_iterations._fallback = 0
 
 
-def test_paused_stored_session_shows_paused_mode_and_resume(
+def test_paused_stored_session_shows_paused_badge_and_resume(
     training_panel_module, monkeypatch
 ):
     _stub_stored_session(
@@ -2491,9 +2553,7 @@ def test_paused_stored_session_shows_paused_mode_and_resume(
         assert model.bindings["show_ctrl_paused"][0]() is True
         assert model.bindings["show_ctrl_completed"][0]() is False
         assert model.bindings["show_ctrl_ready"][0]() is False
-        assert "status.paused" in model.bindings["status_mode"][0]()
         assert "7,000/30,000" in model.bindings["progress_text"][0]()
-        assert "session_at_iteration" not in model.bindings["status_mode"][0]()
     finally:
         runtime.has_trainer._fallback = False
         runtime.training_state._fallback = "idle"
@@ -2529,9 +2589,7 @@ def test_stopped_stored_session_keeps_stopped_mode_and_edit_controls(
         assert model.bindings["show_ctrl_stopped"][0]() is True
         assert model.bindings["show_ctrl_completed"][0]() is False
         assert model.bindings["show_ctrl_ready"][0]() is False
-        assert "status.stopped" in model.bindings["status_mode"][0]()
         assert "7,000/30,000" in model.bindings["progress_text"][0]()
-        assert "session_at_iteration" not in model.bindings["status_mode"][0]()
     finally:
         runtime.has_trainer._fallback = False
         runtime.training_state._fallback = "idle"
@@ -2756,3 +2814,47 @@ def test_error_details_do_not_participate_in_toolbar_layout():
     assert len(error_actions.findall(".//button")) == 2
     assert toolbar.find(".//*[@class='training-status-badge is-error']") is None
     assert controls.find(".//*[@class='training-status-badge is-error']") is not None
+
+
+@pytest.mark.parametrize(
+    "prop,initial,changed,method,args",
+    [
+        ("strategy", "mrnf", "mcmc", "_set_strategy", ()),
+        ("sh_degree", 3, 2, "_set_int_param", ("sh_degree",)),
+        ("depth_loss_mode", "ssi", "ssi-disparity", "_set_depth_loss_mode", ()),
+        ("lambda_dssim", 0.25, 0.5, "_set_slider_prop", ("lambda_dssim",)),
+    ],
+)
+def test_restored_control_echo_is_not_an_edit(
+    training_panel_module, monkeypatch, prop, initial, changed, method, args
+):
+    class Params:
+        def __init__(self):
+            object.__setattr__(self, "writes", [])
+            object.__setattr__(self, "gut", False)
+            object.__setattr__(self, prop, initial)
+
+        def __setattr__(self, name, value):
+            self.writes.append((name, value))
+            object.__setattr__(self, name, value)
+
+        def has_params(self):
+            return True
+
+        def set(self, name, value):
+            setattr(self, name, value)
+
+        def set_strategy(self, value):
+            self.strategy = value
+
+    params = Params()
+    monkeypatch.setattr(training_panel_module.lf, "optimization_params", lambda: params)
+    panel = training_panel_module.TrainingPanel()
+    setter = getattr(panel, method)
+    setter(*args, initial)
+    assert params.writes == []
+    setter(*args, changed)
+    assert params.writes == [(prop, changed)]
+    assert getattr(params, prop) == changed
+    setter(*args, changed)
+    assert params.writes == [(prop, changed)]

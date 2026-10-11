@@ -8,6 +8,7 @@
 #include "core/event_bridge/localization_manager.hpp"
 #include "core/events.hpp"
 #include "core/logger.hpp"
+#include "core/mesh_data.hpp"
 #include "core/number_format.hpp"
 #include "core/parameter_manager.hpp"
 #include "core/parameters.hpp"
@@ -19,11 +20,14 @@
 #include "gui/error_event_bridge.hpp"
 #include "gui/gallery_scene_publication.hpp"
 #include "gui/gui_manager.hpp"
+#include "gui/import_error.hpp"
 #include "gui/panel_registry.hpp"
 #include "gui/string_keys.hpp"
 #include "gui/utils/native_file_dialog.hpp"
 #include "gui/video_export_utils.hpp"
 #include "internal/resource_paths.hpp"
+#include "io/apple_reframe.hpp"
+#include "io/apple_reframe_conversion.hpp"
 #include "io/dataset_scene_import.hpp"
 #include "io/exporter.hpp"
 #include "io/formats/colmap.hpp"
@@ -33,9 +37,9 @@
 #include "rendering/environment_image.hpp"
 #include "rendering/mesh2splat.hpp"
 #include "rendering/mesh_offscreen_renderer.hpp"
-#include "rendering/passes/vulkan_mesh_pass.hpp"
 #include "rendering/rendering.hpp"
 #include "rendering/rendering_manager.hpp"
+#include "rendering/viewport_draw_types.hpp"
 #include "scene/scene_manager.hpp"
 #include "scene/scene_render_state.hpp"
 #include "sequencer/keyframe.hpp"
@@ -44,7 +48,7 @@
 #include "visualizer/gui/video_widget_interface.hpp"
 #include "visualizer/scene_coordinate_utils.hpp"
 #include "visualizer_impl.hpp"
-#include "window/vulkan_context.hpp"
+#include "window/graphics_context.hpp"
 #include "window/window_manager.hpp"
 #include <algorithm>
 #include <bit>
@@ -145,17 +149,14 @@ namespace lfs::vis::gui {
             window_manager->wakeEventLoop();
     }
 
-    void truncateSHDegree(lfs::core::SplatData& splat, const int target_degree) {
-        splat.set_sh_degree(target_degree);
-    }
-
     struct BorrowExportPlan {
         core::Scene::MergeStorageMode storage_mode = core::Scene::MergeStorageMode::Clone;
         std::shared_mutex* model_mutex = nullptr;
     };
 
     [[nodiscard]] BorrowExportPlan makeBorrowSingleIdentityExportPlan(const lfs::vis::SceneManager& scene_manager,
-                                                                      const std::vector<std::string>& node_names) {
+                                                                      const std::vector<std::string>& node_names,
+                                                                      const ExportFormat format) {
         BorrowExportPlan plan;
         if (node_names.size() != 1)
             return plan;
@@ -166,6 +167,10 @@ namespace lfs::vis::gui {
             return plan;
 
         if (node->model->has_deleted_mask())
+            return plan;
+
+        // Only RAD stores an LOD tree; other formats need the merge to flatten it to its leaves.
+        if (format != ExportFormat::RAD && node->model->lod_tree && node->model->lod_tree->has_tree())
             return plan;
 
 #if LFS_BUILD_TRAINER
@@ -469,14 +474,13 @@ namespace lfs::vis::gui {
             .shadow_map_resolution = render_settings.mesh_shadow_resolution,
             .is_emphasized = is_selected,
             .dim_non_emphasized = render_settings.desaturate_unselected && any_selected,
-            .flash_intensity = 0.0f,
             .background_color = render_settings.background_color,
             .transparent_background = environmentBackgroundEnabled(render_settings)};
     }
 
     SceneRenderState makeVideoExportGaussianSceneState(const VideoExportSceneSnapshot& snapshot) {
         SceneRenderState state;
-        state.combined_model = snapshot.combined_model.get();
+        state.combined_model = snapshot.gaussianModel();
         state.model_transforms = snapshot.model_transforms;
         state.node_active_sh_degrees = snapshot.node_active_sh_degrees;
         state.transform_indices = snapshot.transform_indices;
@@ -554,7 +558,7 @@ namespace lfs::vis::gui {
         rendering::RenderingEngine& engine,
         VideoExportEnvironmentState& environment_state,
         VideoExportMeshRendererState* mesh_renderer_state,
-        VulkanContext* vulkan_context,
+        GraphicsContext* graphics_context,
         const VideoExportSceneSnapshot& snapshot,
         const RenderSettings& render_settings,
         const lfs::sequencer::CameraState& cam_state,
@@ -567,7 +571,7 @@ namespace lfs::vis::gui {
 
         std::optional<rendering::GpuFrame> primary_frame;
 
-        if (snapshot.combined_model && snapshot.combined_model->size() > 0) {
+        if (snapshot.gaussianModel() && snapshot.gaussianModel()->size() > 0) {
             if (render_settings.point_cloud_mode) {
                 rendering::PointCloudRenderRequest request{
                     .frame_view = frame_view,
@@ -585,7 +589,7 @@ namespace lfs::vis::gui {
                 applyVideoExportPointCloudFilters(request.filters, snapshot, render_settings);
 
                 if (!requires_composite_pass) {
-                    auto render_result = engine.renderPointCloudImage(*snapshot.combined_model, request);
+                    auto render_result = engine.renderPointCloudImage(*snapshot.gaussianModel(), request);
                     if (!render_result || !render_result->image) {
                         return std::unexpected(render_result ? LOC(lichtfeld::Strings::Runtime::RENDERED_POINT_CLOUD_INVALID)
                                                              : render_result.error());
@@ -593,7 +597,7 @@ namespace lfs::vis::gui {
                     return *render_result->image;
                 }
 
-                auto render_result = engine.renderPointCloudGpuFrame(*snapshot.combined_model, request);
+                auto render_result = engine.renderPointCloudGpuFrame(*snapshot.gaussianModel(), request);
                 if (!render_result || !render_result->valid()) {
                     return std::unexpected(render_result ? LOC(lichtfeld::Strings::Runtime::RENDERED_POINT_CLOUD_INVALID)
                                                          : render_result.error());
@@ -604,7 +608,17 @@ namespace lfs::vis::gui {
                 const auto camera_rotation = glm::mat3_cast(cam_state.rotation);
                 auto preview_image = render_environment
                                          ? rendering_manager.renderPreviewImageRgba8(
-                                               *snapshot.combined_model,
+                                               *snapshot.gaussianModel(),
+                                               std::move(scene_state),
+                                               camera_rotation,
+                                               cam_state.position,
+                                               cam_state.focal_length_mm,
+                                               width,
+                                               height)
+                                     : snapshot.borrowed_model
+                                         // Sequence switches must not inherit interactive depth-tie order.
+                                         ? rendering_manager.renderPreviewImageRgb8(
+                                               *snapshot.gaussianModel(),
                                                std::move(scene_state),
                                                camera_rotation,
                                                cam_state.position,
@@ -612,7 +626,7 @@ namespace lfs::vis::gui {
                                                width,
                                                height)
                                          : rendering_manager.renderPreviewImage(
-                                               *snapshot.combined_model,
+                                               *snapshot.gaussianModel(),
                                                std::move(scene_state),
                                                camera_rotation,
                                                cam_state.position,
@@ -639,7 +653,7 @@ namespace lfs::vis::gui {
                 }
                 primary_frame = std::move(*materialized);
             }
-        } else if (snapshot.point_cloud && snapshot.point_cloud->size() > 0) {
+        } else if (snapshot.pointCloud() && snapshot.pointCloud()->size() > 0) {
             const std::vector<glm::mat4> point_cloud_transforms = {snapshot.point_cloud_transform};
             rendering::PointCloudRenderRequest request{
                 .frame_view = frame_view,
@@ -656,7 +670,7 @@ namespace lfs::vis::gui {
                 .transparent_background = render_environment};
             applyVideoExportPointCloudFilters(request.filters, snapshot, render_settings);
 
-            auto render_result = engine.renderPointCloudGpuFrame(*snapshot.point_cloud, request);
+            auto render_result = engine.renderPointCloudGpuFrame(*snapshot.pointCloud(), request);
             if (!render_result || !render_result->valid()) {
                 return std::unexpected(render_result ? LOC(lichtfeld::Strings::Runtime::RENDERED_POINT_CLOUD_INVALID)
                                                      : render_result.error());
@@ -690,9 +704,9 @@ namespace lfs::vis::gui {
                 return std::unexpected(
                     "Failed to render GPU mesh layer: renderer state is unavailable");
             }
-            if (vulkan_context == nullptr) {
+            if (graphics_context == nullptr) {
                 return std::unexpected(
-                    "Failed to render GPU mesh layer: no Vulkan context is available");
+                    "Failed to render GPU mesh layer: no graphics context is available");
             }
 
             try {
@@ -701,7 +715,7 @@ namespace lfs::vis::gui {
                 }
 
                 const glm::mat4 projection = viewport.getProjectionMatrix();
-                VulkanMeshPassParams mesh_params{
+                ViewportMeshPassDesc mesh_params{
                     .view_projection = projection * viewport.getViewMatrix(),
                     .camera_position = viewport.translation,
                     .items = {},
@@ -711,15 +725,15 @@ namespace lfs::vis::gui {
                 };
                 mesh_params.items.reserve(snapshot.meshes.size());
                 for (const auto& mesh_snapshot : snapshot.meshes) {
-                    if (!mesh_snapshot.mesh) {
+                    if (!mesh_snapshot.meshData()) {
                         return std::unexpected(
                             "Failed to render GPU mesh layer: mesh snapshot is invalid");
                     }
 
                     const auto options = makeVideoExportMeshOptions(
                         render_settings, any_selected, mesh_snapshot.is_selected);
-                    mesh_params.items.push_back(VulkanMeshDrawItem{
-                        .mesh = mesh_snapshot.mesh.get(),
+                    mesh_params.items.push_back(ViewportMeshDrawItem{
+                        .mesh = mesh_snapshot.meshData(),
                         .model = mesh_snapshot.transform,
                         .light_dir = options.light_dir,
                         .light_intensity = options.light_intensity,
@@ -727,7 +741,6 @@ namespace lfs::vis::gui {
                         .backface_culling = options.backface_culling,
                         .is_emphasized = options.is_emphasized,
                         .dim_non_emphasized = options.dim_non_emphasized,
-                        .flash_intensity = options.flash_intensity,
                         .wireframe_overlay = options.wireframe_overlay,
                         .wireframe_color = options.wireframe_color,
                         .wireframe_width = options.wireframe_width,
@@ -737,10 +750,10 @@ namespace lfs::vis::gui {
                 }
 
                 auto mesh_layer = mesh_renderer_state->renderer->render(
-                    *vulkan_context, mesh_params, projection, width, height);
+                    *graphics_context, mesh_params, projection, width, height);
                 if (!mesh_layer) {
                     return std::unexpected(std::format(
-                        "Failed to render GPU mesh layer: {}", mesh_layer.error()));
+                        "Failed to render GPU mesh layer: {}", mesh_layer.error().detail()));
                 }
                 if (!isValidVideoExportMeshLayer(*mesh_layer, width, height)) {
                     return std::unexpected(
@@ -884,6 +897,8 @@ namespace lfs::vis::gui {
     }
 
     void AsyncTaskManager::shutdown() {
+        if (auto* loader = viewer_->getDataLoader())
+            loader->cancelPendingImports();
         if (isExporting())
             cancelExport();
         if (export_state_.thread && export_state_.thread->joinable())
@@ -936,7 +951,7 @@ namespace lfs::vis::gui {
                                           const bool replace_first,
                                           std::vector<std::string> name_hints,
                                           std::vector<bool> visibility,
-                                          std::optional<core::events::cmd::LoadGalleryScene> gallery) {
+                                          std::optional<core::events::cmd::LoadGalleryScene> gallery, const bool import_batch, const bool reframe_photo) {
         if (paths.empty()) {
             LOG_WARN("Splat load requested without paths");
             return false;
@@ -969,6 +984,10 @@ namespace lfs::vis::gui {
 
         splat_load_state_.job = *created;
         splat_load_state_.replace_first = replace_first;
+        splat_load_state_.reframe_photo = reframe_photo;
+        splat_load_state_.reframe_error.clear();
+        splat_load_state_.validate_batch = import_batch && !gallery;
+        viewer_->getSceneManager()->getScene().setImportValidation(splat_load_state_.validate_batch);
         splat_load_state_.gallery = std::move(gallery);
         splat_load_state_.gallery_group_uuid.reset();
         splat_load_state_.scene_generation = gallery_scene_epoch_;
@@ -979,7 +998,12 @@ namespace lfs::vis::gui {
             splat_load_state_.requests.clear();
             splat_load_state_.loaded_count = 0;
             splat_load_state_.failed_count = 0;
+            splat_load_state_.failures.clear();
+            splat_load_state_.attachment_pending = false;
             splat_load_state_.consolidation_pending = false;
+            splat_load_state_.pending_render_request.reset();
+            splat_load_state_.batch_stopped.store(false);
+            splat_load_state_.batch_stop_reason.clear();
             for (size_t index = 0; index < paths.size(); ++index) {
                 splat_load_state_.requests.push_back(SplatLoadRequest{
                     .path = std::move(paths[index]),
@@ -987,14 +1011,15 @@ namespace lfs::vis::gui {
                     .is_visible = index >= visibility.size() || visibility[index],
                     .replace_scene = replace_first && index == 0,
                     .transform = splat_load_state_.gallery ? splat_load_state_.gallery->transforms[index] : glm::mat4{1.0f},
-                    .active_sh_degree = splat_load_state_.gallery ? splat_load_state_.gallery->sh_degrees[index] : -1});
+                    .active_sh_degree = splat_load_state_.gallery ? splat_load_state_.gallery->sh_degrees[index] : -1,
+                    .reframe_photo = reframe_photo});
             }
         }
 
         {
             const std::lock_guard lock(import_state_.mutex);
             import_state_.path = splat_load_state_.requests.front().path;
-            import_state_.dataset_type = "Splat";
+            import_state_.dataset_type = reframe_photo ? "Apple Reframe" : "Splat";
             import_state_.num_images = 0;
             import_state_.num_points = 0;
             import_state_.success = false;
@@ -1024,33 +1049,88 @@ namespace lfs::vis::gui {
                         break;
                     }
                     const auto stage_started_at = std::chrono::steady_clock::now();
-                    auto result = viewer_->getSceneManager()->stageSplatFile(
-                        request.path,
-                        [this, job, index, total = requests.size()](const float pct,
-                                                                    const std::string& stage) {
-                            jobs_.report(job,
-                                         (static_cast<float>(index) + pct / 100.0F) /
-                                             static_cast<float>(total),
-                                         stage);
+                    std::string user_error;
+                    auto result = [&]() -> lfs::Result<lfs::io::LoadResult> {
+                        if (splat_load_state_.batch_stopped.load()) {
+                            return lfs::make_error(lfs::ErrorInit{
+                                .code = lfs::ErrorCode::ResourceExhausted,
+                                .domain = lfs::ErrorDomain::IO,
+                                .detail = splat_load_state_.batch_stop_reason,
+                                .detection = LFS_SOURCE_SITE_CURRENT(),
+                            });
+                        }
+                        const auto progress = [this, job, index, total = requests.size()](const float pct,
+                                                                                          const std::string& stage) {
+                            jobs_.report(job, (static_cast<float>(index) + pct / 100.0F) / static_cast<float>(total), stage);
                             publishImportOverlayState();
                             wakeMainThreadForAsyncWork();
-                        },
-                        [this, job, &stop_token]() {
+                        };
+                        const auto cancel = [this, job, &stop_token]() {
                             return stop_token.stop_requested() || jobs_.cancelRequested(job);
-                        },
-                        request.active_sh_degree >= 0);
+                        };
+                        const lfs::LegacyErrorContext stage_error_context{
+                            .code = lfs::ErrorCode::Internal,
+                            .domain = lfs::ErrorDomain::IO,
+                            .operation = "stageSplatFile",
+                            .source = LFS_SOURCE_SITE_CURRENT(),
+                        };
+                        std::expected<lfs::io::LoadResult, lfs::Error> staged;
+                        if (request.reframe_photo) {
+                            auto generated = lfs::io::createAppleReframeSplat(request.path, {.progress = progress, .cancel_requested = cancel});
+                            if (!generated) {
+                                user_error = generated.error().message;
+                                staged = std::unexpected(lfs::make_legacy_error(
+                                    generated.error().format(), stage_error_context));
+                            } else {
+                                staged = std::move(*generated);
+                            }
+                        } else {
+                            auto legacy_staged = viewer_->getSceneManager()->stageSplatFile(
+                                request.path, progress, cancel,
+                                request.active_sh_degree >= 0, &user_error);
+                            if (!legacy_staged) {
+                                staged = std::unexpected(lfs::make_legacy_error(
+                                    std::move(legacy_staged.error()), stage_error_context));
+                            } else {
+                                staged = std::move(*legacy_staged);
+                            }
+                        }
+                        return lfs::Result<lfs::io::LoadResult>::from_expected(std::move(staged));
+                    }();
+
+                    const std::string error_message = result ? std::string{} : std::string(result.error().detail());
+
+                    if (!result && splat_load_state_.validate_batch) {
+                        // Legacy loader errors flatten the native allocation
+                        // cause into text. Stop this batch after device OOM:
+                        // trying later files can consume the space the renderer
+                        // needs to keep the already accepted nodes interactive.
+                        if (isImportOutOfMemory(error_message)) {
+                            splat_load_state_.batch_stop_reason = error_message;
+                            splat_load_state_.batch_stopped.store(true);
+                        }
+                    }
 
                     SplatLoadCompletion completion{
                         .request = request,
                         .result = result ? std::optional<lfs::io::LoadResult>(std::move(*result)) : std::nullopt,
-                        .error = result ? std::string{} : result.error(),
+                        .error = result ? std::string{} : ((splat_load_state_.validate_batch || request.reframe_photo) && !user_error.empty() && !isImportOutOfMemory(error_message) ? user_error : error_message),
                         .stage_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - stage_started_at)};
                     {
                         const std::lock_guard lock(splat_load_state_.mutex);
                         splat_load_state_.completions.push_back(std::move(completion));
+                        splat_load_state_.attachment_pending = true;
                     }
                     wakeMainThreadForAsyncWork();
+                    if (splat_load_state_.validate_batch) {
+                        // Do not retain staged files or allocate the next model
+                        // until the viewer has consumed this completion.
+                        std::unique_lock lock(splat_load_state_.mutex);
+                        splat_load_state_.completion_consumed.wait(lock, stop_token, [this] {
+                            return !splat_load_state_.attachment_pending;
+                        });
+                    }
                     if (!result && (stop_token.stop_requested() || jobs_.cancelRequested(job))) {
                         canceled = true;
                         break;
@@ -1064,7 +1144,90 @@ namespace lfs::vis::gui {
         return true;
     }
 
+    bool AsyncTaskManager::discardPendingImport(const core::Uuid& uuid) {
+        auto* manager = viewer_->getSceneManager();
+        const bool restore_selection = manager->selectionState().generation() ==
+                                       splat_load_state_.attachment_selection_generation;
+        try {
+            if (const auto* node = manager->getScene().getNodeByUuid(uuid); node && node->mesh)
+                viewer_->getGuiManager()->discardImportMesh(node->mesh->id());
+        } catch (const std::exception& error) {
+            LOG_ERROR("Could not release failed mesh import: {}", error.what());
+            return false;
+        }
+        if (!manager->discardFailedImport(uuid))
+            return false;
+        if (restore_selection) {
+            std::vector<core::NodeId> ids;
+            for (const auto& selected : splat_load_state_.previous_selection) {
+                if (const auto* node = manager->getScene().getNodeByUuid(selected))
+                    ids.push_back(node->id);
+            }
+            manager->selectNodesById(ids);
+        }
+        return true;
+    }
+
     void AsyncTaskManager::checkAsyncSplatLoadCompletion() {
+        // Check the epoch captured before staging, not one captured after attachment.
+        if ((splat_load_state_.thread || splat_load_state_.pending_render_request ||
+             splat_load_state_.worker_complete.load(std::memory_order_acquire)) &&
+            splat_load_state_.scene_generation != gallery_scene_epoch_) {
+            cancelImport(false);
+            return;
+        }
+        auto* const manager = viewer_->getSceneManager();
+        if (splat_load_state_.pending_render_request && manager) {
+            auto& scene = manager->getScene();
+            auto* rendering = viewer_->getRenderingManager();
+            const bool uses_combined = !rendering || rendering->importUsesCombinedModel();
+            auto error = uses_combined ? scene.combinedModelBuildError() : std::string{};
+            if (uses_combined && scene.combinedModelBuildPending())
+                return;
+            if (uses_combined && error.empty()) {
+                try {
+                    // Small aggregates use the same synchronous path as the viewport.
+                    static_cast<void>(scene.getCombinedModel());
+                    if (scene.combinedModelBuildPending())
+                        return;
+                } catch (const std::exception& failure) {
+                    error = failure.what();
+                }
+            }
+            if (error.empty() && viewer_->getWindow()) {
+                if (auto* rendering = viewer_->getRenderingManager()) {
+                    const auto rendered = viewer_->getGuiManager()->pollImportRenderCheck(splat_load_state_.pending_render_node);
+                    if (!rendered)
+                        return;
+                    error = *rendered;
+                }
+            }
+            if (auto* rendering = viewer_->getRenderingManager())
+                rendering->cancelImportRenderCheck();
+            viewer_->getGuiManager()->endImportRenderCheck();
+            if (!error.empty()) {
+                // Attachment is provisional until the new node can be rendered.
+                // Previously accepted nodes remain owned by the scene.
+                if (!discardPendingImport(splat_load_state_.pending_render_node)) {
+                    cancelImport();
+                    return;
+                }
+                LOG_ERROR("Import rendering failed for '{}': {}", core::path_to_utf8(splat_load_state_.pending_render_request->path), error);
+                const std::string reason = isImportOutOfMemory(error) ? error : LOC("runtime.import_render_failed");
+                --splat_load_state_.loaded_count;
+                ++splat_load_state_.failed_count;
+                splat_load_state_.failures.emplace_back(
+                    splat_load_state_.pending_render_request->path, reason);
+                splat_load_state_.batch_stop_reason = reason;
+                splat_load_state_.batch_stopped.store(true);
+            }
+            splat_load_state_.pending_render_request.reset();
+            {
+                const std::lock_guard lock(splat_load_state_.mutex);
+                splat_load_state_.attachment_pending = false;
+            }
+            splat_load_state_.completion_consumed.notify_all();
+        }
         if (splat_load_state_.gallery && jobs_.cancelRequested(splat_load_state_.job) &&
             splat_load_state_.worker_complete.load(std::memory_order_acquire)) {
             cancelImport(); // The worker has finished; joining cannot wait on IO.
@@ -1113,17 +1276,36 @@ namespace lfs::vis::gui {
         }
         for (auto& completion : completions) {
             if (!completion.error.empty()) {
+                if (completion.request.reframe_photo)
+                    splat_load_state_.reframe_error = completion.error;
                 ++splat_load_state_.failed_count;
-                lfs::core::events::state::SplatFileLoadFailed{
-                    .path = completion.request.path,
-                    .error = completion.error}
-                    .emit();
+                if (splat_load_state_.validate_batch)
+                    splat_load_state_.failures.emplace_back(completion.request.path, completion.error);
+                else
+                    core::events::state::SplatFileLoadFailed{.path = completion.request.path, .error = completion.error}.emit();
                 continue;
             }
             if (!completion.result || !scene_manager)
                 continue;
 
+            splat_load_state_.previous_selection.clear();
+            for (const auto id : scene_manager->getSelectedNodeIds()) {
+                if (const auto* node = scene_manager->getScene().getNodeById(id))
+                    splat_load_state_.previous_selection.push_back(node->uuid);
+            }
+            splat_load_state_.attachment_selection_generation = scene_manager->selectionState().generation();
+            core::Uuid imported_uuid;
+            bool counted_as_loaded = false;
             try {
+                if (splat_load_state_.validate_batch) {
+                    viewer_->getGuiManager()->beginImportRenderCheck();
+                    // Release the old render copy before attachment can grow
+                    // selection masks or allocate the replacement aggregate.
+                    scene_manager->drainGpuForTensorRelease();
+                    if (auto* rendering = viewer_->getRenderingManager())
+                        rendering->releaseSceneModelResources();
+                    scene_manager->getScene().discardUnconsolidatedModelCache();
+                }
                 jobs_.report(splat_load_state_.job, std::nullopt,
                              LOC(lichtfeld::Strings::Runtime::TASK_APPLYING));
                 const auto attach_started_at = std::chrono::steady_clock::now();
@@ -1134,12 +1316,38 @@ namespace lfs::vis::gui {
                     // earlier requests failed.
                     completion.request.replace_scene = true;
                 }
-                if (completion.request.replace_scene && splat_load_state_.loaded_count == 0) {
+                if (completion.request.reframe_photo) {
+                    if (jobs_.cancelRequested(splat_load_state_.job) || !scene_manager->canClearScene())
+                        throw std::runtime_error("Photo reconstruction cancelled because the scene is no longer editable");
+                    auto model = std::get<std::shared_ptr<core::SplatData>>(completion.result->data);
+                    const auto photo_view = completion.result->photo_view;
+                    const float aspect = photo_view ? photo_view->source_aspect : 1.0f;
+                    // The predictor works in a square canonical image. Preserve
+                    // its Gaussian covariance and restore source proportions
+                    // through the node transform (also captured by undo/redo).
+                    const auto placement = io::reframe::groundedPlacement(
+                        aspect, photo_view ? photo_view->bounds_min : std::array<float, 3>{-1.0f, -1.0f, 0.0f},
+                        photo_view ? photo_view->bounds_max : std::array<float, 3>{1.0f, 1.0f, 2.0f});
+                    const glm::vec3 translation{placement.translation[0], placement.translation[1], placement.translation[2]};
+                    // Face the standard scene camera by rotating the grounded
+                    // reconstruction 180 degrees around world Y, at the origin.
+                    // diag(-1, 1, -1) is an exact half-turn, not a reflection.
+                    const auto facing = glm::scale(glm::mat4{1.0f}, glm::vec3{-1.0f, 1.0f, -1.0f});
+                    const auto transform = facing * glm::translate(glm::mat4{1.0f}, translation) *
+                                           glm::scale(glm::mat4{1.0f}, glm::vec3{aspect, 1.0f, 1.0f} * placement.scale);
+                    node_name = scene_manager->addGeneratedSplatNode(
+                        std::make_unique<core::SplatData>(std::move(*model)), "",
+                        completion.request.name_hint, true, "Create Splat from Photo", transform);
+                    if (node_name.empty())
+                        throw std::runtime_error("Could not attach reconstructed splats");
+                    if (auto* rendering_manager = viewer_->getRenderingManager())
+                        rendering_manager->markDirty(DirtyFlag::ALL, FrameReason::SceneChange);
+                } else if (completion.request.replace_scene && splat_load_state_.loaded_count == 0) {
                     node_name = scene_manager->attachLoadedSplatFile(
                         completion.request.path,
                         completion.request.name_hint,
                         completion.request.is_visible,
-                        std::move(*completion.result), true);
+                        std::move(*completion.result), true, false, &imported_uuid, &splat_load_state_.attachment_selection_generation, true);
                 } else {
                     if (splat_load_state_.gallery)
                         std::get<std::shared_ptr<core::SplatData>>(completion.result->data)->set_active_sh_degree(completion.request.active_sh_degree);
@@ -1148,7 +1356,7 @@ namespace lfs::vis::gui {
                         completion.request.name_hint,
                         splat_load_state_.gallery ? false : completion.request.is_visible,
                         std::move(*completion.result), splat_load_state_.gallery.has_value(), gallery_group,
-                        splat_load_state_.gallery.has_value());
+                        splat_load_state_.gallery.has_value(), &imported_uuid, &splat_load_state_.attachment_selection_generation);
                     if (splat_load_state_.gallery) {
                         scene_manager->getScene().setNodeTransform(node_name, completion.request.transform);
                         scene_manager->getScene().setNodeVisibility(node_name, true);
@@ -1163,12 +1371,40 @@ namespace lfs::vis::gui {
                          attach_elapsed.count(),
                          completion.stage_elapsed.count() + attach_elapsed.count());
                 ++splat_load_state_.loaded_count;
+                counted_as_loaded = true;
+                if (splat_load_state_.validate_batch) {
+                    splat_load_state_.pending_render_request = completion.request;
+                    splat_load_state_.pending_render_node = imported_uuid;
+                    auto* rendering = viewer_->getRenderingManager();
+                    if (!rendering || rendering->importUsesCombinedModel()) {
+                        // One aggregate per attachment is needed to validate real
+                        // allocations before staging the next file. Comparison
+                        // uses the owned node models and needs no aggregate.
+                        scene_manager->getScene().requestCombinedModelBuild(false);
+                        static_cast<void>(scene_manager->getScene().getCombinedModel());
+                    }
+                }
             } catch (const std::exception& error) {
+                if (completion.request.reframe_photo)
+                    splat_load_state_.reframe_error = error.what();
+                viewer_->getGuiManager()->endImportRenderCheck();
+                LOG_ERROR("Import attachment failed for '{}': {}", core::path_to_utf8(completion.request.path), error.what());
+                if (splat_load_state_.validate_batch) {
+                    if (!imported_uuid.is_nil() && !discardPendingImport(imported_uuid)) {
+                        cancelImport();
+                        return;
+                    }
+                    if (counted_as_loaded)
+                        --splat_load_state_.loaded_count;
+                    splat_load_state_.pending_render_request.reset();
+                    splat_load_state_.batch_stop_reason = error.what();
+                    splat_load_state_.batch_stopped.store(true);
+                }
                 ++splat_load_state_.failed_count;
-                lfs::core::events::state::SplatFileLoadFailed{
-                    .path = completion.request.path,
-                    .error = error.what()}
-                    .emit();
+                if (splat_load_state_.validate_batch)
+                    splat_load_state_.failures.emplace_back(completion.request.path, error.what());
+                else
+                    core::events::state::SplatFileLoadFailed{.path = completion.request.path, .error = error.what()}.emit();
             }
         }
 
@@ -1185,6 +1421,15 @@ namespace lfs::vis::gui {
             }
         }
         gallery_transaction.reset();
+        if (!completions.empty()) {
+            completions.clear();
+            {
+                const std::lock_guard lock(splat_load_state_.mutex);
+                if (!splat_load_state_.pending_render_request)
+                    splat_load_state_.attachment_pending = false;
+            }
+            splat_load_state_.completion_consumed.notify_all();
+        }
 
         if (!splat_load_state_.worker_complete.load(std::memory_order_acquire)) {
             publishImportOverlayState();
@@ -1197,11 +1442,16 @@ namespace lfs::vis::gui {
         }
         const auto state = jobs_.update(splat_load_state_.job);
         if (!state || state->status == JobStatus::Canceled) {
+            splat_load_state_.gallery.reset();
+            splat_load_state_.gallery_group_uuid.reset();
+            splat_load_state_.worker_complete.store(false, std::memory_order_release);
             std::lock_guard lock(splat_load_state_.mutex);
             splat_load_state_.completions.clear();
             return;
         }
         if (state->worker_canceled) {
+            splat_load_state_.gallery.reset();
+            splat_load_state_.gallery_group_uuid.reset();
             jobs_.canceled(splat_load_state_.job);
             std::lock_guard lock(splat_load_state_.mutex);
             splat_load_state_.completions.clear();
@@ -1209,7 +1459,7 @@ namespace lfs::vis::gui {
             return;
         }
 
-        if (scene_manager && splat_load_state_.loaded_count > 1 &&
+        if (scene_manager && !splat_load_state_.validate_batch && splat_load_state_.loaded_count > 1 &&
             !splat_load_state_.consolidation_pending) {
             jobs_.report(splat_load_state_.job, 0.98F,
                          LOC(lichtfeld::Strings::Runtime::TASK_APPLYING));
@@ -1224,12 +1474,24 @@ namespace lfs::vis::gui {
                 publishImportOverlayState();
                 return;
             }
-            // Preserve the original float coefficients for editing and re-export.
-            // The renderer cache may quantize its own combined copy.
             if (!splat_load_state_.gallery)
                 scene_manager->consolidateNodeModels();
             splat_load_state_.consolidation_pending = false;
         }
+        if (!splat_load_state_.failures.empty()) {
+            if (splat_load_state_.validate_batch) {
+                lfs::core::events::state::SplatBatchLoadFailed{
+                    .failures = std::move(splat_load_state_.failures),
+                    .loaded_count = splat_load_state_.loaded_count}
+                    .emit();
+            } else {
+                for (const auto& [path, error] : splat_load_state_.failures)
+                    lfs::core::events::state::SplatFileLoadFailed{.path = path, .error = error}.emit();
+            }
+            splat_load_state_.failures.clear();
+        }
+        if (scene_manager)
+            scene_manager->getScene().setImportValidation(false);
         const bool success = splat_load_state_.loaded_count > 0;
         {
             const std::lock_guard lock(import_state_.mutex);
@@ -1242,9 +1504,17 @@ namespace lfs::vis::gui {
                          LOC(lichtfeld::Strings::Runtime::TASK_COMPLETE));
             jobs_.completed(splat_load_state_.job);
         } else {
-            jobs_.failed(splat_load_state_.job, "No splat files could be loaded");
+            jobs_.failed(splat_load_state_.job, splat_load_state_.reframe_photo
+                                                    ? (splat_load_state_.reframe_error.empty() ? "Photo reconstruction failed" : splat_load_state_.reframe_error)
+                                                    : "No splat files could be loaded");
         }
-        import_state_.show_completion.store(true, std::memory_order_release);
+        // Gallery ownership ends with this job, before a dataset can commit its clear.
+        splat_load_state_.gallery.reset();
+        splat_load_state_.gallery_group_uuid.reset();
+        // Batch failures already have a localized file-error modal. Keeping the
+        // dataset failure overlay open as well obscures it and blocks input
+        // even after the file-error modal is dismissed.
+        import_state_.show_completion.store(success || !splat_load_state_.validate_batch, std::memory_order_release);
         if (success)
             scheduleImportCompletionDismiss();
         publishImportOverlayState();
@@ -1255,12 +1525,47 @@ namespace lfs::vis::gui {
     void AsyncTaskManager::setupEvents() {
         using namespace lfs::core::events;
 
-        state::SceneCleared::when([this](const auto&) { ++gallery_scene_epoch_; });
+        state::SceneReplacing::when([this](const auto& event) {
+            if (!viewer_->getSceneManager() || event.scene != &viewer_->getSceneManager()->getScene())
+                return;
+            ++gallery_scene_epoch_;
+            if (auto* loader = viewer_->getDataLoader())
+                loader->cancelPendingImports();
+            // Dataset application also clears the scene. Cancel splat staging,
+            // without canceling the dataset job currently committing that clear.
+            if (splat_load_state_.thread || splat_load_state_.pending_render_request)
+                cancelImport(false);
+        });
+        state::SceneCleared::when([this](const auto& event) {
+            // Normal import replacement emits SceneCleared too; only history
+            // restoration is a new explicit boundary here. Gallery retains
+            // master's epoch invalidation on all scene clears.
+            const bool reframe_running = splat_load_state_.reframe_photo && jobs_.anyRunning(JobType::Import);
+            if (!event.from_history && !canCancelGalleryImport() && !reframe_running)
+                return;
+            ++gallery_scene_epoch_;
+            if (event.from_history) {
+                if (auto* loader = viewer_->getDataLoader())
+                    loader->cancelPendingImports();
+            }
+            cancelImport(false);
+        });
 
         cmd::PrepareGalleryProject::when([this](const auto& command) {
             startGalleryProjectExport({command.source_path, command.destination,
                                        command.payload_format, command.expected_commit_uuid});
         });
+
+#if defined(LFS_HAS_APPLE_REFRAME)
+        cmd::CreateSplatFromPhoto::when([this](const auto& command) {
+            auto* manager = viewer_->getSceneManager();
+            if (!manager || !manager->canClearScene())
+                throw std::runtime_error("The scene is not editable while training or another scene operation is active");
+            if (!startSplatLoad({command.path}, false,
+                                {core::path_to_utf8(command.path.stem()) + " (Reframe)"}, {}, std::nullopt, false, true))
+                throw std::runtime_error("Another import is active. Try again when it finishes.");
+        });
+#endif
 
         cmd::LoadGalleryScene::when([this](const auto& command) {
             std::vector<std::string> names;
@@ -1308,6 +1613,10 @@ namespace lfs::vis::gui {
             params.dataset.output_path = output_path;
             if (!cmd.init_path.empty())
                 params.init_path = lfs::core::path_to_utf8(cmd.init_path);
+            params.add_splat_paths = cmd.add_splat_paths;
+            params.add_splat_freeze = cmd.add_splat_freeze;
+            params.freeze_lr_scale = cmd.freeze_lr_scale;
+            params.exclude_frozen_add_splats_from_export = cmd.exclude_frozen_add_splats_from_export;
             if (!cmd.centralize_dataset.empty())
                 params.dataset.centralize_dataset = cmd.centralize_dataset;
             if (cmd.max_width.has_value() && *cmd.max_width >= 0)
@@ -1331,6 +1640,8 @@ namespace lfs::vis::gui {
                     LOC(lichtfeld::Strings::Runtime::TASK_INITIALIZING))) {
                 return;
             }
+            import_state_.show_completion.store(
+                false, std::memory_order_release);
             {
                 const std::lock_guard lock(import_state_.mutex);
                 import_state_.path = e.path;
@@ -1424,14 +1735,36 @@ namespace lfs::vis::gui {
         });
     }
 
+    bool AsyncTaskManager::importWorkersFinished() const {
+        if (splat_load_state_.thread && !splat_load_state_.worker_complete.load(std::memory_order_acquire))
+            return false;
+        if (import_state_.thread) {
+            const auto state = jobs_.peek(import_state_.job);
+            if (state && (state->status == JobStatus::Initialized || state->status == JobStatus::Running))
+                return false;
+        }
+        return true;
+    }
+
     void AsyncTaskManager::pollImportCompletion() {
+        if (import_cancel_pending_) {
+            cancelImport(false);
+            if (import_cancel_pending_)
+                return;
+        }
         checkAsyncSplatLoadCompletion();
         checkAsyncImportCompletion();
         settlePendingJobs();
+        if (auto* loader = viewer_->getDataLoader())
+            loader->processPendingImports();
     }
 
     bool AsyncTaskManager::hasPendingMainThreadCompletions() const {
-        return import_state_.load_complete.load(std::memory_order_acquire) ||
+        if (import_cancel_pending_)
+            return importWorkersFinished();
+        return splat_load_state_.pending_render_request.has_value() ||
+               (viewer_->getDataLoader() && viewer_->getDataLoader()->hasPendingImports()) ||
+               import_state_.load_complete.load(std::memory_order_acquire) ||
                splat_load_state_.worker_complete.load(std::memory_order_acquire) ||
                [&] {
                    const std::lock_guard lock(splat_load_state_.mutex);
@@ -1454,7 +1787,8 @@ namespace lfs::vis::gui {
                                          bool rad_streamable,
                                          int spz_version,
                                          bool include_provenance,
-                                         int lod_levels, float lod_ratio, int chunk_count_k, float chunk_extent, int chunk_min_k, int kmeans_iterations) {
+                                         int lod_levels, float lod_ratio, int chunk_count_k, float chunk_extent, int chunk_min_k, int kmeans_iterations,
+                                         const bool apply_modifiers) {
         if (isExporting()) {
             if (lfs::vis::gui::isGalleryPublicationFormat(format))
                 throw std::runtime_error("Wait for the current export to finish before uploading.");
@@ -1525,9 +1859,24 @@ namespace lfs::vis::gui {
         splats.reserve(node_names.size());
         for (const auto& name : node_names) {
             const auto* node = scene.getNode(name);
+            if (node && scene_manager->isTileStreamNode(node->uuid)) {
+                // A streamed node holds only the tiles drawn for the current view. The export
+                // dialog closes on its own, so report the reason to the user as well.
+                const std::string error = LOC("runtime.tiles3d_export_streamed");
+                publishExportFailureState(format, path, error);
+                lfs::core::events::state::ExportFailed{.error = error}.emit();
+                return;
+            }
             if (node && node->type == core::NodeType::SPLAT && node->model) {
+                if (const auto& tree = node->model->lod_tree;
+                    tree && tree->has_tree() && node->model->size() < tree->total_nodes()) {
+                    publishExportFailureState(format, path, LOCF(lichtfeld::Strings::Runtime::EXPORT_STREAMED_LOD, name));
+                    return;
+                }
+                const auto evaluated = apply_modifiers ? node->evaluated_model : nullptr;
                 splats.push_back(ExportSplatSource{
-                    .data = node->model.get(),
+                    .data = evaluated ? evaluated.get() : node->model.get(),
+                    .owner = evaluated,
                     .transform = scene_coords::nodeDataWorldTransform(scene, node->id)});
             }
         }
@@ -1536,7 +1885,11 @@ namespace lfs::vis::gui {
             return;
         }
 
-        auto borrow_plan = makeBorrowSingleIdentityExportPlan(*scene_manager, node_names);
+        auto borrow_plan = makeBorrowSingleIdentityExportPlan(*scene_manager, node_names, format);
+        if (std::ranges::any_of(splats, [](const auto& source) { return source.owner != nullptr; })) {
+            borrow_plan.storage_mode = core::Scene::MergeStorageMode::Clone;
+            borrow_plan.model_mutex = nullptr;
+        }
 
         auto provenance = include_provenance ? make_gui_export_stamp(*scene_manager)
                                              : core::make_minimal_provenance_stamp();
@@ -2190,6 +2543,7 @@ namespace lfs::vis::gui {
         const auto job =
             jobs_.peek(import_state_.job);
         state.active = job && job->running();
+        state.cancellable = canCancelImport();
         state.show_completion = import_state_.show_completion.load();
         state.progress =
             job ? job->progress : 0.0F;
@@ -2324,8 +2678,26 @@ namespace lfs::vis::gui {
         publishImportOverlayState();
     }
 
+    bool AsyncTaskManager::canCancelGalleryImport() const {
+        const auto active = jobs_.active(JobType::Import);
+        return splat_load_state_.gallery.has_value() && active &&
+               active->handle == splat_load_state_.job;
+    }
+
     bool AsyncTaskManager::requestGalleryImportCancel() {
         if (!canCancelGalleryImport())
+            return false;
+        return requestImportCancel();
+    }
+
+    bool AsyncTaskManager::canCancelImport() const {
+        const auto active = jobs_.active(JobType::Import);
+        return (splat_load_state_.gallery.has_value() || splat_load_state_.reframe_photo) &&
+               active && active->handle == splat_load_state_.job;
+    }
+
+    bool AsyncTaskManager::requestImportCancel() {
+        if (!canCancelImport())
             return false;
         jobs_.requestCancel(splat_load_state_.job, LOC(lichtfeld::Strings::Runtime::TASK_CANCELLING));
         if (splat_load_state_.thread)
@@ -2335,30 +2707,47 @@ namespace lfs::vis::gui {
     }
 
     void AsyncTaskManager::cancelImport(const bool wait_for_worker) {
-        if (!wait_for_worker && splat_load_state_.gallery && splat_load_state_.thread &&
-            !splat_load_state_.worker_complete.load(std::memory_order_acquire)) {
-            jobs_.requestCancel(splat_load_state_.job, LOC(lichtfeld::Strings::Runtime::TASK_CANCELLING));
-            splat_load_state_.thread->request_stop();
-            ++gallery_scene_epoch_;
+        if (auto* gui = viewer_->getGuiManager())
+            gui->endImportRenderCheck();
+        if (auto* rendering = viewer_->getRenderingManager())
+            rendering->cancelImportRenderCheck();
+        if (!wait_for_worker && !importWorkersFinished()) {
+            import_cancel_pending_ = true;
+            if (const auto active = jobs_.active(JobType::Import);
+                active && (active->handle == splat_load_state_.job || active->handle == import_state_.job))
+                jobs_.requestCancel(active->handle, LOC(lichtfeld::Strings::Runtime::TASK_CANCELLING));
+            if (splat_load_state_.thread)
+                splat_load_state_.thread->request_stop();
+            if (import_state_.thread)
+                import_state_.thread->request_stop();
+            if (splat_load_state_.scene_generation == gallery_scene_epoch_)
+                ++gallery_scene_epoch_;
+            if (auto* manager = viewer_->getSceneManager())
+                manager->getScene().setImportValidation(false);
             publishImportOverlayState();
-            return; // Poll joins after staging finishes; project switches do not wait on IO.
+            return; // Join only after completion; project switches never wait on IO.
         }
+        import_cancel_pending_ = false;
+        if (auto* manager = viewer_->getSceneManager())
+            manager->getScene().setImportValidation(false);
         const auto splat_job = splat_load_state_.job;
         const auto import_job = import_state_.job;
-        const bool cancel_gallery = isImporting() && splat_load_state_.gallery_group_uuid.has_value();
+        const bool cancel_gallery = canCancelGalleryImport() && splat_load_state_.gallery_group_uuid.has_value();
         const bool had_activity = isImporting() ||
                                   import_state_.show_completion.load() ||
                                   import_state_.thread.has_value() ||
                                   splat_load_state_.thread.has_value();
         if (!had_activity) {
+            splat_load_state_.gallery.reset();
+            splat_load_state_.gallery_group_uuid.reset();
             return;
         }
 
         LOG_INFO("Cancelling import");
         cancelImportCompletionDismiss();
-        if (isImporting()) {
-            jobs_.requestCancel(
-                import_state_.job, LOC(lichtfeld::Strings::Runtime::TASK_CANCELLING));
+        if (const auto active = jobs_.active(JobType::Import);
+            active && (active->handle == splat_job || active->handle == import_job)) {
+            jobs_.requestCancel(active->handle, LOC(lichtfeld::Strings::Runtime::TASK_CANCELLING));
         }
         if (import_state_.thread) {
             import_state_.thread->request_stop();
@@ -2381,6 +2770,8 @@ namespace lfs::vis::gui {
             splat_load_state_.gallery_group_uuid.reset();
         }
 
+        splat_load_state_.gallery.reset();
+        splat_load_state_.gallery_group_uuid.reset();
         const auto cancel_if_running = [this](const JobHandle handle) {
             if (const auto state = jobs_.update(handle); state && state->running())
                 jobs_.canceled(handle);
@@ -2395,6 +2786,9 @@ namespace lfs::vis::gui {
         import_state_.load_complete.store(false);
         import_state_.show_completion.store(false);
         splat_load_state_.worker_complete.store(false, std::memory_order_release);
+        splat_load_state_.pending_render_request.reset();
+        if (auto* rendering = viewer_->getRenderingManager())
+            rendering->cancelImportRenderCheck();
         {
             const std::lock_guard lock(import_state_.mutex);
             import_state_.path.clear();
@@ -2647,7 +3041,12 @@ namespace lfs::vis::gui {
             return;
         }
 
+        const auto committing_job = import_state_.job;
         const auto result = scene_manager->applyLoadedDataset(path, params, std::move(*load_result));
+        // Scene callbacks may explicitly replace or cancel the committing job.
+        const auto active = jobs_.active(JobType::Import);
+        if (!committing_job || import_state_.job != committing_job || !active || active->handle != committing_job)
+            return;
 
         if (result) {
             if (auto* data_loader = viewer_->getDataLoader())
@@ -2775,6 +3174,9 @@ namespace lfs::vis::gui {
             return;
         }
         const auto& timeline = gui_manager->sequencer().timeline();
+        const auto* sequence = gui_manager->sequencer().plySequence();
+        const auto sequence_uuid = sequence ? std::optional(sequence->node_uuid) : std::nullopt;
+        std::vector<size_t> sequence_frames;
         if (timeline.empty()) {
             fail_start(LOC(lichtfeld::Strings::Runtime::VIDEO_NO_KEYFRAMES));
             return;
@@ -2808,7 +3210,8 @@ namespace lfs::vis::gui {
             return;
         }
 
-        const auto snapshot_result = captureVideoExportSceneSnapshot(*scene_manager);
+        const auto snapshot_result = captureVideoExportSceneSnapshot(
+            *scene_manager, sequence ? VideoExportCapture::ImmediateRender : VideoExportCapture::Owned);
         if (!snapshot_result) {
             fail_start(snapshot_result.error());
             return;
@@ -2821,17 +3224,21 @@ namespace lfs::vis::gui {
         }
 
         const auto export_options = *validated_options;
-        const float duration = timeline.duration();
+        const float duration = timeline.clipDuration();
         const int total_frames = static_cast<int>(std::ceil(duration * export_options.framerate)) + 1;
         const int width = export_options.width;
         const int height = export_options.height;
 
         std::vector<lfs::sequencer::CameraState> frame_states;
         frame_states.reserve(total_frames);
-        const float start_time = timeline.startTime();
+        const float start_time = 0.0f;
         const float time_step = 1.0f / static_cast<float>(export_options.framerate);
-        for (int i = 0; i < total_frames; ++i)
-            frame_states.push_back(timeline.evaluate(start_time + static_cast<float>(i) * time_step));
+        for (int i = 0; i < total_frames; ++i) {
+            const float time = start_time + static_cast<float>(i) * time_step;
+            frame_states.push_back(timeline.evaluate(time));
+            if (sequence)
+                sequence_frames.push_back(*gui_manager->sequencer().plySequenceFrameIndex(time));
+        }
 
         if (!beginJob(
                 video_export_state_.job,
@@ -2870,20 +3277,23 @@ namespace lfs::vis::gui {
         video_export_state_.thread.emplace(
             [this, job, viewer = viewer_, path, export_options, total_frames, width, height,
              engine, scene_manager, rendering_manager, render_settings, start_time, time_step,
+             sequence_uuid, sequence_frames = std::move(sequence_frames),
              environment_state = video_export_environment_state_.get(),
              mesh_renderer_state = video_export_mesh_renderer_state_.get(),
-             snapshot = *snapshot_result,
+             snapshot = sequence_uuid ? VideoExportSceneSnapshot{} : *snapshot_result,
              frame_states = std::move(frame_states)](std::stop_token stop_token) mutable {
                 jobs_.work(job);
                 bool cancelled = false;
                 std::string error_msg;
-                auto cleanup_video_export_state = [this, viewer]() {
+                auto cleanup_video_export_state = [this, viewer, sequence_uuid]() {
                     if (!video_export_environment_state_ && !video_export_mesh_renderer_state_) {
                         return;
                     }
                     auto cleanup_result = postToViewerAndWait(
                         viewer,
-                        [this]() -> std::expected<void, std::string> {
+                        [this, viewer, sequence_uuid]() -> std::expected<void, std::string> {
+                            if (sequence_uuid)
+                                viewer->getGuiManager()->sequencerUI().finishPlySequenceExport();
                             resetVideoExportMeshRendererState();
                             resetVideoExportEnvironmentState();
                             return {};
@@ -2942,33 +3352,73 @@ namespace lfs::vis::gui {
                         break;
                     }
 
-                    auto frame_tensor = postToViewerAndWait(
-                        viewer,
-                        [viewer, engine, scene_manager, rendering_manager, environment_state,
-                         mesh_renderer_state, snapshot_ptr = &snapshot, render_settings, width, height,
-                         cam_state = frame_states[frame],
-                         clip_time = start_time + static_cast<float>(frame) * time_step]()
+                    const auto render_frame = [&] {
+                        return postToViewerAndWait(
+                            viewer,
+                            [viewer, engine, scene_manager, rendering_manager, environment_state,
+                             mesh_renderer_state, snapshot_ptr = &snapshot, render_settings, width, height, sequence_uuid, sequence_frame = sequence_uuid ? sequence_frames[frame] : 0,
+                             fps = static_cast<float>(export_options.framerate),
+                             cam_state = frame_states[frame],
+                             clip_time = start_time + static_cast<float>(frame) * time_step]() mutable
                             -> std::expected<lfs::core::Tensor, std::string> {
-                            if (lfs::python::has_scene_time_callback()) {
-                                lfs::python::tick_scene_time_callback(clip_time);
-                                refreshVideoExportMeshTransforms(
-                                    *snapshot_ptr, scene_manager->getScene());
-                            }
-                            auto* const window_manager = viewer->getWindowManager();
-                            auto* const vulkan_context =
-                                window_manager != nullptr ? window_manager->getVulkanContext() : nullptr;
-                            return renderVideoExportFrame(
-                                *rendering_manager,
-                                *engine,
-                                *environment_state,
-                                mesh_renderer_state,
-                                vulkan_context,
-                                *snapshot_ptr,
-                                render_settings,
-                                cam_state,
-                                width,
-                                height);
-                        });
+                                if (sequence_uuid) {
+                                    auto& sequencer_ui = viewer->getGuiManager()->sequencerUI();
+                                    const auto* current = sequencer_ui.controller().plySequence();
+                                    if (!current || current->node_uuid != *sequence_uuid)
+                                        return std::unexpected(std::string(LOC(lichtfeld::Strings::Runtime::VIDEO_EXPORT_SEQUENCE_CHANGED)));
+                                    auto ready = sequencer_ui.preparePlySequenceExportFrame(sequence_frame);
+                                    if (!ready)
+                                        return std::unexpected(std::string(ready.error().user_message()));
+                                    if (!*ready)
+                                        return lfs::core::Tensor{};
+                                }
+                                if (lfs::python::has_scene_time_callback()) {
+                                    lfs::python::tick_scene_time_callback(clip_time);
+                                }
+                                const auto evaluated = viewer->getGuiManager()->sequencer().prepareExportFrame(
+                                    scene_manager->modifierManager(), clip_time, fps);
+                                if (!evaluated)
+                                    return std::unexpected(evaluated.error().message);
+                                // Capture effective payloads after the worker fence. Sequence frames
+                                // borrow only for this synchronous viewer-thread render.
+                                auto current_snapshot = captureVideoExportSceneSnapshot(
+                                    *scene_manager, sequence_uuid ? VideoExportCapture::ImmediateRender : VideoExportCapture::Owned);
+                                if (!current_snapshot)
+                                    return std::unexpected(current_snapshot.error());
+                                snapshot_ptr = &*current_snapshot;
+                                auto* const window_manager = viewer->getWindowManager();
+                                auto* const graphics_context =
+                                    window_manager != nullptr ? window_manager->getGraphicsContext() : nullptr;
+                                return renderVideoExportFrame(
+                                    *rendering_manager,
+                                    *engine,
+                                    *environment_state,
+                                    mesh_renderer_state,
+                                    graphics_context,
+                                    *snapshot_ptr,
+                                    render_settings,
+                                    cam_state,
+                                    width,
+                                    height);
+                            });
+                    };
+                    auto frame_tensor = render_frame();
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(2);
+                    // No viewer-thread wait: let the player drain asynchronous frame loads.
+                    while (frame_tensor && !frame_tensor->is_valid()) {
+                        if (stop_token.stop_requested() || jobs_.cancelRequested(job)) {
+                            cancelled = true;
+                            break;
+                        }
+                        if (std::chrono::steady_clock::now() >= deadline) {
+                            frame_tensor = std::unexpected(std::string(LOC(lichtfeld::Strings::Runtime::VIDEO_EXPORT_SEQUENCE_FRAME_TIMEOUT)));
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        frame_tensor = render_frame();
+                    }
+                    if (cancelled)
+                        break;
 
                     if (!frame_tensor) {
                         LOG_ERROR("Failed to render frame {}: {}", frame, frame_tensor.error());

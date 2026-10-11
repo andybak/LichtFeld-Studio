@@ -5,14 +5,15 @@
 #include "app/converter.hpp"
 #include "app/converter_output_paths.hpp"
 #include "app/converter_overwrite.hpp"
+#include "app/terminal_progress_bar.hpp"
 #include "core/checkpoint_format.hpp"
 #include "core/error.hpp"
+#include "core/host_metrics.hpp"
 #include "core/logger.hpp"
 #include "core/mesh_data.hpp"
 #include "core/path_utils.hpp"
 #include "core/provenance.hpp"
 #include "core/splat_data.hpp"
-#include "indicators.hpp"
 #include "io/exporter.hpp"
 #include "io/formats/rad.hpp"
 #include "io/formats/ssog.hpp"
@@ -27,7 +28,6 @@
 #include <fstream>
 #include <iostream>
 #include <istream>
-#include <mutex>
 #include <optional>
 #include <print>
 
@@ -102,75 +102,7 @@ namespace lfs::app {
             return targets;
         }
 
-        // Terminal progress bar for conversions, styled like the training bar.
-        // report() is thread-safe: RAD chunk encoding fires the export progress
-        // callback from TBB worker threads.
-        class ConvertProgressBar {
-        public:
-            ConvertProgressBar() {
-                bar_.set_option(indicators::option::Start("["));
-#ifdef _WIN32
-                bar_.set_option(indicators::option::BarWidth(38));
-                bar_.set_option(indicators::option::Fill("="));
-                bar_.set_option(indicators::option::Lead(">"));
-                bar_.set_option(indicators::option::Remainder(" "));
-#else
-                bar_.set_option(indicators::option::BarWidth(40));
-                bar_.set_option(indicators::option::Fill("█"));
-                bar_.set_option(indicators::option::Lead("▌"));
-                bar_.set_option(indicators::option::Remainder("░"));
-#endif
-                bar_.set_option(indicators::option::End("]"));
-                bar_.set_option(indicators::option::PrefixText("Converting "));
-                bar_.set_option(indicators::option::ShowPercentage(true));
-                bar_.set_option(indicators::option::ShowElapsedTime(true));
-                bar_.set_option(indicators::option::ShowRemainingTime(true));
-                bar_.set_option(indicators::option::ForegroundColor(indicators::Color::cyan));
-                bar_.set_option(indicators::option::FontStyles(
-                    std::vector<indicators::FontStyle>{indicators::FontStyle::bold}));
-            }
-
-            bool report(const float progress, const std::string& stage) {
-                const int percent = static_cast<int>(std::clamp(progress, 0.0f, 1.0f) * 100.0f);
-                std::lock_guard lock(mutex_);
-                if (percent == last_percent_ && stage == last_stage_) {
-                    return true;
-                }
-                last_percent_ = percent;
-                last_stage_ = stage;
-                bar_.set_option(indicators::option::PostfixText(std::format("{:<40}", stage)));
-                bar_.set_progress(static_cast<size_t>(percent));
-                return true;
-            }
-
-            void complete() {
-                std::lock_guard lock(mutex_);
-                if (!bar_.is_completed()) {
-                    bar_.set_progress(100);
-                    bar_.mark_as_completed();
-                    std::cout << std::endl;
-                }
-            }
-
-            // Ends the bar line without forcing 100% so errors print cleanly below.
-            void abort() {
-                std::lock_guard lock(mutex_);
-                if (!bar_.is_completed()) {
-                    bar_.mark_as_completed();
-                    std::cout << std::endl;
-                }
-            }
-
-            ~ConvertProgressBar() {
-                abort();
-            }
-
-        private:
-            indicators::ProgressBar bar_;
-            std::mutex mutex_;
-            int last_percent_ = -1;
-            std::string last_stage_;
-        };
+        using ConvertProgressBar = TerminalProgressBar;
 
         template <typename Parameters>
         lfs::io::SsogSaveOptions ssogOptions(const Parameters& p) {
@@ -445,19 +377,8 @@ namespace lfs::app {
             // Full load + Bhattacharyya workset at 1.5x capacity, per splat.
             const std::uint64_t per_splat = 360 + static_cast<std::uint64_t>(rest_coeffs) * 40;
             const std::uint64_t estimated = info->vertex_count * per_splat;
-            std::uint64_t budget = 8ull << 30;
-#ifndef _WIN32
-            std::ifstream meminfo("/proc/meminfo");
-            std::string line;
-            while (std::getline(meminfo, line)) {
-                if (line.starts_with("MemAvailable:")) {
-                    std::uint64_t kb = 0;
-                    std::sscanf(line.c_str(), "MemAvailable: %lu kB", &kb);
-                    budget = kb * 1024;
-                    break;
-                }
-            }
-#endif
+            const auto memory = core::host_metrics::memory();
+            const std::uint64_t budget = memory ? memory->available_bytes : 8ull << 30;
             return estimated > budget * 7 / 10;
         }
 

@@ -31,10 +31,6 @@ namespace lfs::vis {
     class SceneManager;
     class RenderingManager;
 
-    enum class GraphicsBackend {
-        Vulkan,
-    };
-
     enum class ProjectSwitchDisposition {
         RequireClean,
         DiscardChanges,
@@ -81,12 +77,14 @@ namespace lfs::vis {
     struct RuntimeServiceControls {
         std::function<bool()> toggle_mcp_enabled;
         std::function<bool()> toggle_mcp_binding;
+        std::optional<int> mcp_port_override;
     };
 
     LFS_VIS_API void setRuntimeServiceControls(RuntimeServiceControls controls);
     LFS_VIS_API bool toggleMcpRuntimeEnabled();
     LFS_VIS_API bool toggleMcpRuntimeBinding();
-    [[nodiscard]] LFS_VIS_API std::uint64_t runtimeServiceRevision();
+    // Port from the command line; it wins over the saved preference for this session.
+    [[nodiscard]] LFS_VIS_API std::optional<int> mcpPortOverride();
 
     struct LFS_VIS_API ProjectPayloadInfo {
         std::string chapter;
@@ -172,7 +170,6 @@ namespace lfs::vis {
         bool safe_mode = false;
         std::function<RuntimeServiceStatus()> mcp_status_provider;
         bool gut = false;
-        GraphicsBackend graphics_backend = GraphicsBackend::Vulkan;
         int monitor_x = 0; // Monitor hint for window placement
         int monitor_y = 0;
         int monitor_width = 0;
@@ -183,6 +180,8 @@ namespace lfs::vis {
         std::optional<std::filesystem::path>
             project_lifecycle_settings_path;
     };
+
+    class PointCloudUpdateManager;
 
     class LFS_VIS_API Visualizer {
     public:
@@ -205,6 +204,7 @@ namespace lfs::vis {
         virtual SceneManager* getSceneManager() = 0;
         virtual RenderingManager* getRenderingManager() = 0;
 
+        virtual std::shared_ptr<PointCloudUpdateManager> pointCloudUpdates() { return {}; }
         virtual bool postWork(WorkItem work) = 0;
         // Drain viewer-owned work while an explicit project operation waits
         // for a worker. Normal frames drain this queue from update().

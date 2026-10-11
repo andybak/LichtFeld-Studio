@@ -52,6 +52,7 @@ namespace lfs::core::internal {
         size_t count_nonzero_float(StorageRef, size_t, ExecContext) override;
         bool has_nan(StorageRef, size_t, ExecContext) override;
         bool has_inf(StorageRef, size_t, ExecContext) override;
+        bool arg_extreme(StorageRef, StorageRef, StorageRef, const ArgExtremeProgram&, ExecContext) override;
         void cumsum(StorageRef, const StridedLayout&, int, ExecContext) override;
         void sort_1d(StorageRef, StorageRef, size_t, const SortProgram&, ExecContext) override;
         void sort_2d(StorageRef, StorageRef, const SortProgram&, ExecContext) override;
@@ -68,18 +69,40 @@ namespace lfs::core::internal {
         void project_points(StorageRef, StorageRef, size_t, const PointProjection&,
                             const StorageRef*, size_t, const StorageRef*,
                             const StorageRef*, size_t, ExecContext) override;
+        void rasterize_points(const PointRasterProgram&, ExecContext) override;
+        void nearest_point_indices(StorageRef, StorageRef, StorageRef, StorageRef, StorageRef, size_t, size_t, size_t, float, ExecContext) override;
+        void camera_frustum_counts(StorageRef, StorageRef, StorageRef, size_t, size_t, float, ExecContext) override;
         void radius_neighbors(StorageRef, StorageRef, StorageRef, StorageRef, StorageRef,
-                              size_t, size_t, float, ExecContext) override;
+                              size_t, size_t, float, bool, std::optional<StorageRef>, ExecContext) override;
+        void radius_neighbor_counts(StorageRef, StorageRef, StorageRef, StorageRef, StorageRef,
+                                    size_t, size_t, float, int32_t, std::optional<StorageRef>, ExecContext) override;
+        void radius_neighbor_min(StorageRef, StorageRef, StorageRef, StorageRef, StorageRef, StorageRef,
+                                 size_t, size_t, float, std::optional<StorageRef>, ExecContext) override;
+        bool radius_connected_components(StorageRef, StorageRef, StorageRef, StorageRef, StorageRef, size_t, size_t,
+                                         float, ExecContext) override;
+        bool point_tree_counts(StorageRef, StorageRef, StorageRef, StorageRef, StorageRef, std::optional<StorageRef>,
+                               StorageRef, const PointTreeProgram&, ExecContext) override;
+        bool point_tree_components(StorageRef, StorageRef, StorageRef, StorageRef, StorageRef, StorageRef, StorageRef,
+                                   StorageRef, const PointTreeProgram&, ExecContext) override;
+        bool triangle_tree_parity(StorageRef, StorageRef, StorageRef, StorageRef, StorageRef, const PointTreeProgram&,
+                                  ExecContext) override;
+        bool point_tree_spacing(StorageRef, StorageRef, StorageRef, StorageRef, StorageRef, const PointTreeProgram&,
+                                ExecContext) override;
+        bool simplify_merge(const std::array<StorageRef, 5>&, StorageRef, StorageRef, const std::array<StorageRef, 5>&,
+                            const SimplifyMergeProgram&, ExecContext) override;
+        void point_neighbor_spacing(StorageRef, StorageRef, StorageRef, StorageRef, StorageRef,
+                                    size_t, size_t, float, ExecContext) override;
         void mark_points_2d(StorageRef, StorageRef, size_t, const PointRegion2D&,
                             const StorageRef*, size_t, ExecContext) override;
         void filter_points(StorageRef mask, const PointFilterProgram& program, ExecContext context) override;
         void update_labels(StorageRef, StorageRef, const LabelUpdateProgram&, ExecContext) override;
         void ppisp_apply(StorageRef input, StorageRef output, int width, int height, const PpispParams& params, ExecContext context) override;
         void environment_composite(StorageRef rgb, StorageRef alpha, StorageRef environment, StorageRef output, const EnvironmentCompositeParams& params, ExecContext context) override;
+        Tensor image_warp(const Tensor& input, const UndistortParams& params, int mode, bool inverse, Tensor* validity, ExecContext context) override;
         Tensor image_undistort(const Tensor& input, const UndistortParams& params, bool mask, ExecContext context) override;
         Tensor image_resize_prior(const Tensor& input, int height, int width, bool normal, ExecContext context) override;
         void histogram_u8(StorageRef, StorageRef, size_t, ExecContext) override;
-        void affine_splat_geometry(StorageRef, StorageRef, StorageRef, StorageRef, const splat_transform::LinearTransform&, size_t, ExecContext) override;
+        void affine_splat_geometry(StorageRef, StorageRef, StorageRef, StorageRef, const splat_transform::LinearTransform&, size_t, std::optional<StorageRef>, ExecContext) override;
         void sh_codec(StorageRef, StorageRef, const ShCodecProgram&, ExecContext) override;
         Tensor morton_sort(const Tensor& positions, Tensor* sorted_keys, ExecContext context) override;
         std::tuple<Tensor, Tensor> kmeans_sh(const Tensor& shN, int n_points, int sh_coeffs, int k,
@@ -119,7 +142,6 @@ namespace lfs::core::internal {
                     const StridedLayout&, const IndexProgram&, ExecContext) override;
         void gather_fused_unary(StorageRef, StorageRef, StorageRef, PointwiseOp,
                                 const IndexProgram&, ExecContext) override;
-        void take(StorageRef, StorageRef, StorageRef, const IndexProgram&, ExecContext) override;
         void index_select(StorageRef, StorageRef, StorageRef, const StridedLayout&,
                           const IndexProgram&, ExecContext) override;
         void scatter(StorageRef, StorageRef, StorageRef, const StridedLayout&,
@@ -158,11 +180,14 @@ namespace lfs::core::internal {
 
         StorageRef allocate(size_t, size_t, ExecContext) override;
         void deallocate(StorageRef, ExecContext) noexcept override;
+        void push_range(const char*) override;
+        void pop_range() override;
         void record_stream(StorageRef, ExecContext) override;
         void release_stream(ExecContext) override;
         void rehome_stream(StorageRef, ExecContext) override;
         void trim() override;
         void trim_if_reserved_unused_exceeds(size_t) override;
+        void hold_freed_memory(bool) override;
         MemoryInfo stats() override;
         void shutdown() override;
         void set_allocation_iteration(int) override;

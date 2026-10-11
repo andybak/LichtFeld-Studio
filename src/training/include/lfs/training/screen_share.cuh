@@ -6,10 +6,6 @@
 
 #include <cmath>
 
-#ifdef __CUDACC__
-#include <cuda_runtime.h>
-#endif
-
 namespace lfs::training {
 
     // Dimensionless angular / screen-share of a 3D Gaussian. Saturates toward 1
@@ -67,27 +63,6 @@ namespace lfs::training {
         return max_screen_share > 0.0f && max_screen_share < 1.0f;
     }
 
-    // Oversize-split draw score: only share > limit is eligible, blended with
-    // error so the budget prefers oversized splats that also reconstruct poorly.
-    [[nodiscard]]
-#ifdef __CUDACC__
-    __host__ __device__
-#endif
-        inline float oversize_split_score(
-            const float error_score,
-            const float max_share,
-            const float limit) {
-#ifdef __CUDA_ARCH__
-        if (!(limit > 0.0f) || !(limit < 1.0f) || !(max_share > limit) || !(error_score > 0.0f))
-            return 0.0f;
-        return sqrtf(error_score) * (max_share / limit);
-#else
-        if (!(limit > 0.0f) || !(limit < 1.0f) || !(max_share > limit) || !(error_score > 0.0f))
-            return 0.0f;
-        return std::sqrt(error_score) * (max_share / limit);
-#endif
-    }
-
 #ifdef __CUDACC__
     __device__ __forceinline__ void atomic_max_float(float* addr, const float val) {
         int* const addr_i = reinterpret_cast<int*>(addr);
@@ -103,6 +78,10 @@ namespace lfs::training {
         }
     }
 
+    // First-moment-only term: penalty * log2(share / limit) Adam-normalized steps.
+    // It scales with the old second moment, so feeding it into v as well grows v
+    // by (1 - beta2) * (penalty * log2(share / limit) * bc2)^2 per step and
+    // overflows it within tens of iterations for large penalties.
     __device__ __forceinline__ float screen_share_hinge_extra_grad(
         const float share,
         const float limit,
@@ -117,5 +96,24 @@ namespace lfs::training {
         return hinge * denom;
     }
 #endif
+
+#ifdef __CUDACC__
+    __host__ __device__
+#endif
+        inline float
+        oversize_split_score(
+            const float error_score,
+            const float max_share,
+            const float limit) {
+#ifdef __CUDA_ARCH__
+        if (!(limit > 0.0f) || !(limit < 1.0f) || !(max_share > limit) || !(error_score > 0.0f))
+            return 0.0f;
+        return sqrtf(error_score) * (max_share / limit);
+#else
+        if (!(limit > 0.0f) || !(limit < 1.0f) || !(max_share > limit) || !(error_score > 0.0f))
+            return 0.0f;
+        return std::sqrt(error_score) * (max_share / limit);
+#endif
+    }
 
 } // namespace lfs::training

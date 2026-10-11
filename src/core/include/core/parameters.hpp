@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "core/error.hpp"
 #include "core/export.hpp"
 #include "core/mesh2splat.hpp"
 #include "core/training_backend.hpp"
@@ -51,6 +52,77 @@ namespace lfs::core {
             SegmentAndIgnore, // 3-band mask (0-255): value<128 ignore, 128<=value<=250 segment, value>250 keep
             AlphaConsistent   // Enforce exact alpha values from mask
         };
+
+        enum class PPISPHoldoutAppearance { Mean,
+                                            Nearest };
+
+        [[nodiscard]] inline constexpr std::optional<PPISPHoldoutAppearance> ppisp_holdout_appearance_from_string(std::string_view value) noexcept {
+            if (value == "mean")
+                return PPISPHoldoutAppearance::Mean;
+            if (value == "nearest")
+                return PPISPHoldoutAppearance::Nearest;
+            return std::nullopt;
+        }
+
+        enum class EvalSpace {
+            Distorted,
+            Undistorted,
+        };
+
+        [[nodiscard]] inline constexpr std::string_view eval_space_name(
+            const EvalSpace space) noexcept {
+            switch (space) {
+            case EvalSpace::Distorted:
+                return "distorted";
+            case EvalSpace::Undistorted:
+                return "undistorted";
+            }
+            return "distorted";
+        }
+
+        [[nodiscard]] inline constexpr std::optional<EvalSpace> eval_space_from_string(
+            const std::string_view value) noexcept {
+            if (value == "distorted")
+                return EvalSpace::Distorted;
+            if (value == "undistorted")
+                return EvalSpace::Undistorted;
+            return std::nullopt;
+        }
+
+        // Grid the render is quantized to before metrics; Auto follows each reference image's encoding.
+        enum class EvalBitDepth {
+            Auto,
+            Eight,
+            Sixteen,
+            Float,
+        };
+
+        [[nodiscard]] inline constexpr std::string_view eval_bit_depth_name(const EvalBitDepth depth) noexcept {
+            switch (depth) {
+            case EvalBitDepth::Auto:
+                return "auto";
+            case EvalBitDepth::Eight:
+                return "8";
+            case EvalBitDepth::Sixteen:
+                return "16";
+            case EvalBitDepth::Float:
+                return "float";
+            }
+            return "auto";
+        }
+
+        [[nodiscard]] inline constexpr std::optional<EvalBitDepth> eval_bit_depth_from_string(
+            const std::string_view value) noexcept {
+            if (value == "auto")
+                return EvalBitDepth::Auto;
+            if (value == "8")
+                return EvalBitDepth::Eight;
+            if (value == "16")
+                return EvalBitDepth::Sixteen;
+            if (value == "float")
+                return EvalBitDepth::Float;
+            return std::nullopt;
+        }
 
         enum class DensifyErrorMap {
             Ssim,   // full SSIM (luminance × contrast × structure)
@@ -175,6 +247,7 @@ namespace lfs::core {
             float shs_lr = 0.0025f;
             float opacity_lr = 0.025f;
             float scaling_lr = 0.005f;
+            float late_lr_anneal = 1.0f;
             float scaling_lr_end = 0.005f;
             float rotation_lr = 0.001f;
             // Adam and refinement signals only; strategy noise, decay, and resets remain crop-unaware.
@@ -190,6 +263,14 @@ namespace lfs::core {
             int sh_degree = 3;
             float opacity_reg = 0.01f;
             float scale_reg = 0.01f;
+            float scale_reg_decay_power = -1.0f;
+            float erank_reg = 0.0f;
+            float dc_reg = 0.0f;
+            float sh_rest_reg = 0.0f;
+            float thin_structure_weight = 0.0f;
+            float gradient_loss_weight = 0.0f;
+            bool opacity_decay_rendered_only = false;
+            float densify_structure_weight = 0.0f;
             float init_opacity = 0.5f;
             float init_scaling = 0.1f;
             int max_cap = 1000000;
@@ -199,6 +280,12 @@ namespace lfs::core {
             bool bg_modulation = false;                        // Enable sinusoidal background modulation
             bool enable_eval = false;                          // Only evaluate when explicitly enabled
             bool eval_all = false;                             // Train on every image and evaluate all of them
+            bool eval_flip = false;                            // Also compute FLIP and save its error maps
+            EvalSpace eval_space = EvalSpace::Distorted;       // Reference image space used for evaluation
+            EvalBitDepth eval_bit_depth = EvalBitDepth::Auto;  // Grid the render is quantized to for evaluation
+            std::string eval_mask = "";                        // Mesh path, bbox:..., cropbox, masks:<folder>, depth:near,far, points:radius,close or points:<file>; empty disables
+            bool eval_mask_invert = false;                     // Score the pixels outside the evaluation mask instead
+            float eval_mask_opacity = 0.85f;                   // Rendered opacity a pixel needs to count as covered by a splat mask
             bool enable_save_eval_images = true;               // Save during evaluation images
             bool headless = false;                             // Disable visualization during training
             bool auto_train = false;                           // Start training immediately on startup
@@ -219,6 +306,7 @@ namespace lfs::core {
             bool use_depth_loss = false;         // Use dataset depth maps when available
             float depth_loss_weight = 2.0f;      // Depth supervision weight (decays over training)
             std::string depth_loss_mode = "ssi"; // ssi (auto prior), ssi-disparity, or ssi-depth
+            bool depth_auto_generate = true;     // Generate missing/mismatched maps from images/ with MoGe-2
 
             // Normal supervision
             bool use_normal_loss = false;             // Use dataset normal maps when available
@@ -265,6 +353,7 @@ namespace lfs::core {
             int ppisp_warmup_steps = 500;
             bool ppisp_freeze_from_sidecar = false;
             std::filesystem::path ppisp_sidecar_path = {};
+            PPISPHoldoutAppearance ppisp_holdout_appearance = PPISPHoldoutAppearance::Nearest;
             bool ppisp_use_controller = false;
             bool ppisp_freeze_gaussians_on_distill = true;
             int ppisp_controller_activation_step = -1; // Negative values use the last-5000-steps default schedule
@@ -275,7 +364,8 @@ namespace lfs::core {
             size_t reset_every = 3'000;
             bool gut = false;
             bool undistort = false;
-            float steps_scaler = 1.f; // Scales training step counts; values <= 0 disable scaling
+            float steps_scaler = 1.f;       // Scales training step counts; values <= 0 disable scaling
+            float image_count_scaler = 1.f; // Share of steps_scaler applied by the GUI image-count auto-scale
 
             // MRNF strategy specific parameters
             float growth_grad_threshold = 0.003f;
@@ -290,22 +380,15 @@ namespace lfs::core {
             // Dimensionless on-screen share cap. <=0 or >=1 disables the cap.
             float max_screen_share = 0.3f;
             float screen_share_penalty = 1.0f;
-            // Fraction of MRNF growth budget spent splitting over-cap splats. 0 disables.
-            float oversize_split_fraction = 0.15f;
             bool use_edge_map = true;
-            bool background_improvements = false;
-            float far_scene_min_fraction = 0.01f; // min deep-far splat fraction that activates far-field (0 = always on); mrnf_defaults() overrides to 0.0
-            bool growth_ratio_rank = false;       // rank growth by err/vis^growth_ratio_pow; mrnf_defaults() overrides to true
-            float growth_ratio_pow = 0.75f;
-            size_t fill_pacing_iter = 0; // pace cap fill until this iteration (0 = off); mrnf_defaults() overrides to 15000
-            size_t far_seed_dose = 0;    // far seeds per refine window (0 = starvation default); mrnf_defaults() overrides to 2000
-            // Config-file / C++ only (no registry, GUI, locale, or CLI).
-            bool explore_starvation_weighting = true;
 
             // Random initialization parameters
             bool random = false;        // Use random initialization instead of SfM
             int init_num_pts = 100'000; // Number of random points to initialize
             float init_extent = 3.0f;   // Extent of random point cloud
+            float init_origin_x = 0.0f; // Center of random initialization volume
+            float init_origin_y = 0.0f;
+            float init_origin_z = 0.0f;
 
             // Sparsity optimization parameters
             bool enable_sparsity = false;
@@ -326,6 +409,8 @@ namespace lfs::core {
             void remove_step_scaling();
             [[nodiscard]] int resolved_total_iterations() const;
             [[nodiscard]] bool normal_supervision_active(int iter) const;
+            [[nodiscard]] float scale_reg_at(int iter) const;
+            void resolve_mrnf_capacity_defaults();
             // Every test_every-th image is withheld from training for evaluation.
             [[nodiscard]] bool holds_out_eval_images() const { return enable_eval && !eval_all; }
             [[nodiscard]] int resolved_ppisp_controller_activation_step(int total_iterations) const;
@@ -354,6 +439,26 @@ namespace lfs::core {
             static OptimizationParameters igs_plus_defaults();
             static OptimizationParameters defaults_for_strategy(std::string_view strategy);
         };
+
+        // eval_mask is a mesh path, "bbox:x0,y0,z0,x1,y1,z1" (a world-space box), "cropbox"
+        // (the training model's crop box when training starts), "masks:<folder>" (one mask per image),
+        // "depth:near,far" (rendered pixels whose expected depth lies in the range), "points:radius,close"
+        // (the initial point cloud splatted with a pixel radius and closed by `close` pixels) or "points:<file>"
+        // (the positions of a splat or point cloud PLY, with the default radius and closing).
+        [[nodiscard]] LFS_CORE_API bool is_eval_mask_box(std::string_view spec);
+        [[nodiscard]] LFS_CORE_API bool is_eval_mask_cropbox(std::string_view spec);
+        [[nodiscard]] LFS_CORE_API bool is_eval_mask_folder(std::string_view spec);
+        [[nodiscard]] LFS_CORE_API std::string_view eval_mask_folder(std::string_view spec);
+        [[nodiscard]] LFS_CORE_API bool is_eval_mask_depth(std::string_view spec);
+        [[nodiscard]] LFS_CORE_API std::optional<std::array<float, 2>> parse_eval_mask_depth(std::string_view spec);
+        [[nodiscard]] LFS_CORE_API bool is_eval_mask_points(std::string_view spec);
+        [[nodiscard]] LFS_CORE_API std::optional<std::array<int, 2>> parse_eval_mask_points(std::string_view spec);
+        // The PLY of a points:<file> spec, whose positions replace the initial point cloud.
+        [[nodiscard]] LFS_CORE_API std::optional<std::string_view> eval_mask_points_file(std::string_view spec);
+        // The PLY of a splat:<file> spec, whose rendered coverage selects the evaluated pixels.
+        [[nodiscard]] LFS_CORE_API std::optional<std::string_view> eval_mask_splat_file(std::string_view spec);
+        [[nodiscard]] LFS_CORE_API std::optional<std::array<float, 6>> parse_eval_mask_box(std::string_view spec);
+        [[nodiscard]] LFS_CORE_API std::string normalize_eval_mask(std::string_view spec);
 
         struct LFS_CORE_API LoadingParams {
             bool use_cpu_memory = true;
@@ -386,13 +491,17 @@ namespace lfs::core {
             bool invert_masks = false;
             float mask_threshold = 0.5f;
 
-            // PRMS-authoritative pending import option (ownership matrix).
-            // DatasetConfig::to_json omits it; project PRMS round-trips it.
+            // Dataset import option; persisted in training configs and project PRMS.
             std::string centralize_dataset = "off";
 
             nlohmann::json to_json() const;
             static DatasetConfig from_json(const nlohmann::json& j);
             [[nodiscard]] std::string validate() const;
+
+            // output_name without a splat or project extension, so "scene.ply" names scene.ply, not scene.ply.ply.
+            [[nodiscard]] std::string output_stem() const;
+            // output_path/<output_stem>.licht, or output_path/project.licht without an output name.
+            [[nodiscard]] std::filesystem::path project_file() const;
         };
 
         struct LFS_CORE_API ServerConfig {
@@ -465,6 +574,7 @@ namespace lfs::core {
             // Optional trained splats to append to the training model before optimizer initialization
             std::vector<std::filesystem::path> add_splat_paths;
             std::vector<bool> add_splat_freeze;
+            bool add_splats_applied = false;
             float freeze_lr_scale = 0.0f;
             bool exclude_frozen_add_splats_from_export = false;
             bool include_provenance = true; // always written to the format's metadata slot; caller chooses full vs minimal, writers fall back to minimal
@@ -493,6 +603,9 @@ namespace lfs::core {
             // Headless camera-path -> video render mode (see --render-camera-path)
             std::optional<RenderPathConfig> render_path = std::nullopt;
 
+            // eval subcommand: score the model without training, saving or exporting.
+            bool evaluate_only = false;
+
             // Python scripts to execute for custom training callbacks
             std::vector<std::filesystem::path> python_scripts;
 
@@ -511,6 +624,9 @@ namespace lfs::core {
             // True when -i/--iter was provided. Resume adapters use this to
             // distinguish an explicit continuation target from the default.
             bool cli_iterations_set = false;
+            // True when the command line set any absolute step value; the GUI
+            // image-count auto-scale then leaves that strategy untouched.
+            bool cli_step_values_set = false;
 
             ExplicitTrainingOverrides overrides;
 
@@ -530,6 +646,24 @@ namespace lfs::core {
                                   RAD,
                                   SSOG,
                                   GLB };
+
+        // Inline so that tools compiled without lfs_core, such as the standalone path tests, can use it.
+        [[nodiscard]] constexpr std::string_view output_format_extension(
+            const OutputFormat format) noexcept {
+            switch (format) {
+            case OutputFormat::PLY: return ".ply";
+            case OutputFormat::SOG: return ".sog";
+            case OutputFormat::SSOG: return ".ssog";
+            case OutputFormat::SPZ: return ".spz";
+            case OutputFormat::GLB: return ".glb";
+            case OutputFormat::HTML: return ".html";
+            case OutputFormat::USD: return ".usd";
+            case OutputFormat::USDA: return ".usda";
+            case OutputFormat::USDC: return ".usdc";
+            case OutputFormat::RAD: return ".rad";
+            }
+            return ".ply";
+        }
 
         // PLY -> RAD only: per-bucket LOD tree builder for the out-of-core
         // converter. BHATT is the quality-validated default; OCTREE trades
@@ -604,6 +738,7 @@ namespace lfs::core {
             bool no_download = false;
             bool download_only = false;
             std::vector<std::filesystem::path> image_paths; // Empty = scan images_folder
+            std::string depth_folder = "depth";
             std::string normals_folder = "normals";
         };
 
@@ -612,6 +747,9 @@ namespace lfs::core {
         LFS_CORE_API std::expected<OptimizationParameters, std::string> read_optim_params_from_json(
             const std::filesystem::path& path,
             ExplicitTrainingOverrides& captured_overrides);
+        LFS_CORE_API std::expected<TrainingParameters, lfs::Error> read_training_parameters_from_json(
+            const std::filesystem::path& path,
+            const TrainingParameters& defaults = {});
 
         // Save training parameters to JSON
         LFS_CORE_API std::expected<void, std::string> save_training_parameters_to_json(

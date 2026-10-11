@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace lfs::core {
@@ -42,14 +43,7 @@ namespace lfs::core {
 
         MeshData() = default;
 
-        MeshData(Tensor verts, Tensor idx)
-            : vertices(std::move(verts)),
-              indices(std::move(idx)) {
-            assert(vertices.ndim() == 2 && vertices.shape()[1] == 3);
-            assert(vertices.dtype() == DataType::Float32);
-            assert(indices.ndim() == 2 && indices.shape()[1] == 3);
-            assert(indices.dtype() == DataType::Int32);
-        }
+        MeshData(Tensor verts, Tensor idx);
 
         MeshData(const MeshData&) = delete;
         MeshData& operator=(const MeshData&) = delete;
@@ -104,6 +98,14 @@ namespace lfs::core {
         // heap address. generation() only tracks in-place edits of one mesh.
         uint64_t id() const { return id_; }
 
+        // Read-only payload capture: retain identity/generation while copying
+        // metadata and sharing immutable tensor storage, like SplatData snapshots.
+        std::shared_ptr<const MeshData> readOnlySnapshot() const {
+            auto snapshot = std::make_shared<MeshData>(to(vertices.device()));
+            snapshot->id_ = id_;
+            return snapshot;
+        }
+
         MeshData to(Device device) const {
             MeshData m;
             m.vertices = vertices.is_valid() ? vertices.to(device) : vertices;
@@ -120,6 +122,7 @@ namespace lfs::core {
         }
 
         void compute_normals();
+        void validate_indices() const;
 
     private:
         static uint64_t next_id();

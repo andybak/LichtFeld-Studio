@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include "gui/panel_layout.hpp"
+#include "gui/gui_input.hpp"
 #include "gui/panel_registry.hpp"
 #include "rml_im_mode_layout.hpp"
 
@@ -58,7 +58,6 @@ namespace lfs::vis::gui {
     private:
         enum class LifecycleState : uint8_t {
             AwaitingModelBind,
-            BindingModel,
             ModelBound,
             Mounted,
         };
@@ -71,7 +70,6 @@ namespace lfs::vis::gui {
         void callOnUnload(Rml::ElementDocument* doc);
         void callOnLoad(Rml::ElementDocument* doc);
         bool isModelBound() const;
-        bool isBindingModel() const;
         bool isMounted() const;
         void setLifecycleState(LifecycleState next_state);
         void resetLifecycle();
@@ -109,7 +107,7 @@ namespace lfs::vis::gui {
         bool enabled_visible_ = true;
         uint64_t last_scene_gen_ = 0;
         uint64_t last_prepare_frame_ = 0;
-        bool content_dirty_ = false;
+        bool content_dirty_ = true;
         float layout_width_ = -1.0f;
         float layout_height_ = -1.0f;
         float layout_scale_ = -1.0f;

@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "core/export.hpp"
+
 #include "gui/line_renderer.hpp"
 
 #include <glm/glm.hpp>
@@ -46,11 +48,15 @@ namespace lfs::vis::gui {
         BoundsGizmoHandle active_handle = BoundsGizmoHandle::None;
         glm::vec3 center_world{0.0f};
         glm::vec3 half_extents_world{0.0f};
+        bool released = false;
+        bool returned_to_start = false;
     };
 
-    BoundsGizmoResult drawBoundsGizmo(const BoundsGizmoConfig& config);
+    LFS_VIS_API BoundsGizmoResult drawBoundsGizmo(const BoundsGizmoConfig& config);
 
-    [[nodiscard]] bool isBoundsGizmoHovered();
+    LFS_VIS_API void beginBoundsGizmoFrame();
+    [[nodiscard]] LFS_VIS_API bool isBoundsGizmoHovered();
     [[nodiscard]] bool isBoundsGizmoActive();
+    LFS_VIS_API void cancelBoundsGizmoDrag();
 
 } // namespace lfs::vis::gui

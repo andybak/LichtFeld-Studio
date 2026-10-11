@@ -1,8 +1,10 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "screen/screen_service.hpp"
 #include "visualizer/ipc/render_settings_convert.hpp"
 #include "visualizer/ipc/view_context.hpp"
+#include "visualizer/project/session_state.hpp"
 #include "visualizer/rendering/rendering_manager.hpp"
 #include "visualizer/rendering/rendering_types.hpp"
 
@@ -17,6 +19,65 @@ TEST(RenderSettingsDefaults, CameraFrustumsAreDisabledByDefault) {
     EXPECT_FALSE(proxy_settings.show_camera_frustums);
     EXPECT_FLOAT_EQ(render_settings.camera_frustum_scale, 0.25f);
     EXPECT_FLOAT_EQ(proxy_settings.camera_frustum_scale, 0.25f);
+}
+
+TEST(RenderSettingsDefaults, GTComparisonUsesFitByDefault) {
+    const lfs::vis::RenderSettings render_settings;
+    const lfs::vis::RenderSettingsProxy proxy_settings;
+
+    EXPECT_FALSE(render_settings.gt_comparison_actual_size);
+    EXPECT_FALSE(proxy_settings.gt_comparison_actual_size);
+}
+
+TEST(RenderSettingsProxy, GTComparisonActualSizeRoundTrips) {
+    lfs::vis::RenderSettings settings;
+    settings.gt_comparison_actual_size = true;
+
+    const auto proxy = lfs::vis::to_proxy(settings);
+    EXPECT_TRUE(proxy.gt_comparison_actual_size);
+
+    lfs::vis::RenderSettings roundtrip;
+    lfs::vis::apply_proxy(roundtrip, proxy);
+    EXPECT_TRUE(roundtrip.gt_comparison_actual_size);
+}
+
+TEST(RenderSettingsSanitization, NonRgbGTComparisonClearsActualSize) {
+    lfs::vis::RenderSettings settings;
+    settings.gt_comparison_mode = lfs::vis::GTComparisonMode::Normal;
+    settings.gt_comparison_actual_size = true;
+
+    lfs::vis::sanitizeGTComparisonSettings(settings);
+
+    EXPECT_FALSE(settings.gt_comparison_actual_size);
+}
+
+TEST(RenderSettingsSession, GTComparisonActualSizeIsNotSaved) {
+    lfs::vis::RenderSettings settings;
+    settings.gt_comparison_actual_size = true;
+
+    const auto json = lfs::vis::project::renderSettingsToProjectJson(settings);
+    EXPECT_FALSE(json.contains("gt_comparison_actual_size"));
+    EXPECT_TRUE(settings.gt_comparison_actual_size);
+
+    const lfs::io::project::ViewSessionChapter view;
+    EXPECT_FALSE(view.dom().get_json("render_settings.gt_comparison_actual_size"));
+}
+
+TEST(RenderSettingsSession, GTComparisonAlwaysLoadsInFit) {
+    lfs::vis::RenderSettings active_settings;
+    active_settings.gt_comparison_actual_size = true;
+
+    for (const auto mode : {lfs::vis::GTComparisonMode::RGB,
+                            lfs::vis::GTComparisonMode::Depth,
+                            lfs::vis::GTComparisonMode::Normal}) {
+        active_settings.gt_comparison_mode = mode;
+        const auto json = lfs::vis::project::renderSettingsToProjectJson(active_settings);
+        const auto restored =
+            lfs::vis::project::renderSettingsFromProjectJson(json, active_settings);
+        ASSERT_TRUE(restored);
+        EXPECT_FALSE(restored->gt_comparison_actual_size);
+        EXPECT_EQ(restored->gt_comparison_mode, mode);
+    }
 }
 
 TEST(RenderSettingsDefaults, SceneReconstructionIsDisabledByDefault) {
@@ -163,7 +224,7 @@ TEST(RenderSettingsProxy, GutMirrorStillSwitchesViewerBackend) {
     EXPECT_FALSE(settings.gut);
 }
 
-TEST(RenderSettingsProxy, EquirectangularForcesGutBackend) {
+TEST(RenderSettingsProxy, EquirectangularPreservesSceneBackend) {
     using Backend = lfs::rendering::GaussianRasterBackend;
 
     lfs::vis::RenderSettings settings;
@@ -176,6 +237,9 @@ TEST(RenderSettingsProxy, EquirectangularForcesGutBackend) {
     lfs::vis::apply_proxy(settings, proxy);
 
     EXPECT_TRUE(settings.equirectangular);
+    EXPECT_EQ(settings.raster_backend, Backend::ThreeDgs);
+    EXPECT_FALSE(settings.gut);
+    lfs::vis::enforceProjectionBackend(settings);
     EXPECT_EQ(settings.raster_backend, Backend::ThreeDgut);
     EXPECT_TRUE(settings.gut);
 }
@@ -183,7 +247,9 @@ TEST(RenderSettingsProxy, EquirectangularForcesGutBackend) {
 TEST(RenderSettingsBackendNormalization, RenderingManagerCanSwitchBackFromGutTo3dgs) {
     using Backend = lfs::rendering::GaussianRasterBackend;
 
-    lfs::vis::RenderingManager manager;
+    lfs::vis::screen::ScreenService manager_views;
+
+    lfs::vis::RenderingManager manager{manager_views};
     auto settings = manager.getSettings();
     settings.raster_backend = Backend::ThreeDgut;
     settings.gut = true;
@@ -202,10 +268,12 @@ TEST(RenderSettingsBackendNormalization, RenderingManagerCanSwitchBackFromGutTo3
     EXPECT_FALSE(settings.gut);
 }
 
-TEST(RenderSettingsBackendNormalization, RenderingManagerEquirectangularUpdateForcesGutBackend) {
+TEST(RenderSettingsBackendNormalization, RenderingManagerEquirectangularUpdatePreservesSceneBackend) {
     using Backend = lfs::rendering::GaussianRasterBackend;
 
-    lfs::vis::RenderingManager manager;
+    lfs::vis::screen::ScreenService manager_views;
+
+    lfs::vis::RenderingManager manager{manager_views};
     auto settings = manager.getSettings();
     settings.raster_backend = Backend::ThreeDgs;
     settings.gut = false;
@@ -214,6 +282,9 @@ TEST(RenderSettingsBackendNormalization, RenderingManagerEquirectangularUpdateFo
 
     settings = manager.getSettings();
     EXPECT_TRUE(settings.equirectangular);
+    EXPECT_EQ(settings.raster_backend, Backend::ThreeDgs);
+    EXPECT_FALSE(settings.gut);
+    lfs::vis::enforceProjectionBackend(settings);
     EXPECT_EQ(settings.raster_backend, Backend::ThreeDgut);
     EXPECT_TRUE(settings.gut);
 }
@@ -221,7 +292,9 @@ TEST(RenderSettingsBackendNormalization, RenderingManagerEquirectangularUpdateFo
 TEST(RenderSettingsBackendNormalization, RenderingManagerKeepsGutToggleWorking) {
     using Backend = lfs::rendering::GaussianRasterBackend;
 
-    lfs::vis::RenderingManager manager;
+    lfs::vis::screen::ScreenService manager_views;
+
+    lfs::vis::RenderingManager manager{manager_views};
     auto settings = manager.getSettings();
     ASSERT_EQ(settings.raster_backend, Backend::ThreeDgs);
     ASSERT_FALSE(settings.gut);

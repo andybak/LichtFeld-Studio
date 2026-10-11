@@ -101,6 +101,9 @@ namespace lfs::core::internal {
         }
     }
 
+    void VulkanBackendOps::push_range(const char*) {}
+    void VulkanBackendOps::pop_range() {}
+
     void VulkanBackendOps::record_stream(StorageRef, ExecContext) {}
 
     void VulkanBackendOps::release_stream(ExecContext) {}
@@ -117,6 +120,10 @@ namespace lfs::core::internal {
         if (context->memory().cached_bytes() > threshold_bytes) {
             context->memory().trim();
         }
+    }
+
+    void VulkanBackendOps::hold_freed_memory(const bool hold) {
+        acquire_vulkan_context()->memory().hold_freed(hold);
     }
 
     MemoryInfo VulkanBackendOps::stats() {
@@ -174,19 +181,23 @@ namespace lfs::core::internal {
         acquire_vulkan_context()->memory().memset(request);
     }
 
-    void VulkanBackendOps::synchronize_stream(ExecContext) {
+    void VulkanBackendOps::synchronize_stream(const ExecContext execution) {
         LFS_FACADE_TRACE(service_synchronize_stream);
+        const auto context = acquire_vulkan_context();
+        auto id = reinterpret_cast<uint64_t>(execution.cuda_stream);
+        if (id == 0)
+            id = context->recorders().current_queue();
+        context->recorders().queue_wait(id);
+    }
+
+    void VulkanBackendOps::synchronize_device() {
         const auto context = acquire_vulkan_context();
         context->recorders().wait_all();
         context->check_fault_buffer();
     }
 
-    void VulkanBackendOps::synchronize_device() {
-        synchronize_stream({});
-    }
-
     void VulkanBackendOps::device_barrier() {
-        synchronize_stream({});
+        synchronize_device();
     }
 
     void VulkanBackendOps::wait_for(const SyncToken token) {
@@ -303,6 +314,10 @@ namespace lfs::core::internal {
             void drain() override {
                 auto context = acquire_vulkan_context();
                 context->recorders().wait_all();
+            }
+
+            void run_while_idle(const std::function<void()>& release) override {
+                acquire_vulkan_context()->run_after_queue_idle(release);
             }
 
             std::shared_ptr<void> execution_scope() override {

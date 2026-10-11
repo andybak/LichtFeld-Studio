@@ -4,19 +4,15 @@
 
 #include "strategy_utils.hpp"
 #include "core/assert.hpp"
-#include "core/cuda/sh_layout.cuh"
-#include "core/cuda_error.hpp"
 #include "core/logger.hpp"
 #include "core/tensor_completion.hpp"
-#include "core/tensor_cuda_interop.hpp"
-#include "core/training_churn_metrics.hpp"
-#include "kernels/pruning_kernels.hpp"
+#include "core/tensor_execution.hpp"
+#include "lfs/training/ops/registry.hpp"
 #include "lfs/training/sh_value_storage.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cuda_runtime.h>
 #include <vector>
 
 namespace lfs::training {
@@ -152,7 +148,6 @@ namespace lfs::training {
         if (params.max_cap > 0) {
             config.initial_capacity = static_cast<size_t>(params.max_cap);
             config.growth_factor = 1.5f; // Still allow growth beyond max_cap if needed
-            LOG_INFO("AdamOptimizer: pre-allocating capacity for {} Gaussians (optimizer states)", config.initial_capacity);
         }
 
         LOG_DEBUG("Creating optimizer with per-parameter LRs:");
@@ -378,12 +373,7 @@ namespace lfs::training {
         assert(rotations.shape()[0] == n);
 
         auto dead_mask = Tensor::empty({n}, Device::GPU, DataType::Bool);
-        pruning::launch_compute_dead_mask(
-            flat_opacities.ptr<float>(),
-            rotations.ptr<float>(),
-            dead_mask.ptr<uint8_t>(),
-            n,
-            min_opacity);
+        training_ops(lfs::core::default_gpu_backend()).refine->dead_mask(flat_opacities, rotations, dead_mask, min_opacity);
         return dead_mask;
     }
 
@@ -395,10 +385,7 @@ namespace lfs::training {
         assert(rotations.ndim() == 2 && rotations.shape()[1] == 4);
 
         auto near_zero_mask = Tensor::empty({n}, Device::GPU, DataType::Bool);
-        pruning::launch_compute_near_zero_rotation_mask(
-            rotations.ptr<float>(),
-            near_zero_mask.ptr<uint8_t>(),
-            n);
+        training_ops(lfs::core::default_gpu_backend()).refine->rotation_mask(rotations, near_zero_mask);
         return near_zero_mask;
     }
 
@@ -417,8 +404,11 @@ namespace lfs::training {
                                    ? n
                                    : std::max(
                                          n, static_cast<size_t>(static_cast<double>(std::max(n_capacity, n)) * 1.2) + 1);
-        f32_a = Tensor::zeros_direct(TensorShape({new_cap}), new_cap, device, DataType::Float32);
-        bool_a = Tensor::zeros_direct(TensorShape({new_cap}), new_cap, device, DataType::Bool);
+        LFS_ASSERT_MSG(device == Device::GPU, "DensifyNScratch requires CUDA storage");
+        f32_a = Tensor::empty_exact({new_cap}, DataType::Float32);
+        bool_a = Tensor::empty_exact({new_cap}, DataType::Bool);
+        f32_a.zero_();
+        bool_a.zero_();
         n_capacity = new_cap;
     }
 
@@ -450,10 +440,11 @@ namespace lfs::training {
             (use_shN && (!shN.is_valid() || shN.ndim() != 3));
 
         if (capacity < need || layout_changed) {
-            const auto alloc_start = std::chrono::steady_clock::now();
-            const size_t new_cap = std::max(
-                need,
-                static_cast<size_t>(static_cast<double>(std::max(capacity, need)) * 1.2) + 1);
+            const size_t new_cap = capacity == 0
+                                       ? need
+                                       : std::max(
+                                             need,
+                                             static_cast<size_t>(static_cast<double>(std::max(capacity, need)) * 1.2) + 1);
             means = Tensor::empty({new_cap, 3}, device);
             rotations = Tensor::empty({new_cap, 4}, device);
             scales = Tensor::empty({new_cap, 3}, device);
@@ -473,40 +464,11 @@ namespace lfs::training {
                 shN = Tensor();
             }
             capacity = new_cap;
-            lfs::core::TrainingChurnMetrics::instance().record_child_alloc(static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - alloc_start)
-                    .count()));
         } else if (use_shN && sh_rest_in > 0 &&
                    (!shN.is_valid() || shN.shape()[0] < capacity || shN.shape()[1] != sh_rest_in)) {
-            const auto alloc_start = std::chrono::steady_clock::now();
             sh_rest = sh_rest_in;
             shN = Tensor::empty({capacity, sh_rest_in, 3}, device);
-            lfs::core::TrainingChurnMetrics::instance().record_child_alloc(static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - alloc_start)
-                    .count()));
         }
-    }
-
-    DensifyChildWorkspace::~DensifyChildWorkspace() {
-        if (!means.is_valid() && !rotations.is_valid() && !scales.is_valid() &&
-            !sh0.is_valid() && !sh0_flat.is_valid() && !shN.is_valid() &&
-            !opacities.is_valid()) {
-            return;
-        }
-        const auto free_start = std::chrono::steady_clock::now();
-        means = {};
-        rotations = {};
-        scales = {};
-        sh0 = {};
-        sh0_flat = {};
-        shN = {};
-        opacities = {};
-        lfs::core::TrainingChurnMetrics::instance().record_child_free(static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - free_start)
-                .count()));
     }
 
     namespace {
@@ -645,12 +607,10 @@ namespace lfs::training {
                     auto idx_i32 = indices.dtype() == DataType::Int32
                                        ? indices
                                        : indices.to(DataType::Int32);
-                    const auto stream = lfs::core::getCurrentCUDAStream();
+                    const auto stream = lfs::core::TensorExecutionTarget::current();
                     idx_i32.sync_to_stream(stream);
                     state->grad.set_stream(stream);
-                    shN_swizzled_zero_at_indices(
-                        state->grad.ptr<float>(), idx_i32.ptr<int>(),
-                        idx_i32.numel(), shN_layout_rest, stream);
+                    training_sh_ops().zero_rows(state->grad, idx_i32, shN_layout_rest);
                 }
                 continue;
             }

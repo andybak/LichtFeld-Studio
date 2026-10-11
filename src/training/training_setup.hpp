@@ -5,6 +5,7 @@
 #pragma once
 #include "io/dataset_scene_import.hpp"
 
+#include "core/error.hpp"
 #include "core/parameters.hpp"
 #include "core/point_cloud.hpp"
 #include "core/scene.hpp"
@@ -26,6 +27,10 @@ namespace lfs::io::project {
 namespace lfs::training {
     class Trainer;
 
+    /// Returns Gaussian splat init file path
+    [[nodiscard]] std::optional<std::filesystem::path> gaussianSplatInitPath(
+        const lfs::core::param::TrainingParameters& params);
+
     /// Scene-graph payload produced by prepareTrainingModel(). Heavy tensor work
     /// is finished; the owner thread still has to replace the POINTCLOUD node.
     struct TrainingModelGraphInstall {
@@ -33,6 +38,8 @@ namespace lfs::training {
         lfs::core::NodeId parent_id = lfs::core::NULL_NODE;
         lfs::core::NodeId point_cloud_node_id = lfs::core::NULL_NODE;
         glm::mat4 node_transform{1.0f};
+        // Removing the point cloud node drops the scene's initial point cloud; the points eval mask still needs it.
+        bool keep_initial_point_cloud = false;
         bool has_preserved_cropbox = false;
         lfs::core::CropBoxData preserved_cropbox_data{};
         glm::mat4 preserved_cropbox_transform{1.0f};
@@ -73,9 +80,16 @@ namespace lfs::training {
         const std::filesystem::path& destination = {},
         std::optional<std::filesystem::path> source_path = std::nullopt);
 
+    /// Rows of model without its frozen --add-splat ranges and soft-deleted rows;
+    /// nullopt when model has no frozen ranges.
+    [[nodiscard]] lfs::Result<std::optional<lfs::core::SplatData>> exclude_frozen_rows(
+        const lfs::core::SplatData& model);
+
     /// Write `--export` formats next to project.licht after a terminal project
-    /// save. No-op when `params.export_formats` is empty.
-    void export_final_splats(
+    /// save. No-op when `params.export_formats` is empty. Frozen --add-splat rows
+    /// are left out when --exclude-export was given or restored from the checkpoint.
+    /// Every format is attempted; the error names each one that failed.
+    [[nodiscard]] lfs::Status export_final_splats(
         const Trainer& trainer,
         const lfs::core::param::TrainingParameters& params);
 

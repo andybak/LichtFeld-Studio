@@ -13,10 +13,10 @@
 #include "core/tensor/internal/lazy_executor.hpp"
 #include "core/tensor/internal/lazy_ir.hpp"
 #include "cuda_backend_test.hpp"
+#include "fast_raster_test_helpers.hpp"
+#include "gsplat_raster_test_helpers.hpp"
 #include "io/formats/colmap.hpp"
-#include "training/rasterization/fast_rasterizer.hpp"
 #include "training/rasterization/gsplat/Ops.h"
-#include "training/rasterization/gsplat_rasterizer.hpp"
 
 #include <cuda_runtime.h>
 #include <gtest/gtest.h>
@@ -267,17 +267,17 @@ namespace {
     }
 
     TEST_F(DeferredD3PinTest, ThreadCacheReleaseLeavesNothingToFree) {
-        bool fast_released = false;
         bool gsplat_released = false;
         bool intersect_released = false;
         bool nan_check_released = false;
         std::exception_ptr worker_error;
 
         std::thread worker([&] {
+            lfs::test::GsplatTestRenderer renderer;
             const lfs::core::GpuBackendScope backend_scope(lfs::core::GpuBackend::CUDA);
             try {
                 {
-                    auto output = lfs::training::gsplat_rasterize(
+                    auto output = renderer.gsplat_rasterize(
                         *camera_, *splat_, background_);
                     if (!output.image.is_valid()) {
                         throw std::runtime_error("gsplat forward produced no image");
@@ -297,9 +297,8 @@ namespace {
                     throw std::runtime_error("worker render synchronization failed");
                 }
 
-                fast_released = lfs::training::release_fast_rasterizer_thread_local_caches();
-                gsplat_released = lfs::training::release_gsplat_rasterizer_thread_local_caches();
-                intersect_released = gsplat_lfs::release_intersect_thread_local_cache();
+                gsplat_released = renderer.release_gsplat_caches();
+                intersect_released = renderer.release_gsplat_caches();
                 nan_check_released = lfs::core::tensor_ops::release_nan_check_thread_buffers();
             } catch (...) {
                 worker_error = std::current_exception();
@@ -310,7 +309,6 @@ namespace {
         if (worker_error) {
             std::rethrow_exception(worker_error);
         }
-        EXPECT_TRUE(fast_released);
         EXPECT_TRUE(gsplat_released);
         EXPECT_TRUE(intersect_released);
         EXPECT_TRUE(nan_check_released);

@@ -4,7 +4,9 @@
  */
 
 #include "io/scene_chapter_adapter.hpp"
+#include "io/sfm_observation_chapter.hpp"
 
+#include "core/logger.hpp"
 #include "core/path_utils.hpp"
 #include "io/capture_omit_filter.hpp"
 
@@ -219,6 +221,30 @@ namespace lfs::io::project {
             result.has_image = camera.has_image();
             result.split =
                 camera.split() == lfs::core::CameraSplit::Train ? "train" : "eval";
+            if (camera.is_undistort_precomputed()) {
+                const lfs::core::UndistortParams& params = camera.undistort_params();
+                result.undistortion = CameraUndistortionRecord{
+                    .source = CameraCalibrationRecord{
+                        .focal_x = params.src_fx,
+                        .focal_y = params.src_fy,
+                        .center_x = params.src_cx,
+                        .center_y = params.src_cy,
+                        .width = params.src_width,
+                        .height = params.src_height,
+                    },
+                    .destination = CameraCalibrationRecord{
+                        .focal_x = params.dst_fx,
+                        .focal_y = params.dst_fy,
+                        .center_x = params.dst_cx,
+                        .center_y = params.dst_cy,
+                        .width = params.dst_width,
+                        .height = params.dst_height,
+                    },
+                    .prepared = camera.is_undistort_prepared(),
+                    .crop_solve_failed = params.crop_solve_failed,
+                };
+            }
+            result.sfm_observation_count = camera.sfm_observation_count();
             return result;
         }
 
@@ -233,19 +259,20 @@ namespace lfs::io::project {
                     "Payload binding has a null UUID, invalid fourcc, or empty source kind",
                     node.uuid);
             }
-            if (binding.source_kind == "rad") {
+            // Streamed sources (live RAD, 3D Tiles, streamed SOG) are referenced, never embedded.
+            if (binding.source_kind == "rad" || binding.source_kind == "tiles3d") {
                 if (binding.fourcc != "REFS" || !binding.reference_uuid ||
                     *binding.reference_uuid != binding.instance_uuid) {
                     return fail<void>(
                         lfs::ErrorCode::FailedPrecondition,
-                        "A live RAD node cannot be embedded.",
-                        "RAD binding must be an external REFS instance", node.uuid);
+                        "A streamed splat node cannot be embedded.",
+                        "RAD and streamed-model bindings must be external REFS instances", node.uuid);
                 }
                 if (node.payload_diverged) {
                     return fail<void>(
                         lfs::ErrorCode::FailedPrecondition,
-                        "An edited live RAD node cannot be saved.",
-                        "Bake the RAD node to an embedded resident splat before saving",
+                        "An edited streamed splat node cannot be saved.",
+                        "Edits to a streamed node are not stored by its reference",
                         node.uuid);
                 }
                 return {};
@@ -415,7 +442,8 @@ namespace lfs::io::project {
         using UndistortCache = std::map<UndistortCacheKey, lfs::core::UndistortParams>;
 
         std::shared_ptr<lfs::core::Camera> hydrate_camera(
-            const CameraRecord& value, UndistortCache& undistort_cache) {
+            const CameraRecord& value, UndistortCache& undistort_cache, const lfs::core::Uuid& node_uuid,
+            const std::shared_ptr<const SfmObservationChapterSource>& sfm_observations) {
             auto camera = std::make_shared<lfs::core::Camera>(
                 float_tensor(value.rotation, {3, 3}),
                 float_tensor(value.translation, {3}),
@@ -430,7 +458,23 @@ namespace lfs::io::project {
                 value.camera_height, value.uid, value.camera_id,
                 lfs::core::utf8_to_path(value.depth_path),
                 lfs::core::utf8_to_path(value.normal_path));
-            if (camera->has_distortion()) {
+            if (value.undistortion) {
+                const auto calibration = [](const CameraCalibrationRecord& record) {
+                    return lfs::core::CameraCalibration{
+                        .fx = record.focal_x,
+                        .fy = record.focal_y,
+                        .cx = record.center_x,
+                        .cy = record.center_y,
+                        .width = record.width,
+                        .height = record.height,
+                    };
+                };
+                camera->restore_undistortion_state(
+                    calibration(value.undistortion->source),
+                    calibration(value.undistortion->destination),
+                    value.undistortion->prepared,
+                    value.undistortion->crop_solve_failed);
+            } else if (camera->has_distortion()) {
                 // Camera IDs can overlap across datasets; reuse only identical calibrations.
                 UndistortCacheKey key{
                     value.camera_id, value.focal_x, value.focal_y,
@@ -442,7 +486,9 @@ namespace lfs::io::project {
                     camera->adopt_undistortion(cached->second);
                 } else {
                     camera->precompute_undistortion(0.0f);
-                    undistort_cache.emplace(std::move(key), camera->undistort_params());
+                    // Share only parameters that were actually computed.
+                    if (camera->is_undistort_precomputed())
+                        undistort_cache.emplace(std::move(key), camera->undistort_params());
                 }
             }
             camera->set_image_dimensions(value.image_width, value.image_height);
@@ -450,6 +496,21 @@ namespace lfs::io::project {
             camera->set_has_image(value.has_image);
             camera->set_split(value.split == "train" ? lfs::core::CameraSplit::Train
                                                      : lfs::core::CameraSplit::Eval);
+            if (value.sfm_observation_count > 0) {
+                bool stored = false;
+                if (sfm_observations) {
+                    const auto& cameras = sfm_observations->index().cameras;
+                    const auto entry = cameras.find(node_uuid);
+                    stored = entry != cameras.end() && entry->second.count == value.sfm_observation_count;
+                }
+                if (stored) {
+                    camera->set_sfm_observation_source(sfm_observations, node_uuid, value.sfm_observation_count);
+                } else {
+                    LOG_WARN("Camera '{}' lists {} SfM observations that the project does not contain; "
+                             "depth AbsRel is unavailable for it",
+                             value.image_name, value.sfm_observation_count);
+                }
+            }
             return camera;
         }
 
@@ -752,7 +813,8 @@ namespace lfs::io::project {
                 }
                 if (record.camera) {
                     try {
-                        desc.camera = hydrate_camera(*record.camera, undistort_cache);
+                        desc.camera = hydrate_camera(*record.camera, undistort_cache, record.uuid,
+                                                     resolver.sfm_observations);
                     } catch (const std::exception& error) {
                         // LFS-CENSUS-OK(empty-catch): reject malformed camera tensors before mutating the scene.
                         return fail<void>(
@@ -958,12 +1020,14 @@ namespace lfs::io::project {
     lfs::Result<std::unique_ptr<lfs::core::Scene>>
     stage_scene_shell(
         const SceneGraphChapter& chapter,
-        lfs::core::Scene& target) {
+        lfs::core::Scene& target,
+        std::shared_ptr<const SfmObservationChapterSource> sfm_observations) {
         auto staged =
             lfs::core::Scene::createRestoreStage(target);
         if (auto populated =
                 populate_scene_stage(
-                    chapter, *staged, {}, true, false);
+                    chapter, *staged, ScenePayloadResolver{.sfm_observations = std::move(sfm_observations)},
+                    true, false);
             !populated) {
             return std::move(populated).error();
         }

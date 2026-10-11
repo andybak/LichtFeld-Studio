@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <execution>
+#include <limits>
 #include <numeric>
 
 namespace lfs::core {
@@ -326,7 +327,7 @@ namespace lfs::core {
 
         LFS_ASSERT_MSG(dim < shape_.rank(),
                        std::format("slice dimension {} is out of range for rank {}", dim, shape_.rank()));
-        LFS_ASSERT_MSG(start < end && end <= shape_[dim],
+        LFS_ASSERT_MSG(start <= end && end <= shape_[dim],
                        std::format("slice range [{}, {}) is invalid for dimension {} of size {}",
                                    start, end, dim, shape_[dim]));
 
@@ -364,11 +365,13 @@ namespace lfs::core {
         view.is_view_ = true;
         view.id_ = profiling_enabled_ ? next_id_++ : 0; // Only increment ID when profiling
 
-        // Adjust offset to point to slice start (in elements)
-        view.storage_offset_ = storage_offset_ + start * strides_[dim];
-
         // Adjust shape for the sliced dimension
         view.shape_ = TensorShape(new_dims);
+
+        // Empty views keep a valid offset, including chained endpoint slices.
+        view.storage_offset_ = view.numel() == 0
+                                   ? storage_offset_
+                                   : storage_offset_ + start * strides_[dim];
 
         // Check if strides match the new shape's expected contiguous layout
         // A sliced tensor is contiguous if its strides match row-major order for its shape
@@ -387,6 +390,50 @@ namespace lfs::core {
         return view;
     }
 
+    Tensor Tensor::slice(size_t dim, size_t start, size_t end, size_t step) const {
+        LFS_ASSERT_MSG(step > 0,
+                       "slice step must be positive");
+        if (step == 1) {
+            return slice(dim, start, end);
+        }
+
+        Tensor base = slice(dim, start, end);
+        base.materialize_if_deferred();
+        const size_t extent = end - start;
+        const size_t count = extent / step + (extent % step != 0);
+        auto dims = base.shape_.dims();
+        dims[dim] = count;
+        auto strides = base.strides_;
+        if (count > 1 && strides[dim] != 0) {
+            LFS_ASSERT_MSG(step <= std::numeric_limits<size_t>::max() / strides[dim],
+                           "slice stride overflows size_t");
+            strides[dim] *= step;
+        }
+
+        Tensor view;
+        view.data_ = base.data_;
+        view.data_owner_ = base.data_owner_;
+        view.shape_ = TensorShape(dims);
+        view.strides_ = strides;
+        view.storage_offset_ = base.storage_offset_;
+        view.device_ = base.device_;
+        view.dtype_ = base.dtype_;
+        view.is_view_ = true;
+        view.id_ = profiling_enabled_ ? next_id_++ : 0;
+
+        size_t expected_stride = 1;
+        view.is_contiguous_ = true;
+        for (int dimension = static_cast<int>(view.shape_.rank()) - 1; dimension >= 0; --dimension) {
+            if (view.strides_[static_cast<size_t>(dimension)] != expected_stride) {
+                view.is_contiguous_ = false;
+                break;
+            }
+            expected_stride *= view.shape_[static_cast<size_t>(dimension)];
+        }
+        base.propagate_view_meta(view);
+        return view;
+    }
+
     size_t Tensor::calculate_offset(const std::vector<size_t>& indices) const {
         LFS_DEBUG_ASSERT_MSG(indices.size() <= strides_.size(),
                              std::format("offset index rank must not exceed stride rank "
@@ -402,49 +449,6 @@ namespace lfs::core {
             offset += indices[i] * strides_[i];
         }
         return offset;
-    }
-
-    Tensor Tensor::copy_slice(const std::vector<size_t>& starts,
-                              const std::vector<size_t>& ends,
-                              const std::vector<size_t>& new_shape) const {
-        LFS_ASSERT_MSG(dtype_ == DataType::Float32,
-                       "non-contiguous slice copying currently supports only Float32");
-        auto result = internal::allocate_like(*this, TensorShape(new_shape), dtype_);
-
-        if (device_ == Device::GPU) {
-            auto cpu_copy = to(Device::CPU);
-            auto cpu_result = cpu_copy.copy_slice(starts, ends, new_shape);
-            return internal::copy_to_backend(
-                cpu_result, gpu_backend_of(*this).value());
-        } else {
-            const float* src = ptr<float>();
-            float* dst = result.ptr<float>();
-
-            size_t total = 1;
-            for (size_t s : new_shape) {
-                total *= s;
-            }
-
-            std::vector<size_t> indices(shape_.rank());
-            for (size_t i = 0; i < shape_.rank(); ++i) {
-                indices[i] = starts[i];
-            }
-
-            for (size_t dst_idx = 0; dst_idx < total; ++dst_idx) {
-                size_t src_idx = calculate_offset(indices);
-                dst[dst_idx] = src[src_idx];
-
-                for (int d = static_cast<int>(shape_.rank()) - 1; d >= 0; --d) {
-                    indices[d]++;
-                    if (indices[d] < ends[d]) {
-                        break;
-                    }
-                    indices[d] = starts[d];
-                }
-            }
-        }
-
-        return result;
     }
 
     std::vector<size_t> Tensor::resolve_dims(std::span<const int> dims) const {

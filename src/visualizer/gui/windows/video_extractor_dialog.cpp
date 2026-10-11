@@ -13,6 +13,9 @@
 #include "gui/string_keys.hpp"
 #include "gui/ui_context.hpp"
 #include "gui/utils/native_file_dialog.hpp"
+#include "io/media_studio_backends.hpp"
+#include "media/media_ingest.hpp"
+#include "media/media_options.hpp"
 #include <cctype>
 
 #include <RmlUi/Core.h>
@@ -123,6 +126,10 @@ namespace lfs::gui {
 
             const std::string attr_name = cacheAttrName("control", "value");
             if (el->GetAttribute<Rml::String>(attr_name.c_str(), "") == value)
+                return false;
+            // A text field being typed in keeps its text; its blur writes the clamped value.
+            if (auto* const document = el->GetOwnerDocument();
+                document && document->GetFocusLeafNode() == el && el->GetAttribute<Rml::String>("type", "") == "text")
                 return false;
 
             if (auto* const input = dynamic_cast<Rml::ElementFormControlInput*>(el))
@@ -248,6 +255,7 @@ namespace lfs::gui {
 
     VideoExtractorDialog::VideoExtractorDialog()
         : player_(std::make_unique<io::VideoPlayer>()) {
+        io::registerStudioMediaBackends();
         listener_.owner = this;
     }
 
@@ -353,6 +361,7 @@ namespace lfs::gui {
         document_ = nullptr;
         clearElementCache();
         elements_cached_ = false;
+        preview_src_.clear();
         last_language_.clear();
         controls_dirty_ = true;
     }
@@ -361,47 +370,52 @@ namespace lfs::gui {
         joinExtractionThread();
 
         extraction_thread_.emplace([this, params]() {
-            io::VideoFrameExtractor extractor;
-
-            io::VideoFrameExtractor::Params extract_params;
-            extract_params.video_path = params.video_path;
-            extract_params.output_dir = params.output_dir;
-            extract_params.mode = params.mode;
-            extract_params.fps = params.fps;
-            extract_params.frame_interval = params.frame_interval;
-            extract_params.format = params.format;
-            extract_params.jpg_quality = params.jpg_quality;
-            extract_params.start_time = params.start_time;
-            extract_params.end_time = params.end_time;
-            extract_params.resolution_mode = params.resolution_mode;
-            extract_params.scale = params.scale;
-            extract_params.custom_width = params.custom_width;
-            extract_params.custom_height = params.custom_height;
-            extract_params.filename_pattern = params.filename_pattern;
-            extract_params.sharpness.enabled = params.sharpness_enabled;
-            extract_params.sharpness.algorithm = params.sharpness_algorithm;
-            extract_params.sharpness.threshold = params.sharpness_threshold;
-            extract_params.sharpness.window_candidates_target = params.window_candidates_target;
-            extract_params.sharpness.window_mode = params.sharpness_window_mode;
-            extract_params.generate_metadata = params.generate_metadata;
-            extract_params.convert_hdr_to_sdr = params.convert_hdr_to_sdr;
-            extract_params.rotation = params.rotation;
-            extract_params.cancel_requested = [this]() {
-                return stop_extraction_requested_.load();
+            io::registerStudioMediaBackends();
+            media::IngestRequest request;
+            request.input = params.video_path;
+            request.selection.mode = params.mode == io::ExtractionMode::FPS ? media::SelectionMode::FPS : media::SelectionMode::Interval;
+            request.selection.fps = params.fps;
+            request.selection.interval = params.frame_interval;
+            request.start_seconds = params.start_time;
+            request.end_seconds = params.end_time;
+            request.geometry.mode = params.resolution_mode == io::ResolutionMode::Original ? media::ResizeMode::Original
+                                    : params.resolution_mode == io::ResolutionMode::Scale  ? media::ResizeMode::Scale
+                                                                                           : media::ResizeMode::Custom;
+            request.geometry.scale = params.scale;
+            request.geometry.width = params.custom_width;
+            request.geometry.height = params.custom_height;
+            request.geometry.clockwise_rotation = params.rotation;
+            request.sharpness.enabled = params.sharpness_enabled;
+            request.sharpness.method = params.sharpness_algorithm == io::SharpnessAlgorithm::LAPLACIAN   ? media::SharpnessMethod::Laplacian
+                                       : params.sharpness_algorithm == io::SharpnessAlgorithm::TENENGRAD ? media::SharpnessMethod::Tenengrad
+                                                                                                         : media::SharpnessMethod::Combined;
+            request.sharpness.threshold = params.sharpness_threshold;
+            request.sharpness.window_candidates = params.window_candidates_target;
+            request.sharpness.window = params.sharpness_window_mode;
+            request.convert_hdr_to_sdr = params.convert_hdr_to_sdr;
+            request.output_format = params.format == io::ImageFormat::EXR ? media::FramePixelFormat::RGBFloat32 : media::FramePixelFormat::RGB8;
+            request.input_color = params.input_color;
+            request.cancelled = [this] { return stop_extraction_requested_.load(); };
+            request.progress = [this](const media::IngestProgress& progress) {
+                updateProgress(progress.processed, progress.estimated, progress.discarded);
             };
-
-            extract_params.progress_callback = [this](const int current, const int total, const int discarded) {
-                updateProgress(current, total, discarded);
-            };
-
-            std::string error;
-            if (!extractor.extract(extract_params, error)) {
-                if (extractor.lastOutcome() == io::ExtractionOutcome::Cancelled) {
+            media::FileExtraction files;
+            files.files.output_directory = params.output_dir;
+            files.files.filename_pattern = params.filename_pattern;
+            files.files.format = params.format == io::ImageFormat::EXR ? media::FrameFileFormat::EXR : params.format == io::ImageFormat::PNG ? media::FrameFileFormat::PNG
+                                                                                                                                             : media::FrameFileFormat::JPEG;
+            files.files.exr = params.exr;
+            files.files.remove_stale_frames = params.remove_stale_frames;
+            files.files.jpeg_quality = params.jpg_quality;
+            files.write_metadata = params.generate_metadata;
+            const auto result = media::MediaIngest::extractFiles(request, files);
+            if (!result) {
+                if (result.error().code() == ErrorCode::Cancelled) {
                     LOG_INFO("Video frame extraction stopped");
                     setExtractionStopped();
                 } else {
-                    LOG_ERROR("Video frame extraction failed: {}", error);
-                    setExtractionError(error);
+                    LOG_ERROR("Video frame extraction failed: {}", result.error().detail());
+                    setExtractionError(std::string(result.error().detail()));
                 }
             } else {
                 LOG_INFO("Video frame extraction completed successfully");
@@ -493,8 +507,20 @@ namespace lfs::gui {
 
         const bool video_path_changed = path != video_path_;
         video_path_ = path;
+        source_description_.reset();
+        source_probe_error_.clear();
+        auto description = media::MediaIngest::probe(path);
+        if (description) {
+            for (const auto& stream : description->streams)
+                if (description->selected_video_stream == stream.index) {
+                    source_description_ = stream;
+                    break;
+                }
+        } else
+            source_probe_error_ = std::string(description.error().detail());
         trim_start_ = 0.0f;
         trim_end_ = static_cast<float>(player_->duration());
+        trim_end_is_auto_ = true;
         custom_width_ = std::max(16, player_->sourceWidth());
         custom_height_ = std::max(16, player_->sourceHeight());
         rotation_deg_ = player_->rotation();
@@ -584,7 +610,7 @@ namespace lfs::gui {
         }
 
         if (!preview_texture_)
-            preview_texture_ = std::make_unique<lfs::vis::gui::VulkanUiTexture>();
+            preview_texture_ = std::make_unique<lfs::vis::gui::UiTexture>();
         if (preview_texture_->upload(upload_data, width, height, channels)) {
             preview_texture_width_ = width;
             preview_texture_height_ = height;
@@ -661,6 +687,10 @@ namespace lfs::gui {
         interval_input_el_ = nullptr;
         interval_value_el_ = nullptr;
         format_select_el_ = nullptr;
+        exr_selects_.fill(nullptr);
+        exr_options_el_ = nullptr;
+        exr_preflight_el_ = nullptr;
+        metadata_option_el_ = nullptr;
         quality_row_el_ = nullptr;
         quality_slider_el_ = nullptr;
         quality_value_el_ = nullptr;
@@ -738,6 +768,12 @@ namespace lfs::gui {
         interval_input_el_ = document_->GetElementById("interval-input");
         interval_value_el_ = document_->GetElementById("interval-value");
         format_select_el_ = dynamic_cast<Rml::ElementFormControlSelect*>(document_->GetElementById("format-select"));
+        constexpr std::array<const char*, 4> exr_ids{"exr-precision", "exr-compression", "input-transfer", "input-primaries"};
+        for (size_t i = 0; i < exr_ids.size(); ++i)
+            exr_selects_[i] = dynamic_cast<Rml::ElementFormControlSelect*>(document_->GetElementById(exr_ids[i]));
+        exr_options_el_ = document_->GetElementById("exr-options");
+        exr_preflight_el_ = document_->GetElementById("exr-preflight");
+        metadata_option_el_ = document_->GetElementById("metadata-option");
         quality_row_el_ = document_->GetElementById("quality-row");
         quality_slider_el_ = document_->GetElementById("quality-slider");
         quality_value_el_ = document_->GetElementById("quality-value");
@@ -868,6 +904,8 @@ namespace lfs::gui {
         listen_input(fps_slider_el_);
         listen_change(interval_input_el_);
         listen_change(format_select_el_);
+        for (auto* control : exr_selects_)
+            listen_change(control);
         listen_change(quality_slider_el_);
         listen_input(quality_slider_el_);
         listen_change(resolution_select_el_);
@@ -1049,7 +1087,7 @@ namespace lfs::gui {
         bool changed = false;
         changed |= setCachedChecked(hdr_to_sdr_el_, hdr_to_sdr_);
         changed |= setCachedProperty(hdr_to_sdr_row_el_, "display",
-                                     is_hdr ? "inline-flex" : "none");
+                                     (is_hdr && format_selection_ != 2) ? "inline-flex" : "none");
         changed |= setCachedDisabled(hdr_to_sdr_el_,
                                      extracting_.load() || !conversion_supported);
 
@@ -1139,12 +1177,29 @@ namespace lfs::gui {
             markContentDirty();
     }
 
+    std::string VideoExtractorDialog::exrPreflightError() const {
+        if (format_selection_ != 2 || !player_->isOpen())
+            return {};
+        if (player_->isHdr())
+            return LOC(VideoExtractor::EXR_HDR_UNSUPPORTED);
+        if (!source_description_)
+            return source_probe_error_.empty() ? LOC(VideoExtractor::SOURCE_METADATA_UNAVAILABLE) : source_probe_error_;
+        media::FrameColor overrides;
+        overrides.transfer = media::outputOptionValues<media::ColorTransfer>[std::clamp(exr_selections_[2], 0, 3)].value;
+        overrides.primaries = media::outputOptionValues<media::ColorPrimaries>[std::clamp(exr_selections_[3], 0, 2)].value;
+        const auto valid = media::validateFloatSdrSource(*source_description_, overrides);
+        return valid ? std::string{} : std::string(valid.error().detail());
+    }
+
     void VideoExtractorDialog::syncControls() {
         bool changed = false;
         const bool has_video = player_->isOpen();
         const bool extracting = extracting_.load();
         const bool stop_requested = stop_extraction_requested_.load();
-        const bool can_start = has_video && !output_dir_.empty() && !extracting;
+        const auto preflight = exrPreflightError();
+        const bool can_start = has_video && !output_dir_.empty() && !extracting && preflight.empty();
+        changed |= setCachedText(exr_preflight_el_, preflight);
+        changed |= setCachedProperty(exr_preflight_el_, "display", preflight.empty() ? "none" : "block");
 
         changed |= setCachedDisabled(step_back_btn_el_, !has_video);
         changed |= setCachedDisabled(play_btn_el_, !has_video);
@@ -1161,6 +1216,12 @@ namespace lfs::gui {
 
         changed |= setCachedSelect(mode_select_el_, mode_selection_);
         changed |= setCachedSelect(format_select_el_, format_selection_);
+        changed |= setCachedProperty(exr_options_el_, "display", format_selection_ == 2 ? "block" : "none");
+        changed |= setCachedProperty(metadata_option_el_, "display", format_selection_ == 2 ? "none" : "inline-flex");
+        for (size_t i = 0; i < exr_selects_.size(); ++i) {
+            changed |= setCachedSelect(exr_selects_[i], exr_selections_[i]);
+            changed |= setCachedDisabled(exr_selects_[i], extracting);
+        }
         changed |= setCachedSelect(resolution_select_el_, resolution_mode_);
         changed |= setCachedSelect(scale_select_el_, scale_selection_);
 
@@ -1236,8 +1297,9 @@ namespace lfs::gui {
                                                : lfs::core::path_to_utf8(output_dir_);
         changed |= setCachedText(video_value_el_, video_display);
         changed |= setCachedText(output_value_el_, output_display);
-        changed |= setCachedProperty(select_hint_el_, "display", can_start ? "none" : "inline-block");
-        changed |= setCachedText(select_hint_el_, LOC(VideoExtractor::SELECT_BOTH));
+        const bool inputs_missing = !player_->isOpen() || output_dir_.empty();
+        changed |= setCachedProperty(select_hint_el_, "display", inputs_missing || !preflight.empty() ? "inline-block" : "none");
+        changed |= setCachedText(select_hint_el_, preflight.empty() ? LOC(VideoExtractor::SELECT_BOTH) : preflight);
 
         if (changed)
             markContentDirty();
@@ -1313,13 +1375,17 @@ namespace lfs::gui {
                 out_w = custom_width_;
                 out_h = custom_height_;
             }
+            // Frames are scaled first, then rotated.
+            if (rotation_deg_ == 90 || rotation_deg_ == 270)
+                std::swap(out_w, out_h);
         }
 
         changed |= setCachedText(output_resolution_el_,
                                  player_->isOpen()
                                      ? LOCF(VideoExtractor::OUTPUT_RES, out_w, out_h)
                                      : std::format("{} --", LOC(VideoExtractor::OUTPUT)));
-        const char* const ext = format_selection_ == 0 ? ".png" : ".jpg";
+        const char* const ext = format_selection_ == 2 ? ".exr" : format_selection_ == 0 ? ".png"
+                                                                                         : ".jpg";
         const std::string preview = io::formatFrameFilenameStem(filename_pattern_.data(), 1);
         changed |= setCachedText(pattern_example_el_,
                                  LOCF(VideoExtractor::EXAMPLE, preview.c_str(), ext));
@@ -1359,7 +1425,7 @@ namespace lfs::gui {
 
         if (event_id == Rml::EventId::Change || event_id == Rml::EventId::Blur ||
             event.GetType() == "input") {
-            handleChange(id);
+            handleChange(id, event_id != Rml::EventId::Blur);
             event.StopPropagation();
         }
     }
@@ -1398,12 +1464,14 @@ namespace lfs::gui {
             controls_dirty_ = true;
             markContentDirty();
         } else if (id == "btn-trim-end-set" && player_->isOpen()) {
+            trim_end_is_auto_ = false;
             trim_end_ = std::clamp(static_cast<float>(player_->currentTime()),
                                    trim_start_ + MIN_TRIM_SECONDS,
                                    static_cast<float>(player_->duration()));
             controls_dirty_ = true;
             markContentDirty();
         } else if (id == "btn-trim-reset" && player_->isOpen()) {
+            trim_end_is_auto_ = true;
             trim_start_ = 0.0f;
             trim_end_ = static_cast<float>(player_->duration());
             controls_dirty_ = true;
@@ -1412,24 +1480,8 @@ namespace lfs::gui {
             beginExtractionFromUi();
         } else if (id == "overwrite-yes") {
             if (pending_params_set_) {
-                // Clear the folder
-                const auto& dir = pending_params_.output_dir;
-                if (std::filesystem::exists(dir)) {
-                    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-                        if (!entry.is_regular_file())
-                            continue;
-                        const auto ext = entry.path().extension().string();
-                        std::string lower;
-                        lower.reserve(ext.size());
-                        for (auto c : ext)
-                            lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-                        if (lower == ".jpg" || lower == ".jpeg" || lower == ".png" ||
-                            entry.path().filename() == "extraction_metadata.json") {
-                            std::error_code ec;
-                            std::filesystem::remove(entry.path(), ec);
-                        }
-                    }
-                }
+                pending_params_.exr.overwrite = true;
+                pending_params_.remove_stale_frames = true;
                 pending_params_set_ = false;
                 if (overwrite_overlay_el_)
                     overwrite_overlay_el_->SetClass("hidden", true);
@@ -1476,13 +1528,20 @@ namespace lfs::gui {
         }
     }
 
-    void VideoExtractorDialog::handleChange(const std::string& id) {
+    void VideoExtractorDialog::handleChange(const std::string& id, const bool explicit_edit) {
         Rml::Element* changed_control = nullptr;
 
         if (id == "mode-select") {
             mode_selection_ = mode_select_el_ ? mode_select_el_->GetSelection() : mode_selection_;
         } else if (id == "format-select") {
             format_selection_ = format_select_el_ ? format_select_el_->GetSelection() : format_selection_;
+        } else if (id == "exr-precision" || id == "exr-compression" || id == "input-transfer" || id == "input-primaries") {
+            if (extracting_.load())
+                return;
+            constexpr std::array<const char*, 4> ids{"exr-precision", "exr-compression", "input-transfer", "input-primaries"};
+            for (size_t i = 0; i < ids.size(); ++i)
+                if (id == ids[i] && exr_selects_[i])
+                    exr_selections_[i] = exr_selects_[i]->GetSelection();
         } else if (id == "resolution-select") {
             resolution_mode_ = resolution_select_el_ ? resolution_select_el_->GetSelection() : resolution_mode_;
         } else if (id == "scale-select") {
@@ -1533,9 +1592,11 @@ namespace lfs::gui {
             applyTextInput(id);
             if (id == "trim-start-input")
                 changed_control = trim_start_input_el_;
-            else if (id == "trim-end-input")
+            else if (id == "trim-end-input") {
+                if (explicit_edit)
+                    trim_end_is_auto_ = false;
                 changed_control = trim_end_input_el_;
-            else if (id == "custom-width-input")
+            } else if (id == "custom-width-input")
                 changed_control = custom_width_input_el_;
             else if (id == "custom-height-input")
                 changed_control = custom_height_input_el_;
@@ -1615,8 +1676,10 @@ namespace lfs::gui {
 
         if (target == TimelineDragTarget::TrimStart)
             trim_start_ = std::clamp(time, 0.0f, trim_end_ - MIN_TRIM_SECONDS);
-        else if (target == TimelineDragTarget::TrimEnd)
+        else if (target == TimelineDragTarget::TrimEnd) {
+            trim_end_is_auto_ = false;
             trim_end_ = std::clamp(time, trim_start_ + MIN_TRIM_SECONDS, duration);
+        }
 
         controls_dirty_ = true;
         markContentDirty();
@@ -1649,7 +1712,7 @@ namespace lfs::gui {
         applyTextInput("custom-height-input");
         applyTextInput("pattern-input");
 
-        if (!player_->isOpen() || output_dir_.empty() || extracting_.load())
+        if (!player_->isOpen() || output_dir_.empty() || extracting_.load() || !exrPreflightError().empty())
             return;
 
         VideoExtractionParams params;
@@ -1658,10 +1721,16 @@ namespace lfs::gui {
         params.mode = mode_selection_ == 0 ? io::ExtractionMode::FPS : io::ExtractionMode::INTERVAL;
         params.fps = static_cast<double>(fps_);
         params.frame_interval = frame_interval_;
-        params.format = format_selection_ == 0 ? io::ImageFormat::PNG : io::ImageFormat::JPG;
+        params.format = format_selection_ == 2 ? io::ImageFormat::EXR : format_selection_ == 0 ? io::ImageFormat::PNG
+                                                                                               : io::ImageFormat::JPG;
+        if (format_selection_ == 2) {
+            params.exr.precision = media::outputOptionValues<media::ExrPrecision>[std::clamp(exr_selections_[0], 0, 1)].value;
+            params.exr.compression = media::outputOptionValues<media::ExrCompression>[std::clamp(exr_selections_[1], 0, 1)].value;
+            params.input_color.transfer = media::outputOptionValues<media::ColorTransfer>[std::clamp(exr_selections_[2], 0, 3)].value;
+            params.input_color.primaries = media::outputOptionValues<media::ColorPrimaries>[std::clamp(exr_selections_[3], 0, 2)].value;
+        }
         params.jpg_quality = jpg_quality_;
         params.start_time = static_cast<double>(trim_start_);
-        params.end_time = static_cast<double>(trim_end_);
         static constexpr std::array<io::ResolutionMode, 3> RES_MODES{
             io::ResolutionMode::Original,
             io::ResolutionMode::Scale,
@@ -1680,29 +1749,19 @@ namespace lfs::gui {
             params.sharpness_algorithm = ALGO_MAP[std::clamp(sharpness_algorithm_select_el_->GetSelection(), 0, 2)];
         }
         params.sharpness_window_mode = sharpness_mode_select_el_ && sharpness_mode_select_el_->GetSelection() == 1;
+        params.end_time = io::extractionEndTime(
+            trim_end_, player_->duration(),
+            trim_end_is_auto_ && params.mode == io::ExtractionMode::INTERVAL &&
+                !(params.sharpness_enabled && params.sharpness_window_mode));
         params.window_candidates_target = window_candidates_target_;
         params.sharpness_threshold = static_cast<double>(readIntValue(sharpness_threshold_slider_el_, 10));
         params.generate_metadata = generate_metadata_el_ && generate_metadata_el_->HasAttribute("checked");
-        params.convert_hdr_to_sdr = hdr_to_sdr_;
+        params.convert_hdr_to_sdr = format_selection_ != 2 && hdr_to_sdr_;
         params.rotation = rotation_deg_;
 
         // Check if output folder already contains generated extraction files
         if (std::filesystem::exists(output_dir_)) {
-            bool has_generated = false;
-            for (const auto& entry : std::filesystem::directory_iterator(output_dir_)) {
-                if (!entry.is_regular_file())
-                    continue;
-                const auto ext = entry.path().extension().string();
-                std::string ext_lower;
-                ext_lower.reserve(ext.size());
-                for (auto c : ext)
-                    ext_lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-                if (ext_lower == ".jpg" || ext_lower == ".jpeg" || ext_lower == ".png" ||
-                    entry.path().filename() == "extraction_metadata.json") {
-                    has_generated = true;
-                    break;
-                }
-            }
+            const bool has_generated = !io::generatedExtractionFiles(output_dir_, params.filename_pattern, format_selection_ != 2).empty();
             if (has_generated) {
                 pending_params_ = params;
                 pending_params_set_ = true;

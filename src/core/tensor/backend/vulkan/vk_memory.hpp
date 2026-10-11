@@ -1,6 +1,7 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
+#include "core/export.hpp"
 #include "core/tensor/internal/private_access.hpp"
 
 #include "../descriptors.hpp"
@@ -8,6 +9,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -16,6 +18,9 @@
 #include <vector>
 #include <vk_mem_alloc.h>
 #include <vulkan/vulkan.h>
+#ifdef __APPLE__
+#include <vulkan/vulkan_metal.h>
+#endif
 
 namespace lfs::core {
     class MemoryInfo;
@@ -33,22 +38,23 @@ namespace lfs::core::internal {
         VulkanMemory(const VulkanMemory&) = delete;
         VulkanMemory& operator=(const VulkanMemory&) = delete;
 
-        [[nodiscard]] StorageRef allocate(size_t bytes, size_t alignment,
-                                          ExecContext context);
+        [[nodiscard]] LFS_CORE_API StorageRef allocate(size_t bytes, size_t alignment,
+                                                       ExecContext context);
         // Host-visible, persistently mapped storage for results the host reads
         // right after they are produced (scalar reductions, counters): shaders
         // write it through its device address and read_readback waits for the
         // producer and copies from the mapping, so the staging ring and its
         // mutex stay out of the path. The block comes back zeroed.
-        [[nodiscard]] StorageRef allocate_readback(size_t bytes);
+        [[nodiscard]] LFS_CORE_API StorageRef allocate_readback(size_t bytes);
         void read_readback(StorageRef storage, void* destination, size_t bytes);
-        void deallocate(StorageRef storage) noexcept;
-        void copy_host_to_device(const CopyRequest& request);
+        LFS_CORE_API void deallocate(StorageRef storage) noexcept;
+        LFS_CORE_API void copy_host_to_device(const CopyRequest& request);
         void copy_device_to_device(const CopyRequest& request);
-        void memset(const FillRequest& request);
+        LFS_CORE_API void memset(const FillRequest& request);
         [[nodiscard]] uint64_t copy_to_readback(StorageRef src, StorageRef dst, size_t bytes);
         // The caller has waited for writes and the host-read barrier.
         void copy_mapped(StorageRef storage, void* destination, size_t bytes);
+        [[nodiscard]] std::byte* mapped_pointer(StorageRef storage) const;
         [[nodiscard]] uint64_t foreign_use(std::span<const StorageRef> reads,
                                            std::span<const StorageRef> writes,
                                            uint64_t current_value) const;
@@ -58,14 +64,19 @@ namespace lfs::core::internal {
                               uint64_t timeline_value, VkPipelineStageFlags2 stage,
                               VkDeviceSize bytes);
 
-        [[nodiscard]] static VkBuffer buffer_for(StorageRef storage);
-        [[nodiscard]] static VkDeviceSize offset_for(StorageRef storage);
+        [[nodiscard]] LFS_CORE_API static VkBuffer buffer_for(StorageRef storage);
+        [[nodiscard]] LFS_CORE_API static VkDeviceSize offset_for(StorageRef storage);
 
         void trim();
-        [[nodiscard]] MemoryInfo stats() const;
-        [[nodiscard]] size_t cached_bytes() const noexcept;
+        // Nested holds keep freed buffers of the direct range for reuse instead
+        // of returning them to the driver; the last release destroys them.
+        void hold_freed(bool hold);
+        [[nodiscard]] LFS_CORE_API MemoryInfo stats() const;
+        [[nodiscard]] LFS_CORE_API size_t cached_bytes() const noexcept;
         [[nodiscard]] uint64_t live_object_count() const noexcept;
-        [[nodiscard]] bool owns_address(const void* pointer) const noexcept;
+        [[nodiscard]] LFS_CORE_API bool owns_address(const void* pointer) const noexcept;
+        // Borrow an existing allocation; the caller keeps its arena alive.
+        [[nodiscard]] LFS_CORE_API StorageRef borrow_address(const void* pointer, size_t bytes) const;
         [[nodiscard]] bool exports_memory() const noexcept { return exports_memory_; }
         struct CudaBlockInfo {
             VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -91,12 +102,19 @@ namespace lfs::core::internal {
         void ensure_staging(size_t bytes);
         [[nodiscard]] StagingSlice acquire_staging(size_t bytes, size_t alignment);
         void collect_retired_locked(uint64_t completed);
+        void destroy_free_when_idle_locked();
         void destroy_free_locked();
         [[nodiscard]] AllocationRecord& allocation_for(StorageRef storage) const;
 
         VulkanContext& context_;
         VkExportMemoryAllocateInfo export_alloc_info_{};
+#ifdef __APPLE__
+        VkExportMetalObjectCreateInfoEXT metal_export_info_{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT};
+#endif
         VmaPool device_pool_ = VK_NULL_HANDLE;
+#ifdef __APPLE__
+        VmaPool host_pool_ = VK_NULL_HANDLE;
+#endif
         bool exports_memory_ = false;
         mutable std::mutex allocations_mutex_;
         std::unordered_map<uint64_t, std::unique_ptr<AllocationRecord>> allocations_;
@@ -107,6 +125,8 @@ namespace lfs::core::internal {
         std::unordered_map<VkDeviceSize,
                            std::vector<std::unique_ptr<AllocationRecord>>>
             readback_free_lists_;
+        std::multimap<VkDeviceSize, std::unique_ptr<AllocationRecord>> held_;
+        uint32_t freed_memory_holds_ = 0;
         mutable std::mutex staging_mutex_;
         VkBuffer staging_buffer_ = VK_NULL_HANDLE;
         VmaAllocation staging_allocation_ = VK_NULL_HANDLE;

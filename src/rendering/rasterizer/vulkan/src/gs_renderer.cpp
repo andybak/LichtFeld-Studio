@@ -5,6 +5,7 @@
 #include "visible_mask.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <csignal>
@@ -207,21 +208,16 @@ void VulkanGSRenderer::tagDeferredVisibleCountReadback(const VkSemaphore semapho
 }
 
 void VulkanGSRenderer::tagDeferredLodSelectionReadback(const VkSemaphore semaphore,
-                                                       const std::uint64_t value) {
-    if (lod_selection_readback_pending_) {
-        if (semaphore == VK_NULL_HANDLE || value == 0) {
-            lfs::rendering::throw_renderer_contract(
-                std::format(
-                    "LOD-selection readback requires a valid completion timeline tag (semaphore={:#x}, value={}, pending={}, prior_semaphore={:#x}, prior_value={})",
-                    lfs::rendering::vkHandleValue(semaphore),
-                    value,
-                    lod_selection_readback_pending_,
-                    lfs::rendering::vkHandleValue(lod_selection_readback_signal_),
-                    lod_selection_readback_value_),
-                LFS_SOURCE_SITE_CURRENT());
-        }
-        lod_selection_readback_signal_ = semaphore;
-        lod_selection_readback_value_ = value;
+                                                       const std::uint64_t value,
+                                                       const LodSelectionReadbackIdentity identity) {
+    for (auto& slot : lod_selection_readbacks_) {
+        if (!slot.pending || slot.value != 0)
+            continue;
+        if (semaphore == VK_NULL_HANDLE || value == 0)
+            lfs::rendering::throw_renderer_contract("Invalid LOD readback completion tag", LFS_SOURCE_SITE_CURRENT());
+        slot.signal = semaphore;
+        slot.value = value;
+        slot.identity = identity;
     }
 }
 
@@ -657,14 +653,16 @@ void VulkanGSRenderer::destroyVisibleCountReadback() {
     visible_count_readback_num_splats_ = 0;
 }
 
-void VulkanGSRenderer::ensureLodSelectionReadback(const size_t chunk_capacity) {
-    if (lod_selection_readback_initialized_) {
-        if (lod_selection_readback_chunk_capacity_ >= chunk_capacity)
+void VulkanGSRenderer::ensureLodSelectionReadback(LodSelectionReadbackSlot& slot, const size_t chunk_capacity) {
+    if (slot.initialized) {
+        if (slot.chunk_capacity >= chunk_capacity)
             return;
         // Growing requires a recreate; never destroy under an in-flight copy.
-        if (lod_selection_readback_pending_)
+        if (slot.pending)
             return;
-        destroyLodSelectionReadback();
+        if (slot.buffer.buffer != VK_NULL_HANDLE)
+            vmaDestroyBuffer(allocator, slot.buffer.buffer, slot.buffer.allocation);
+        slot = {};
     }
 
     const VkDeviceSize byte_size = (3 + chunk_capacity) * sizeof(uint32_t);
@@ -680,14 +678,14 @@ void VulkanGSRenderer::ensureLodSelectionReadback(const size_t chunk_capacity) {
                 VMA_ALLOCATION_CREATE_MAPPED_BIT;
 
     VmaAllocationInfo alloc_info{};
-    lod_selection_readback_buffer_.label = "lod_selection_readback";
+    slot.buffer.label = "lod_selection_readback";
     const VkResult create_result = vmaCreateBuffer(allocator, &info, &aci,
-                                                   &lod_selection_readback_buffer_.buffer,
-                                                   &lod_selection_readback_buffer_.allocation,
+                                                   &slot.buffer.buffer,
+                                                   &slot.buffer.allocation,
                                                    &alloc_info);
     if (create_result != VK_SUCCESS) {
-        lod_selection_readback_buffer_.buffer = VK_NULL_HANDLE;
-        lod_selection_readback_buffer_.allocation = VK_NULL_HANDLE;
+        slot.buffer.buffer = VK_NULL_HANDLE;
+        slot.buffer.allocation = VK_NULL_HANDLE;
         lfs::rendering::throw_vk_result(
             create_result,
             "vmaCreateBuffer",
@@ -700,52 +698,42 @@ void VulkanGSRenderer::ensureLodSelectionReadback(const size_t chunk_capacity) {
                 static_cast<int>(create_result)),
             LFS_SOURCE_SITE_CURRENT());
     }
-    lod_selection_readback_buffer_.allocSize = byte_size;
-    lod_selection_readback_buffer_.capacity = byte_size;
-    lod_selection_readback_buffer_.size = byte_size;
-    lod_selection_readback_mapped_ = static_cast<uint32_t*>(alloc_info.pMappedData);
-    if (lod_selection_readback_mapped_ == nullptr) {
-        const VkBuffer failed_buffer = lod_selection_readback_buffer_.buffer;
-        const VmaAllocation failed_allocation = lod_selection_readback_buffer_.allocation;
+    slot.buffer.allocSize = byte_size;
+    slot.buffer.capacity = byte_size;
+    slot.buffer.size = byte_size;
+    slot.mapped = static_cast<uint32_t*>(alloc_info.pMappedData);
+    if (slot.mapped == nullptr) {
+        const VkBuffer failed_buffer = slot.buffer.buffer;
+        const VmaAllocation failed_allocation = slot.buffer.allocation;
         vmaDestroyBuffer(allocator, failed_buffer, failed_allocation);
-        lod_selection_readback_buffer_ = {};
+        slot.buffer = {};
         lfs::rendering::throw_renderer_contract(
             std::format(
                 "LOD-selection readback allocation was not persistently mapped (requested_bytes={}, buffer={:#x}, allocation={:#x}, mapped_pointer={:#x})",
                 byte_size,
                 lfs::rendering::vkHandleValue(failed_buffer),
                 lfs::rendering::vkHandleValue(failed_allocation),
-                lfs::rendering::vkHandleValue(lod_selection_readback_mapped_)),
+                lfs::rendering::vkHandleValue(slot.mapped)),
             LFS_SOURCE_SITE_CURRENT());
     }
-    std::memset(lod_selection_readback_mapped_, 0, byte_size);
+    std::memset(slot.mapped, 0, byte_size);
     setDebugObjectName(VK_OBJECT_TYPE_BUFFER,
-                       lod_selection_readback_buffer_.buffer,
+                       slot.buffer.buffer,
                        "vksplat.readback.lod_selection");
-    lod_selection_readback_initialized_ = true;
-    lod_selection_readback_pending_ = false;
-    lod_selection_readback_signal_ = VK_NULL_HANDLE;
-    lod_selection_readback_value_ = 0;
-    lod_selection_readback_capacity_ = 0;
-    lod_selection_readback_chunk_capacity_ = chunk_capacity;
+    slot.initialized = true;
+    slot.pending = false;
+    slot.signal = VK_NULL_HANDLE;
+    slot.value = 0;
+    slot.capacity = 0;
+    slot.chunk_capacity = chunk_capacity;
 }
 
 void VulkanGSRenderer::destroyLodSelectionReadback() {
-    if (!lod_selection_readback_initialized_)
-        return;
-    if (lod_selection_readback_buffer_.buffer != VK_NULL_HANDLE) {
-        vmaDestroyBuffer(allocator,
-                         lod_selection_readback_buffer_.buffer,
-                         lod_selection_readback_buffer_.allocation);
+    for (auto& slot : lod_selection_readbacks_) {
+        if (slot.buffer.buffer != VK_NULL_HANDLE)
+            vmaDestroyBuffer(allocator, slot.buffer.buffer, slot.buffer.allocation);
+        slot = {};
     }
-    lod_selection_readback_buffer_ = {};
-    lod_selection_readback_mapped_ = nullptr;
-    lod_selection_readback_initialized_ = false;
-    lod_selection_readback_pending_ = false;
-    lod_selection_readback_signal_ = VK_NULL_HANDLE;
-    lod_selection_readback_value_ = 0;
-    lod_selection_readback_capacity_ = 0;
-    lod_selection_readback_chunk_capacity_ = 0;
 }
 
 std::optional<VulkanGSRenderer::PrimitiveVisibilityStats>
@@ -773,23 +761,31 @@ VulkanGSRenderer::pollDeferredPrimitiveVisibilityStats() {
 
 std::optional<VulkanGSRenderer::LodSelectionStats>
 VulkanGSRenderer::pollDeferredLodSelectionStats() {
-    if (!lod_selection_readback_pending_ || !lod_selection_readback_mapped_)
+    LodSelectionReadbackSlot* oldest = nullptr;
+    for (auto& candidate : lod_selection_readbacks_)
+        if (candidate.pending && (!oldest || candidate.order < oldest->order))
+            oldest = &candidate;
+    if (!oldest)
         return std::nullopt;
-    if (lod_selection_readback_signal_ == VK_NULL_HANDLE || lod_selection_readback_value_ == 0)
+    auto& slot = *oldest;
+    if (!slot.pending || !slot.mapped)
         return std::nullopt;
-    if (!timelineValueComplete(lod_selection_readback_signal_, lod_selection_readback_value_))
+    if (slot.signal == VK_NULL_HANDLE || slot.value == 0)
+        return std::nullopt;
+    if (!timelineValueComplete(slot.signal, slot.value))
         return std::nullopt;
     if (!invalidateReadbackBuffer(
-            lod_selection_readback_buffer_,
+            slot.buffer,
             (3 + 4 + kLodCompactProtectedCap + 2 * kLodCompactMissCap) * sizeof(uint32_t)))
         return std::nullopt;
 
     LodSelectionStats stats{};
-    stats.candidate_count = lod_selection_readback_mapped_[0];
-    stats.rendered_capacity = lod_selection_readback_capacity_;
-    stats.overflow_count = lod_selection_readback_mapped_[1];
-    stats.threshold_scale = std::bit_cast<float>(lod_selection_readback_mapped_[2]);
-    const uint32_t* const words = lod_selection_readback_mapped_;
+    stats.identity = slot.identity;
+    stats.candidate_count = slot.mapped[0];
+    stats.rendered_capacity = slot.capacity;
+    stats.overflow_count = slot.mapped[1];
+    stats.threshold_scale = std::bit_cast<float>(slot.mapped[2]);
+    const uint32_t* const words = slot.mapped;
     const size_t protected_count =
         std::min<size_t>(words[3], kLodCompactProtectedCap);
     const size_t miss_count = std::min<size_t>(words[4], kLodCompactMissCap);
@@ -801,10 +797,10 @@ VulkanGSRenderer::pollDeferredLodSelectionStats() {
     for (size_t i = 0; i < miss_count; ++i) {
         stats.miss_candidates.emplace_back(misses[i * 2], misses[i * 2 + 1]);
     }
-    lod_selection_readback_pending_ = false;
-    lod_selection_readback_signal_ = VK_NULL_HANDLE;
-    lod_selection_readback_value_ = 0;
-    lod_selection_readback_capacity_ = 0;
+    slot.pending = false;
+    slot.signal = VK_NULL_HANDLE;
+    slot.value = 0;
+    slot.capacity = 0;
     return stats;
 }
 
@@ -874,7 +870,18 @@ void VulkanGSRenderer::recordLodSelectionReadback(VulkanGSPipelineBuffers& buffe
     // pairs; independent of the logical chunk count.
     constexpr size_t kPayloadWords =
         4 + kLodCompactProtectedCap + 2 * kLodCompactMissCap;
-    ensureLodSelectionReadback(kPayloadWords);
+    // Untagged copies belong to a cancelled recording or an earlier traversal
+    // in this same command batch. Only submitted, tagged slots are in flight.
+    for (auto& prior : lod_selection_readbacks_)
+        if (prior.pending && prior.value == 0)
+            prior.pending = false;
+    auto available = std::find_if(lod_selection_readbacks_.begin(), lod_selection_readbacks_.end(),
+                                  [](const auto& slot) { return !slot.pending; });
+    // Grow under multi-target load instead of overwriting a tagged GPU copy.
+    auto& slot = available == lod_selection_readbacks_.end()
+                     ? lod_selection_readbacks_.emplace_back()
+                     : *available;
+    ensureLodSelectionReadback(slot, kPayloadWords);
     if (buffers.lod_gpu_counts.deviceBuffer.buffer == VK_NULL_HANDLE ||
         buffers.lod_compact_counts.deviceBuffer.buffer == VK_NULL_HANDLE)
         return;
@@ -889,7 +896,7 @@ void VulkanGSRenderer::recordLodSelectionReadback(VulkanGSPipelineBuffers& buffe
         {.buffer = &buffers.lod_compact_counts.deviceBuffer, .use = BufferUse::TransferRead},
         {.buffer = &buffers.lod_compact_protected.deviceBuffer, .use = BufferUse::TransferRead},
         {.buffer = &buffers.lod_compact_misses.deviceBuffer, .use = BufferUse::TransferRead},
-        {.buffer = &lod_selection_readback_buffer_, .use = BufferUse::TransferWrite},
+        {.buffer = &slot.buffer, .use = BufferUse::TransferWrite},
     };
     planTransfer(std::span{pre_copy});
 
@@ -900,7 +907,7 @@ void VulkanGSRenderer::recordLodSelectionReadback(VulkanGSPipelineBuffers& buffe
         copy.dstOffset = dst_word * sizeof(uint32_t);
         copy.size = words * sizeof(uint32_t);
         validateBufferRange(src, 0, copy.size, "LOD-selection readback source");
-        validateBufferRange(lod_selection_readback_buffer_,
+        validateBufferRange(slot.buffer,
                             copy.dstOffset,
                             copy.size,
                             "LOD-selection readback destination");
@@ -910,7 +917,7 @@ void VulkanGSRenderer::recordLodSelectionReadback(VulkanGSPipelineBuffers& buffe
                 LFS_SOURCE_SITE_CURRENT());
         }
         vulkan_dispatch_.cmd_copy_buffer(command_buffer, src.buffer,
-                                         lod_selection_readback_buffer_.buffer, 1, &copy);
+                                         slot.buffer.buffer, 1, &copy);
     };
     copy_region(buffers.lod_gpu_counts.deviceBuffer, 0, 3);
     copy_region(buffers.lod_compact_counts.deviceBuffer, 3, 4);
@@ -920,15 +927,16 @@ void VulkanGSRenderer::recordLodSelectionReadback(VulkanGSPipelineBuffers& buffe
 
     // Host coherence still requires fence/timeline wait at endCommandBatch (§3.2 G3).
     const DeclaredAccess host_read{
-        .buffer = &lod_selection_readback_buffer_,
+        .buffer = &slot.buffer,
         .use = BufferUse::HostRead,
     };
     planTransfer(std::span{&host_read, 1});
 
-    lod_selection_readback_pending_ = true;
-    lod_selection_readback_signal_ = VK_NULL_HANDLE;
-    lod_selection_readback_value_ = 0;
-    lod_selection_readback_capacity_ = rendered_capacity;
+    slot.pending = true;
+    slot.order = ++lod_selection_readback_order_;
+    slot.signal = VK_NULL_HANDLE;
+    slot.value = 0;
+    slot.capacity = rendered_capacity;
 }
 
 bool VulkanGSRenderer::invalidateReadbackBuffer(_VulkanBuffer& buffer, VkDeviceSize size) {
@@ -995,11 +1003,6 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
             "Conditional rendering was enabled without both command entry points",
             LFS_SOURCE_SITE_CURRENT());
     }
-    LOG_INFO("vksplat depth waves: {} slots ({})",
-             supports_conditional_rendering_ ? HIGS_DEPTH_MAX_WAVES
-                                             : HIGS_DEPTH_MAX_WAVES_FALLBACK,
-             supports_conditional_rendering_ ? "conditional rendering"
-                                             : "VK_EXT_conditional_rendering unavailable");
 
     createComputePipeline(pipeline_projection_forward, spirv_paths.at("projection_forward"));
     createComputePipeline(pipeline_projection_forward_3dgut, spirv_paths.at("projection_forward_3dgut"));
@@ -1116,6 +1119,10 @@ void VulkanGSRenderer::initializeExternal(const std::map<std::string, std::strin
             create_optional(pipeline_macro_raster_fp32[i], lean ? "macro_raster_fp32_lean" : "macro_raster_fp32");
             create_optional(pipeline_macro_raster_overlays[i], lean ? "macro_raster_overlays_lean" : "macro_raster_overlays");
             create_optional(pipeline_macro_raster_overlays_fp32[i], lean ? "macro_raster_overlays_fp32_lean" : "macro_raster_overlays_fp32");
+#if defined(LFS_VULKAN_MACOS_REFERENCE)
+            create_optional(pipeline_macro_raster_fp32_precise_alpha[i], lean ? "macro_raster_fp32_lean_precise_alpha" : "macro_raster_fp32_precise_alpha");
+            create_optional(pipeline_macro_raster_overlays_fp32_precise_alpha[i], lean ? "macro_raster_overlays_fp32_lean_precise_alpha" : "macro_raster_overlays_fp32_precise_alpha");
+#endif
             create_optional(pipeline_macro_compose[i], "macro_compose");
             create_optional(pipeline_macro_compose_overlays[i], "macro_compose_overlays");
         }
@@ -1378,6 +1385,11 @@ void VulkanGSRenderer::executeProjectionForward(
     } else {
         projection_uniforms.lod_enabled &= ~kLodEnabledWriteOverlayFlags;
     }
+    if (buffers.deleted_mask.deviceBuffer.buffer != VK_NULL_HANDLE) {
+        projection_uniforms.lod_enabled |= kLodEnabledDeletedMask;
+    } else {
+        projection_uniforms.lod_enabled &= ~kLodEnabledDeletedMask;
+    }
     if (buffers.quant_pool) {
         projection_uniforms.lod_page_splats = buffers.pool_page_splats;
         tagged.push_back({buffers.page_frames.deviceBuffer, BufferUse::ComputeRead});
@@ -1386,6 +1398,10 @@ void VulkanGSRenderer::executeProjectionForward(
         projection_uniforms.shN_layout_slots = buffers.shN_n_cells;
         tagged.push_back({buffers.shN_bounds.deviceBuffer, BufferUse::ComputeRead});
     }
+    tagged.push_back({buffers.deleted_mask.deviceBuffer.buffer != VK_NULL_HANDLE
+                          ? buffers.deleted_mask.deviceBuffer
+                          : primitive_depth_keys,
+                      BufferUse::ComputeRead});
     applyShNUniforms(projection_uniforms, buffers, deviceInfo.maxStorageBufferRange);
 
     auto& pipeline = buffers.quant_pool
@@ -1399,7 +1415,7 @@ void VulkanGSRenderer::executeProjectionForward(
                                                : pipeline_projection_forward_shn_f16)
                          : (use_gut_projection ? pipeline_projection_forward_3dgut
                                                : pipeline_projection_forward);
-    // fp32: 24 layouts; quant/q16: 25 with the extra last binding; q16/f16 skip
+    // fp32: 25 layouts; quant/q16: 26 with the extra SH binding; q16/f16 skip
     // binding 2 (shN is BDA). tagged keeps placeholder slots so indices match
     // shader binding numbers.
     executeCompute(
@@ -1515,7 +1531,7 @@ void VulkanGSRenderer::executeLegacyDepthWaves(
     auto& n_contributors = resize_scratch(buffers.n_contributors, alloc_pixels);
 
     constexpr size_t kRadix = 256u;
-    constexpr size_t kPartitionSize = 512u * 8u;
+    constexpr size_t kPartitionSize = RADIX_PARTITION_SIZE;
     const size_t radix_passes = _CEIL_DIV(static_cast<size_t>(sort_bits), size_t{8});
     resizeDeviceBuffer(buffers._sorting_histogram, radix_passes * kRadix);
     resizeDeviceBuffer(buffers._sorting_histogram_cumsum,
@@ -1845,11 +1861,13 @@ void VulkanGSRenderer::executeSelectionMask(
     using lfs::rendering::vulkan::BufferUse;
     using lfs::rendering::vulkan::DeclaredAccess;
 
-    // Tags from selection_mask.slang bindings 0–10.
+    // Tags from selection_mask.slang bindings 0-11.
     const size_t num_words = _CEIL_DIV(static_cast<size_t>(uniforms.num_splats), 4);
+    VulkanGSSelectionMaskUniforms selection_uniforms = uniforms;
+    selection_uniforms.deleted_mask_enabled = buffers.deleted_mask.deviceBuffer.buffer != VK_NULL_HANDLE;
     executeCompute(
         {{num_words, SUBGROUP_SIZE}},
-        &uniforms, sizeof(uniforms),
+        &selection_uniforms, sizeof(selection_uniforms),
         pipeline_selection_mask,
         std::vector<TaggedBinding>{
             {buffers.xyz_ws.deviceBuffer, BufferUse::ComputeRead},
@@ -1863,6 +1881,10 @@ void VulkanGSRenderer::executeSelectionMask(
             {polygon_mask, BufferUse::ComputeRead},
             {buffers.opacity_raw.deviceBuffer, BufferUse::ComputeRead},
             {ring_pick_out, BufferUse::ComputeWrite},
+            {buffers.deleted_mask.deviceBuffer.buffer != VK_NULL_HANDLE
+                 ? buffers.deleted_mask.deviceBuffer
+                 : buffers.xyz_ws.deviceBuffer,
+             BufferUse::ComputeRead},
         });
 
     // Handoff: host/CUDA download consumers lack their own barrier site (§3.4.5).
@@ -2226,7 +2248,7 @@ void VulkanGSRenderer::executeSortIndirectCountImpl(
     };
 
     const int RADIX = 256;
-    const int WORKGROUP_SIZE = 512;
+    const int WORKGROUP_SIZE = RADIX_WORKGROUP_SIZE;
     const int PARTITION_DIVISION = 8;
     const int PARTITION_SIZE = PARTITION_DIVISION * WORKGROUP_SIZE;
 
@@ -2422,7 +2444,7 @@ void VulkanGSRenderer::executeSortPrimitivesByDepth(
         uint32_t num_splats;
         uint32_t sort_partition_size;
         uint32_t pad0, pad1;
-    } prepare_uniforms{static_cast<uint32_t>(num_splats), 512u * 8u, 0, 0};
+    } prepare_uniforms{static_cast<uint32_t>(num_splats), RADIX_PARTITION_SIZE, 0, 0};
 
     {
         PerfTimer::Timer<PerfTimer::PrepareVisibleSort> gpu_timer(this);
@@ -2671,6 +2693,11 @@ void VulkanGSRenderer::executeProjectionForwardSurvivors(
     } else {
         survivor_uniforms.lod_enabled &= ~kLodEnabledWriteOverlayFlags;
     }
+    if (buffers.deleted_mask.deviceBuffer.buffer != VK_NULL_HANDLE) {
+        survivor_uniforms.lod_enabled |= kLodEnabledDeletedMask;
+    } else {
+        survivor_uniforms.lod_enabled &= ~kLodEnabledDeletedMask;
+    }
     if (buffers.quant_pool) {
         survivor_uniforms.lod_page_splats = buffers.pool_page_splats;
     }
@@ -2737,6 +2764,10 @@ void VulkanGSRenderer::executeProjectionForwardSurvivors(
         survivor_uniforms.shN_layout_slots = buffers.shN_n_cells;
         tagged.push_back({buffers.shN_bounds.deviceBuffer, BufferUse::ComputeRead}); // 29
     }
+    tagged.push_back({buffers.deleted_mask.deviceBuffer.buffer != VK_NULL_HANDLE
+                          ? buffers.deleted_mask.deviceBuffer
+                          : unsorted_keys,
+                      BufferUse::ComputeRead});
     applyShNUniforms(survivor_uniforms, buffers, deviceInfo.maxStorageBufferRange);
 
     // Indirect: plan() adds implicit IndirectRead on survivor_state (replaces L2629 handoff).
@@ -2779,7 +2810,7 @@ void VulkanGSRenderer::executeSortPrimitivesByDepthVisible(
         static_cast<uint32_t>(
             std::min<size_t>(visible_capacity,
                              static_cast<size_t>(std::numeric_limits<uint32_t>::max()))),
-        512u * 8u, 0, 0};
+        RADIX_PARTITION_SIZE, 0, 0};
 
     using lfs::rendering::vulkan::BufferUse;
     using lfs::rendering::vulkan::DeclaredAccess;
@@ -2937,7 +2968,8 @@ void VulkanGSRenderer::executeMacroDepthWaves(
     const _VulkanBuffer& selection_colors,
     const _VulkanBuffer& overlay_params,
     const bool overlays_active,
-    const bool predicate_waves) {
+    const bool predicate_waves,
+    const std::span<const uint32_t> exact_depth_sample_mask) {
     PerfTimer::Timer<PerfTimer::RasterizeForward> timer(this);
     DEVICE_GUARD;
 
@@ -3063,8 +3095,29 @@ void VulkanGSRenderer::executeMacroDepthWaves(
     auto& pixel_depth = resize_scratch(buffers.pixel_depth, alloc_pixels);
     auto& n_contributors = resize_scratch(buffers.n_contributors, alloc_pixels);
 
+    const _VulkanBuffer* depth_sample_mask = &pixel_depth;
+    if (!exact_depth_sample_mask.empty()) {
+        const size_t expected_words = (_CEIL_DIV(size_t(uniforms.image_width), size_t{HIGS_DEPTH_SAMPLE_TILE_SIZE}) *
+                                           _CEIL_DIV(size_t(uniforms.image_height), size_t{HIGS_DEPTH_SAMPLE_TILE_SIZE}) +
+                                       31u) /
+                                      32u;
+        if (exact_depth_sample_mask.size() != expected_words) {
+            lfs::rendering::throw_renderer_contract("Exact depth mask dimensions do not match the viewport",
+                                                    LFS_SOURCE_SITE_CURRENT());
+        }
+        auto& mask = resizeDeviceBuffer(buffers.exact_depth_sample_mask, expected_words);
+        const lfs::rendering::vulkan::DeclaredAccess write{.buffer = &mask, .use = lfs::rendering::vulkan::BufferUse::TransferWrite};
+        planTransfer(std::span{&write, 1});
+        const auto bytes = std::as_bytes(exact_depth_sample_mask);
+        for (size_t offset = 0; offset < bytes.size(); offset += 65536u) {
+            vkCmdUpdateBuffer(command_buffer, mask.buffer, mask.offset + offset,
+                              std::min(size_t{65536u}, bytes.size() - offset), bytes.data() + offset);
+        }
+        depth_sample_mask = &mask;
+    }
+
     constexpr size_t kRadix = 256u;
-    constexpr size_t kPartitionSize = 512u * 8u;
+    constexpr size_t kPartitionSize = RADIX_PARTITION_SIZE;
     const size_t radix_passes = _CEIL_DIV(static_cast<size_t>(sort_bits), size_t{8});
     resizeDeviceBuffer(buffers._sorting_histogram, radix_passes * kRadix);
     resizeDeviceBuffer(buffers._sorting_histogram_cumsum,
@@ -3080,14 +3133,17 @@ void VulkanGSRenderer::executeMacroDepthWaves(
                          _CEIL_DIV(_CEIL_DIV(alloc_macro_tiles, kCumsumBlock),
                                    kCumsumBlock)));
 
-    // Spark-rad opacity (lod_enabled bit 2) still needs the fp32 blend math;
-    // overlays no longer force fp32 — pick the matching overlay/plain variant.
+    // Production Spark density uses the original FP32 footprint. The Mac test
+    // reference also offers accurate transparent geometry/partial coverage.
     const bool use_fp32 = (uniforms.lod_enabled & 4u) != 0u;
-    auto& raster_pipeline = overlays_active
-                                ? (use_fp32 ? pipeline_macro_raster_overlays_fp32
-                                            : pipeline_macro_raster_overlays)
-                                : (use_fp32 ? pipeline_macro_raster_fp32
-                                            : pipeline_macro_raster);
+    auto* raster_pipeline = overlays_active
+                                ? (use_fp32 ? &pipeline_macro_raster_overlays_fp32 : &pipeline_macro_raster_overlays)
+                                : (use_fp32 ? &pipeline_macro_raster_fp32 : &pipeline_macro_raster);
+#if defined(LFS_VULKAN_MACOS_REFERENCE)
+    if ((uniforms.mip_filter & 16u) != 0u)
+        raster_pipeline = overlays_active ? &pipeline_macro_raster_overlays_fp32_precise_alpha
+                                          : &pipeline_macro_raster_fp32_precise_alpha;
+#endif
     auto& compose_pipeline = overlays_active
                                  ? pipeline_macro_compose_overlays
                                  : pipeline_macro_compose;
@@ -3116,6 +3172,8 @@ void VulkanGSRenderer::executeMacroDepthWaves(
             wave * sizeof(uint32_t));
 
         VulkanGSRendererUniforms wave_uniforms = uniforms;
+        if (!exact_depth_sample_mask.empty())
+            wave_uniforms.mip_filter |= 8u;
         wave_uniforms.depth_wave = static_cast<uint32_t>(wave);
         const auto record = bufferView(
             wave_buffer,
@@ -3227,6 +3285,8 @@ void VulkanGSRenderer::executeMacroDepthWaves(
                                      {buffers.orig_ids.deviceBuffer, BufferUse::ComputeRead}});
         }
 
+        compose_bindings.push_back({*depth_sample_mask, BufferUse::ComputeRead});
+
         for (size_t batch_wave = 0; batch_wave < batch_waves; ++batch_wave) {
             wave_uniforms.wave_base =
                 static_cast<uint32_t>(batch_wave * HIGS_RASTER_WAVE_BATCHES);
@@ -3235,7 +3295,7 @@ void VulkanGSRenderer::executeMacroDepthWaves(
                 indirect::byteOffset(indirect::MacroWaveDispatch::rasterWordOffset(batch_wave)),
                 &wave_uniforms,
                 sizeof(wave_uniforms),
-                raster_pipeline[buffers.is_unsorted_1],
+                (*raster_pipeline)[buffers.is_unsorted_1],
                 raster_bindings);
             executeComputeIndirect(
                 macro_wave_args,

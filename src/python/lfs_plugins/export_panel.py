@@ -70,6 +70,17 @@ def _progress_format_name(fmt):
     return EXPORT_PROGRESS_FORMAT_NAMES.get(fmt, "file")
 
 
+def _exported_count(node):
+    """Splats the export writes: soft-deleted rows are left out."""
+    try:
+        splat = node.splat_data()
+    except Exception:
+        splat = None
+    if splat is None:
+        return int(node.gaussian_count)
+    return int(splat.visible_count())
+
+
 @panel_class("export")
 class ExportPanel(Panel):
 
@@ -106,6 +117,7 @@ class ExportPanel(Panel):
         self._rad_flip_y = False  # Y-flip checkbox (off by default)
         self._rad_streamable = True
         self._include_provenance = True
+        self._apply_modifiers = True
         self._doc = None  # Document reference for DOM access
         self._reactive_unsubscribers = []
 
@@ -163,6 +175,8 @@ class ExportPanel(Panel):
         model.bind_func("include_provenance", lambda: self._include_provenance)
         model.bind_func("show_include_provenance", self._show_include_provenance)
         model.bind_event("toggle_include_provenance", self._on_toggle_include_provenance)
+        model.bind_func("apply_modifiers", lambda: self._apply_modifiers)
+        model.bind_event("toggle_apply_modifiers", self._on_toggle_apply_modifiers)
 
         model.bind_event("do_cancel", self._on_cancel)
         model.bind_event("do_cancel_export", self._on_cancel_export)
@@ -275,6 +289,10 @@ class ExportPanel(Panel):
     def _on_toggle_include_provenance(self, _handle, _ev, _args):
         self._include_provenance = not self._include_provenance
         self._dirty_model("include_provenance")
+
+    def _on_toggle_apply_modifiers(self, _handle, _ev, _args):
+        self._apply_modifiers = not self._apply_modifiers
+        self._dirty_model("apply_modifiers")
 
     def _set_rad_export_mode(self, value):
         streamable = str(value) != "non_stream"
@@ -587,7 +605,7 @@ class ExportPanel(Panel):
                     {
                         "name": node.name,
                         "selected": node.name in self._selected_nodes,
-                        "count_text": f"({node.gaussian_count:,})",
+                        "count_text": f"({_exported_count(node):,})",
                     }
                     for node in nodes
                 ],
@@ -838,6 +856,7 @@ class ExportPanel(Panel):
                     rad_streamable=self._rad_streamable,
                     spz_version=self._spz_version,
                     include_provenance=self._include_provenance,
+                    apply_modifiers=self._apply_modifiers,
                     **self._ssog_settings,
                 )
             finally:

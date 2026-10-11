@@ -72,7 +72,7 @@ namespace lfs::vis::input {
         ZOOM_SPEED_DOWN,
         // View
         TOGGLE_SPLIT_VIEW,
-        TOGGLE_INDEPENDENT_SPLIT_VIEW,
+        TOGGLE_SPLIT_VIEWPORT,
         TOGGLE_GT_COMPARISON,
         TOGGLE_DEPTH_MODE, // Deprecated: migrated to TOGGLE_SELECTION_DEPTH_FILTER on load
         CYCLE_PLY,
@@ -153,6 +153,18 @@ namespace lfs::vis::input {
         ASSET_GALLERY_PRIMARY,
         ASSET_GALLERY_COPY_LINK,
         ASSET_REFRESH,
+        // 3D view navigation and area shortcuts.
+        VIEW_AXIS_TOP,
+        VIEW_AXIS_BOTTOM,
+        VIEW_AXIS_FRONT,
+        VIEW_AXIS_BACK,
+        VIEW_AXIS_RIGHT,
+        VIEW_AXIS_LEFT,
+        VIEW_TOGGLE_PERSPECTIVE,
+        VIEW_FRAME_ALL,
+        TOGGLE_QUAD_VIEW,
+        TOGGLE_MAXIMIZE_AREA,
+        TOGGLE_NODE_EDITOR,
 
     };
 
@@ -300,6 +312,7 @@ namespace lfs::vis::input {
         std::uint64_t getBindingsRevision() const { return bindings_revision_; }
 
         static std::optional<std::filesystem::path> getConfigDir();
+        [[nodiscard]] static bool isPersistenceEnabled() noexcept;
         static void setPersistenceEnabled(bool enabled) noexcept;
 
         // Query effective bindings. Mode-local bindings are checked first; actions
@@ -338,7 +351,6 @@ namespace lfs::vis::input {
         // Capture mode for rebinding (called from Python)
         void startCapture(ToolMode mode, Action action);
         void cancelCapture();
-        void captureKey(int key, int mods);
         void captureKey(int physical_key, int logical_key, int mods);
         void captureMouseButton(int button, int mods, std::optional<int> chord_key = std::nullopt);
         void captureMouseButton(int button, int mods, double x, double y, std::optional<int> chord_key = std::nullopt);

@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include "core/atomic_file.hpp"
+#include "core/export.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -43,21 +46,50 @@ namespace lfs::core::image_codecs {
         int max_width = 0;
     };
 
-    bool probe(const std::filesystem::path& path, Probe& result, std::string& error);
-    bool decode(const std::filesystem::path& path, Image& result, std::string& error);
-    bool decode_to_buffer(const std::filesystem::path& path, DecodeTarget& target, Probe& result, std::string& error);
-    bool decode_memory(const std::uint8_t* data, size_t size, Image& result, std::string& error);
-    bool decode_memory_to_buffer(const std::uint8_t* data, size_t size, DecodeTarget& target, Probe& result, std::string& error);
-    bool decode_jpeg_memory(const std::uint8_t* data, size_t size, Image& result, std::string& error);
+    /// libjpeg scale denominator for a decode that is resampled to max_width afterwards: the largest
+    /// reduction that keeps at least max_width pixels along the longer side.
+    [[nodiscard]] constexpr unsigned jpeg_scale_denominator(const unsigned max_dimension, const unsigned max_width) {
+        for (const unsigned denominator : {8u, 4u, 2u}) {
+            if ((max_dimension + denominator - 1) / denominator >= max_width)
+                return denominator;
+        }
+        return 1;
+    }
 
-    bool write_jpeg(const std::filesystem::path& path, const std::uint8_t* data,
-                    int width, int height, int channels, int quality,
-                    const std::optional<std::string>& comment, std::string& error);
-    bool write_png(const std::filesystem::path& path, const void* data,
-                   int width, int height, int channels, int bit_depth,
-                   int compression_level, const std::optional<std::string>& comment,
-                   std::string& error);
-    bool write_tiff(const std::filesystem::path& path, const std::uint8_t* data,
-                    int width, int height, int channels, std::string& error);
+    LFS_IMAGE_CODECS_API bool probe(const std::filesystem::path& path, Probe& result, std::string& error);
+    LFS_IMAGE_CODECS_API bool decode(const std::filesystem::path& path, Image& result, std::string& error);
+    LFS_IMAGE_CODECS_API bool decode_to_buffer(const std::filesystem::path& path, DecodeTarget& target, Probe& result, std::string& error);
+    LFS_IMAGE_CODECS_API bool decode_memory(const std::uint8_t* data, size_t size, Image& result, std::string& error);
+    LFS_IMAGE_CODECS_API bool decode_memory_to_buffer(const std::uint8_t* data, size_t size, DecodeTarget& target, Probe& result, std::string& error);
+
+    // RGB uses 4:2:0 by default; full_chroma selects 4:4:4 for high-quality exports.
+    LFS_IMAGE_CODECS_API bool write_jpeg(const std::filesystem::path& path, const std::uint8_t* data,
+                                         int width, int height, int channels, int quality,
+                                         const std::optional<std::string>& comment, std::string& error);
+    LFS_IMAGE_CODECS_API bool write_jpeg(const std::filesystem::path& path, const std::uint8_t* data,
+                                         int width, int height, int channels, int quality,
+                                         const std::optional<std::string>& comment, std::string& error,
+                                         bool full_chroma);
+    LFS_IMAGE_CODECS_API bool write_png(const std::filesystem::path& path, const void* data,
+                                        int width, int height, int channels, int bit_depth,
+                                        int compression_level, const std::optional<std::string>& comment,
+                                        std::string& error);
+    LFS_IMAGE_CODECS_API bool write_tiff(const std::filesystem::path& path, const std::uint8_t* data,
+                                         int width, int height, int channels, std::string& error);
+
+    // Packed display bytes: preserve samples, PNG/TIFF alpha and legacy codec
+    // defaults. JPEG drops RGBA alpha; gray-alpha JPEG is unsupported. This is
+    // shared atomic file service; legacy callers keep overwrite enabled and do
+    // not create directories. No linear/EXR conversion.
+    LFS_IMAGE_CODECS_API bool write_image_u8(const std::filesystem::path& path, const std::uint8_t* data,
+                                             int width, int height, int channels, int jpeg_quality,
+                                             const std::optional<std::string>& comment, std::string& error,
+                                             bool jpeg_full_chroma = false);
+    // Explicit publication/cancellation policy; encoding is shared with the
+    // path-based codecs and does not close the atomic service's borrowed stream.
+    LFS_IMAGE_CODECS_API Status write_image_u8(const std::filesystem::path& path, const std::uint8_t* data,
+                                               int width, int height, int channels, int jpeg_quality,
+                                               const std::optional<std::string>& comment, const AtomicFileOptions&,
+                                               bool jpeg_full_chroma = false);
 
 } // namespace lfs::core::image_codecs

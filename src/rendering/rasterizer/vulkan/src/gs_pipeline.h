@@ -67,7 +67,6 @@ public:
     void untrackExternalParent(VkBuffer buffer);
     // Test / audit access to the host-side planner (not a render-path seam).
     [[nodiscard]] lfs::rendering::vulkan::BufferBarrierPlanner& barrierPlanner() noexcept;
-    [[nodiscard]] const lfs::rendering::vulkan::BufferBarrierPlanner& barrierPlanner() const noexcept;
 
     // Epic #1496 §3.2: plan transfer/fill/host accesses and emit ≤1 barrier2 when non-empty.
     // Requires an active command batch. No trailing barrier after the transfer op itself.
@@ -87,6 +86,11 @@ public:
     template <typename T>
     _VulkanBuffer& resizeAndCopyDeviceBuffer(Buffer<T>& buffer, size_t new_size, bool clear);
     void beginCommandBatch();
+    void setGrowCommandBatchRing(bool enabled) { grow_command_batch_ring_ = enabled; }
+    // Growth-retired buffers are freed inside the gate, never immediately. The gate
+    // runs its argument once no queue of the device has work in flight.
+    using MemoryReleaseGate = std::function<void(const std::function<void()>&)>;
+    void setMemoryReleaseGate(MemoryReleaseGate gate) { memory_release_gate_ = std::move(gate); }
     void endCommandBatch(bool use_fence = true,
                          VkSemaphore signal_semaphore = VK_NULL_HANDLE,
                          std::uint64_t signal_value = 0);
@@ -168,14 +172,6 @@ protected:
         return CpuStageTimer(this, std::move(name));
     }
 
-    void bufferMemoryBarrier(const std::vector<std::pair<_VulkanBuffer, BarrierMask>>& buffers, BarrierMask dstMask);
-    struct BufferBarrier {
-        _VulkanBuffer buffer;
-        BarrierMask src_mask;
-        BarrierMask dst_mask;
-    };
-    void bufferMemoryBarrier(const std::vector<BufferBarrier>& barriers);
-
     size_t current_vram = 0;
     size_t peak_vram = 0;
 
@@ -196,7 +192,9 @@ protected:
         std::uint32_t pending_timestamp_count = 0;
         std::vector<std::pair<int, int>> pending_timestamp_marks;
     };
-    std::array<CommandBatchSlot, kCommandBatchSlotCount> command_batch_slots_{};
+    std::vector<CommandBatchSlot> command_batch_slots_{kCommandBatchSlotCount};
+    bool grow_command_batch_ring_ = false;
+    void appendCommandBatchSlot();
     std::uint32_t next_command_batch_slot_ = 0;
     std::uint32_t active_command_batch_slot_ = 0;
 
@@ -209,10 +207,11 @@ protected:
     };
     struct RetiredBufferShell {
         _VulkanBuffer shell;
-        std::array<BufferRetireKey, kCommandBatchSlotCount> keys{};
+        std::vector<BufferRetireKey> keys;
         std::uint32_t key_count = 0;
     };
     std::vector<RetiredBufferShell> retired_buffer_shells_;
+    MemoryReleaseGate memory_release_gate_;
     // Scripted-test forge counter for createBuffer when allocator is null.
     std::uintptr_t test_buffer_handle_counter_ = 0xB1000;
 

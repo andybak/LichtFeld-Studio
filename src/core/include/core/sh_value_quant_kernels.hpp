@@ -25,6 +25,17 @@ namespace lfs::core::sh_value_quant {
         std::uint32_t coeffs_rest,
         cudaStream_t stream = nullptr);
 
+    /// Encode canonical [N, source_rest, 3] rows into u16 + bounds with coeffs_rest coefficients;
+    /// coefficients past source_rest encode as zero.
+    void encode_shN_canonical_to_u16(
+        const float* src_canonical,
+        std::uint16_t* dst_u16,
+        float* bounds_float2,
+        std::size_t n_primitives,
+        std::uint32_t source_rest,
+        std::uint32_t coeffs_rest,
+        cudaStream_t stream = nullptr);
+
     /// Decode u16 + bounds into float4-swizzled (zeros float4 tail pad).
     void decode_shN_u16_to_float4(
         const std::uint16_t* src_u16,
@@ -60,7 +71,8 @@ namespace lfs::core::sh_value_quant {
         std::size_t n_dst,
         std::size_t n_src_primitives,
         std::uint32_t coeffs_rest,
-        cudaStream_t stream = nullptr);
+        cudaStream_t stream = nullptr,
+        bool match_cpu_rounding = false);
 
     /// Gather-decode selected source prims into canonical [n_dst, rest, 3].
     void decode_shN_u16_gathered_to_canonical(
@@ -70,21 +82,6 @@ namespace lfs::core::sh_value_quant {
         float* dst_canonical,
         std::size_t n_dst,
         std::size_t n_src_primitives,
-        std::uint32_t coeffs_rest,
-        cudaStream_t stream = nullptr);
-
-    /// Overlay canonical [K, rest, 3] rows into a compact float4-swizzled
-    /// chunk of n_chunk prims that represents global prims
-    /// [block_start, block_start + n_chunk). dest_indices[group_offset + i]
-    /// is the global primitive for canonical row group_offset + i.
-    void overlay_canonical_into_float4_chunk(
-        const float* src_canonical,
-        const std::int64_t* dest_indices,
-        float* dst_float4_swizzled,
-        std::size_t group_offset,
-        std::size_t n_group,
-        std::size_t block_start,
-        std::size_t n_chunk,
         std::uint32_t coeffs_rest,
         cudaStream_t stream = nullptr);
 
@@ -115,10 +112,12 @@ namespace lfs::core::sh_value_quant {
     /// One launch over unique touched 256-splat blocks: decode (or zero-init
     /// past n_decode_src), overlay the sorted canonical run, reduce bounds,
     /// encode in place. Grid may be K; extra blocks no-op via n_runs_device.
+    /// Sorted entry i reads canonical row canonical_rows[i], or row i when
+    /// canonical_rows is null (canonical already in sorted order).
     void reencode_touched_q16_blocks(
         std::uint16_t* codes,
         float* bounds_float2,
-        const float* sorted_canonical,
+        const float* canonical,
         const std::int64_t* sorted_dest,
         const std::int32_t* unique_block_ids,
         const std::int32_t* run_offsets,
@@ -127,6 +126,35 @@ namespace lfs::core::sh_value_quant {
         std::size_t n_prims,
         std::size_t n_decode_src,
         std::uint32_t coeffs_rest,
+        cudaStream_t stream = nullptr,
+        const std::int64_t* canonical_rows = nullptr);
+
+    /// The two halves of encode_shN_u16_gathered for callers that cannot hold a
+    /// second full code array: the dest block bounds, then cells
+    /// [cell_begin, cell_end) of every dest primitive, written as a code array
+    /// with (cell_end - cell_begin) cells per primitive. Together they produce
+    /// the same codes and bounds as encode_shN_u16_gathered.
+    void gathered_shN_u16_block_bounds(
+        const std::uint16_t* src_u16,
+        const float* src_bounds_float2,
+        const std::int64_t* perm,
+        float* dest_bounds_float2,
+        std::size_t n_dst,
+        std::size_t n_src_primitives,
+        std::uint32_t coeffs_rest,
+        cudaStream_t stream = nullptr);
+
+    void encode_shN_u16_gathered_cells(
+        const std::uint16_t* src_u16,
+        const float* src_bounds_float2,
+        const std::int64_t* perm,
+        const float* dest_bounds_float2,
+        std::uint16_t* dest_group_u16,
+        std::size_t n_dst,
+        std::size_t n_src_primitives,
+        std::uint32_t coeffs_rest,
+        std::uint32_t cell_begin,
+        std::uint32_t cell_end,
         cudaStream_t stream = nullptr);
 
     /// Gather-decode perm[dest] with source per-block bounds, reduce dest

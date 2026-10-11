@@ -220,8 +220,8 @@ namespace lfs::training {
         std::optional<lfs::core::Tensor> normal = {}; // Optional normals [3,H,W], float32 in [-1,1]
         std::optional<lfs::core::TensorFence> image_ready = {};
         std::optional<lfs::core::TensorFence> mask_ready = {};
-        CUevent_st* depth_ready_event = nullptr;
-        CUevent_st* normal_ready_event = nullptr;
+        std::optional<lfs::core::TensorFence> depth_ready = {};
+        std::optional<lfs::core::TensorFence> normal_ready = {};
         // Ring-backed tensors must never outlive this keepalive handle.
         std::shared_ptr<void> decoded_frame_keepalive = {};
     };
@@ -234,6 +234,18 @@ namespace lfs::training {
     };
 
     /// Camera dataset - loads images from cameras
+    /// Fraction of cameras whose image is not a JPEG (0.0 = all JPEG, 1.0 = none).
+    [[nodiscard]] inline float non_jpeg_ratio(const std::vector<std::shared_ptr<lfs::core::Camera>>& cameras) {
+        if (cameras.empty())
+            return 0.0f;
+        const auto count = std::count_if(cameras.begin(), cameras.end(), [](const auto& cam) {
+            auto ext = cam->image_path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            return ext != ".jpg" && ext != ".jpeg";
+        });
+        return static_cast<float>(count) / static_cast<float>(cameras.size());
+    }
+
     class CameraDataset {
     public:
         enum class Split {
@@ -283,8 +295,6 @@ namespace lfs::training {
                     }
                 }
             }
-
-            LOG_INFO("Dataset created with {} images (split: {})", indices_.size(), static_cast<int>(split_));
         }
 
         lfs::core::Camera* get_camera(size_t index) const {
@@ -363,16 +373,7 @@ namespace lfs::training {
         int get_max_width() const { return config_.max_width; }
 
         /// Returns fraction of non-JPEG images (0.0 = all JPEG, 1.0 = none)
-        [[nodiscard]] float get_non_jpeg_ratio() const {
-            if (cameras_.empty())
-                return 0.0f;
-            const auto count = std::count_if(cameras_.begin(), cameras_.end(), [](const auto& cam) {
-                auto ext = cam->image_path().extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                return ext != ".jpg" && ext != ".jpeg";
-            });
-            return static_cast<float>(count) / static_cast<float>(cameras_.size());
-        }
+        [[nodiscard]] float get_non_jpeg_ratio() const { return non_jpeg_ratio(cameras_); }
 
     private:
         std::vector<std::shared_ptr<lfs::core::Camera>> cameras_;
@@ -401,8 +402,6 @@ namespace lfs::training {
     template <typename Sampler>
     class PipelinedDataLoader {
     public:
-        using BatchType = std::vector<CameraExample>;
-
         PipelinedDataLoader(std::shared_ptr<CameraDataset> dataset,
                             Sampler sampler,
                             lfs::io::PipelinedLoaderConfig config = {},
@@ -451,13 +450,11 @@ namespace lfs::training {
                     .target = lfs::core::Tensor(),
                     .image_ready = std::move(ready.image_ready),
                     .mask_ready = std::move(ready.mask_ready),
-                    .depth_ready_event = ready.depth_ready_event,
-                    .normal_ready_event = ready.normal_ready_event,
+                    .depth_ready = std::move(ready.depth_ready),
+                    .normal_ready = std::move(ready.normal_ready),
                 };
                 example.decoded_frame_keepalive = std::make_shared<
                     std::vector<std::shared_ptr<void>>>(std::move(ready.decoded_frame_leases));
-                ready.depth_ready_event = nullptr;
-                ready.normal_ready_event = nullptr;
 
                 // Attach mask if present
                 if (ready.mask && ready.mask->is_valid()) {

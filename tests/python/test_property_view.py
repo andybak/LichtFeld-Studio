@@ -333,6 +333,33 @@ EXPECTED_NUMBER_ROWS = {
         10.0,
         False,
     ),
+    "init_origin_x": (
+        "training.init.origin_x",
+        "training.tooltip.origin_x",
+        3,
+        0.1,
+        -1_000_000.0,
+        1_000_000.0,
+        False,
+    ),
+    "init_origin_y": (
+        "training.init.origin_y",
+        "training.tooltip.origin_y",
+        3,
+        0.1,
+        -1_000_000.0,
+        1_000_000.0,
+        False,
+    ),
+    "init_origin_z": (
+        "training.init.origin_z",
+        "training.tooltip.origin_z",
+        3,
+        0.1,
+        -1_000_000.0,
+        1_000_000.0,
+        False,
+    ),
     "min_opacity": (
         "training.thresholds.min_opacity",
         "training.tooltip.min_opacity",
@@ -378,6 +405,15 @@ EXPECTED_NUMBER_ROWS = {
         0.1,
         False,
     ),
+    "eval_mask_opacity": (
+        "training_params.eval_mask_opacity",
+        "training.tooltip.eval_mask_opacity",
+        2,
+        0.05,
+        0.01,
+        1.0,
+        False,
+    ),
 }
 
 
@@ -401,6 +437,10 @@ EXPECTED_CHECKBOX_ROWS = {
     "use_depth_loss": (
         "training_params.use_depth_loss",
         "training.tooltip.use_depth_loss",
+    ),
+    "depth_auto_generate": (
+        "training_params.depth_auto_generate",
+        "training.tooltip.depth_auto_generate",
     ),
     "use_normal_loss": (
         "training_params.use_normal_loss",
@@ -443,9 +483,13 @@ EXPECTED_CHECKBOX_ROWS = {
         "training_params.eval_all",
         "training.tooltip.eval_all",
     ),
-    "background_improvements": (
-        "training_params.background_improvements",
-        "training.tooltip.background_improvements",
+    "eval_flip": (
+        "training_params.eval_flip",
+        "training.tooltip.eval_flip",
+    ),
+    "eval_mask_invert": (
+        "training_params.eval_mask_invert",
+        "training.tooltip.eval_mask_invert",
     ),
 }
 
@@ -482,13 +526,40 @@ EXPECTED_SELECT_ROWS = {
             (3, "training.options.normal_loss_space.world"),
         ),
     ),
+    "eval_space": (
+        "training_params.eval_space",
+        "training.tooltip.eval_space",
+        (
+            (0, "training.options.eval_space.distorted"),
+            (1, "training.options.eval_space.undistorted"),
+        ),
+    ),
+    "eval_bit_depth": (
+        "training_params.eval_bit_depth",
+        "training.tooltip.eval_bit_depth",
+        (
+            (0, "training.options.eval_bit_depth.auto"),
+            (1, "training.options.eval_bit_depth.eight"),
+            (2, "training.options.eval_bit_depth.sixteen"),
+            (3, "training.options.eval_bit_depth.float"),
+        ),
+    ),
 }
 
 EXPECTED_ADVANCED_IDS = (
     "means_lr_end",
     "scaling_lr_end",
+    "late_lr_anneal",
     "cropbox_lr_scale",
     "cropbox_loss_weight",
+    "scale_reg_decay_power",
+    "erank_reg",
+    "dc_reg",
+    "sh_rest_reg",
+    "thin_structure_weight",
+    "gradient_loss_weight",
+    "opacity_decay_rendered_only",
+    "densify_structure_weight",
     "morton_reorder_interval",
     "min_opacity",
     "growth_grad_threshold",
@@ -501,13 +572,8 @@ EXPECTED_ADVANCED_IDS = (
     "densify_error_map",
     "max_screen_share",
     "screen_share_penalty",
-    "oversize_split_fraction",
     "use_edge_map",
-    "far_scene_min_fraction",
-    "growth_ratio_rank",
-    "growth_ratio_pow",
-    "fill_pacing_iter",
-    "far_seed_dose",
+    "ppisp_holdout_appearance",
 )
 
 
@@ -538,13 +604,13 @@ def test_full_migration_inventory_and_schema_are_exact(lf):
     assert property_view.NUMBER_PROPS == tuple(EXPECTED_NUMBER_ROWS)
     assert property_view.BOOL_PROPS == tuple(EXPECTED_CHECKBOX_ROWS)
     assert property_view.SELECT_PROPS == tuple(EXPECTED_SELECT_ROWS)
-    assert len(property_view.MIGRATED_PROP_IDS) == 62
-    assert len(set(property_view.MIGRATED_PROP_IDS)) == 62
+    assert len(property_view.MIGRATED_PROP_IDS) == 70
+    assert len(set(property_view.MIGRATED_PROP_IDS)) == 70
 
     group_info = lf.ui.property_group_info("optimization")
     resolved_runs = property_view.resolve_runs(group_info)
     rendered = tuple(prop for run in resolved_runs for prop in run.prop_ids)
-    assert len(EXPECTED_RENDERED_PROP_IDS) == 85  # Backend alone has a bespoke selector.
+    assert len(EXPECTED_RENDERED_PROP_IDS) == 97  # Backend has a bespoke selector.
     assert len(rendered) == len(set(rendered)) == len(EXPECTED_RENDERED_PROP_IDS)
     assert set(rendered) == EXPECTED_RENDERED_PROP_IDS
 
@@ -552,10 +618,6 @@ def test_full_migration_inventory_and_schema_are_exact(lf):
 def test_auto_advanced_roster_and_exclusions_follow_declaration_order(lf):
     group_info = lf.ui.property_group_info("optimization")
     assert property_view.auto_advanced_prop_ids(group_info) == EXPECTED_ADVANCED_IDS
-    assert "background_improvements" not in EXPECTED_ADVANCED_IDS
-    assert "background_improvements" in {
-        prop_id for run in property_view.BASIC_RUNS for prop_id in run.prop_ids
-    }
 
     properties = {meta["id"]: meta for meta in group_info["properties"]}
     for prop_id in EXPECTED_ADVANCED_IDS:
@@ -572,6 +634,7 @@ def test_auto_advanced_roster_and_exclusions_follow_declaration_order(lf):
         "headless",
         "prune_ratio",
         "steps_scaler",
+        "eval_mask",
     }
 
     future_group = {
@@ -603,16 +666,12 @@ def test_strategy_applicability_filters_auto_rows_and_search(lf):
         "bounds_percentile",
         "use_error_map",
         "use_edge_map",
-        "background_improvements",
-        "far_scene_min_fraction",
-        "growth_ratio_rank",
-        "growth_ratio_pow",
-        "fill_pacing_iter",
-        "far_seed_dose",
     }
-    auto_mrnf_only = known_mrnf_only - {"grow_until_iter", "background_improvements"}
+    auto_mrnf_only = known_mrnf_only - {"grow_until_iter"}
     for prop_id in known_mrnf_only:
         assert properties[prop_id]["strategies"] == ["mrnf"]
+    # all_strategies() omits the strategy restriction from group_info.
+    assert properties["gradient_loss_weight"].get("strategies", []) == []
 
     params = {
         "strategy": "mcmc",
@@ -635,7 +694,9 @@ def test_strategy_applicability_filters_auto_rows_and_search(lf):
     assert not ({record["id"] for record in binding._records()} & auto_mrnf_only)
     assert "min_opacity" in {record["id"] for record in binding._records()}
     query["value"] = "edge"
-    assert binding._records() == []
+    mcmc_edge_ids = [record["id"] for record in binding._records()]
+    assert mcmc_edge_ids == ["gradient_loss_weight"]
+    assert "use_edge_map" not in mcmc_edge_ids
 
     params["strategy"] = "mnrf"
     query["value"] = ""
@@ -644,7 +705,10 @@ def test_strategy_applicability_filters_auto_rows_and_search(lf):
     }
     assert "min_opacity" not in {record["id"] for record in binding._records()}
     query["value"] = "edge"
-    assert [record["id"] for record in binding._records()] == ["use_edge_map"]
+    assert [record["id"] for record in binding._records()] == [
+        "gradient_loss_weight",
+        "use_edge_map",
+    ]
 
     curated = property_view.SectionBinding(
         "curated_strategy_filter",
@@ -739,7 +803,8 @@ def test_all_number_rows_match_registry_declarations(lf):
         assert prop_info["precision"] == precision
         assert prop_info["step"] == pytest.approx(step)
         if prop_id in property_view.LEARNING_RATES:
-            assert prop_info["live_update"] is True
+            # Opacity LR is fixed during training on this branch; late_lr_anneal schedules it.
+            assert prop_info["live_update"] is (prop_id != "opacity_lr")
 
 
 def test_checkbox_and_select_rows_match_registry_declarations(lf):
@@ -756,7 +821,6 @@ def test_checkbox_and_select_rows_match_registry_declarations(lf):
             "use_bilateral_grid",
             "random",
             "undistort",
-            "background_improvements",
         }:
             assert params.prop_info(prop_id)["needs_restart"] is True
 
@@ -1185,12 +1249,110 @@ def test_training_rml_mounts_every_run_with_writable_records():
     assert 'data-event-change="pv_change(row.id, ev.value)"' in rml
     assert 'data-event-blur="pv_blur(row.id, row.text)"' in rml
     assert 'data-event-escapecancel="pv_escape(row.id)"' in rml
+    assert (
+        'data-for="row : pv_dataset_eval_space_rows" data-if="dep_undistort"'
+        in rml
+    )
     assert re.search(r'(?<!data-attr-)data-tooltip="row\.tooltip_key"', rml) is None
 
     assert 'data-if="row.id == \'iterations\'"' in rml
-    assert 'data-class-steps-scale-lock-row="row.id == \'iterations\'"' in rml
+    assert 'class="prop-label prop-label--with-action" data-if="row.id == \'iterations\'"' in rml
     assert "steps_scaler" not in rml
     assert 'data-value="pv_search_query"' in rml
     assert 'data-event-click="pv_search_clear"' in rml
     assert 'id="sec-advanced-registry"' in rml
     assert rml.index('id="sec-save-steps"') < rml.index('id="sec-advanced-registry"')
+
+
+@pytest.mark.parametrize("saved_mode", [0, 1])
+def test_select_creation_echo_keeps_restored_values_clean(saved_mode):
+    params = {"mode": saved_mode}
+    writes = []
+    queued = []
+
+    def write(prop, value):
+        writes.append((prop, value))
+        params[prop] = value
+        return True
+
+    row = {
+        "id": "mode",
+        "kind": "select",
+        "label_key": "",
+        "tooltip_key": "",
+        "precision": None,
+        "step": 1,
+        "min": None,
+        "max": None,
+        "is_int": False,
+        "name": "Mode",
+        "items": [
+            {"name": "Zero", "value": 0, "locale_key": "", "tooltip_key": ""},
+            {"name": "One", "value": 1, "locale_key": "", "tooltip_key": ""},
+        ],
+    }
+    binding = property_view.SectionBinding(
+        "restored", [row], lambda: params, {}, queued.append, value_setter=write
+    )
+    assert binding.set_value("mode", str(saved_mode)) is True
+    assert writes == []
+    assert queued == []
+
+    # A user selection still reaches the real setter and publishes the row.
+    changed = 1 - saved_mode
+    assert binding.set_value("mode", str(changed)) is True
+    assert writes == [("mode", changed)]
+    assert params["mode"] == changed
+    assert queued == [binding]
+
+    # The ensuing model echo must not create another parameter edit.
+    assert binding.set_value("mode", str(changed)) is True
+    assert writes == [("mode", changed)]
+    assert queued == [binding]
+    assert binding.set_value("mode", "invalid") is False
+    assert binding.set_value("mode", 2) is False
+    assert writes == [("mode", changed)]
+
+
+def _run_template_blocks(rml, run_id):
+    blocks = []
+    for opening in re.finditer(rf'<div[^>]*data-for="row : pv_{run_id}_rows"[^>]*>', rml):
+        depth, pos = 1, opening.end()
+        while depth:
+            tag = re.compile(r"<div\b|</div>").search(rml, pos)
+            depth += 1 if tag.group(0) == "<div" else -1
+            pos = tag.end()
+        blocks.append((opening.group(0), rml[opening.start() : pos]))
+    return blocks
+
+
+def test_run_templates_render_every_row_kind_they_contain(lf):
+    # Catches a run gaining a property of a new kind while its RML template
+    # still renders only the old widget (a bool row drawn as a number input).
+    rml = TRAINING_RML.read_text()
+    group_info = lf.ui.property_group_info("optimization")
+    kind_by_type = {
+        "float": "number", "int": "number", "size_t": "number",
+        "bool": "checkbox", "enum": "select",
+    }
+    kind_of = {
+        meta["id"]: kind_by_type[meta["type"]]
+        for meta in group_info["properties"] if meta["type"] in kind_by_type
+    }
+    widget_of = {
+        "number": r'<input type="text" class="number-input"[^>]*',
+        "checkbox": r'<input type="checkbox"[^>]*',
+        "select": r"<select[^>]*",
+    }
+    for run in property_view.resolve_runs(group_info):
+        kinds = {kind_of[prop] for prop in run.prop_ids}
+        blocks = _run_template_blocks(rml, run.id)
+        assert blocks, run.id
+        for kind in kinds:
+            selector = f"row.kind == '{kind}'"
+            assert any(
+                re.search(widget_of[kind] + re.escape(selector), block)
+                or (selector in opening and re.search(widget_of[kind], block))
+                or (len(kinds) == 1 and "row.kind" not in block and re.search(widget_of[kind], block))
+                for opening, block in blocks
+            ), (run.id, kind)

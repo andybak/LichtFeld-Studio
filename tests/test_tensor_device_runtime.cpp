@@ -144,19 +144,19 @@ TEST(TensorDeviceRuntime, ReservedAllocationBytesUnsupportedWithoutTensor) {
     EXPECT_FALSE(reserved_allocation_bytes(Tensor{}));
 }
 
-TEST(TensorDeviceRuntime, CudaReservedAllocationSizeUnknown) {
+TEST(TensorDeviceRuntime, CudaReservedAllocationExtent) {
     using namespace lfs::core;
     if (!gpu_backend_available(GpuBackend::CUDA))
         GTEST_SKIP() << "Backend unavailable";
     const GpuBackendScope scope(GpuBackend::CUDA);
     const Tensor tensor = Tensor::empty({17}, Device::GPU);
-    EXPECT_FALSE(reserved_allocation_bytes(tensor));
+    EXPECT_EQ(reserved_allocation_bytes(tensor), tensor.bytes());
 }
 
-TEST(TensorDeviceRuntime, VulkanReservedAllocationBytesUnsupported) {
+TEST(TensorDeviceRuntime, CpuReservedAllocationExtent) {
     using namespace lfs::core;
     const Tensor host = Tensor::empty({17}, Device::CPU);
-    EXPECT_FALSE(reserved_allocation_bytes(host));
+    EXPECT_EQ(reserved_allocation_bytes(host), host.bytes());
 }
 
 TEST(TensorDeviceRuntime, CudaPinnedAllocatorStats) {
@@ -205,12 +205,24 @@ TEST(TensorDeviceRuntime, CudaElapsedGpuTime) {
     EXPECT_GE(*elapsed, 0.0f);
 }
 
-TEST(TensorDeviceRuntime, VulkanElapsedGpuTimeUnsupported) {
+TEST(TensorDeviceRuntime, VulkanElapsedGpuTime) {
     using namespace lfs::core;
+    if (!gpu_backend_available(GpuBackend::Vulkan))
+        GTEST_SKIP() << "Backend unavailable";
+    const GpuBackendScope scope(GpuBackend::Vulkan);
     GpuElapsed timer(GpuBackend::Vulkan, 2);
-    EXPECT_FALSE(timer.ready());
-    EXPECT_FALSE(timer.mark(0, nullptr));
-    EXPECT_FALSE(timer.wait_queue(nullptr));
-    EXPECT_FALSE(timer.wait_queue(reinterpret_cast<void*>(1)));
-    EXPECT_FALSE(timer.milliseconds(0, 1));
+    if (!timer.ready()) {
+        EXPECT_FALSE(timer.mark(0, nullptr));
+        EXPECT_FALSE(timer.milliseconds(0, 1));
+        return;
+    }
+    ASSERT_TRUE(timer.mark(0, nullptr));
+    const Tensor values = Tensor::full({32}, 4.0f, Device::GPU);
+    static_cast<void>(values);
+    ASSERT_TRUE(timer.mark(1, nullptr));
+    ASSERT_TRUE(timer.wait_event(1));
+    const auto elapsed = timer.milliseconds(0, 1);
+    ASSERT_TRUE(elapsed);
+    EXPECT_GE(*elapsed, 0.0f);
+    EXPECT_FALSE(timer.mark(2, nullptr));
 }

@@ -6,16 +6,20 @@
 
 #include "../../internal/tensor_impl.hpp"
 #include "core/assert.hpp"
+#include "core/error.hpp"
 #include "vk_context.hpp"
 #include "vk_memory.hpp"
 #include "vk_ops_common.hpp"
 #include "vk_pipelines.hpp"
 #include "vk_recorder.hpp"
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <span>
 
 namespace lfs::core::internal {
@@ -31,8 +35,17 @@ namespace lfs::core::internal {
         constexpr uint32_t kNormal = 3;
         constexpr uint32_t kMultinomialReplacement = 4;
         constexpr uint32_t kGumbelKeys = 5;
-        constexpr uint32_t kRankSelect = 6;
         constexpr uint32_t kWeightStatistics = 7;
+        constexpr uint32_t kRunningSums = 8;
+        constexpr uint32_t kBlockOffsets = 9;
+        // Weights per block of running sums; random.slang's kSumBlock.
+        constexpr uint32_t kSumBlock = 1024;
+
+        // A power of two that brings the largest weight near 2^0.
+        float multinomial_scale(const float maximum) {
+            const uint32_t exponent = std::clamp((std::bit_cast<uint32_t>(maximum) >> 23) & 255u, 1u, 253u);
+            return std::bit_cast<float>((254u - exponent) << 23);
+        }
 
         struct RandomPush {
             uint64_t output_address;
@@ -88,12 +101,11 @@ namespace lfs::core::internal {
         }
 
         struct WeightStatistics {
-            float sum;
+            float maximum;
             uint32_t invalid;
-            float scale;
         };
 
-        // One workgroup sums scaled weights and flags negative or non-finite ones;
+        // One workgroup finds the largest weight and flags negative or non-finite ones;
         // the result is read back so the host can reject bad inputs like the CUDA
         // path does.
         WeightStatistics weight_statistics(VulkanContext& context, const StorageRef weights,
@@ -156,35 +168,56 @@ namespace lfs::core::internal {
         }
         LFS_ASSERT_MSG(weights.dtype == DataType::Float32 && output.dtype == DataType::Int64,
                        "Vulkan multinomial requires Float32 weights and Int64 samples");
+        const uint32_t categories = checked_u32(program.count, "Vulkan multinomial category count exceeds uint32");
+        const uint32_t samples = checked_u32(program.sample_count, "Vulkan multinomial sample count exceeds uint32");
+        const size_t sum_blocks = (program.count + kSumBlock - 1) / kSumBlock;
+        if (program.count > size_t{std::numeric_limits<uint32_t>::max()} - sum_blocks) {
+            throw lfs::Exception(lfs::make_error({
+                .code = lfs::ErrorCode::BoundsViolation,
+                .domain = lfs::ErrorDomain::Tensor,
+                .user_message = "Vulkan multinomial category count exceeds safe indexing range",
+                .detection = LFS_SOURCE_SITE_CURRENT(),
+            }));
+        }
         const auto context = acquire_vulkan_context();
         const WeightStatistics statistics = weight_statistics(*context, weights, program.count);
         LFS_ASSERT_MSG(statistics.invalid == 0,
                        "multinomial weights must be finite and non-negative");
-        LFS_ASSERT_MSG(std::isfinite(statistics.sum) && statistics.sum > 0.0f,
+        LFS_ASSERT_MSG(statistics.maximum > 0.0f,
                        "multinomial weights must have a positive finite sum");
-        const uint32_t categories = checked_u32(program.count, "Vulkan multinomial category count exceeds uint32");
-        const uint32_t samples = checked_u32(program.sample_count, "Vulkan multinomial sample count exceeds uint32");
         if (program.replacement) {
+            // Running sums within blocks, the blocks' offsets, then a binary
+            // search per draw. The weights are scaled so their maximum sits
+            // near 2^0, which keeps the sums finite.
+            const uint32_t blocks = static_cast<uint32_t>(sum_blocks);
+            const StorageRef sums =
+                context->memory().allocate((program.count + blocks + 1) * sizeof(float), 16, {});
             const RandomPush push{
                 .output_address = address(output),
                 .weights_address = address(weights),
+                .keys_address = address(sums),
                 .seed = program.seed,
                 .count = categories,
                 .sample_count = samples,
-                .first = statistics.scale,
-                .total = statistics.sum,
+                .first = multinomial_scale(statistics.maximum),
             };
-            const std::array reads{weights};
-            const std::array writes{output};
-            record_random(*context, kMultinomialReplacement, push, reads, writes,
+            const std::array sum_reads{weights};
+            const std::array sum_writes{sums};
+            record_random(*context, kRunningSums, push, sum_reads, sum_writes, dispatch_groups(*context, blocks));
+            record_random(*context, kBlockOffsets, push, sum_writes, sum_writes, 1);
+            const std::array draw_reads{sums};
+            const std::array draw_writes{output};
+            record_random(*context, kMultinomialReplacement, push, draw_reads, draw_writes,
                           dispatch_groups(*context, program.sample_count));
+            context->memory().deallocate(sums);
             return;
         }
         LFS_ASSERT_MSG(program.sample_count <= program.count,
                        "multinomial sample count exceeds weights without replacement");
-        // Gumbel-top-k: the sample_count largest perturbed log-weights, ranked by
-        // counting so no sort is needed; ties fall back to the lower index.
+        // Gumbel-top-k: the sample_count largest perturbed log-weights. The
+        // sort is stable, so ties fall back to the lower index.
         const StorageRef keys = context->memory().allocate(program.count * sizeof(float), 16, {});
+        const StorageRef order = context->memory().allocate(program.count * sizeof(int64_t), 16, {});
         const RandomPush key_push{
             .weights_address = address(weights),
             .keys_address = address(keys),
@@ -196,17 +229,18 @@ namespace lfs::core::internal {
         const std::array key_writes{keys};
         record_random(*context, kGumbelKeys, key_push, key_reads, key_writes,
                       dispatch_groups(*context, program.count));
-        const RandomPush rank_push{
-            .output_address = address(output),
-            .keys_address = address(keys),
-            .count = categories,
-            .sample_count = samples,
-        };
-        const std::array rank_reads{keys};
-        const std::array rank_writes{output};
-        record_random(*context, kRankSelect, rank_push, rank_reads, rank_writes,
-                      dispatch_groups(*context, program.count));
+        StorageRef key_values = keys, key_order = order;
+        key_values.dtype = DataType::Float32;
+        key_order.dtype = DataType::Int64;
+        sort_1d(key_values, key_order, program.count, SortProgram{.dim_size = program.count, .descending = true}, {});
+        copy_device_to_device(CopyRequest{
+            .src = key_order,
+            .dst = output,
+            .bytes = program.sample_count * sizeof(int64_t),
+            .synchronous = false,
+        });
         context->memory().deallocate(keys);
+        context->memory().deallocate(order);
     }
 
 } // namespace lfs::core::internal

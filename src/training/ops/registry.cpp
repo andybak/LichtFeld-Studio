@@ -3,11 +3,9 @@
 
 #include "lfs/training/ops/registry.hpp"
 
-#include "lfs/training/ops/adam_cuda.hpp"
-#include "lfs/training/ops/mcmc_cuda.hpp"
-#include "lfs/training/ops/photometric_cuda.hpp"
-
+#include <array>
 #include <format>
+#include <stdexcept>
 
 namespace lfs::training {
     namespace {
@@ -15,47 +13,95 @@ namespace lfs::training {
         // Families without a table slot still run in the CUDA trainer.
         [[nodiscard]] bool family_available(const TrainingOps& ops, const Family family) {
             switch (family) {
+            case Family::Session:
+                return ops.session != nullptr;
             case Family::Photometric:
                 return ops.photometric != nullptr;
             case Family::Adam:
                 return ops.adam != nullptr;
             case Family::Mcmc:
                 return ops.mcmc != nullptr;
+            case Family::Mrnf:
+                return ops.mrnf != nullptr;
+            case Family::Geometry:
+                return ops.geometry != nullptr;
+            case Family::Fast:
+                return ops.fast != nullptr;
+            case Family::Morton:
+                return ops.morton != nullptr;
+            case Family::Masks:
+                return ops.masks != nullptr;
+            case Family::ExtraLoss:
+                return ops.extra_loss != nullptr;
+            case Family::Bilateral:
+                return ops.bilateral != nullptr;
+            case Family::TrainingImage:
+                return ops.training_image != nullptr;
+            case Family::Sh:
+                return ops.sh != nullptr;
+            case Family::PPISP:
+                return ops.ppisp != nullptr;
+            case Family::Controller:
+                return ops.controller != nullptr;
+            case Family::Gsplat:
+                return ops.gsplat != nullptr;
+            case Family::Refine:
+                return ops.refine != nullptr;
+            case Family::SharedImage:
+                return ops.shared_image != nullptr;
+            case Family::Lpips:
+                return ops.lpips != nullptr;
+            case Family::Blob:
+                return ops.blob != nullptr;
+            case Family::Structure:
+                return ops.structure != nullptr;
             case Family::Count:
                 return false;
-            default:
-                return ops.backend == core::GpuBackend::CUDA;
             }
+            return false;
         }
 
     } // namespace
 
+    const TrainingOps& cuda_training_ops_table();
+    const TrainingOps& metal_training_ops_table();
+    const TrainingOps& vulkan_training_ops_table();
+
     const TrainingOps& training_ops(const core::GpuBackend backend) {
-        static const TrainingOps kCuda{
-            .backend = core::GpuBackend::CUDA,
-            .photometric = &cuda_photometric_ops(),
-            .adam = &cuda_adam_ops(),
-            .mcmc = &cuda_mcmc_ops(),
-        };
-        static const TrainingOps kVulkan{
-            .backend = core::GpuBackend::Vulkan,
-            .photometric = nullptr,
-            .adam = nullptr,
-        };
-        static const TrainingOps kMetal{
-            .backend = core::GpuBackend::Metal,
-            .photometric = nullptr,
-            .adam = nullptr,
-        };
-        switch (backend) {
-        case core::GpuBackend::CUDA:
-            return kCuda;
-        case core::GpuBackend::Vulkan:
-            return kVulkan;
-        case core::GpuBackend::Metal:
-            return kMetal;
+        static const TrainingOps& kCuda = cuda_training_ops_table();
+        static const TrainingOps& kVulkan = vulkan_training_ops_table();
+        static const TrainingOps& kMetal = metal_training_ops_table();
+        static const std::array tables{&kCuda, &kVulkan, &kMetal};
+        const auto index = static_cast<size_t>(backend);
+        return index < tables.size() ? *tables[index] : kVulkan;
+    }
+
+    const ops::MortonOps& training_morton_ops() {
+        const auto backend = core::default_gpu_backend();
+        const auto* morton = training_ops(backend).morton;
+        if (!morton)
+            throw std::runtime_error(unavailable_training_family(backend, Family::Morton)
+                                         .value_or("Morton training ops are unavailable"));
+        return *morton;
+    }
+
+    const ops::SessionOps& training_session_ops() {
+        const auto backend = core::default_gpu_backend();
+        const auto* session = training_ops(backend).session;
+        if (!session)
+            throw std::runtime_error(unavailable_training_family(backend, Family::Session)
+                                         .value_or("Session training ops are unavailable"));
+        return *session;
+    }
+
+    const ops::ShOps& training_sh_ops() {
+        const auto* sh = training_ops(core::default_gpu_backend()).sh;
+        if (sh == nullptr) {
+            throw std::runtime_error(
+                unavailable_training_family(core::default_gpu_backend(), Family::Sh)
+                    .value_or("Sh training ops are unavailable"));
         }
-        return kVulkan;
+        return *sh;
     }
 
     std::string_view training_family_name(const Family family) {
@@ -79,6 +125,8 @@ namespace lfs::training {
         case Family::TrainingImage: return "TrainingImage";
         case Family::SharedImage: return "SharedImage";
         case Family::Lpips: return "Lpips";
+        case Family::Blob: return "Blob";
+        case Family::Structure: return "Structure";
         case Family::Count: break;
         }
         return {};

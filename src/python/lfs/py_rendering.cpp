@@ -28,6 +28,7 @@
 #include "visualizer/rendering/rendering_manager.hpp"
 #include "visualizer/rendering/scene_upscaler_registry.hpp"
 #include "visualizer/rendering/viewport_appearance_correction.hpp"
+#include "visualizer/scene/scene_manager.hpp"
 #include "visualizer/visualizer.hpp"
 
 #include <algorithm>
@@ -42,6 +43,8 @@
 #include <functional>
 #include <numbers>
 #include <optional>
+#include <string>
+#include <type_traits>
 #include <variant>
 
 #include <glm/glm.hpp>
@@ -53,6 +56,24 @@ namespace lfs::python {
     namespace {
         constexpr std::uintmax_t MAX_RENDERED_ASSET_PREVIEW_BYTES =
             2ull * 1024ull * 1024ull * 1024ull;
+
+        // Render-setting values are C++ scalars/arrays; queued work must never
+        // retain a Python object or call Python equality while the GIL is released.
+        bool sameRenderSettingValue(const std::any& a, const std::any& b) {
+            if (a.type() != b.type())
+                return false;
+            if (a.type() == typeid(bool))
+                return std::any_cast<bool>(a) == std::any_cast<bool>(b);
+            if (a.type() == typeid(int))
+                return std::any_cast<int>(a) == std::any_cast<int>(b);
+            if (a.type() == typeid(float))
+                return std::any_cast<float>(a) == std::any_cast<float>(b);
+            if (a.type() == typeid(std::string))
+                return std::any_cast<const std::string&>(a) == std::any_cast<const std::string&>(b);
+            if (a.type() == typeid(std::array<float, 3>))
+                return std::any_cast<std::array<float, 3>>(a) == std::any_cast<std::array<float, 3>>(b);
+            throw std::runtime_error("Unsupported C++ render property value");
+        }
 
         enum class PreviewReadback {
             FloatRgb,
@@ -603,10 +624,6 @@ namespace lfs::python {
         }
     } // namespace
 
-    void set_render_scene_context(core::Scene* scene) {
-        set_scene_for_python(scene);
-    }
-
     core::Scene* get_render_scene() {
         if (auto* app_scene = get_application_scene()) {
             return app_scene;
@@ -793,8 +810,6 @@ namespace lfs::python {
         add_float(&Proxy::voxel_size, "voxel_size", "Point Size", "Point size in point cloud mode", 0.01, 0.001, 0.1);
 
         // Selection Colors
-        add_color3(&Proxy::selection_color_committed, "selection_color_committed", "Committed",
-                   "Committed selection color", {0.859, 0.325, 0.325});
         add_color3(&Proxy::selection_color_preview, "selection_color_preview", "Preview", "Preview selection color",
                    {0.0, 0.871, 0.298});
         add_color3(&Proxy::selection_color_center_marker, "selection_color_center_marker", "Center Marker",
@@ -857,6 +872,8 @@ namespace lfs::python {
         add_int_enum(&Proxy::gt_comparison_mode, "gt_comparison_mode", "GT Compare",
                      "Ground-truth comparison payload",
                      {{"RGB", "rgb", 0}, {"Normal", "normal", 1}, {"Depth", "depth", 2}, {"Loss", "loss", 3}}, 0);
+        add_bool(&Proxy::gt_comparison_actual_size, "gt_comparison_actual_size", "GT Compare 1:1",
+                 "Map one ground-truth image pixel to one physical framebuffer pixel", false);
         add_int_enum(&Proxy::camera_metrics_mode, "camera_metrics_mode", "Camera Metrics",
                      "Compute metrics when jumping to a source camera",
                      {{"Off", "OFF", 0}, {"PSNR", "PSNR", 1}, {"PSNR + SSIM", "PSNR_SSIM", 2}}, 0);
@@ -974,53 +991,85 @@ namespace lfs::python {
           prop_(&settings_, "render_settings") {}
 
     void PyRenderSettings::set(const std::string& name, nb::object value) {
+        using core::prop::PropertyObjectRef;
+        auto meta = core::prop::PropertyRegistry::instance().get_property(prop_.group_id(), name);
+        if (!meta)
+            throw nb::attribute_error(("Unknown property: " + name).c_str());
+        if (meta->is_readonly())
+            throw nb::attribute_error(("Property is read-only: " + name).c_str());
+        if (meta->source != core::prop::PropSource::CPP)
+            throw nb::value_error("Render settings require a C++ property");
+        const auto target = vis::capture_render_settings_target();
+        auto* const viewer = get_visualizer();
+        if (!target || !viewer || !viewer->acceptsPostedWork())
+            throw std::runtime_error("The target view is unavailable or the viewer is shutting down");
+
         if (name == "scene_upscaler") {
-            const auto backend_id = nb::cast<std::string>(value);
-            const auto backend = vis::sceneUpscalerBackendFromId(backend_id);
-            if (!backend) {
-                throw nb::value_error(
-                    "Field 'scene_upscaler' must name a registered scene reconstruction backend");
+            const auto backend = vis::sceneUpscalerBackendFromId(nb::cast<std::string>(value));
+            if (!backend)
+                throw nb::value_error("Field 'scene_upscaler' must name a registered scene reconstruction backend");
+            if (!vis::sceneUpscalerBackendAvailable(*backend))
+                throw nb::value_error("Field 'scene_upscaler' names a scene reconstruction backend that is not available in this process");
+        }
+        // Run both conversion and the metadata setter under the GIL. In
+        // particular, enum strings are resolved before anything is enqueued.
+        auto validated = settings_;
+        auto validation_ref = PropertyObjectRef::cpp(&validated);
+        meta->setter(validation_ref, python_to_any(value, meta->type));
+        const std::any converted = meta->getter(validation_ref);
+        (void)sameRenderSettingValue(converted, converted);
+        struct Applied {
+            vis::RenderSettingsProxy settings;
+            std::any previous;
+            std::any current;
+            bool changed = false;
+        };
+        const auto apply_property = [target = *target, converted, getter = meta->getter, setter = meta->setter,
+                                     raster_backend = name == "raster_backend",
+                                     intent = vis::RenderSettingsUpdateIntent{
+                                         .scene_upscaler_explicit = name == "scene_upscaler",
+                                         .scene_upscaler_preset_explicit = name == "scene_upscaler_preset"}]() -> std::optional<Applied> {
+            auto fresh = vis::get_render_settings_for_view(target);
+            if (!fresh)
+                return std::nullopt;
+            auto ref = PropertyObjectRef::cpp(&*fresh);
+            const auto previous = getter(ref);
+            setter(ref, converted);
+            if (raster_backend) {
+                const auto backend = static_cast<rendering::GaussianRasterBackend>(fresh->raster_backend);
+                fresh->raster_backend = static_cast<int>(rendering::normalizeViewerRasterBackend(backend, fresh->gut));
+                fresh->gut = rendering::isGutBackend(static_cast<rendering::GaussianRasterBackend>(fresh->raster_backend));
             }
-            if (!vis::sceneUpscalerBackendAvailable(*backend)) {
-                throw nb::value_error(
-                    "Field 'scene_upscaler' names a scene reconstruction backend "
-                    "that is not available in this process");
-            }
+            // Equality is evaluated against live settings on the viewer thread,
+            // so an earlier queued write cannot be lost to a stale proxy echo.
+            if (sameRenderSettingValue(previous, getter(ref)))
+                return Applied{*fresh, previous, previous, false};
+            auto normalized = vis::update_render_settings_for_view(target, *fresh, intent);
+            if (!normalized)
+                return std::nullopt;
+            auto normalized_ref = PropertyObjectRef::cpp(&*normalized);
+            auto current = getter(normalized_ref);
+            const bool changed = !sameRenderSettingValue(previous, current);
+            return Applied{std::move(*normalized), previous, std::move(current), changed};
+        };
+        std::optional<Applied> applied;
+        if (viewer->isOnViewerThread()) {
+            applied = apply_property();
+        } else {
+            nb::gil_scoped_release release;
+            applied = vis::post_work_and_wait(
+                [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
+                apply_property, []() -> std::optional<Applied> { return std::nullopt; });
         }
-        // Re-read live settings immediately before applying the requested property
-        // and its dependent normalization. A retained snapshot may be stale after
-        // a focus change or another write; dispatching it with DirtyFlag::ALL would
-        // overwrite unrelated settings.
-        const auto fresh = vis::get_render_settings();
-        if (fresh) {
-            settings_ = *fresh;
+        if (!applied)
+            throw std::runtime_error("The target view was removed or the viewer stopped accepting work");
+        settings_ = std::move(applied->settings);
+        if (applied->changed) {
+            auto ref = PropertyObjectRef::cpp(&settings_);
+            if (meta->on_update)
+                meta->on_update(ref, applied->previous, applied->current);
+            core::prop::PropertyRegistry::instance().notify(prop_.group_id(), name, applied->previous, applied->current);
         }
-        prop_.setattr(name, value);
-        if (name == "raster_backend") {
-            const auto backend = static_cast<rendering::GaussianRasterBackend>(settings_.raster_backend);
-            settings_.raster_backend =
-                static_cast<int>(rendering::normalizeViewerRasterBackend(backend, settings_.gut));
-            settings_.gut = rendering::isGutBackend(
-                static_cast<rendering::GaussianRasterBackend>(settings_.raster_backend));
-        }
-        if (!fresh) {
-            // Without live settings, keep local validation/mutation but do not dispatch
-            // a potentially stale proxy.
-            return;
-        }
-        vis::update_render_settings(
-            settings_,
-            {.scene_upscaler_explicit = name == "scene_upscaler",
-             .scene_upscaler_preset_explicit = name == "scene_upscaler_preset"});
-        // update_render_settings may normalize dependent properties (for
-        // example the preset when switching scene reconstruction backends).
-        // Keep this Python proxy in lockstep with that applied state so the
-        // next property assignment cannot restore a stale, cross-backend
-        // preset.
-        if (const auto applied = vis::get_render_settings()) {
-            settings_ = *applied;
-        }
-        request_redraw();
     }
 
     void PyRenderSettings::prop_setattr(const std::string& name, nb::object value) {
@@ -1125,22 +1174,6 @@ namespace lfs::python {
     }
 
     namespace {
-        [[nodiscard]] std::optional<vis::SplitViewPanelId> parsePanelArg(const std::string& panel) {
-            if (panel.empty() || panel == "main")
-                return std::nullopt;
-            if (panel == "left")
-                return vis::SplitViewPanelId::Left;
-            if (panel == "right")
-                return vis::SplitViewPanelId::Right;
-            throw std::invalid_argument("panel must be 'main', 'left', or 'right'");
-        }
-
-        [[nodiscard]] std::optional<vis::ViewInfo> viewInfoForPanelArg(const std::string& panel) {
-            const auto panel_id = parsePanelArg(panel);
-            return panel_id ? vis::get_view_info_for_panel(*panel_id)
-                            : vis::get_current_view_info();
-        }
-
         [[nodiscard]] std::string normalizeExportImageFormat(std::string format,
                                                              const std::filesystem::path& path) {
             if (format.empty()) {
@@ -1247,49 +1280,52 @@ namespace lfs::python {
 
         using ExportImageResult = std::expected<core::Tensor, std::string>;
 
-        [[nodiscard]] ExportImageResult runExportOnViewerThread(
-            std::function<ExportImageResult()> invoke_render) {
+        template <typename RenderResult>
+        [[nodiscard]] RenderResult runExportOnViewerThread(
+            std::function<RenderResult()> invoke_render) {
+            const auto failure = [](const char* detail) -> RenderResult {
+                if constexpr (std::is_same_v<RenderResult, ExportImageResult>)
+                    return std::unexpected(detail);
+                else
+                    return make_error({.code = ErrorCode::Cancelled, .domain = ErrorDomain::Rendering, .detail = detail, .detection = LFS_SOURCE_SITE_CURRENT()});
+            };
             auto* const viewer = get_visualizer();
-            if (!viewer || viewer->isOnViewerThread()) {
+            if (!viewer || viewer->isOnViewerThread())
                 return invoke_render();
-            }
-            if (!viewer->acceptsPostedWork()) {
-                return std::unexpected("viewer is not accepting export work");
-            }
-
+            if (!viewer->acceptsPostedWork())
+                return failure("viewer is not accepting export work");
             nb::gil_scoped_release release;
             return vis::post_work_and_wait(
                 [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); },
                 std::move(invoke_render),
-                []() -> ExportImageResult {
-                    return std::unexpected("viewport export was cancelled");
-                });
+                [failure]() -> RenderResult { return failure("viewport export was cancelled"); });
         }
 
-        [[nodiscard]] core::Tensor renderCurrentViewExport(const vis::ViewInfo& view_info,
-                                                           const int width,
-                                                           const int height,
-                                                           const vis::ExportPostProcessMode mode) {
-            auto result = runExportOnViewerThread([&view_info, width, height, mode]() -> ExportImageResult {
-                auto* const viewer = get_visualizer();
-                auto* const rendering_manager = viewer ? viewer->getRenderingManager() : nullptr;
-                auto* const scene_manager = viewer ? viewer->getSceneManager() : nullptr;
-                if (!rendering_manager || !scene_manager) {
-                    return std::unexpected("no active viewer is available");
-                }
-                const vis::RenderingManager::ExportImageRequest request{
-                    .rotation = viewInfoRotationMatrix(view_info),
-                    .translation = {view_info.translation[0],
-                                    view_info.translation[1],
-                                    view_info.translation[2]},
+        vis::RenderingManager::ExportImageRequest currentViewImageRequest(
+            const vis::ViewInfo& view_info, int width, int height, vis::ExportPostProcessMode mode) {
+            return {.rotation = viewInfoRotationMatrix(view_info),
+                    .translation = {view_info.translation[0], view_info.translation[1], view_info.translation[2]},
                     .focal_length_mm = lfs::rendering::vFovToFocalLength(view_info.fov),
                     .width = width,
                     .height = height,
                     .reference_height = view_info.height,
                     .orthographic_override = view_info.orthographic,
                     .ortho_scale_override = viewInfoOrthoScale(view_info),
-                    .mode = mode,
-                };
+                    .mode = mode};
+        }
+
+        [[nodiscard]] core::Tensor renderCurrentViewExport(const vis::ViewInfo& view_info,
+                                                           const int width,
+                                                           const int height,
+                                                           const vis::ExportPostProcessMode mode) {
+            auto result = runExportOnViewerThread<ExportImageResult>([&view_info, width, height, mode]() -> ExportImageResult {
+                auto* const viewer = get_visualizer();
+                auto* const rendering_manager = viewer ? viewer->getRenderingManager() : nullptr;
+                auto* const scene_manager = viewer ? viewer->getSceneManager() : nullptr;
+                if (!rendering_manager || !scene_manager) {
+                    return std::unexpected("no active viewer is available");
+                }
+                const auto request = currentViewImageRequest(view_info, width, height, mode);
                 return rendering_manager->renderExportImage(scene_manager, request);
             });
             if (!result) {
@@ -1302,7 +1338,7 @@ namespace lfs::python {
         // transparent fallback): applies the same PPISP correction path.
         [[nodiscard]] core::Tensor applyExportPostProcessThreadSafe(core::Tensor image,
                                                                     const vis::ExportPostProcessMode mode) {
-            auto result = runExportOnViewerThread(
+            auto result = runExportOnViewerThread<ExportImageResult>(
                 [image = std::move(image), mode]() mutable -> ExportImageResult {
                     auto* const viewer = get_visualizer();
                     auto* const rendering_manager = viewer ? viewer->getRenderingManager() : nullptr;
@@ -1310,7 +1346,7 @@ namespace lfs::python {
                     if (!rendering_manager || !scene_manager) {
                         return std::unexpected("no active viewer is available");
                     }
-                    const auto view_info = viewInfoForPanelArg("main");
+                    const auto view_info = vis::get_current_view_info();
                     const vis::ExportPostProcessView view{
                         .rotation = view_info ? viewInfoRotationMatrix(*view_info) : glm::mat3{1.0f},
                         .focal_length_mm =
@@ -1376,8 +1412,8 @@ namespace lfs::python {
         }
     } // namespace
 
-    std::optional<PyCameraState> get_camera(const std::string& panel) {
-        const auto info = viewInfoForPanelArg(panel);
+    std::optional<PyCameraState> get_camera() {
+        const auto info = vis::get_current_view_info();
         if (!info)
             return std::nullopt;
 
@@ -1397,17 +1433,13 @@ namespace lfs::python {
 
     void set_camera(const std::tuple<float, float, float>& eye,
                     const std::tuple<float, float, float>& target,
-                    const std::tuple<float, float, float>& up,
-                    const std::string& panel) {
+                    const std::tuple<float, float, float>& up) {
         const vis::SetViewParams params{
             .eye = {std::get<0>(eye), std::get<1>(eye), std::get<2>(eye)},
             .target = {std::get<0>(target), std::get<1>(target), std::get<2>(target)},
             .up = {std::get<0>(up), std::get<1>(up), std::get<2>(up)},
         };
-        if (const auto panel_id = parsePanelArg(panel))
-            vis::apply_set_view_for_panel(*panel_id, params);
-        else
-            vis::apply_set_view(params);
+        vis::apply_set_view(params);
     }
 
     void set_camera_fov(float fov_degrees) {
@@ -1470,6 +1502,106 @@ namespace lfs::python {
             levels.append(item);
         }
         result["levels"] = levels;
+        return result;
+    }
+
+    namespace {
+        // The viewer thread updates and erases the tile streamers and reads their settings
+        // every frame; scripts run on their own thread, so tile state is only touched on
+        // the viewer thread (like the capture functions). Returns `fn()`, or an empty
+        // result when there is no scene or the viewer is shutting down.
+        template <typename Fn>
+        auto on_viewer_thread(Fn fn) -> std::invoke_result_t<Fn, vis::SceneManager&> {
+            using Result = std::invoke_result_t<Fn, vis::SceneManager&>;
+            auto* const viewer = get_visualizer();
+            const auto run = [viewer, &fn]() -> Result {
+                auto* const scene_manager = viewer ? viewer->getSceneManager() : nullptr;
+                return scene_manager ? fn(*scene_manager) : Result{};
+            };
+            if (!viewer || viewer->isOnViewerThread())
+                return run();
+            if (!viewer->acceptsPostedWork())
+                return Result{};
+            nb::gil_scoped_release release;
+            return vis::post_work_and_wait(
+                [viewer](vis::Visualizer::WorkItem work) { return viewer->postWork(std::move(work)); }, run,
+                [] { return Result{}; });
+        }
+    } // namespace
+
+    nb::dict get_tiles_settings() {
+        const auto settings = on_viewer_thread([](vis::SceneManager& scene_manager) {
+            return std::optional(scene_manager.tileStreamSettings());
+        });
+        nb::dict result;
+        if (settings) {
+            result["cache_fraction"] = settings->cache_fraction;
+            result["max_sse"] = settings->max_sse;
+            result["cull"] = settings->cull;
+            result["freeze"] = settings->freeze;
+            result["num_load_workers"] = settings->num_load_workers;
+            result["lod_base_distance"] = settings->lod_base_distance;
+            result["lod_multiplier"] = settings->lod_multiplier;
+        }
+        return result;
+    }
+
+    void set_tiles_settings(const std::optional<float> cache_fraction, const std::optional<float> max_sse,
+                            const std::optional<bool> cull, const std::optional<bool> freeze,
+                            const std::optional<int> num_load_workers,
+                            const std::optional<float> lod_base_distance,
+                            const std::optional<float> lod_multiplier) {
+        const bool applied = on_viewer_thread([&](vis::SceneManager& scene_manager) {
+            auto& settings = scene_manager.tileStreamSettings();
+            if (cache_fraction)
+                settings.cache_fraction = std::clamp(*cache_fraction, 0.0f, 1.0f);
+            if (max_sse)
+                settings.max_sse = std::max(*max_sse, 0.0f);
+            if (cull)
+                settings.cull = *cull;
+            if (freeze)
+                settings.freeze = *freeze;
+            if (num_load_workers)
+                settings.num_load_workers = std::max(*num_load_workers, 0);
+            // PlayCanvas clamps these to 0.1 and 1.2.
+            if (lod_base_distance)
+                settings.lod_base_distance = std::max(*lod_base_distance, 0.1f);
+            if (lod_multiplier)
+                settings.lod_multiplier = std::max(*lod_multiplier, 1.2f);
+            return true;
+        });
+        // Streamers apply settings on the next frame; draw one even when idle.
+        if (applied)
+            request_redraw();
+    }
+
+    std::optional<std::string> get_tiles_mode() {
+        return on_viewer_thread([](vis::SceneManager& scene_manager) { return scene_manager.tileMode(); });
+    }
+
+    std::optional<nb::dict> get_tiles_stats() {
+        const auto stats =
+            on_viewer_thread([](vis::SceneManager& scene_manager) { return scene_manager.tileStreamStats(); });
+        if (!stats)
+            return std::nullopt;
+        nb::dict result;
+        result["tiles"] = stats->tiles;
+        result["drawn_tiles"] = stats->drawn_tiles;
+        result["cached_tiles"] = stats->cached_tiles;
+        result["loading_tiles"] = stats->loading_tiles;
+        result["failed_tiles"] = stats->failed_tiles;
+        result["skipped_contents"] = stats->skipped_contents;
+        result["drawn_splats"] = stats->drawn_splats;
+        result["full_detail_splats"] = stats->full_detail_splats;
+        result["cache_bytes"] = stats->cache_bytes;
+        result["drawn_bytes"] = stats->drawn_bytes;
+        result["cache_limit_bytes"] = stats->cache_limit_bytes;
+        result["gpu_total_bytes"] = stats->gpu_total_bytes;
+        result["build_ms"] = stats->build_ms;
+        result["max_sse"] = stats->max_sse;
+        result["load_workers"] = stats->load_workers;
+        result["distance_lod"] = stats->distance_lod;
+        result["mode"] = "stream";
         return result;
     }
 
@@ -1611,8 +1743,8 @@ namespace lfs::python {
         return std::nullopt;
     }
 
-    std::optional<PyViewInfo> get_current_view(const std::string& panel) {
-        const auto view_info = viewInfoForPanelArg(panel);
+    std::optional<PyViewInfo> get_current_view() {
+        const auto view_info = vis::get_current_view_info();
         if (!view_info)
             return std::nullopt;
 
@@ -1656,7 +1788,7 @@ namespace lfs::python {
         }
         output_path = imageExportPathForFormat(std::move(output_path), normalized_format);
 
-        auto view_info = viewInfoForPanelArg("main");
+        auto view_info = vis::get_current_view_info();
         if (!view_info) {
             throw std::runtime_error("no active viewport is available");
         }
@@ -1666,8 +1798,13 @@ namespace lfs::python {
         int target_width = width;
         int target_height = height;
 
+        const auto render_settings = vis::get_render_settings();
+        const bool split_view =
+            render_settings && render_settings->split_view_mode != static_cast<int>(vis::SplitViewMode::Disabled);
+
         core::Tensor image;
-        if (!transparent && target_width <= 0 && target_height <= 0) {
+        // Only the live viewport composes split-view panels; every other export renders the scene.
+        if (!transparent && target_width <= 0 && target_height <= 0 && split_view) {
             auto captured = viewportRenderImageHwc(captureViewportRenderThreadSafe(), true);
             if (!captured || !captured->is_valid()) {
                 throw std::runtime_error("viewport capture failed");
@@ -1714,7 +1851,6 @@ namespace lfs::python {
                         vis::ExportPostProcessMode::Transparent);
                 }
             } else {
-                const auto render_settings = vis::get_render_settings();
                 const bool export_hdr_environment =
                     render_settings &&
                     render_settings->environment_mode ==
@@ -1904,6 +2040,31 @@ Returns:
     or None if no active visualizer scene is available
 )doc");
 
+        m.def("render_linear_image", [](int width, int height, bool transparent) {
+            auto result = runExportOnViewerThread<Result<core::Tensor>>(
+                [width, height, transparent]() -> Result<core::Tensor> {
+                    auto* const viewer = get_visualizer();
+                    const auto view = vis::get_current_view_info();
+                    if (!viewer || !view || !viewer->getRenderingManager() || !viewer->getSceneManager())
+                        return make_error({.code = ErrorCode::FailedPrecondition, .domain = ErrorDomain::Rendering,
+                                           .detail = "No active viewer is available for float render capture", .detection = LFS_SOURCE_SITE_CURRENT()});
+                    const auto request = currentViewImageRequest(*view, width, height,
+                        transparent ? vis::ExportPostProcessMode::Transparent : vis::ExportPostProcessMode::Opaque);
+                    return viewer->getRenderingManager()->renderLinearImage(viewer->getSceneManager(), request);
+                });
+            if (!result)
+                throw Exception(result.error());
+            return PyTensor(std::move(*result)); }, nb::arg("width"), nb::arg("height"), nb::arg("transparent") = true,
+              R"doc(Render the current Gaussian view before byte quantization.
+
+Returns CPU Float32 [H,W,4], relative linear BT709 RGB and straight alpha.
+Uses the current raster tone settings before PPISP and environment export
+post-processing. This is display-referred SDR linear color, not scene HDR.
+The returned tensor owns its samples and remains valid after later renders.
+Use io.save_exr_image with explicit matching color and EXR options.
+Raises an error if no active renderable viewer is available.
+)doc");
+
         m.def("render_view_u8", &render_view_u8, nb::arg("rotation"), nb::arg("translation"), nb::arg("width"), nb::arg("height"),
               nb::arg("fov") = DEFAULT_FOV, nb::arg("bg_color") = nb::none(),
               nb::arg("orthographic") = nb::none(), nb::arg("ortho_scale") = nb::none(),
@@ -1940,14 +2101,10 @@ Returns:
     Tensor [N, 2] with (x, y) pixel coordinates for each Gaussian
 )doc");
 
-        m.def("get_current_view", &get_current_view, nb::arg("panel") = std::string{"main"},
+        m.def("get_current_view", &get_current_view,
               R"doc(
 Get current viewport camera pose (None if not available).
 
-Args:
-    panel: 'main' (default) returns the focused viewport, 'left'/'right' returns the
-        per-panel camera. In independent split-view mode, the right panel has its own
-        camera; otherwise both panels share the main camera.
 )doc");
 
         nb::class_<PyCameraState>(m, "CameraState")
@@ -1956,19 +2113,15 @@ Args:
             .def_ro("up", &PyCameraState::up)
             .def_ro("fov", &PyCameraState::fov);
 
-        m.def("get_camera", &get_camera, nb::arg("panel") = std::string{"main"},
+        m.def("get_camera", &get_camera,
               R"doc(
 Get current viewport camera state (eye, target, up, fov) or None if unavailable.
 
-Args:
-    panel: 'main' (default), 'left', or 'right'. 'left'/'right' return the per-panel
-        camera in independent split-view mode; otherwise both panels share the main camera.
 )doc");
 
         m.def("set_camera", &set_camera,
               nb::arg("eye"), nb::arg("target"),
               nb::arg("up") = std::make_tuple(0.0f, 1.0f, 0.0f),
-              nb::arg("panel") = std::string{"main"},
               R"doc(
 Move the viewport camera to look from eye toward target.
 
@@ -1976,8 +2129,6 @@ Args:
     eye: camera position (x, y, z).
     target: look-at target (x, y, z).
     up: world up vector (default (0, 1, 0)).
-    panel: 'main' (default), 'left', or 'right'. In independent split-view mode the right
-        panel can be moved independently; otherwise this falls back to the main camera.
 )doc");
 
         m.def("set_camera_fov", &set_camera_fov,
@@ -2044,6 +2195,22 @@ Args:
         m.def("get_render_settings", &get_render_settings);
         m.def("get_lod_stats", &get_lod_stats,
               "Get LOD statistics: {enabled, selected, budget, levels:[{level, count}, ...]}");
+        m.def("get_tiles_settings", &get_tiles_settings,
+              "Get tile streaming settings: {cache_fraction, max_sse, cull, freeze, num_load_workers, "
+              "lod_base_distance, lod_multiplier}");
+        m.def("set_tiles_settings", &set_tiles_settings, nb::arg("cache_fraction") = nb::none(),
+              nb::arg("max_sse") = nb::none(), nb::arg("cull") = nb::none(), nb::arg("freeze") = nb::none(),
+              nb::arg("num_load_workers") = nb::none(), nb::arg("lod_base_distance") = nb::none(),
+              nb::arg("lod_multiplier") = nb::none(),
+              "Update tile streaming settings (3D Tiles, streamed SOG); omitted values keep their current "
+              "setting. lod_base_distance and lod_multiplier set the distances at which streamed SOG levels "
+              "switch, like PlayCanvas lodBaseDistance / lodMultiplier");
+        m.def("get_tiles_stats", &get_tiles_stats,
+              "Get statistics (incl. max_sse in use) of the streamed model (3D Tiles, streamed SOG), or None when "
+              "none streams");
+        m.def("get_tiles_mode", &get_tiles_mode,
+              "'stream' when a model streams (3D Tiles, streamed SOG), 'flat' when a 3D Tiles tileset loaded fully, "
+              "or None");
     }
 
 } // namespace lfs::python

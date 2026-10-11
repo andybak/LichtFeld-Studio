@@ -63,6 +63,7 @@ namespace lfs::vis {
         p.show_pivot = s.show_pivot;
         p.split_view_mode = static_cast<int>(s.split_view_mode);
         p.gt_comparison_mode = static_cast<int>(s.gt_comparison_mode);
+        p.gt_comparison_actual_size = s.gt_comparison_actual_size;
         p.split_position = s.split_position;
         p.split_view_offset = s.split_view_offset;
         p.raster_backend = static_cast<int>(s.raster_backend);
@@ -74,7 +75,6 @@ namespace lfs::vis {
         p.depth_view_min = s.depth_view_min;
         p.depth_view_max = s.depth_view_max;
         p.depth_visualization_mode = static_cast<int>(s.depth_visualization_mode);
-        p.selection_color_committed = detail::to_array(s.selection_color_committed);
         p.selection_color_preview = detail::to_array(s.selection_color_preview);
         p.selection_color_center_marker = detail::to_array(s.selection_color_center_marker);
         p.depth_clip_enabled = s.depth_clip_enabled;
@@ -160,6 +160,7 @@ namespace lfs::vis {
         s.show_pivot = p.show_pivot;
         s.split_view_mode = static_cast<SplitViewMode>(p.split_view_mode);
         s.gt_comparison_mode = static_cast<GTComparisonMode>(p.gt_comparison_mode);
+        s.gt_comparison_actual_size = p.gt_comparison_actual_size;
         sanitizeGTComparisonSettings(s);
         s.split_position = p.split_position;
         s.split_view_offset = p.split_view_offset;
@@ -172,7 +173,6 @@ namespace lfs::vis {
                                : lfs::rendering::normalizeViewerRasterBackend(requested_backend, p.gut);
         s.gut = lfs::rendering::isGutBackend(s.raster_backend);
         s.equirectangular = p.equirectangular;
-        enforceProjectionBackend(s);
         s.orthographic = p.orthographic;
         s.ortho_scale = p.ortho_scale;
         s.depth_view = p.depth_view;
@@ -181,7 +181,6 @@ namespace lfs::vis {
         s.depth_visualization_mode =
             static_cast<lfs::rendering::DepthVisualizationMode>(p.depth_visualization_mode);
         sanitizeDepthViewSettings(s);
-        s.selection_color_committed = detail::to_vec3(p.selection_color_committed);
         s.selection_color_preview = detail::to_vec3(p.selection_color_preview);
         s.selection_color_center_marker = detail::to_vec3(p.selection_color_center_marker);
         s.depth_clip_enabled = p.depth_clip_enabled;

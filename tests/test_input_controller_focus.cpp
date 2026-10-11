@@ -1,31 +1,41 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/camera.hpp"
 #include "core/editor_context.hpp"
 #include "core/event_bridge/event_bridge.hpp"
 #include "core/event_bridge/scoped_handler.hpp"
 #include "core/events.hpp"
 #include "core/services.hpp"
+#include "core/splat_data.hpp"
 #include "core/user_paths.hpp"
 #include "gui/gui_focus_state.hpp"
 #include "gui/gui_manager.hpp"
+#include "gui/rmlui/rmlui_manager.hpp"
+#include "input/camera_animation_cadence.hpp"
 #include "input/frame_input_buffer.hpp"
 #include "input/input_controller.hpp"
 #include "input/input_router.hpp"
 #include "input/key_codes.hpp"
 #include "internal/viewport.hpp"
+#include "operator/operator_registry.hpp"
 #include "python/python_runtime.hpp"
 #include "rendering/coordinate_conventions.hpp"
+#include "rendering/gt_comparison_geometry.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
+#include "screen/screen_service.hpp"
+#include "test_view_targets.hpp"
 #include "tools/tool_base.hpp"
 #include "visualizer/visualizer.hpp"
 #include "visualizer_impl.hpp"
+#include <algorithm>
 
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <glm/gtc/constants.hpp>
 #include <gtest/gtest.h>
 #include <iterator>
@@ -33,6 +43,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <variant>
 #include <vector>
 
@@ -119,9 +130,142 @@ namespace lfs::vis {
         };
     } // namespace
 
+    TEST_F(InputControllerFocusTest, HeldOrbitRequestsFramesOnlyWhenTheCameraChanges) {
+        Viewport viewport(200, 200);
+        TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_PRESS, 100.0, 100.0);
+        ASSERT_TRUE(controller.isCameraDragging());
+        EXPECT_TRUE(controller.isContinuousInputActive());
+        EXPECT_FALSE(controller.needsCameraAnimationFrame());
+
+        const auto before = viewport.camera.R;
+        controller.handleMouseMove(120.0, 110.0);
+        EXPECT_NE(viewport.camera.R, before);
+        ASSERT_TRUE(viewport.camera.hasOrbitMomentum());
+        EXPECT_FALSE(controller.needsCameraAnimationFrame());
+
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_RELEASE, 120.0, 110.0);
+        EXPECT_FALSE(controller.isCameraDragging());
+        EXPECT_TRUE(controller.needsCameraAnimationFrame());
+        for (int i = 0; i < 300; ++i)
+            controller.update(1.0f / 60.0f);
+        EXPECT_FALSE(controller.needsCameraAnimationFrame());
+    }
+
+    TEST_F(InputControllerFocusTest, HeldPanVelocityIsNotAnAnimationUntilRelease) {
+        Viewport viewport(200, 200);
+        TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::RIGHT),
+                                     input::ACTION_PRESS, 100.0, 100.0);
+        ASSERT_TRUE(controller.isCameraDragging());
+        EXPECT_FALSE(controller.needsCameraAnimationFrame());
+        controller.handleMouseMove(125.0, 105.0);
+        ASSERT_TRUE(viewport.camera.hasPanMomentum());
+        EXPECT_FALSE(controller.needsCameraAnimationFrame());
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::RIGHT),
+                                     input::ACTION_RELEASE, 125.0, 105.0);
+        EXPECT_TRUE(controller.needsCameraAnimationFrame());
+    }
+
+    TEST_F(InputControllerFocusTest, HeldLookIsEventDrivenButKeyboardMovementAnimates) {
+        Viewport viewport(200, 200);
+        TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
+        controller.initialize();
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        router.focusViewportKeyboard();
+        controller.setCameraNavigationMode(InputController::CameraNavigationMode::FPV);
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_PRESS, 100.0, 100.0);
+        ASSERT_TRUE(controller.isCameraDragging());
+        controller.handleMouseMove(120.0, 110.0);
+        EXPECT_FALSE(controller.needsCameraAnimationFrame());
+        controller.handleKey(input::KEY_W, input::ACTION_PRESS, input::KEYMOD_NONE);
+        EXPECT_TRUE(controller.needsCameraAnimationFrame());
+    }
+
+    TEST_F(InputControllerFocusTest, PausedOrbitDecaysWithoutFrameTicks) {
+        Viewport viewport(200, 200);
+        TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_PRESS, 100.0, 100.0);
+        controller.handleMouseMove(120.0, 110.0);
+        ASSERT_TRUE(viewport.camera.hasOrbitMomentum());
+        const auto paused_rotation = viewport.camera.R;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
+                                     input::ACTION_RELEASE, 120.0, 110.0);
+        EXPECT_FALSE(controller.needsCameraAnimationFrame());
+        EXPECT_EQ(viewport.camera.R, paused_rotation);
+    }
+
+    TEST(CameraAnimationCadenceTest, ContinuousTicksUseDisplayOpportunitiesWithoutACatchUpBurst) {
+        CameraAnimationCadence cadence;
+        const CameraAnimationCadence::Clock::time_point start{};
+        int frames = 0;
+        int last_visible_input = -1;
+        for (int input = 0; input < 1000; ++input) {
+            const auto now = start + std::chrono::milliseconds(input);
+            if (cadence.secondsUntilReady(now, 0.01) == 0.0) {
+                cadence.startFrame(now);
+                last_visible_input = input;
+                ++frames;
+            }
+        }
+        EXPECT_EQ(frames, 100);
+        EXPECT_EQ(last_visible_input, 990);
+        // No accumulated render debt after a slow frame or an idle period.
+        const auto later = start + std::chrono::seconds(2);
+        EXPECT_EQ(cadence.secondsUntilReady(later, 0.01), 0.0);
+        cadence.startFrame(later);
+        EXPECT_GT(cadence.secondsUntilReady(later, 0.01), 0.0);
+    }
+
+    TEST(CameraAnimationCadenceTest, FirstUpdateIsImmediateAndDisplayChangesAreRespected) {
+        CameraAnimationCadence cadence;
+        const CameraAnimationCadence::Clock::time_point start{};
+        EXPECT_EQ(cadence.secondsUntilReady(start, 1.0 / 60.0), 0.0);
+        cadence.startFrame(start);
+        const auto next = start + std::chrono::milliseconds(5);
+        EXPECT_GT(cadence.secondsUntilReady(next, 1.0 / 60.0), 0.0);
+        EXPECT_EQ(cadence.secondsUntilReady(next, 1.0 / 240.0), 0.0);
+    }
+
+    // Fails if a wake without input (a viewer-thread user event) counts as input, which would let
+    // demand-driven frames skip the display pacing, or if any kind of user input does not bypass it.
+    TEST(FrameInputBufferTest, OnlyUserInputBypassesDisplayPacing) {
+        FrameInputBuffer input;
+        input.had_event = true;
+        input.user_event = true;
+        EXPECT_FALSE(input.hasUserInput());
+
+        const std::vector<std::function<void(FrameInputBuffer&)>> inputs{
+            [](FrameInputBuffer& b) { b.mouse_moved = true; },
+            [](FrameInputBuffer& b) { b.window_event = true; },
+            [](FrameInputBuffer& b) { b.mouse_wheel = 1.0f; },
+            [](FrameInputBuffer& b) { b.mouse_wheel_x = -1.0f; },
+            [](FrameInputBuffer& b) { b.mouse_button_events.emplace_back(); },
+            [](FrameInputBuffer& b) { b.input_events.emplace_back(); },
+            [](FrameInputBuffer& b) { b.keys_pressed.push_back(SDL_SCANCODE_W); },
+        };
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            FrameInputBuffer buffer;
+            inputs[i](buffer);
+            EXPECT_TRUE(buffer.hasUserInput()) << "input kind " << i;
+        }
+    }
+
     TEST_F(InputControllerFocusTest, CameraViewHotkeysDoNotBypassGuiKeyboardCapture) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -139,9 +283,57 @@ namespace lfs::vis {
         EXPECT_EQ(goto_cam_view_count, 0);
     }
 
+    TEST_F(InputControllerFocusTest, CameraViewKeysUseSceneUidsWithoutTrainerAndPreserveComparison) {
+        Viewport viewport(200, 200);
+        TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        router.focusViewportKeyboard();
+        SceneManager scene_manager;
+        screen::ScreenService rendering_manager_views;
+        RenderingManager rendering_manager{rendering_manager_views};
+        services().set(&scene_manager);
+        services().set(&rendering_manager);
+        auto& scene = scene_manager.getScene();
+        scene_manager.changeContentType(SceneManager::ContentType::Dataset);
+        const auto group = scene.addCameraGroup("Cameras", scene.addGroup("Dataset"), 3);
+        for (const int uid : {4, 17, 42}) {
+            auto camera = std::make_shared<core::Camera>(
+                core::Tensor::eye(3, core::Device::CPU),
+                core::Tensor::zeros({3}, core::Device::CPU),
+                100.0f, 100.0f, 32.0f, 32.0f,
+                core::Tensor(), core::Tensor(), core::CameraModelType::PINHOLE,
+                std::to_string(uid), std::filesystem::path("source.png"), std::filesystem::path{},
+                64, 64, uid);
+            scene.addCamera(std::to_string(uid), group, std::move(camera));
+        }
+        ASSERT_EQ(services().trainerOrNull(), nullptr);
+        controller.handleKey(input::KEY_G, input::ACTION_PRESS, input::KEYMOD_NONE);
+        ASSERT_TRUE(rendering_manager.isGTComparisonActive());
+        const auto press = [&](const int key, const int expected_uid) {
+            controller.handleKey(key, input::ACTION_PRESS, input::KEYMOD_NONE);
+            controller.handleKey(key, input::ACTION_RELEASE, input::KEYMOD_NONE);
+            controller.update(0.016f);
+            EXPECT_EQ(rendering_manager.getCurrentCameraId(), expected_uid);
+            EXPECT_TRUE(rendering_manager.isGTComparisonActive());
+        };
+        press(input::KEY_LEFT, 42);
+        press(input::KEY_RIGHT, 4);
+        press(input::KEY_RIGHT, 17);
+        press(input::KEY_LEFT, 4);
+        core::events::cmd::GoToCamView{.cam_id = 17}.emit();
+        press(input::KEY_RIGHT, 42);
+
+        controller.handleScroll(0.0, 1.0);
+        EXPECT_FALSE(rendering_manager.isGTComparisonActive());
+    }
+
     TEST_F(InputControllerFocusTest, RebindingKeyCaptureBypassesPythonKeyboardCapture) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
 
         controller.getBindings().startCapture(input::ToolMode::GLOBAL,
                                               input::Action::TOOL_ALIGN);
@@ -161,7 +353,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, ViewportViewHotkeysBypassGuiKeyboardFocusWhenNotTextEditing) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -181,13 +374,14 @@ namespace lfs::vis {
         controller.handleKey(input::KEY_G, input::ACTION_PRESS, input::KEYMOD_NONE);
         controller.handleKey(input::KEY_V, input::ACTION_PRESS, input::KEYMOD_NONE);
 
-        EXPECT_EQ(toggle_gt_count, 1);
+        EXPECT_EQ(toggle_gt_count, 0);
         EXPECT_EQ(toggle_split_count, 1);
     }
 
     TEST_F(InputControllerFocusTest, ViewportViewHotkeysWorkAfterViewportFocus) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -206,13 +400,96 @@ namespace lfs::vis {
         controller.handleKey(input::KEY_G, input::ACTION_PRESS, input::KEYMOD_NONE);
         controller.handleKey(input::KEY_V, input::ACTION_PRESS, input::KEYMOD_NONE);
 
-        EXPECT_EQ(toggle_gt_count, 1);
+        EXPECT_EQ(toggle_gt_count, 0);
         EXPECT_EQ(toggle_split_count, 1);
+    }
+
+    TEST_F(InputControllerFocusTest, GUsesNodeCompareForViewerAndKeepsVBindings) {
+        using lfs::core::DataType;
+        using lfs::core::Device;
+        using lfs::core::Tensor;
+
+        Viewport viewport(200, 200);
+        class CommandRecordingViewTargets final : public ViewTargets {
+        public:
+            explicit CommandRecordingViewTargets(Viewport& viewport) : views_(viewport) {}
+            ViewTarget activeView() override { return views_.activeView(); }
+            ViewTarget viewAt(float x, float y) override { return views_.viewAt(x, y); }
+            ViewTarget findView(ViewId id) override { return views_.findView(id); }
+            ViewId viewId(const Viewport& viewport) const override { return views_.viewId(viewport); }
+            std::uint64_t viewEpoch() const override { return views_.viewEpoch(); }
+            void activateView(ViewId id) override { views_.activateView(id); }
+            bool runViewCommand(ViewId id, std::string_view command) override {
+                commands.emplace_back(id, command);
+                return true;
+            }
+            std::vector<std::pair<ViewId, std::string>> commands;
+
+        private:
+            TestViewTargets views_;
+        } controller_views{viewport};
+        InputController controller(nullptr, controller_views);
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        router.focusViewportKeyboard();
+
+        SceneManager scene_manager;
+        lfs::vis::screen::ScreenService manager_views;
+        RenderingManager rendering_manager{manager_views};
+        services().set(&scene_manager);
+        services().set(&rendering_manager);
+        auto& scene = scene_manager.getScene();
+        const auto make_splat = [](const float x) {
+            return std::make_unique<lfs::core::SplatData>(
+                0,
+                Tensor::from_vector({x, 0.0f, 2.0f}, {size_t{1}, size_t{3}}, Device::CPU),
+                Tensor::from_vector({1.0f, 1.0f, 1.0f}, {size_t{1}, size_t{1}, size_t{3}}, Device::CPU),
+                Tensor::zeros({size_t{1}, size_t{0}, size_t{3}}, Device::CPU, DataType::Float32),
+                Tensor::zeros({size_t{1}, size_t{3}}, Device::CPU),
+                Tensor::from_vector({1.0f, 0.0f, 0.0f, 0.0f}, {size_t{1}, size_t{4}}, Device::CPU),
+                Tensor::from_vector({8.0f}, {size_t{1}, size_t{1}}, Device::CPU),
+                1.0f);
+        };
+        int split_toggles = 0;
+        int gt_toggles = 0;
+        lfs::event::ScopedHandler handlers;
+        handlers.subscribe<core::events::cmd::ToggleSplitView>([&](const auto&) { ++split_toggles; });
+        handlers.subscribe<core::events::cmd::ToggleGTComparison>([&](const auto&) { ++gt_toggles; });
+
+        controller.handleKey(input::KEY_G, input::ACTION_PRESS, input::KEYMOD_NONE);
+        EXPECT_EQ(split_toggles, 0);
+        EXPECT_EQ(gt_toggles, 0);
+        EXPECT_FALSE(rendering_manager.isGTComparisonActive());
+
+        scene.addSplat("first", make_splat(0.0f));
+        controller.handleKey(input::KEY_G, input::ACTION_PRESS, input::KEYMOD_NONE);
+        EXPECT_EQ(split_toggles, 0);
+        EXPECT_EQ(gt_toggles, 0);
+        EXPECT_FALSE(rendering_manager.isGTComparisonActive());
+
+        scene.addSplat("second", make_splat(1.0f));
+        controller.handleKey(input::KEY_G, input::ACTION_PRESS, input::KEYMOD_NONE);
+        EXPECT_EQ(split_toggles, 1);
+        EXPECT_EQ(gt_toggles, 0);
+        EXPECT_FALSE(rendering_manager.isGTComparisonActive());
+
+        controller.handleKey(input::KEY_V, input::ACTION_PRESS, input::KEYMOD_NONE);
+        EXPECT_EQ(split_toggles, 2);
+        EXPECT_EQ(gt_toggles, 0);
+
+        controller.handleKey(input::KEY_V, input::ACTION_PRESS, input::KEYMOD_SHIFT);
+        EXPECT_EQ(split_toggles, 2);
+        EXPECT_EQ(gt_toggles, 0);
+        ASSERT_EQ(controller_views.commands.size(), 1u);
+        EXPECT_EQ(controller_views.commands.front().first, controller_views.activeView().id);
+        EXPECT_EQ(controller_views.commands.front().second, "area:side");
     }
 
     TEST_F(InputControllerFocusTest, EscapeWithScenePanelFocusStaysWithGui) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -229,7 +506,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, ProgrammaticViewportFocusAllowsViewportHotkeys) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -246,12 +524,13 @@ namespace lfs::vis {
         router.focusViewportKeyboard();
         controller.handleKey(input::KEY_G, input::ACTION_PRESS, input::KEYMOD_NONE);
 
-        EXPECT_EQ(toggle_gt_count, 1);
+        EXPECT_EQ(toggle_gt_count, 0);
     }
 
     TEST_F(InputControllerFocusTest, ViewportViewHotkeysStayBlockedDuringTextEntry) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -281,7 +560,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, DeleteNodeShortcutDoesNotFireDuringTextEntry) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -291,7 +571,9 @@ namespace lfs::vis {
         scene_manager.selectNode("delete_me");
         ASSERT_EQ(scene_manager.getSelectedNodeNames(), std::vector<std::string>{"delete_me"});
 
-        ToolContext tool_context(nullptr, &scene_manager, &viewport, nullptr);
+        lfs::vis::TestViewTargets tool_context_views{viewport};
+
+        ToolContext tool_context(nullptr, &scene_manager, &tool_context_views, nullptr);
         controller.setToolContext(&tool_context);
 
         lfs::event::ScopedHandler handlers;
@@ -312,9 +594,133 @@ namespace lfs::vis {
                   input::ShortcutScope::GlobalWhenNotTextEditing);
     }
 
+    TEST_F(InputControllerFocusTest, EditorFocusProtectsKeysUntilBlur) {
+        Viewport viewport(200, 200);
+        TestViewTargets controller_views{viewport};
+        InputController controller(nullptr, controller_views);
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        SceneManager scene;
+        scene.getScene().addGroup("model");
+        scene.selectNode("model");
+        ToolContext context(nullptr, &scene, &controller_views, nullptr);
+        controller.setToolContext(&context);
+        lfs::event::ScopedHandler handlers;
+        int deletes = 0;
+        handlers.subscribe<core::events::cmd::RemovePLY>([&](const auto&) { ++deletes; });
+
+        router.focusViewportKeyboard();
+        router.beginMouseButton(input::ACTION_PRESS, 10, 10);
+        router.endMouseButton(input::ACTION_RELEASE);
+        gui::guiFocusState().want_text_input = true;
+        EXPECT_TRUE(router.isTextInputActive());
+        controller.handleKey(input::KEY_DELETE, input::ACTION_PRESS, 0);
+        EXPECT_EQ(deletes, 0);
+
+        gui::guiFocusState().want_text_input = true;
+        controller.handleKey(input::KEY_DELETE, input::ACTION_PRESS, 0);
+        EXPECT_EQ(deletes, 0);
+        gui::guiFocusState().reset();
+        router.focusViewportKeyboard();
+        controller.handleKey(input::KEY_DELETE, input::ACTION_PRESS, 0);
+        EXPECT_EQ(deletes, 1);
+        router.onWindowFocusLost();
+        EXPECT_FALSE(router.isTextInputActive());
+    }
+
+    TEST_F(InputControllerFocusTest, EditorLettersDoNotBecomeCameraScrollChords) {
+        Viewport viewport(200, 200);
+        TestViewTargets controller_views{viewport};
+        InputController controller(nullptr, controller_views);
+        const glm::mat3 original = viewport.camera.R;
+        gui::guiFocusState().want_text_input = true;
+        controller.handleKey(input::KEY_R, input::ACTION_PRESS, 0);
+        controller.handleScroll(0.0, 1.0);
+        for (int column = 0; column < 3; ++column)
+            EXPECT_LT(glm::distance(viewport.camera.R[column], original[column]), 1e-6f);
+        controller.handleKey(input::KEY_R, input::ACTION_RELEASE, 0);
+        gui::guiFocusState().reset();
+        controller.handleKey(input::KEY_R, input::ACTION_PRESS, 0);
+        controller.handleScroll(0.0, 1.0);
+        EXPECT_GT(glm::distance(viewport.camera.R[0], original[0]), 1e-3f);
+        controller.handleKey(input::KEY_R, input::ACTION_RELEASE, 0);
+    }
+
+    TEST_F(InputControllerFocusTest, EditorKeysNeverReachModalOperatorsEvenOverViewport) {
+        Viewport viewport(200, 200);
+        TestViewTargets controller_views{viewport};
+        InputController controller(nullptr, controller_views);
+        input::InputRouter router;
+        router.setInputController(&controller);
+        controller.setInputRouter(&router);
+        router.focusViewportKeyboard();
+        int received = 0;
+        constexpr auto id = "test.editor.key_isolation";
+        op::operators().registerCallbackOperator(
+            {.python_class_id = id, .label = "Key isolation"},
+            {.invoke = [](op::OperatorProperties&) { return op::OperatorResult::RUNNING_MODAL; },
+             .modal = [&](const op::ModalEvent&, op::OperatorProperties&) {
+                 ++received;
+                 return op::OperatorResult::RUNNING_MODAL; }});
+        ASSERT_EQ(op::operators().invoke(id).status, op::OperatorResult::RUNNING_MODAL);
+        gui::guiFocusState().want_text_input = true;
+        for (const auto key : {input::KEY_DELETE, input::KEY_BACKSPACE, input::KEY_Z,
+                               input::KEY_Y, input::KEY_A, input::KEY_C, input::KEY_X,
+                               input::KEY_V, input::KEY_HOME, input::KEY_END,
+                               input::KEY_G, input::KEY_R, input::KEY_W, input::KEY_D}) {
+            for (const auto mods : {0, input::KEYMOD_CTRL, input::KEYMOD_CTRL | input::KEYMOD_SHIFT}) {
+                controller.handleKey(key, input::ACTION_PRESS, mods);
+                controller.handleKey(key, input::ACTION_REPEAT, mods);
+                controller.handleKey(key, input::ACTION_RELEASE, mods);
+            }
+        }
+        EXPECT_EQ(received, 0);
+        gui::guiFocusState().reset();
+        controller.handleKey(input::KEY_G, input::ACTION_PRESS, 0);
+        EXPECT_EQ(received, 1);
+        op::operators().cancelModalOperator();
+        op::operators().unregisterOperator(id);
+    }
+
+    TEST_F(InputControllerFocusTest, OwnedModifierReleaseReachesModalAfterTextFocus) {
+        Viewport viewport(200, 200);
+        TestViewTargets controller_views{viewport};
+        InputController controller(nullptr, controller_views);
+        gui::RmlUIManager dispatcher;
+        std::vector<int> actions;
+        constexpr auto id = "test.input.press_owner";
+        op::operators().registerCallbackOperator(
+            {.python_class_id = id, .label = "Press owner"},
+            {.invoke = [](op::OperatorProperties&) { return op::OperatorResult::RUNNING_MODAL; },
+             .modal = [&](const op::ModalEvent& event, op::OperatorProperties&) {
+                 if (const auto* key = event.as<KeyEvent>())
+                     actions.push_back(key->action);
+                 return op::OperatorResult::RUNNING_MODAL; }});
+        ASSERT_EQ(op::operators().invoke(id).status, op::OperatorResult::RUNNING_MODAL);
+        SDL_Event down{};
+        down.type = SDL_EVENT_KEY_DOWN;
+        down.key.scancode = SDL_SCANCODE_LALT;
+        down.key.down = true;
+        ASSERT_FALSE(dispatcher.dispatchInputEvent(down).consumed);
+        controller.handleKey(input::KEY_LEFT_ALT, input::ACTION_PRESS, input::KEYMOD_ALT);
+        SDL_Event up = down;
+        up.type = SDL_EVENT_KEY_UP;
+        up.key.down = false;
+        const auto release = dispatcher.dispatchInputEvent(up);
+        ASSERT_TRUE(release.owned_release);
+        gui::guiFocusState().want_text_input = true;
+        controller.handleKey(input::KEY_LEFT_ALT, input::KEY_LEFT_ALT, SDL_SCANCODE_LALT,
+                             input::ACTION_RELEASE, 0, release.owned_release);
+        EXPECT_EQ(actions, (std::vector<int>{input::ACTION_PRESS, input::ACTION_RELEASE}));
+        op::operators().cancelModalOperator();
+        op::operators().unregisterOperator(id);
+    }
+
     TEST_F(InputControllerFocusTest, DeleteNodeShortcutFiresWhenViewportFocused) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -324,7 +730,9 @@ namespace lfs::vis {
         scene_manager.selectNode("delete_me");
         ASSERT_EQ(scene_manager.getSelectedNodeNames(), std::vector<std::string>{"delete_me"});
 
-        ToolContext tool_context(nullptr, &scene_manager, &viewport, nullptr);
+        lfs::vis::TestViewTargets tool_context_views{viewport};
+
+        ToolContext tool_context(nullptr, &scene_manager, &tool_context_views, nullptr);
         controller.setToolContext(&tool_context);
 
         lfs::event::ScopedHandler handlers;
@@ -343,7 +751,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, TransformToolShortcutDoesNotFireDuringTextEntry) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -370,7 +779,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, ProjectSaveShortcutRemainsGlobalDuringTextEntry) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -394,7 +804,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, ViewportClickDuringTextEntryDoesNotStartCameraGesture) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -416,7 +827,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, GlobalShortcutsUseLogicalKeyWhileMovementUsesPhysicalKey) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         controller.initialize();
         input::InputRouter router;
         router.setInputController(&controller);
@@ -442,7 +854,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, RedoAliasUsesLogicalKeyAndDoesNotTriggerMovement) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         controller.initialize();
         input::InputRouter router;
         router.setInputController(&controller);
@@ -465,7 +878,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, CameraDragBindingsIgnoreExtraShiftModifier) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
 
         EXPECT_EQ(controller.getBindings().getActionForDrag(
                       input::ToolMode::GLOBAL, input::MouseButton::MIDDLE, input::KEYMOD_SHIFT),
@@ -580,7 +994,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, StaleMouseCaptureDoesNotRequireSecondViewportClick) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -598,7 +1013,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, MissedMouseReleaseClearsPointerCapture) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -614,99 +1030,10 @@ namespace lfs::vis {
         EXPECT_EQ(router.pointerTarget(2500.0, 2500.0), input::InputTarget::None);
     }
 
-    TEST_F(InputControllerFocusTest, FreshLeftDockEdgePressUsesOneOwnershipVerdict) {
-        struct DockPanel final : gui::IPanel {
-            void draw(const gui::PanelDrawContext&) override {}
-            gui::PanelRenderCapabilities renderCapabilities() const override {
-                return {.direct = true};
-            }
-            gui::PanelDirectRenderResult renderDirect(
-                const gui::PanelDirectRenderRequest&, const gui::PanelDrawContext&) override {
-                return {.handled = true, .height = 100.0f};
-            }
-        };
-        struct RegisteredDockPanel {
-            RegisteredDockPanel() {
-                gui::PanelInfo info;
-                info.id = "test.input.focus.left-dock";
-                info.label = info.id;
-                info.space = gui::PanelSpace::LeftDock;
-                info.panel = std::make_shared<DockPanel>();
-                gui::PanelRegistry::instance().register_panel(std::move(info));
-            }
-            ~RegisteredDockPanel() {
-                gui::PanelRegistry::instance().unregister_panel("test.input.focus.left-dock");
-            }
-        };
-
-        ViewerOptions options;
-        options.show_startup_overlay = false;
-        options.safe_mode = true;
-        VisualizerImpl viewer(options);
-        RegisteredDockPanel registered_panel;
-        auto& gui = *viewer.getGuiManager();
-        // This fixture does not initialize the GUI, where the startup option is applied.
-        gui.dismissStartupOverlay();
-        ASSERT_FALSE(gui.isStartupBlockingInput());
-        gui::ScreenState screen{.work_pos = {0.0f, 0.0f}, .work_size = {1280.0f, 720.0f}};
-        gui::UIContext ui;
-        gui::PanelDrawContext draw_ctx{.ui = &ui};
-        gui::PanelInputState previous_input;
-        previous_input.mouse_x = 1000.0f;
-        previous_input.mouse_y = 400.0f;
-        gui.panelLayout().renderLeftDock(draw_ctx, true, false, previous_input, screen);
-        ASSERT_TRUE(gui.panelLayout().isLeftDockVisible());
-        ASSERT_FALSE(gui.panelLayout().isResizingPanel());
-        gui.last_ui_layout_work_pos_ = screen.work_pos;
-        gui.last_ui_layout_work_size_ = screen.work_size;
-        gui.viewport_layout_ = gui.panelLayout().computeViewportLayout(true, false, false, screen);
-
-        const auto edge = gui::PanelLayoutManager::leftDockResizeRect(
-            screen.work_pos.x, screen.work_pos.y, screen.work_size.y,
-            lfs::python::get_shared_dpi_scale(), gui.panelLayout().getLeftDockWidth());
-        const float x = (edge.x0 + 3.0f * edge.x1) / 4.0f;
-        const float y = 400.0f;
-        ASSERT_TRUE(gui.isPositionInViewport(x, y));
-        const auto hover_hit = gui.hitTestPointer(x, y);
-        ASSERT_FALSE(hover_hit.blocks_pointer);
-        ASSERT_FALSE(hover_hit.blocks_mouse_button);
-
-        Viewport viewport(1280, 720);
-        InputController controller(nullptr, viewport);
-        const auto viewport_pos = gui.getViewportPos();
-        const auto viewport_size = gui.getViewportSize();
-        controller.updateViewportBounds(viewport_pos.x, viewport_pos.y, viewport_size.x, viewport_size.y);
-        ASSERT_TRUE(controller.isViewportPoint(x, y));
-        input::InputRouter router;
-        router.setInputController(&controller);
-        controller.setInputRouter(&router);
-        router.focusViewportKeyboard();
-        ASSERT_EQ(router.hoverTarget(x, y), input::InputTarget::Viewport);
-
-        FrameInputBuffer frame;
-        SDL_Event event{};
-        event.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
-        event.button.button = SDL_BUTTON_MIDDLE;
-        event.button.x = x;
-        event.button.y = y;
-        frame.processEvent(event);
-        const auto hit = gui.hitTestMouseButton(x, y);
-        frame.notePressOwner(event.button.button, hit.blocks_pointer || hit.blocks_mouse_button);
-        router.beginMouseButton(input::ACTION_PRESS, x, y, hit);
-        controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
-                                     input::ACTION_PRESS, x, y);
-
-        ASSERT_EQ(frame.mouse_button_events.size(), 1);
-        EXPECT_TRUE(frame.mouse_button_events.front().gui_owned);
-        EXPECT_EQ(router.state().pointer_capture, input::InputTarget::Gui);
-        EXPECT_EQ(router.state().keyboard_focus, input::InputTarget::Viewport);
-        EXPECT_EQ(router.hoverTarget(x, y), input::InputTarget::Viewport);
-        EXPECT_FALSE(controller.isContinuousInputActive());
-    }
-
     TEST_F(InputControllerFocusTest, MouseButtonVerdictPreservesCrossButtonCapture) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         controller.updateViewportBounds(0.0f, 0.0f, 200.0f, 200.0f);
         input::InputRouter router;
         router.setInputController(&controller);
@@ -737,7 +1064,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, EmptyMouseButtonVerdictRetainsNoGuiViewportFallback) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         controller.updateViewportBounds(0.0f, 0.0f, 200.0f, 200.0f);
         input::InputRouter router;
         router.setInputController(&controller);
@@ -760,7 +1088,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, HoverTargetIgnoresPointerCapture) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -773,7 +1102,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, SplitToggleClearsActiveCameraDrag) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -789,9 +1119,18 @@ namespace lfs::vis {
         EXPECT_FALSE(controller.isContinuousInputActive());
     }
 
+    TEST_F(InputControllerFocusTest, GTImagePanConvertsTotalDragToPhysicalPixelsOnce) {
+        // These are already physical positions after WindowManager's scaling.
+        const auto displacement = detail::roundedPhysicalDrag({6.5, -7.0});
+        const glm::ivec2 origin = glm::ivec2(100, 200) - displacement;
+
+        EXPECT_EQ(origin, glm::ivec2(93, 207));
+    }
+
     TEST_F(InputControllerFocusTest, FpvModeUsesInPlaceLookForPrimaryCameraDrag) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
         viewport.camera.setPivot(glm::vec3(0.0f));
         viewport.camera.R = glm::mat3(1.0f);
@@ -814,7 +1153,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, TrackballModeAllowsPerfectTopView) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
         viewport.camera.setPivot(glm::vec3(0.0f));
         viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
@@ -834,7 +1174,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, TrackballModeCrossesTopViewWithoutLocking) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
         viewport.camera.setPivot(glm::vec3(0.0f));
         viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
@@ -858,7 +1199,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, TrackballModeOrbitsAwayFromTopViewWithoutRollSnapping) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         viewport.camera.t = glm::vec3(0.0f, 5.0f, 0.0f);
         viewport.camera.setPivot(glm::vec3(0.0f));
         viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
@@ -896,7 +1238,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, TrackballModeDoesNotBankOnDiagonalOrbitDrag) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
         viewport.camera.setPivot(glm::vec3(0.0f));
         viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
@@ -922,7 +1265,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, TrackballSnapAlignsToNearestAxisView) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
         viewport.camera.setPivot(glm::vec3(0.0f));
         viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
@@ -945,13 +1289,14 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, FpvModePitchClampPreventsPoleFlip) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
         viewport.camera.setPivot(glm::vec3(0.0f));
         viewport.camera.R = glm::mat3(1.0f);
         controller.setCameraNavigationMode(InputController::CameraNavigationMode::FPV);
 
-        const double y0 = 900.0;
+        const double y0 = 100.0;
         controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
                                      input::ACTION_PRESS, 40.0, y0);
         controller.handleMouseMove(40.0, y0 - glm::radians(140.0f) / 0.001f);
@@ -969,7 +1314,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, OrbitModeFirstDragFromTopViewDoesNotJump) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
         viewport.camera.setPivot(glm::vec3(0.0f));
         viewport.camera.setAxisAlignedView(1, false);
@@ -991,13 +1337,14 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, OrbitModePitchIntoLimitDoesNotFlip) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
         viewport.camera.setPivot(glm::vec3(0.0f));
         viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
             viewport.camera.t, viewport.camera.getPivot());
 
-        const double y0 = 900.0;
+        const double y0 = 100.0;
         controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
                                      input::ACTION_PRESS, 100.0, y0);
 
@@ -1024,13 +1371,14 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, OrbitModeReachesNearTopDownView) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
         viewport.camera.setPivot(glm::vec3(0.0f));
         viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
             viewport.camera.t, viewport.camera.getPivot());
 
-        const double y0 = 900.0;
+        const double y0 = 100.0;
         controller.handleMouseButton(static_cast<int>(input::AppMouseButton::MIDDLE),
                                      input::ACTION_PRESS, 100.0, y0);
         controller.handleMouseMove(100.0, y0 - glm::radians(85.0f) / 0.002f);
@@ -1089,7 +1437,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, TrackballOrbitPreservesDeliberateRoll) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
         viewport.camera.setPivot(glm::vec3(0.0f));
         viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
@@ -1114,7 +1463,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, NavigationModeSwitchPreservesPivot) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         viewport.camera.t = glm::vec3(0.0f, 0.0f, 5.0f);
         viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
             viewport.camera.t, glm::vec3(0.0f));
@@ -1151,7 +1501,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, SetPivotOnBackgroundKeepsOrbitRadius) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         viewport.camera.t = glm::vec3(0.0f, 0.0f, 7.0f);
         viewport.camera.setPivot(glm::vec3(0.0f));
         viewport.camera.R = lfs::rendering::makeVisualizerLookAtRotation(
@@ -1208,7 +1559,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, PointerTargetsExposeHoverAndCapturedTargets) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -1405,7 +1757,7 @@ namespace lfs::vis {
         EXPECT_EQ(bindings.getActionForKey(input::ToolMode::GLOBAL,
                                            input::KEY_SPACE,
                                            input::MODIFIER_CTRL),
-                  input::Action::NONE);
+                  input::Action::TOGGLE_MAXIMIZE_AREA);
         EXPECT_EQ(bindings.getActionForKey(input::ToolMode::GLOBAL,
                                            input::KEY_H,
                                            input::MODIFIER_CTRL | input::MODIFIER_SHIFT),
@@ -1443,7 +1795,7 @@ namespace lfs::vis {
         ASSERT_TRUE(loaded.loadProfileFromFile(profile_path));
         EXPECT_EQ(loaded.getActionForKey(input::ToolMode::GLOBAL, input::KEY_SPACE,
                                          input::MODIFIER_CTRL),
-                  input::Action::NONE);
+                  input::Action::TOGGLE_MAXIMIZE_AREA);
         EXPECT_EQ(loaded.getActionForKey(input::ToolMode::GLOBAL, input::KEY_H,
                                          input::MODIFIER_CTRL | input::MODIFIER_SHIFT),
                   input::Action::TOGGLE_SCENE_SELECTION_VISIBILITY);
@@ -1556,7 +1908,7 @@ namespace lfs::vis {
         std::ifstream persisted(profile_path);
         ASSERT_TRUE(persisted.is_open());
         const std::string contents((std::istreambuf_iterator<char>(persisted)), {});
-        EXPECT_NE(contents.find("\"version\": 30"), std::string::npos); // PROFILE_VERSION
+        EXPECT_NE(contents.find("\"version\": 33"), std::string::npos); // PROFILE_VERSION
         EXPECT_NE(contents.find("Gallery Primary Action"), std::string::npos);
         EXPECT_NE(contents.find("Copy Gallery Link"), std::string::npos);
         EXPECT_NE(contents.find("Refresh Assets"), std::string::npos);
@@ -1624,7 +1976,7 @@ namespace lfs::vis {
         const auto version_key = contents.find("\"version\":");
         ASSERT_NE(version_key, std::string::npos);
         EXPECT_EQ(contents.find("\"version\":", version_key + 1), std::string::npos);
-        EXPECT_NE(contents.find("\"version\": 30"), std::string::npos);
+        EXPECT_NE(contents.find("\"version\": 33"), std::string::npos);
         EXPECT_NE(contents.find("Toggle MCP Server"), std::string::npos);
         EXPECT_NE(contents.find("Window size"), std::string::npos);
         EXPECT_NE(contents.find("Window drag"), std::string::npos);
@@ -1662,6 +2014,30 @@ namespace lfs::vis {
         EXPECT_EQ(bindings.getActionForKey(ToolMode::GLOBAL, KEY_ENTER, MODIFIER_CTRL), Action::NONE);
         EXPECT_EQ(bindings.getActionForScroll(ToolMode::SELECTION, MODIFIER_SHIFT | MODIFIER_ALT), Action::DEPTH_ADJUST_SIZE);
         EXPECT_EQ(bindings.getActionForDrag(ToolMode::SELECTION, MouseButton::LEFT, MODIFIER_SHIFT | MODIFIER_ALT), Action::DEPTH_WINDOW_DRAG);
+        std::filesystem::remove(path);
+    }
+
+    TEST_F(InputControllerFocusTest, MaximizeAreaHasGlobalCtrlSpaceBinding) {
+        input::InputBindings bindings;
+        EXPECT_EQ(bindings.getActionForKey(input::ToolMode::GLOBAL, input::KEY_SPACE,
+                                           input::MODIFIER_CTRL),
+                  input::Action::TOGGLE_MAXIMIZE_AREA);
+        EXPECT_EQ(input::shortcutScopeForAction(input::Action::TOGGLE_MAXIMIZE_AREA),
+                  input::ShortcutScope::GlobalWhenNotTextEditing);
+    }
+
+    TEST_F(InputControllerFocusTest, VersionThirtyOneProfileMigratesMaximizeBinding) {
+        const auto path = std::filesystem::temp_directory_path() / "lfs_keymap_v31.json";
+        {
+            std::ofstream file(path);
+            ASSERT_TRUE(file.is_open());
+            file << R"({"name":"Legacy","version":31,"bindings":[]})";
+        }
+        input::InputBindings bindings;
+        ASSERT_TRUE(bindings.loadProfileFromFile(path));
+        EXPECT_EQ(bindings.getActionForKey(input::ToolMode::GLOBAL, input::KEY_SPACE,
+                                           input::MODIFIER_CTRL),
+                  input::Action::TOGGLE_MAXIMIZE_AREA);
         std::filesystem::remove(path);
     }
 
@@ -1753,7 +2129,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, McpRuntimeShortcutsDispatchDuringPythonCapture) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
 
         int server_calls = 0;
         int binding_calls = 0;
@@ -1778,11 +2155,13 @@ namespace lfs::vis {
     }
 
     TEST_F(InputControllerFocusTest, CameraFrustumsDefaultToAltCAndToggleRenderSetting) {
-        RenderingManager rendering_manager;
+        lfs::vis::screen::ScreenService rendering_manager_views;
+        RenderingManager rendering_manager{rendering_manager_views};
         services().set(&rendering_manager);
 
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -1803,11 +2182,13 @@ namespace lfs::vis {
     }
 
     TEST_F(InputControllerFocusTest, GridDefaultToAltGAndToggleRenderSetting) {
-        RenderingManager rendering_manager;
+        lfs::vis::screen::ScreenService rendering_manager_views;
+        RenderingManager rendering_manager{rendering_manager_views};
         services().set(&rendering_manager);
 
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -1994,7 +2375,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, ToolControlActivationShortcutsResolveAcrossModesAtRuntime) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -2023,7 +2405,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, ToolLocalOperationalShortcutsDoNotResolveAcrossModes) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -2044,7 +2427,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, CutSelectionDefaultShortcutDispatchesCommand) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         input::InputRouter router;
         router.setInputController(&controller);
         controller.setInputRouter(&router);
@@ -2191,7 +2575,8 @@ namespace lfs::vis {
 
     TEST_F(InputControllerFocusTest, ClearedZoomBindingStopsViewportScrollZoom) {
         Viewport viewport(200, 200);
-        InputController controller(nullptr, viewport);
+        lfs::vis::TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
         controller.getBindings().clearBinding(input::ToolMode::GLOBAL, input::Action::CAMERA_ZOOM);
 
         const glm::vec3 start_t = viewport.camera.t;
@@ -2205,46 +2590,29 @@ namespace lfs::vis {
         }
     }
 
-    TEST_F(InputControllerFocusTest, SetPivotCentersSharedComparisonCamera) {
-        for (const auto mode : {SplitViewMode::Disabled, SplitViewMode::PLYComparison,
-                                SplitViewMode::IndependentDual}) {
-            for (const double click_x : {60.0, 160.0}) {
-                SCOPED_TRACE(static_cast<int>(mode));
-                SCOPED_TRACE(click_x);
-                Viewport primary(200, 200);
-                InputController controller(nullptr, primary);
-                RenderingManager rendering;
-                services().set(&rendering);
-                controller.updateViewportBounds(0, 0, 200, 200);
-                rendering.restoreSplitViewMode(mode, primary);
-                auto& target = rendering.resolvePanelViewport(
-                    primary, mode == SplitViewMode::IndependentDual && click_x > 100
-                                 ? SplitViewPanelId::Right
-                                 : SplitViewPanelId::Left);
-                target.camera.R = glm::mat3(1.0f);
-                target.camera.t = glm::vec3(0.0f, 0.0f, -5.0f);
-                target.camera.pivot = glm::vec3(0.0f);
-                // Exercise the normal right-button double click binding.
-                controller.handleMouseButton(static_cast<int>(input::MouseButton::RIGHT),
-                                             input::ACTION_PRESS, click_x, 80.0);
-                controller.handleMouseButton(static_cast<int>(input::MouseButton::RIGHT),
-                                             input::ACTION_RELEASE, click_x, 80.0);
-                controller.handleMouseButton(static_cast<int>(input::MouseButton::RIGHT),
-                                             input::ACTION_PRESS, click_x, 80.0);
-                ASSERT_TRUE(target.camera.isGliding());
-                target.camera.finishGlide();
-                // Centering a perspective orbit pivot puts it on the camera's
-                // forward axis, regardless of which side of the wipe was clicked.
-                const auto direction = glm::transpose(target.camera.R) *
-                                       (target.camera.pivot - target.camera.t);
-                EXPECT_NEAR(direction.x, 0.0f, 1e-5f);
-                EXPECT_NEAR(direction.y, 0.0f, 1e-5f);
-                EXPECT_NEAR(glm::length(direction), 5.0f, 1e-5f);
-                controller.handleMouseButton(static_cast<int>(input::MouseButton::RIGHT),
-                                             input::ACTION_RELEASE, click_x, 80.0);
-                services().clear();
-            }
-        }
+    TEST_F(InputControllerFocusTest, DatasetCameraJumpPreservesComparison) {
+        Viewport viewport(200, 200);
+        TestViewTargets controller_views{viewport};
+        InputController controller{nullptr, controller_views};
+        SceneManager scene_manager;
+        screen::ScreenService rendering_views;
+        RenderingManager rendering_manager{rendering_views};
+        services().set(&scene_manager);
+        services().set(&rendering_manager);
+        ASSERT_EQ(rendering_views.activeView(), controller_views.viewId(viewport));
+        auto& scene = scene_manager.getScene();
+        const auto group = scene.addCameraGroup("Cameras", scene.addGroup("Dataset"), 1);
+        scene.addCamera("camera", group, std::make_shared<core::Camera>(core::Tensor::eye(3, core::Device::CPU), core::Tensor::zeros({3}, core::Device::CPU), 100.0f, 100.0f, 32.0f, 32.0f, core::Tensor(), core::Tensor(), core::CameraModelType::PINHOLE, "camera", std::filesystem::path{}, std::filesystem::path{}, 64, 64, 17));
+        const auto view = rendering_views.activeView();
+        rendering_manager.editViewSettings(view, [](ViewSettings& settings) {
+            settings.split_view_mode = SplitViewMode::GTComparison;
+        });
+        core::events::cmd::GoToCamView{.cam_id = 17}.emit();
+        controller.update(0.016f);
+        EXPECT_EQ(rendering_manager.getCurrentCameraId(), 17);
+        EXPECT_EQ(rendering_manager.settingsForView(view).split_view_mode, SplitViewMode::GTComparison);
+        core::events::cmd::ResetCamera{}.emit();
+        EXPECT_EQ(rendering_manager.settingsForView(view).split_view_mode, SplitViewMode::Disabled);
     }
 
 } // namespace lfs::vis

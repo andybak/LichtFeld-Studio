@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #pragma once
+#include "gui/line_renderer.hpp"
 
 #include "core/error_bus.hpp"
 #include "core/events.hpp"
@@ -11,28 +12,29 @@
 #include "gui/gizmo_manager.hpp"
 #include "gui/global_context_menu.hpp"
 #include "gui/gui_error_consumer.hpp"
-#include "gui/panel_layout.hpp"
+#include "gui/gui_input.hpp"
 #include "gui/panel_registry.hpp"
 #include "gui/panels/menu_bar.hpp"
 #include "gui/perf_sampler.hpp"
-#include "gui/rml_bottom_dock.hpp"
 #include "gui/rml_menu_bar.hpp"
 #include "gui/rml_modal_overlay.hpp"
 #include "gui/rml_progress_overlay.hpp"
-#include "gui/rml_right_panel.hpp"
 #include "gui/rml_shell_frame.hpp"
 #include "gui/rml_status_bar.hpp"
+#include "gui/rml_template_browser.hpp"
 #include "gui/rml_toast_overlay.hpp"
 #include "gui/rml_viewport_overlay.hpp"
 #include "gui/rmlui/rmlui_manager.hpp"
 #include "gui/scene_tree_session.hpp"
+#include "gui/screen_host.hpp"
 #include "gui/selection_cursor.hpp"
 #include "gui/sequencer_ui_manager.hpp"
 #include "gui/sequencer_ui_state.hpp"
 #include "gui/startup_overlay.hpp"
 #include "gui/ui_context.hpp"
 #include "gui/utils/drag_drop_native.hpp"
-#include "rendering/passes/vulkan_viewport_pass.hpp"
+#include "rendering/render_target_id.hpp"
+#include "rendering/viewport_reference_renderer.hpp"
 #include "visualizer/app_store.hpp"
 #include "visualizer/gui/video_widget_interface.hpp"
 
@@ -50,14 +52,16 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <vulkan/vulkan.h>
 
 struct SDL_Cursor;
 
 namespace lfs::vis {
+    class OrthographicZoomTest;
+    class WindowInputDispatchTest;
     class VisualizerImpl;
+    class SequencerFrameDemandTest_PropagatesPlaybackStreamAndPreviewDemand_Test;
     class WindowManager;
-    class InputControllerFocusTest_FreshLeftDockEdgePressUsesOneOwnershipVerdict_Test;
+    class GraphicsImportErrorScope;
     class VisualizerImplResetTest_RecoveryDeclineKeepsSidecarSuppressesRepeatAndExplicitSaveDeletesIt_Test;
     class VisualizerImplResetTest_NewProjectClearsRecoveryPromptPendingSoNextOpenProceeds_Test;
     class VisualizerImplResetTest_RecoveredPublishUsesRecoveredCommitKind_Test;
@@ -67,7 +71,11 @@ namespace lfs::vis {
     class VisualizerImplResetTest_StartupOffersRecoveryAfterUncleanShutdown_Test;
     class VisualizerImplResetTest_StartupWithCleanLastSessionLeavesBlankSession_Test;
     class VisualizerImplResetTest_UiVisibilityWaitsForMatchingFrame_Test;
+    class UiVisibilityTransitionTest_UiVisibilityWaitsForMatchingFrame_Test;
     class VisualizerImplResetTest_UiVisibilityTimeoutCommitsRequestedLayout_Test;
+    class UiVisibilityTransitionTest_UiVisibilityTimeoutCommitsRequestedLayout_Test;
+    class UiVisibilityTransitionTest_UiVisibilityFinishesWithoutWaitingForFullscreenGuard_Test;
+    class UiVisibilityTransitionTest_UiVisibilityRequestsFreshFrameWithoutCooldown_Test;
     class VisualizerImplResetTest_RecoveryDismissalPersistsAndNewerCandidateIsOffered_Test;
     class VisualizerImplResetTest_RecoverThenCleanQuitDoesNotReoffer_Test;
     class VisualizerImplResetTest_RecoverThenDiscardExitRemovesMasterSidecar_Test;
@@ -99,6 +107,10 @@ namespace lfs::vis {
 
         class LFS_VIS_API GuiManager {
         public:
+            void beginImportRenderCheck();
+            void endImportRenderCheck();
+            std::optional<std::string> pollImportRenderCheck(const core::Uuid& provisional_node);
+            void discardImportMesh(uint64_t mesh_id);
             GuiManager(VisualizerImpl* viewer);
             ~GuiManager();
 
@@ -107,7 +119,7 @@ namespace lfs::vis {
             void shutdown();
             // Drop viewport-pass GPU objects (descriptor sets that sample external
             // scene image views) while the Vulkan context is still alive.
-            void shutdownVulkanViewportPass();
+            void shutdownViewportCompositors();
             [[nodiscard]] bool render();
             void updateInteractiveTransitions();
             [[nodiscard]] bool isInteractiveTransitionSettling() const;
@@ -120,12 +132,24 @@ namespace lfs::vis {
             // is requested immediately while decoded thumbnails remain ready.
             void notifyCameraThumbnailBatchReady();
             void setRmlResizeDeferring(bool defer) { rmlui_manager_.setResizeDeferring(defer); }
+            void prepareInput();
+            void prepareLayout();
+            RmlUIManager::InputDispatchResult dispatchInputEvent(const SDL_Event& event) {
+                if (event.type == SDL_EVENT_WINDOW_FOCUS_LOST)
+                    screen_host_.cancelInput();
+                if (event.type == SDL_EVENT_KEY_DOWN && event.key.scancode == SDL_SCANCODE_ESCAPE && screen_host_.gestureActive()) {
+                    screen_host_.cancelInput();
+                    return {.consumed = true};
+                }
+                return rmlui_manager_.dispatchInputEvent(event);
+            }
             void ensureCjkFontsLoaded() { rmlui_manager_.ensureCjkFontsLoaded(); }
 
             // Sub-manager access
             [[nodiscard]] AsyncTaskManager& asyncTasks() { return async_tasks_; }
             [[nodiscard]] const AsyncTaskManager& asyncTasks() const { return async_tasks_; }
             void enqueueModal(lfs::core::ModalRequest request);
+            void openTemplateBrowser(core::Uuid target, std::string save_tree = {});
             [[nodiscard]] RmlModalOverlay* modalOverlay() { return rml_modal_overlay_.get(); }
             [[nodiscard]] const RmlModalOverlay* modalOverlay() const {
                 return rml_modal_overlay_.get();
@@ -133,14 +157,15 @@ namespace lfs::vis {
             void enqueueToast(ToastRequest request);
             [[nodiscard]] GizmoManager& gizmo() { return gizmo_manager_; }
             [[nodiscard]] const GizmoManager& gizmo() const { return gizmo_manager_; }
-            [[nodiscard]] PanelLayoutManager& panelLayout() { return panel_layout_; }
-            [[nodiscard]] const PanelLayoutManager& panelLayout() const { return panel_layout_; }
+            [[nodiscard]] bool isSequencerVisible() const { return sequencer_visible_; }
+            void setSequencerVisible(bool visible);
+            void focusMainPanelTab(std::string panel_id) { focus_panel_name_ = std::move(panel_id); }
             [[nodiscard]] GlobalContextMenu& globalContextMenu() { return *global_context_menu_; }
+            [[nodiscard]] ScreenHost& screenHost() { return screen_host_; }
+            [[nodiscard]] const ScreenHost& screenHost() const { return screen_host_; }
 
             // State queries
             bool needsAnimationFrame(bool include_export_progress = true) const;
-            [[nodiscard]] std::string describeAnimationDemand() const;
-            [[nodiscard]] bool needsImmediateAnimationFrame() const;
             // Min finite scheduled GUI animation/update delay (seconds). Used by the
             // idle wait path so CSS transitions / timers wake on time without spinning.
             [[nodiscard]] std::optional<double> secondsUntilNextAnimationFrame(
@@ -153,10 +178,11 @@ namespace lfs::vis {
             // Viewport region access
             glm::vec2 getViewportPos() const;
             glm::vec2 getViewportSize() const;
-            glm::vec2 getSceneRenderViewportPos() const;
-            glm::vec2 getSceneRenderViewportSize() const;
             void commitUiVisibilityTransitionIfFrameReady(bool frame_ready);
-            bool isViewportFocused() const;
+            [[nodiscard]] bool isUiHidden() const { return ui_hidden_; }
+            [[nodiscard]] ViewportLayout viewportLayout() const { return viewport_layout_; }
+            [[nodiscard]] std::vector<ViewId> visibleViews() const;
+            [[nodiscard]] screen::AreaId viewAt(float x, float y) const;
             bool isPositionInViewport(double x, double y) const;
             bool isPositionOverFloatingPanel(double x, double y) const;
             [[nodiscard]] GuiHitTestResult hitTestPointer(double x, double y) const;
@@ -182,7 +208,6 @@ namespace lfs::vis {
                 return window_states_;
             }
             [[nodiscard]] std::string scenePanelActiveTab() const;
-            [[nodiscard]] std::unordered_set<int> visibleCameraUids() const;
             void setScenePanelActiveTab(std::string_view tab);
             [[nodiscard]] bool selectAllSceneNodesIfFocused();
             [[nodiscard]] bool toggleSceneSelectionVisibilityIfFocused();
@@ -194,7 +219,6 @@ namespace lfs::vis {
                 const lfs::core::Scene& scene) const;
             void applySceneTreeChrome(const SceneTreeSessionChrome& chrome);
             void resetSceneTreeChrome();
-            [[nodiscard]] float tabStripScroll() const;
             void setTabStripScroll(float value);
 
             void requestExitConfirmation(
@@ -210,6 +234,7 @@ namespace lfs::vis {
             bool isModalWindowOpen() const;
             [[nodiscard]] bool isHardwareSelectionRingActive() const;
             [[nodiscard]] bool selectionCursorNeedsRender(float mouse_x, float mouse_y) const;
+            [[nodiscard]] SDL_Cursor* pipetteCursor() const noexcept { return pipette_cursor_; }
             [[nodiscard]] bool passiveMouseMoveNeedsRender(float mouse_x, float mouse_y) const;
             [[nodiscard]] std::optional<double> secondsUntilTooltipReveal() const;
             [[nodiscard]] bool isStartupVisible() const { return startup_overlay_.isVisible(); }
@@ -222,7 +247,6 @@ namespace lfs::vis {
             // Rebuild static @tr: RML content after a runtime language switch.
             // The reload is deferred until no RML interaction is active.
             void requestLocalizationUiRefresh();
-            void captureKey(int physical_key, int logical_key, int mods);
             void captureMouseButton(int button, int mods, double x, double y, std::optional<int> chord_key = std::nullopt);
             void captureMouseButtonRelease(int button);
             void captureMouseMove(double x, double y);
@@ -243,7 +267,10 @@ namespace lfs::vis {
             void renderViewportDecorations();
 
         private:
-            friend class lfs::vis::InputControllerFocusTest_FreshLeftDockEdgePressUsesOneOwnershipVerdict_Test;
+            std::string import_render_error_;
+            std::unique_ptr<GraphicsImportErrorScope> import_error_capture_;
+            friend class lfs::vis::WindowInputDispatchTest;
+            friend class lfs::vis::SequencerFrameDemandTest_PropagatesPlaybackStreamAndPreviewDemand_Test;
             friend class lfs::vis::VisualizerImplResetTest_RecoveryDeclineKeepsSidecarSuppressesRepeatAndExplicitSaveDeletesIt_Test;
             friend class lfs::vis::VisualizerImplResetTest_NewProjectClearsRecoveryPromptPendingSoNextOpenProceeds_Test;
             friend class lfs::vis::VisualizerImplResetTest_RecoveredPublishUsesRecoveredCommitKind_Test;
@@ -253,7 +280,11 @@ namespace lfs::vis {
             friend class lfs::vis::VisualizerImplResetTest_StartupOffersRecoveryAfterUncleanShutdown_Test;
             friend class lfs::vis::VisualizerImplResetTest_StartupWithCleanLastSessionLeavesBlankSession_Test;
             friend class lfs::vis::VisualizerImplResetTest_UiVisibilityWaitsForMatchingFrame_Test;
+            friend class lfs::vis::UiVisibilityTransitionTest_UiVisibilityWaitsForMatchingFrame_Test;
             friend class lfs::vis::VisualizerImplResetTest_UiVisibilityTimeoutCommitsRequestedLayout_Test;
+            friend class lfs::vis::UiVisibilityTransitionTest_UiVisibilityTimeoutCommitsRequestedLayout_Test;
+            friend class lfs::vis::UiVisibilityTransitionTest_UiVisibilityFinishesWithoutWaitingForFullscreenGuard_Test;
+            friend class lfs::vis::UiVisibilityTransitionTest_UiVisibilityRequestsFreshFrameWithoutCooldown_Test;
             friend class lfs::vis::VisualizerImplResetTest_RecoveryDismissalPersistsAndNewerCandidateIsOffered_Test;
             friend class lfs::vis::VisualizerImplResetTest_RecoverThenCleanQuitDoesNotReoffer_Test;
             friend class lfs::vis::VisualizerImplResetTest_RecoverThenDiscardExitRemovesMasterSidecar_Test;
@@ -264,17 +295,17 @@ namespace lfs::vis {
             friend class lfs::vis::VisualizerImplResetTest_StartupScansLegacyRecoveryDirectory_Test;
             friend class lfs::vis::VisualizerImplResetTest_RecoverTempWithSidecarThenDiscardExitLeavesNoTempFiles_Test;
             friend class lfs::vis::VisualizerImplResetTest_RecoverLegacyScratchThenSaveAsRemovesLegacyFile_Test;
-            [[nodiscard]] bool isPositionOverRightPanelResizeEdge(double x, double y) const;
-            [[nodiscard]] VulkanViewportPassParams buildVulkanViewportParams(VkExtent2D extent,
-                                                                             std::size_t frame_slot) const;
-            void recordVulkanViewport(VkCommandBuffer command_buffer,
-                                      VkExtent2D extent,
-                                      const VulkanViewportPassParams& params);
+            [[nodiscard]] ViewportLayout activeViewportLayout(const ScreenState& screen) const;
+            void syncEditorFlags();
+            void applyScreenCursor(screen::GestureCursor cursor);
+            [[nodiscard]] ViewportFrameDesc buildViewportFrameDesc(
+                ViewId id, glm::uvec2 extent, std::size_t frame_slot) const;
+
+            friend class lfs::vis::OrthographicZoomTest;
             void setupEventHandlers();
             void applyDefaultStyle();
             void initMenuBar();
             void registerNativePanels();
-            void hideBottomDockPanel(const std::string& id);
             void updateInputOverrides(const PanelInputState& input, bool mouse_in_viewport);
             void applyUiScale(float scale);
             void rebuildFonts(float scale);
@@ -322,7 +353,7 @@ namespace lfs::vis {
                 std::filesystem::path locale_dir,
                 std::unordered_map<std::string, std::filesystem::file_time_type> previous_times,
                 bool detect_changes);
-            void launchDevResourceScan();
+            void launchDevResourceScan(bool detect_changes = true);
             bool consumeDevResourceScanResult();
             bool shouldDeferDevResourceHotReload() const;
             bool reloadLocalizationResources();
@@ -332,9 +363,8 @@ namespace lfs::vis {
             bool consumeCameraThumbnailRefresh();
 
             [[nodiscard]] bool isVramHudOverlayVisible() const;
-            [[nodiscard]] bool isVramHudPublishDue(std::chrono::steady_clock::time_point now) const;
             [[nodiscard]] PanelAnimationVisibility panelAnimationVisibility() const;
-            [[nodiscard]] bool drainVulkanFramesForInteractiveTransition(
+            [[nodiscard]] bool drainGraphicsFramesForInteractiveTransition(
                 lfs::vis::WindowManager& window_manager,
                 const char* transition_name);
             void applyInteractiveTransitionCooldown(
@@ -377,6 +407,7 @@ namespace lfs::vis {
 
             // Owned components
             std::unique_ptr<RmlModalOverlay> rml_modal_overlay_;
+            std::unique_ptr<RmlTemplateBrowser> rml_template_browser_;
             std::unique_ptr<RmlProgressOverlay> rml_progress_overlay_;
             std::unique_ptr<RmlToastOverlay> rml_toast_overlay_;
             std::unique_ptr<lfs::gui::IVideoExtractorWidget> video_widget_;
@@ -386,11 +417,11 @@ namespace lfs::vis {
             bool show_main_panel_ = true;
             bool show_vram_hud_ = false;
             bool perf_hud_expanded_ = true;
-            bool vram_hud_visible_published_ = false;
             bool perf_hud_visible_published_ = false;
-            std::chrono::steady_clock::time_point next_vram_hud_publish_{};
             PerfSampler perf_sampler_;
-            std::chrono::steady_clock::time_point ui_toggle_next_allowed_at_{};
+            std::chrono::steady_clock::time_point last_hud_sample_{};
+            bool last_hud_expanded_ = false;
+            std::chrono::steady_clock::time_point ui_visibility_deadline_{};
             bool ui_toggle_pending_ = false;
             bool ui_visibility_resize_active_ = false;
             bool ui_visibility_layout_committed_ = false;
@@ -409,9 +440,8 @@ namespace lfs::vis {
             std::uint64_t synced_menu_language_generation_ = 0;
 
             // Panel layout and viewport
-            PanelLayoutManager panel_layout_;
+            bool sequencer_visible_ = false;
             ViewportLayout viewport_layout_;
-            float menu_toolbar_right_edge_ = 0.0f;
             bool force_exit_ = false;
             bool exit_confirmation_requested_ = false;
             bool exit_confirmation_dismissed_ = false;
@@ -441,14 +471,13 @@ namespace lfs::vis {
 
             StartupOverlay startup_overlay_;
             RmlShellFrame rml_shell_frame_;
-            RmlRightPanel rml_right_panel_;
-            RmlBottomDock rml_bottom_dock_;
             RmlViewportOverlay rml_viewport_overlay_;
             RmlMenuBar rml_menu_bar_;
             bool menu_pointer_capture_active_ = false;
             bool startup_overlay_pointer_capture_active_ = false;
             RmlStatusBar rml_status_bar_;
             std::unique_ptr<GlobalContextMenu> global_context_menu_;
+            ScreenHost screen_host_;
             bool deferred_startup_work_pending_ = false;
             bool first_render_completed_ = false;
 
@@ -468,7 +497,10 @@ namespace lfs::vis {
 
             // RmlUI integration
             RmlUIManager rmlui_manager_;
-            std::unique_ptr<lfs::vis::VulkanViewportPass> vulkan_viewport_pass_;
+            std::shared_ptr<lfs::vis::ViewportReferenceResources> viewport_compositor_resources_;
+            std::unordered_map<ViewId, std::unique_ptr<lfs::vis::ViewportReferenceRenderer>> viewport_compositors_;
+            std::unordered_map<ViewId, RenderTargetId> viewport_pass_targets_;
+            std::unordered_map<ViewId, std::vector<LineRendererCommand>> view_overlay_commands_;
             bool vulkan_gui_ = false;
             SDL_Cursor* pipette_cursor_ = nullptr;
             SDL_Cursor* selection_add_cursor_ = nullptr;
@@ -500,36 +532,12 @@ namespace lfs::vis {
             EditorContextUpdateStamp last_editor_context_update_stamp_;
             glm::vec2 last_ui_layout_work_pos_{-1.0f, -1.0f};
             glm::vec2 last_ui_layout_work_size_{-1.0f, -1.0f};
-            float last_ui_layout_right_panel_w_ = -1.0f;
-            float last_ui_layout_scene_ratio_ = -1.0f;
-            float last_ui_layout_python_console_w_ = -1.0f;
-            float last_ui_layout_bottom_dock_h_ = -1.0f;
-            float last_ui_layout_left_dock_w_ = -1.0f;
-            bool last_ui_layout_show_main_panel_ = false;
-            bool last_ui_layout_show_sequencer_ = false;
             bool last_ui_layout_ui_hidden_ = false;
-            bool last_ui_layout_python_console_visible_ = false;
-            bool last_ui_layout_bottom_dock_visible_ = false;
+            std::uint64_t last_ui_layout_screen_generation_ = 0;
             uint64_t last_ui_layout_panel_visibility_revision_ = 0;
-            bool last_ui_layout_left_dock_visible_ = false;
-            mutable std::chrono::steady_clock::time_point last_animation_demand_description_at_{};
-            mutable std::string animation_demand_description_cache_;
-            enum class RightPanelPointerRegion : uint8_t {
-                None,
-                Resize,
-                SceneHeader,
-                ActiveTab,
-                Chrome,
-            };
-            bool right_panel_pointer_live_capture_ = false;
-            RightPanelPointerRegion right_panel_pointer_capture_region_ =
-                RightPanelPointerRegion::None;
-            bool right_panel_resize_edge_was_hovered_ = false;
-            bool bottom_dock_pointer_live_capture_ = false;
-            bool left_dock_pointer_live_capture_ = false;
+            std::optional<bool> console_flag_seen_;
+            std::optional<bool> sequencer_flag_seen_;
             bool dock_resize_interaction_active_ = false;
-            std::string last_ui_layout_active_tab_;
-            std::string last_ui_layout_bottom_dock_active_tab_;
             std::uint64_t last_pre_scene_panel_sync_generation_ = 0;
 
             std::atomic<bool> camera_thumbnail_refresh_pending_{false};
@@ -550,6 +558,8 @@ namespace lfs::vis {
             DevResourceWatchState dev_resource_watch_;
             bool pending_localization_ui_refresh_ = false;
             std::uint64_t localized_rml_language_generation_ = std::numeric_limits<std::uint64_t>::max();
+            mutable std::filesystem::path random_init_preview_cached_init_path_;
+            mutable bool random_init_preview_has_gaussian_init_ = false;
 
             // Native ErrorBus surfacing (Phase 8). Declared last so
             // error_subscription_ unsubscribes before any other member (the

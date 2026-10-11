@@ -10,6 +10,7 @@
 #include "rendering/rasterizer/vulkan/src/indirect_layout.h"
 #include "rendering/rasterizer/vulkan/src/viewport_scratch_bucket.h"
 #include "rendering/vulkan_wait.hpp"
+#include "visualizer/rendering/frustum_depth_coverage.hpp"
 
 #include <gtest/gtest.h>
 
@@ -28,6 +29,8 @@ VkAccessFlags2 toAccessMask(VulkanGSPipeline::BarrierMask barrierMask);
 VkPipelineStageFlags2 toStageMask(VulkanGSPipeline::BarrierMask barrierMask);
 
 namespace {
+
+    static_assert(lfs::vis::FrustumDepthCoverage::kTileSize == HIGS_DEPTH_SAMPLE_TILE_SIZE);
 
     using namespace lfs::rendering::vulkan;
     using TaggedBinding = VulkanGSPipeline::TaggedBinding;
@@ -131,6 +134,7 @@ namespace {
         std::vector<RecordedOp> ops;
         std::vector<CapturedBarrier2> barriers;
         std::vector<CapturedFill> fills;
+        std::vector<VkDescriptorBufferInfo> macro_depth_masks;
         std::vector<VulkanGSRendererUniforms> projection_uniforms;
         int submit_calls = 0;
         int begin_calls = 0;
@@ -151,6 +155,7 @@ namespace {
             ops.clear();
             barriers.clear();
             fills.clear();
+            macro_depth_masks.clear();
             projection_uniforms.clear();
         }
 
@@ -321,14 +326,19 @@ namespace {
             active()->ops.push_back(RecordedOp::CopyBuffer);
         }
 
-        // No-op push-descriptor — scripted tests never need real descriptor writes.
         static VKAPI_ATTR void VKAPI_CALL push_descriptor_set(VkCommandBuffer,
                                                               VkPipelineBindPoint,
-                                                              VkPipelineLayout,
+                                                              VkPipelineLayout layout,
                                                               uint32_t,
-                                                              uint32_t,
-                                                              const VkWriteDescriptorSet*) {
-            // intentionally empty
+                                                              uint32_t count,
+                                                              const VkWriteDescriptorSet* writes) {
+            if (layout == fakeVkHandle<VkPipelineLayout>(0x5641) ||
+                layout == fakeVkHandle<VkPipelineLayout>(0x5649)) {
+                for (uint32_t i = 0; i < count; ++i) {
+                    if (writes[i].dstBinding == 12)
+                        active()->macro_depth_masks.push_back(*writes[i].pBufferInfo);
+                }
+            }
         }
 
         // Conditional rendering EXT no-ops for predicate_waves audits.
@@ -423,8 +433,6 @@ namespace {
         }
 
         // Expose protected dispatch / barrier APIs for scripted tests.
-        using VulkanGSPipeline::BufferBarrier;
-        using VulkanGSPipeline::bufferMemoryBarrier;
         using VulkanGSPipeline::executeCompute;
         using VulkanGSPipeline::executeComputeIndirect;
 
@@ -614,90 +622,6 @@ TEST(VkSplatTaggedDispatch, UntaggedDispatchInvalidatesForNextTaggedAccess) {
     pipeline.executeCompute(
         {{64u, 64u}}, nullptr, 0, cp,
         std::vector<_VulkanBuffer>{buf_a});
-
-    script.clear_recording();
-    pipeline.executeCompute(
-        {{64u, 64u}}, nullptr, 0, cp,
-        std::vector<TaggedBinding>{{buf_a, BufferUse::ComputeRead}});
-
-    ASSERT_EQ(script.buffer_barrier_calls(), 1u);
-    const CapturedBarrier2* cap = script.first_buffer_barrier_call();
-    ASSERT_NE(cap, nullptr);
-    ASSERT_EQ(cap->buffer_barriers.size(), 1u);
-    EXPECT_EQ(cap->buffer_barriers[0].buffer, buf_a.buffer);
-    expect_src_dst(cap->buffer_barriers[0],
-                   conservativeSrc(),
-                   scopeFor(BufferUse::ComputeRead));
-
-    pipeline.endCommandBatch(/*use_fence=*/false);
-}
-
-// Catches: legacy bufferMemoryBarrier not invalidating planner state (same G8 shape).
-TEST(VkSplatTaggedDispatch, LegacyBufferMemoryBarrierInvalidates) {
-    DispatchScript script;
-    BindScript bind(script);
-
-    TestablePipeline pipeline;
-    pipeline.install_fake_handles();
-    pipeline.setVulkanDispatch(make_scripted_dispatch());
-
-    auto buf_a = makeBuffer(0xA004);
-    auto cp = pipeline.make_fake_pipeline(1);
-
-    pipeline.beginCommandBatch();
-    pipeline.trackExternalParent(buf_a.buffer);
-
-    pipeline.executeCompute(
-        {{64u, 64u}}, nullptr, 0, cp,
-        std::vector<TaggedBinding>{{buf_a, BufferUse::ComputeWrite}});
-
-    // Legacy pair-overload barrier — must invalidate, and must route through dispatch.
-    pipeline.bufferMemoryBarrier(
-        {{buf_a, VulkanGSPipeline::COMPUTE_SHADER_WRITE}},
-        VulkanGSPipeline::COMPUTE_SHADER_READ);
-
-    script.clear_recording();
-    pipeline.executeCompute(
-        {{64u, 64u}}, nullptr, 0, cp,
-        std::vector<TaggedBinding>{{buf_a, BufferUse::ComputeRead}});
-
-    ASSERT_EQ(script.buffer_barrier_calls(), 1u);
-    const CapturedBarrier2* cap = script.first_buffer_barrier_call();
-    ASSERT_NE(cap, nullptr);
-    ASSERT_EQ(cap->buffer_barriers.size(), 1u);
-    EXPECT_EQ(cap->buffer_barriers[0].buffer, buf_a.buffer);
-    expect_src_dst(cap->buffer_barriers[0],
-                   conservativeSrc(),
-                   scopeFor(BufferUse::ComputeRead));
-
-    pipeline.endCommandBatch(/*use_fence=*/false);
-}
-
-// Catches: BufferBarrier (per-entry src/dst) overload not invalidating planner state (G8).
-TEST(VkSplatTaggedDispatch, LegacyBufferBarrierOverloadInvalidates) {
-    DispatchScript script;
-    BindScript bind(script);
-
-    TestablePipeline pipeline;
-    pipeline.install_fake_handles();
-    pipeline.setVulkanDispatch(make_scripted_dispatch());
-
-    auto buf_a = makeBuffer(0xA014);
-    auto cp = pipeline.make_fake_pipeline(1);
-
-    pipeline.beginCommandBatch();
-    pipeline.trackExternalParent(buf_a.buffer);
-
-    pipeline.executeCompute(
-        {{64u, 64u}}, nullptr, 0, cp,
-        std::vector<TaggedBinding>{{buf_a, BufferUse::ComputeWrite}});
-
-    // Per-entry src/dst overload — same invalidate contract as the pair overload.
-    pipeline.bufferMemoryBarrier({TestablePipeline::BufferBarrier{
-        buf_a,
-        VulkanGSPipeline::COMPUTE_SHADER_WRITE,
-        VulkanGSPipeline::COMPUTE_SHADER_READ,
-    }});
 
     script.clear_recording();
     pipeline.executeCompute(
@@ -1065,13 +989,13 @@ namespace {
                 4 + kLodCompactProtectedCap + 2 * kLodCompactMissCap;
             const VkDeviceSize readback_bytes =
                 (3 + kPayloadWords) * sizeof(std::uint32_t);
-            lod_selection_readback_buffer_ = makeBuffer(0xF001, readback_bytes);
-            lod_selection_readback_mapped_ = reinterpret_cast<std::uint32_t*>(
+            lod_selection_readbacks_[0].buffer = makeBuffer(0xF001, readback_bytes);
+            lod_selection_readbacks_[0].mapped = reinterpret_cast<std::uint32_t*>(
                 static_cast<std::uintptr_t>(0xBEEF0000));
-            lod_selection_readback_initialized_ = true;
-            lod_selection_readback_pending_ = false;
-            lod_selection_readback_chunk_capacity_ = kPayloadWords;
-            lod_selection_readback_capacity_ = 0;
+            lod_selection_readbacks_[0].initialized = true;
+            lod_selection_readbacks_[0].pending = false;
+            lod_selection_readbacks_[0].chunk_capacity = kPayloadWords;
+            lod_selection_readbacks_[0].capacity = 0;
 
             // Visible-count readback (two words) for sort-chain audits.
             visible_count_readback_buffer_ = makeBuffer(0xF002, 2 * sizeof(std::uint32_t));
@@ -1137,9 +1061,9 @@ namespace {
             current_vram = 0;
 
             // Skip vmaDestroy on forged readbacks.
-            lod_selection_readback_initialized_ = false;
-            lod_selection_readback_buffer_ = {};
-            lod_selection_readback_mapped_ = nullptr;
+            lod_selection_readbacks_[0].initialized = false;
+            lod_selection_readbacks_[0].buffer = {};
+            lod_selection_readbacks_[0].mapped = nullptr;
             visible_count_readback_initialized_ = false;
             visible_count_readback_buffer_ = {};
             instance_count_readback_initialized_ = false;
@@ -1163,8 +1087,31 @@ namespace {
             all_compute_pipelines.clear();
         }
 
+        void check_lod_identity_tags() {
+            const auto semaphore = fakeVkHandle<VkSemaphore>(0xAB10);
+            auto& a = lod_selection_readbacks_[0];
+            a.pending = true;
+            a.order = 1;
+            tagDeferredLodSelectionReadback(semaphore, 5, {17, 3, 8});
+            auto& b = lod_selection_readbacks_[1];
+            b.pending = true;
+            b.order = 2;
+            tagDeferredLodSelectionReadback(semaphore, 6, {9001, 4, 9});
+            EXPECT_EQ(a.value, 5u);
+            EXPECT_EQ(a.identity.target, 17u);
+            EXPECT_EQ(a.identity.model_generation, 3u);
+            EXPECT_EQ(a.identity.tree_generation, 8u);
+            EXPECT_EQ(b.value, 6u);
+            EXPECT_EQ(b.identity.target, 9001u);
+            // Counter is still zero: neither tagged copy can be consumed.
+            EXPECT_FALSE(pollDeferredLodSelectionStats());
+            EXPECT_TRUE(a.pending);
+            EXPECT_TRUE(b.pending);
+            b = {};
+        }
+
         [[nodiscard]] _VulkanBuffer& lod_readback() noexcept {
-            return lod_selection_readback_buffer_;
+            return lod_selection_readbacks_[0].buffer;
         }
 
         // Drop GPU timestamp bookkeeping so endCommandBatch does not call
@@ -2695,6 +2642,14 @@ TEST(VkSplatTaggedDispatch, MacroDepthWavesAuditW1AndW3) {
             /*overlays_active=*/false,
             /*predicate_waves=*/false);
 
+        // Even without sparse coverage, bind a valid fallback for the mask
+        // descriptor required by the compose shader's full-depth variant.
+        ASSERT_FALSE(script.macro_depth_masks.empty());
+        for (const auto& descriptor : script.macro_depth_masks) {
+            EXPECT_EQ(descriptor.buffer, buffers.pixel_depth.deviceBuffer.buffer);
+            EXPECT_GE(descriptor.range, kAuditWaveImage * kAuditWaveImage * sizeof(float));
+        }
+
         const std::size_t n = total_buffer_barrier_structs(script);
         const std::size_t baseline = armed == 1 ? kAuditMacroDepthW1 : kAuditMacroDepthW3;
         EXPECT_LE(n, baseline) << "W=" << armed;
@@ -2823,4 +2778,13 @@ TEST(VkSplatTaggedDispatch, LegacyDepthWavesConditionalReadPerWave) {
 
     renderer.discard_timestamps();
     renderer.endCommandBatch(/*use_fence=*/false);
+}
+
+TEST(VkSplatTaggedDispatch, LodReadbackKeepsInFlightTargetAndGenerationTags) {
+    DispatchScript script;
+    BindScript bind(script);
+    TestableRenderer renderer;
+    renderer.install_fake_handles();
+    renderer.setVulkanDispatch(make_scripted_dispatch());
+    renderer.check_lod_identity_tags();
 }

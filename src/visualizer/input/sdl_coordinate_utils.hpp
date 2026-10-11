@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include "input/injected_pointer.hpp"
+
+#include <SDL3/SDL_events.h>
 #include <SDL3/SDL_mouse.h>
 #include <SDL3/SDL_video.h>
 #include <glm/vec2.hpp>
@@ -22,6 +25,13 @@ namespace lfs::vis::input {
     }
 
     inline SDL_MouseButtonFlags mouseStateInPixels(SDL_Window* window, float* x, float* y) {
+        if (const auto injected = injectedPointer()) {
+            if (x)
+                *x = injected->x;
+            if (y)
+                *y = injected->y;
+            return injected->buttons;
+        }
         const auto buttons = SDL_GetMouseState(x, y);
         const auto scale = windowPixelScale(window);
         if (x)
@@ -31,21 +41,84 @@ namespace lfs::vis::input {
         return buttons;
     }
 
+    inline SDL_MouseButtonFlags mouseButtons() {
+        if (const auto injected = injectedPointer())
+            return injected->buttons;
+        return SDL_GetMouseState(nullptr, nullptr);
+    }
+
+    inline SDL_MouseButtonFlags mouseStateInWindowCoordinates(SDL_Window* window, float* x,
+                                                              float* y) {
+        if (const auto injected = injectedPointer()) {
+            const auto scale = windowPixelScale(window);
+            if (x)
+                *x = injected->x / scale.x;
+            if (y)
+                *y = injected->y / scale.y;
+            return injected->buttons;
+        }
+        return SDL_GetMouseState(x, y);
+    }
+
+    inline SDL_MouseButtonFlags globalMouseState(SDL_Window* window, float* x, float* y) {
+        if (const auto injected = injectedPointer()) {
+            int window_x = 0;
+            int window_y = 0;
+            SDL_GetWindowPosition(window, &window_x, &window_y);
+            const auto scale = windowPixelScale(window);
+            if (x)
+                *x = static_cast<float>(window_x) + injected->x / scale.x;
+            if (y)
+                *y = static_cast<float>(window_y) + injected->y / scale.y;
+            return injected->buttons;
+        }
+        return SDL_GetGlobalMouseState(x, y);
+    }
+
     // Pointer position for wheel and gesture events. macOS scrolls the window
     // under the cursor even while it is inactive, but SDL only tracks motion in
     // the key window, so its own position can be stale there.
     inline glm::vec2 wheelPointerInPixels(SDL_Window* window) {
+        if (const auto injected = injectedPointer())
+            return {injected->x, injected->y};
         float x = 0.0f, y = 0.0f;
 #ifdef __APPLE__
         int window_x = 0, window_y = 0;
         if (window && SDL_GetWindowPosition(window, &window_x, &window_y)) {
-            SDL_GetGlobalMouseState(&x, &y);
+            globalMouseState(window, &x, &y);
             return glm::vec2(x - static_cast<float>(window_x), y - static_cast<float>(window_y)) *
                    windowPixelScale(window);
         }
 #endif
         mouseStateInPixels(window, &x, &y);
         return {x, y};
+    }
+
+    // Immediate GUI dispatch must use the same pixels as frame-time polling.
+    // Keep the original event in logical coordinates for native window handling.
+    inline SDL_Event pointerEventInPixels(const SDL_Event& native_event, SDL_Window* window) {
+        SDL_Event event = native_event;
+        const auto scale = windowPixelScale(window);
+        switch (event.type) {
+        case SDL_EVENT_MOUSE_MOTION:
+            event.motion.x *= scale.x;
+            event.motion.y *= scale.y;
+            event.motion.xrel *= scale.x;
+            event.motion.yrel *= scale.y;
+            break;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP:
+            event.button.x *= scale.x;
+            event.button.y *= scale.y;
+            break;
+        case SDL_EVENT_MOUSE_WHEEL:
+            event.wheel.mouse_x *= scale.x;
+            event.wheel.mouse_y *= scale.y;
+            break;
+        default:
+            break;
+        }
+        return event;
     }
 
 } // namespace lfs::vis::input

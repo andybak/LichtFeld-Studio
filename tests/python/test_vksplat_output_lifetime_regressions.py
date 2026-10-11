@@ -44,7 +44,7 @@ def test_point_cloud_vulkan_viewport_capture_uses_readback():
     assert "VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL" in source
     assert "PointCloudVulkanRenderer::readOutputImage" in source
 
-    lazy_capture_start = manager.index("point_cloud_vulkan_renderer_->readOutputImage")
+    lazy_capture_start = manager.index("point_scene_renderer_->readOutputImage")
     lazy_capture_body = manager[lazy_capture_start - 500:lazy_capture_start + 500]
     assert "Failed to capture point-cloud Vulkan viewport image" in lazy_capture_body
     assert "[]() -> std::shared_ptr<lfs::core::Tensor> { return {}; }" not in lazy_capture_body
@@ -78,10 +78,12 @@ def test_vulkan_preview_render_view_uses_native_device_limits_not_16k_policy():
     assert "MAX_VIEWPORT_SIZE" not in constants
     assert "16384" not in source
 
-    assert "VksplatViewportRenderer::OutputSlot::Preview" in source
+    assert "preview_render_target_" in source
     assert "format_properties.imageFormatProperties.maxExtent" in context
     assert "exceeds device-supported limit" in context
     assert "kMaxNativePreviewPixelStateBytes" in source
+    # Catches growing the export band budget back: 4 GiB bands peaked at +9.3 GB VRAM for a 32K export.
+    assert "kMaxNativePreviewPixelStateBytes = std::size_t{256} << 20" in source
     assert "renderPreviewImageTiledWithState" in header
     assert "renderPreviewImageTiledWithState" in source
     assert "request.frame_view.intrinsics_override" in source
@@ -108,11 +110,10 @@ def test_vksplat_preview_export_releases_transient_resources():
     source = _read("src/visualizer/rendering/vksplat_viewport_renderer.cpp")
     manager = _read("src/visualizer/rendering/rendering_manager_viewport.cpp")
 
-    assert "releasePreviewResources" in header
-    assert "releaseOutputSlot(OutputSlot::Preview, /*evict=*/true)" in source
+    assert "releaseRenderTarget" in header
+    assert "ring_.releaseRenderTarget(output_index" in source
     assert "releasePrivateScratchBuffers()" in source
     assert "releaseSharedScratchArena()" in source
-    assert "logVramBreakdownIfChanged(\"preview_release\")" in source
     assert "releasePreviewImageResources" in manager
 
 

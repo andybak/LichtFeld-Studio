@@ -1,6 +1,7 @@
 /* SPDX-FileCopyrightText: 2026 LichtFeld Studio Authors
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "core/camera.hpp"
 #include "core/event_bridge/event_bridge.hpp"
 #include "core/event_bus.hpp"
 #include "core/events.hpp"
@@ -20,14 +21,17 @@
 #include "rendering/render_constants.hpp"
 #include "rendering/rendering_manager.hpp"
 #include "scene/scene_manager.hpp"
+#include "screen/screen_service.hpp"
 #include "selection/depth_window_geometry.hpp"
 #include "selection/selection_service.hpp"
+#include "test_view_targets.hpp"
 #include "tools/selection_tool.hpp"
 #include "tools/tool_base.hpp"
 #include "visualizer/app_store.hpp"
 #include "visualizer_impl.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <glm/glm.hpp>
 #include <gtest/gtest.h>
 #include <memory>
@@ -173,7 +177,7 @@ protected:
         lfs::vis::services().clear();
         lfs::vis::op::undoHistory().clear();
 
-        rendering_manager_ = std::make_unique<lfs::vis::RenderingManager>();
+        rendering_manager_ = std::make_unique<lfs::vis::RenderingManager>(screens_);
         scene_manager_ = std::make_unique<lfs::vis::SceneManager>();
         lfs::vis::services().set(rendering_manager_.get());
         lfs::vis::services().set(scene_manager_.get());
@@ -226,6 +230,8 @@ protected:
         context_->setModalEvent(event);
         return op.modal(*context_, props);
     }
+
+    lfs::vis::screen::ScreenService screens_;
 
     std::unique_ptr<lfs::vis::RenderingManager> rendering_manager_;
     std::unique_ptr<lfs::vis::SceneManager> scene_manager_;
@@ -332,7 +338,8 @@ TEST_F(SelectionOperatorModalTest, DepthFilterDoesNotOverrideGaussianRenderMode)
     rendering_manager_->updateSettings(settings);
 
     Viewport viewport(100, 100);
-    lfs::vis::ToolContext tool_context(rendering_manager_.get(), scene_manager_.get(), &viewport, nullptr);
+    lfs::vis::TestViewTargets tool_context_views{viewport};
+    lfs::vis::ToolContext tool_context(rendering_manager_.get(), scene_manager_.get(), &tool_context_views, nullptr);
     tool_context.updateViewportBounds(0.0f, 0.0f, 100.0f, 100.0f);
 
     lfs::vis::tools::SelectionTool tool;
@@ -400,7 +407,8 @@ TEST_F(SelectionOperatorModalTest, ClosedPolygonVertexDragConsumesMouseMoveUntil
 
 TEST_F(SelectionOperatorModalTest, DepthFilterExtentsUseIndependentScaleAxes) {
     Viewport viewport(100, 100);
-    lfs::vis::ToolContext tool_context(rendering_manager_.get(), scene_manager_.get(), &viewport, nullptr);
+    lfs::vis::TestViewTargets tool_context_views{viewport};
+    lfs::vis::ToolContext tool_context(rendering_manager_.get(), scene_manager_.get(), &tool_context_views, nullptr);
     tool_context.updateViewportBounds(0.0f, 0.0f, 100.0f, 100.0f);
 
     constexpr float k_scale_x = 0.4f;
@@ -966,6 +974,14 @@ TEST_F(DepthWindowDragLifecycleTest, ModifierReleaseClearsDepthWindowDragPreview
 }
 
 TEST_F(DepthWindowDragLifecycleTest, GtToggleClearsDepthWindowDragPreview) {
+    scene_manager_->changeContentType(lfs::vis::SceneManager::ContentType::Dataset);
+    auto& scene = scene_manager_->getScene();
+    const auto group = scene.addCameraGroup("Cameras", scene.addGroup("Dataset"), 1);
+    auto camera = std::make_shared<lfs::core::Camera>(
+        Tensor::eye(3, Device::CPU), Tensor::zeros({size_t{3}}, Device::CPU),
+        100.0f, 100.0f, 32.0f, 32.0f, Tensor(), Tensor(), lfs::core::CameraModelType::PINHOLE,
+        "source", std::filesystem::path("source.png"), std::filesystem::path{}, 64, 64, 1);
+    scene.addCamera("source", group, std::move(camera));
     expectMidDragPreviewActive();
     lfs::core::events::cmd::ToggleGTComparison{}.emit();
     EXPECT_FALSE(rendering_manager_->depthWindowDragPreview());
@@ -1161,7 +1177,8 @@ TEST_F(DepthWindowDragLifecycleTest, FocusLossClearsDepthWindowDragPreview) {
     // constructed controller (its cancelModalOperator path is what terminates
     // the drag).
     Viewport focus_viewport(options_.width, options_.height);
-    lfs::vis::InputController input(nullptr, focus_viewport);
+    lfs::vis::TestViewTargets input_views{focus_viewport};
+    lfs::vis::InputController input{nullptr, input_views};
     input.onWindowFocusLost();
     EXPECT_FALSE(rendering_manager_->depthWindowDragPreview());
     EXPECT_FALSE(lfs::vis::op::operators().hasModalOperator());
@@ -1171,11 +1188,11 @@ TEST_F(SelectionOperatorModalTest, PolygonIgnoresDockClicksAndContinuesInViewpor
     using namespace lfs::vis;
     auto& registry = op::operators();
     registry.setSceneManager(scene_manager_.get());
-    registry.registerOperator(op::BuiltinOp::SelectionStroke, SelectionStrokeOperator::DESCRIPTOR,
-                              [] { return std::make_unique<SelectionStrokeOperator>(); });
+    op::registerSelectionOperators();
     Viewport viewport(100, 100);
     input::InputBindings::setPersistenceEnabled(false);
-    InputController controller(nullptr, viewport);
+    lfs::vis::TestViewTargets controller_views{viewport};
+    InputController controller{nullptr, controller_views};
     controller.initialize();
     controller.updateViewportBounds(0, 0, 100, 100);
     OperatorProperties props;
@@ -1226,10 +1243,12 @@ TEST_F(SelectionOperatorModalTest, CameraMotionClearsPassiveHoverWithoutChanging
     set_initial_selection({1, 0});
     Viewport viewport(100, 100);
     input::InputBindings::setPersistenceEnabled(false);
-    InputController controller(nullptr, viewport);
+    lfs::vis::TestViewTargets controller_views{viewport};
+    InputController controller{nullptr, controller_views};
     controller.initialize();
     controller.updateViewportBounds(0, 0, 100, 100);
-    ToolContext tool_context(rendering_manager_.get(), scene_manager_.get(), &viewport, nullptr);
+    lfs::vis::TestViewTargets tool_context_views{viewport};
+    ToolContext tool_context(rendering_manager_.get(), scene_manager_.get(), &tool_context_views, nullptr);
     tool_context.updateViewportBounds(0, 0, 100, 100);
     tools::SelectionTool tool;
     EXPECT_TRUE(tool.initialize(tool_context));

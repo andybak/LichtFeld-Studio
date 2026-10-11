@@ -8,6 +8,7 @@
 
 #include "core/error.hpp"
 #include "core/parameters.hpp"
+#include "core/tensor_execution.hpp"
 #include "core/uuid.hpp"
 
 #include <chrono>
@@ -29,8 +30,15 @@ namespace lfs::training {
     class ADMMSparsityOptimizer;
 
     struct TrainingSnapshotServiceConfig {
+#if defined(__APPLE__)
+        // Four independent slots keep all drain workers busy without retaining
+        // a 256 MiB pinned ring for the lifetime of the trainer.
+        std::size_t ring_slots = 4;
+        std::size_t band_bytes = 16ull * 1024 * 1024;
+#else
         std::size_t ring_slots = 4;
         std::size_t band_bytes = 64ull * 1024 * 1024;
+#endif
         std::size_t calibration_bytes = 32ull * 1024 * 1024;
         int calibration_iterations = 4;
     };
@@ -103,6 +111,9 @@ namespace lfs::training {
         // Explicit saves may use the smaller headroom-only host-memory
         // reserve; autosave captures retain the full safety reserve.
         bool relaxed_host_memory_gate = false;
+        // Asked for the missing bytes before the host-memory gate defers or
+        // rejects the capture; returns how many bytes it released.
+        std::function<std::uint64_t(std::uint64_t)> release_host_memory;
         // Optional origin for the one optimizer-pause clock. The caller sets
         // this immediately before draining model readers/locks so those waits
         // are included with the service-side stream synchronizations.
@@ -114,7 +125,7 @@ namespace lfs::training {
         const PPISP* ppisp = nullptr;
         const PPISPControllerPool* ppisp_controller_pool = nullptr;
         const ADMMSparsityOptimizer* sparsity_optimizer = nullptr;
-        std::span<void* const> mutating_streams;
+        std::span<const lfs::core::TensorExecutionTarget> mutating_queues;
         // Runs inside the measured safe-point clock after all mutation streams
         // are quiescent. The callback may only copy detached value state and
         // must stamp it with the supplied UUID. JSON/DOM/chapter assembly runs
@@ -125,10 +136,39 @@ namespace lfs::training {
             capture_additional_cpu_state;
     };
 
+    // Fixed-size storage constructed without a checkpoint-sized zero pass.
+    // Only the capture service writes it. Publication requires complete byte
+    // coverage and successful completion of every asynchronous drain.
+    class TrainingSnapshotBytes {
+    public:
+        explicit TrainingSnapshotBytes(std::size_t size, bool overwrite = false);
+        TrainingSnapshotBytes(const TrainingSnapshotBytes&) = delete;
+        TrainingSnapshotBytes& operator=(const TrainingSnapshotBytes&) = delete;
+        ~TrainingSnapshotBytes();
+
+        [[nodiscard]] std::size_t size() const noexcept;
+        // Large Apple snapshots are file-backed and intentionally have no
+        // checkpoint-sized contiguous address. Small/test captures retain the
+        // legacy accessors.
+        [[nodiscard]] std::byte* data() noexcept;
+        [[nodiscard]] const std::byte* data() const noexcept;
+        [[nodiscard]] bool file_backed() const noexcept;
+        // Map the immutable file-backed spool after capture completes. The
+        // clean mapping lets the project compressor consume it without a
+        // checkpoint-sized anonymous allocation or per-record memcpy.
+        [[nodiscard]] lfs::Result<std::span<const std::byte>>
+        mapped_data() const;
+        void write_at(std::uint64_t offset, std::span<const std::byte> source);
+
+    private:
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
+    };
+
     struct CapturedTrainingSnapshot {
         lfs::core::Uuid snapshot_uuid;
         int iteration = 0;
-        std::shared_ptr<const std::vector<std::byte>> checkpoint_bytes;
+        std::shared_ptr<const TrainingSnapshotBytes> checkpoint_bytes;
         TrainingSnapshotPauseMetrics metrics;
     };
 
@@ -170,7 +210,6 @@ namespace lfs::training {
         operator=(const PendingTrainingSnapshot&) = delete;
         ~PendingTrainingSnapshot();
 
-        [[nodiscard]] bool ready() const;
         [[nodiscard]] lfs::Result<CapturedTrainingSnapshot>
         wait();
 

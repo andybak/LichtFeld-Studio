@@ -3,7 +3,7 @@
 
 #pragma once
 #include "core/tensor.hpp"
-#include "lfs/kernels/ppisp.cuh"
+#include "core/tensor_ppisp.hpp"
 #include <cassert>
 #include <cmath>
 #include <expected>
@@ -65,13 +65,10 @@ namespace lfs::training {
         bool train_crf = true;      // When false, CRF stays at identity and is not stepped
     };
 
-    /// Full-width row band of a larger image: vignetting is evaluated in full-image
-    /// coordinates so banded application matches a single full-image pass exactly.
-    /// full_height == 0 means the input covers the whole image.
-    struct PPISPRegion {
-        int y_offset = 0;
-        int full_height = 0;
-    };
+    /// Crop of a larger image: vignetting is evaluated in full-image coordinates
+    /// so regional application matches a single full-image pass exactly.
+    /// A zero full extent uses the input extent on that axis.
+    using PPISPRegion = lfs::core::PpispRegion;
 
     /// Physically-Plausible Image Signal Processing for per-camera/per-frame appearance modeling
     class PPISP {
@@ -101,6 +98,11 @@ namespace lfs::training {
         [[nodiscard]] const lfs::core::Tensor& color_params() const { return color_params_; }
         [[nodiscard]] const lfs::core::Tensor& vignetting_params() const { return vignetting_params_; }
         [[nodiscard]] const lfs::core::Tensor& crf_params() const { return crf_params_; }
+        /// Accumulated gradients, laid out like the parameters.
+        [[nodiscard]] const lfs::core::Tensor& exposure_grad() const { return exposure_grad_; }
+        [[nodiscard]] const lfs::core::Tensor& vignetting_grad() const { return vignetting_grad_; }
+        [[nodiscard]] const lfs::core::Tensor& color_grad() const { return color_grad_; }
+        [[nodiscard]] const lfs::core::Tensor& crf_grad() const { return crf_grad_; }
 
         /// Check if a frame UID is registered
         bool is_known_frame(int uid) const;
@@ -119,6 +121,9 @@ namespace lfs::training {
         /// @param uid Original frame UID (translated internally)
         lfs::core::Tensor apply(const lfs::core::Tensor& rgb, int camera_id, int uid,
                                 const PPISPRegion& region = {});
+
+        lfs::core::Tensor apply_interpolated_frames(const lfs::core::Tensor& rgb, int camera_id,
+                                                    int left_uid, int right_uid, float fraction);
 
         /// Same as apply(), but exposure comes from the argument instead of
         /// exposure_params_[frame]. Camera-level vignetting/CRF come from camera_id;
@@ -161,6 +166,8 @@ namespace lfs::training {
         /// @param uid Original frame UID (translated internally)
         lfs::core::Tensor backward(const lfs::core::Tensor& rgb, const lfs::core::Tensor& grad_output, int camera_id,
                                    int uid);
+        /// Backward pass that overwrites the contiguous grad with the gradient with respect to rgb.
+        void backward_in_place(const lfs::core::Tensor& rgb, lfs::core::Tensor& grad, int camera_id, int uid);
 
         /// Backward pass through ISP using controller-predicted params.
         /// Returns gradient w.r.t. controller_params [1,9] for controller backward.
@@ -252,7 +259,7 @@ namespace lfs::training {
         int translate_frame(int uid) const;
 
         lfs::core::Tensor apply_forward(const lfs::core::Tensor& rgb, int camera_idx, int frame_idx,
-                                        const float* exposure, const float* color, int num_frames,
+                                        const lfs::core::Tensor& exposure, const lfs::core::Tensor& color, int num_frames,
                                         const PPISPRegion& region);
 
         void allocate_tensors();

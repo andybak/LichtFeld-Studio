@@ -29,25 +29,6 @@ body {
     z-index: 1;
 }
 
-.viewport-frame-border {
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 4dp;
-    pointer-events: none;
-    z-index: 1;
-}
-
-.left-dock-resize-indicator {
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    pointer-events: none;
-    z-index: 12;
-}
-
 /* Centered in the viewport; the side padding keeps the wrapped lines clear of
    the docked tool rail. */
 .empty-state-hint {
@@ -281,6 +262,10 @@ body {
     z-index: 8;
 }
 
+.gizmo-cramped .viewport-gizmo-controls {
+    display: none;
+}
+
 .viewport-gizmo-control-row {
     display: flex;
     flex-direction: row;
@@ -499,9 +484,12 @@ body {
     padding: 0 0 0 8dp;
     position: relative;
     top: 0;
+    /* Viewport selects align from the top instead of using shared centering. */
+    transform: none;
 }
 
-#depth-view-block .viewport-depth-mode-select selectvalue {
+#depth-view-block .viewport-depth-mode-select selectvalue,
+#gt-compare-mode-block .viewport-depth-mode-select selectvalue {
     height: 20dp;
     line-height: 20dp;
 }
@@ -512,9 +500,11 @@ body {
     line-height: 22dp;
     position: relative;
     top: 0;
+    transform: none;
 }
 
-#depth-view-block .viewport-depth-mode-select selectarrow {
+#depth-view-block .viewport-depth-mode-select selectarrow,
+#gt-compare-mode-block .viewport-depth-mode-select selectarrow {
     height: 20dp;
     line-height: 20dp;
 }
@@ -595,23 +585,6 @@ body {
     min-width: 50dp;
 }
 
-/* The chip labels the depth sliders' target panel in independent-dual only.
-   Keep it inside Near/Far to avoid an extra wrapped line with the sync toggle.
-   Keep this selector a descendant match so styling applies at every width. */
-#selection-block .viewport-selection-depth-panel-chip {
-    flex-grow: 0;
-    flex-shrink: 0;
-    width: 20dp;
-    height: 20dp;
-    line-height: 20dp;
-    text-align: center;
-    font-size: 12dp;
-    font-weight: bold;
-    border-radius: 4dp;
-    /* Palette fill belongs in viewport_overlay.theme.rcss; see
-       docs/docs/development/rmlui-styling.md, Theme Tokens. */
-}
-
 #selection-block .depth-axis-size > .number-input.viewport-selection-depth-input {
     /* Wide enough for the anisotropic "63x45%" Size readout at 1.5x UI scale. */
     width: 104dp;
@@ -637,7 +610,6 @@ body {
     /* Center Near/Far above Size/X/Y with equal slider lengths.
        Pin one action button to the right of each line; this RmlUi has no flex
        `order`, so flow would place both on the last line.
-       Sync shares the chip's independent-dual visibility and sits beside Near/Far.
        Viz stays beside Size/X/Y whenever the depth row is shown. */
     #selection-block .viewport-selection-depth-fields {
         flex-wrap: wrap;
@@ -875,6 +847,7 @@ body {
 }
 
 #gt-compare-mode-block .viewport-gt-compare-panel {
+    position: relative;
     padding: 5dp 6dp;
     border-radius: 6dp;
     gap: 0;
@@ -967,6 +940,78 @@ body {
     color: #a6adc8;
     font-size: 10dp;
     line-height: 12dp;
+}
+
+#gt-compare-mode-block .viewport-gt-compare-actual-size {
+    width: 48dp;
+    min-width: 48dp;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5dp;
+    border-width: 1dp;
+    height: 22dp;
+    min-height: 22dp;
+    margin-left: 4dp;
+    padding: 0 3dp;
+    border-radius: 4dp;
+    font-size: 11dp;
+    line-height: 20dp;
+    box-sizing: border-box;
+}
+
+@keyframes gt-compare-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+.viewport-gt-compare-spinner {
+    width: 10dp;
+    height: 10dp;
+    border-width: 2dp;
+    border-radius: 5dp;
+    box-sizing: border-box;
+    visibility: hidden;
+}
+
+.viewport-gt-compare-spinner.is-spinning {
+    visibility: visible;
+    animation: gt-compare-spin 0.8s linear-in infinite;
+}
+
+#gt-compare-mode-block .viewport-gt-compare-status {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin-top: 4dp;
+    min-width: 0;
+    padding: 4dp 6dp;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 6dp;
+    font-size: 11dp;
+    white-space: nowrap;
+}
+
+.viewport-gt-compare-warning {
+    width: 13dp;
+    height: 13dp;
+    line-height: 13dp;
+    text-align: center;
+    border-width: 1dp;
+    border-radius: 8dp;
+}
+
+.viewport-gt-compare-retry {
+    padding: 2dp 5dp;
+    border-width: 1dp;
+    border-radius: 3dp;
+}
+
+#gt-compare-mode-block .viewport-gt-compare-actual-size:disabled {
+    opacity: 0.45;
+    cursor: default;
 }
 
 .viewport-transform-panel.viewport-export-panel {
@@ -1523,7 +1568,6 @@ body {
 .viewport-lod-stats-value {
     flex-grow: 1;
     min-width: 0;
-    font-family: "JetBrains Mono";
     font-size: 9dp;
     line-height: 14dp;
     text-align: right;
@@ -1590,12 +1634,16 @@ body {
 
 .vram-hud-tabs {
     display: flex;
+    flex-wrap: wrap;
     gap: 0dp;
     border-bottom-width: 1dp;
 }
 
+/* Content-sized tabs wrap onto a second row in a narrow HUD instead of overlapping. */
 .vram-hud-tab {
-    flex: 1;
+    flex: 1 0 auto;
+    padding: 0 6dp;
+    white-space: nowrap;
     height: 24dp;
     font-size: 11dp;
     text-align: center;
@@ -2182,11 +2230,12 @@ body {
     align-items: center;
     gap: 6dp;
     height: 18dp;
-    cursor: pointer;
+    drag: drag;
+    cursor: move;
 }
 
 .perf-hud-strip-title { flex-grow: 1; }
-.perf-hud-strip-rate, .perf-hud-strip-value, .perf-hud-strip-badge { font-family: "JetBrains Mono"; font-weight: normal; }
+.perf-hud-strip-rate, .perf-hud-strip-value, .perf-hud-strip-badge { font-weight: normal; }
 .perf-hud-strip-meter { display: flex; align-items: center; gap: 5dp; height: 18dp; cursor: pointer; }
 .perf-hud-strip-label { width: 34dp; }
 .perf-hud-meter-track { flex-grow: 1; display: flex; height: 7dp; overflow: hidden; border-radius: 3dp; }
@@ -2237,6 +2286,52 @@ body {
     height: 0%;
 }
 
+.vram-hud-timeline-toolbar, .vram-hud-timeline-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4dp;
+    margin-bottom: 5dp;
+}
+
+.vram-hud-timeline-toolbar button, .vram-hud-timeline-legend button {
+    font-size: 10dp;
+    padding: 3dp 6dp;
+    cursor: pointer;
+}
+
+.vram-hud-timeline { display: block; width: 100%; height: 100%; }
+.vram-hud-timeline-frame { position: relative; width: 100%; height: 48%; min-height: 220dp; flex-shrink: 0; margin-bottom: 0dp; overflow: hidden; }
+.vram-hud-timeline-axis { position: absolute; top: 0; bottom: 0; left: 3dp; display: flex; flex-direction: column; justify-content: space-between; pointer-events: none; font-size: 9dp; }
+.vram-hud-timeline-capacity { position: absolute; top: 16dp; right: 5dp; pointer-events: none; font-size: 9dp; }
+.vram-hud-timeline-x-axis { width: 100%; display: flex; justify-content: space-between; height: 15dp; font-size: 9dp; }
+.vram-hud-timeline-markers { position: absolute; top: 0; left: 0; right: 0; height: 16dp; pointer-events: none; }
+.vram-hud-marker { position: absolute; top: 0; font-size: 8dp; opacity: .55; pointer-events: auto; }
+#vram-hud-panel-overview > * { flex-shrink: 0; }
+.vram-hud-crosshair { position: absolute; display: none; top: 0; bottom: 0; width: 1dp; pointer-events: none; }
+.vram-hud-crosshair.active { display: block; }
+.vram-hud-mini-timeline { display: block; width: 100%; height: 28dp; }
+.vram-hud-health { font-size: 10dp; margin-right: 7dp; }
+.vram-hud-timeline-tooltip { min-height: 16dp; font-size: 10dp; white-space: normal; }
+.vram-hud-timeline-legend button { display: flex; align-items: center; gap: 4dp; }
+.vram-hud-timeline-legend button.muted { opacity: .42; }
+.vram-hud-legend-swatch { display: inline-block; width: 8dp; height: 8dp; border-radius: 2dp; }
+.vram-hud-legend-chip b { font-weight: normal; margin-left: 3dp; }
+.vram-hud-section-title { font-size: 11dp; font-weight: bold; cursor: pointer; margin-top: 7dp; }
+.vram-hud-peak { display: flex; flex-direction: column; gap: 3dp; }
+.vram-hud-peak-bar { display: flex; width: 100%; height: 11dp; overflow: hidden; }
+.vram-hud-peak-segment { height: 100%; }
+.vram-hud-peak-row { display: flex; justify-content: space-between; align-items: center; gap: 6dp; font-size: 10dp; }
+.vram-hud-peak-value { min-width: 155dp; text-align: right; }
+.vram-hud-movers { max-height: 130dp; overflow-y: auto; font-size: 10dp; }
+.vram-hud-mover-row { display: flex; align-items: center; gap: 6dp; padding: 2dp; cursor: pointer; }
+.vram-hud-mover-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vram-hud-mover-number { width: 76dp; min-width: 76dp; text-align: right; }
+.vram-hud-mover-spark { display: flex; align-items: flex-end; width: 62dp; min-width: 62dp; height: 14dp; gap: 1dp; }
+.vram-hud-mover-spark span { flex: 1 1 0; min-width: 1dp; }
+.vram-hud-export-path { font-size: 10dp; margin-top: 4dp; }
+.vram-hud-overlay .vram-hud-mini-timeline { display: none; }
+.vram-hud-overlay.perf-hud-compact .vram-hud-mini-timeline { display: block; }
+
 .perf-hud-ledger-allocated,
 .perf-hud-ledger-disclosure,
 .perf-hud-ledger-badge,
@@ -2254,7 +2349,6 @@ body {
 .vram-hud-allocs-summary-value,
 .vram-hud-breakdown-bytes,
 .vram-hud-breakdown-pct {
-    font-family: "JetBrains Mono";
     font-weight: normal;
 }
 
@@ -2284,3 +2378,28 @@ body {
     white-space: nowrap;
     font-size: 13dp;
 }
+.node-preview-position {
+    position: absolute;
+    z-index: 20;
+    top: 24dp;
+    left: 84dp;
+    right: 102dp;
+    display: flex;
+    justify-content: center;
+    pointer-events: none;
+}
+.node-preview-banner {
+    flex: 0 1 340dp;
+    width: 340dp;
+    min-width: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+    padding: 5dp 11dp;
+    border-radius: 12dp;
+    border-width: 0;
+    font-size: 11dp;
+    line-height: 16dp;
+    text-align: center;
+    pointer-events: none;
+}
+.node-preview-banner.hidden { display: none; }

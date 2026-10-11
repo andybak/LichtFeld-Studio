@@ -124,10 +124,7 @@ namespace lfs::vis {
             }
             return input.mouse_wheel != 0.0f ||
                    !input.keys_pressed.empty() ||
-                   !input.keys_released.empty() ||
-                   !input.text_codepoints.empty() ||
-                   !input.text_inputs.empty() ||
-                   input.has_text_editing;
+                   !input.input_events.empty();
         }
 
         [[nodiscard]] bool mouseOverPanel(const PanelInputState& input,
@@ -180,6 +177,16 @@ namespace lfs::vis {
         const auto& id = el->GetId();
         auto& ctrl = panel->controller_;
         auto& ui = panel->ui_state_;
+
+        if (id == "generic-tracks") {
+            for (auto* key = event.GetTargetElement(); key && key != el; key = key->GetParentNode()) {
+                if (!key->HasAttribute("data-time"))
+                    continue;
+                ctrl.seek(key->GetAttribute<float>("data-time", 0));
+                event.StopPropagation();
+                return;
+            }
+        }
 
         if (id == "btn-skip-back")
             ctrl.seekToFirstKeyframe();
@@ -296,9 +303,10 @@ namespace lfs::vis {
     }
 
     void RmlSequencerPanel::destroyGraphicsResources() {
+        timeline_markup_.clear();
         clearPendingComposite();
         if (rml_manager_)
-            rml_manager_->releaseCachedVulkanContext(direct_cache_);
+            rml_manager_->releaseCachedContext(direct_cache_);
         direct_cache_dirty_ = true;
         last_render_signature_.reset();
         unregisterFilmStripSources();
@@ -327,6 +335,7 @@ namespace lfs::vis {
     }
 
     void RmlSequencerPanel::clearElementCache() {
+        timeline_markup_.clear();
         elements_cached_ = false;
         el_panel_ = nullptr;
         el_floating_header_ = nullptr;
@@ -406,7 +415,7 @@ namespace lfs::vis {
 
         clearPendingComposite();
         if (rml_manager_)
-            rml_manager_->releaseCachedVulkanContext(direct_cache_);
+            rml_manager_->releaseCachedContext(direct_cache_);
         direct_cache_dirty_ = true;
         last_render_signature_.reset();
         unregisterFilmStripSources();
@@ -428,6 +437,7 @@ namespace lfs::vis {
         last_ruler_zoom_ = -1.0f;
         last_ruler_pan_ = -1.0f;
         last_ruler_width_ = -1.0f;
+        last_ruler_dp_ratio_ = -1.0f;
         last_ruler_display_end_ = -1.0f;
         last_timeline_revision_ = 0;
         last_selection_revision_ = 0;
@@ -532,7 +542,7 @@ namespace lfs::vis {
                                               const bool refresh) {
         if (!rml_manager_ || !rml_context_)
             return;
-        rml_manager_->queueCachedVulkanContext({
+        rml_manager_->queueCachedContext({
             .context = rml_context_,
             .cache = &direct_cache_,
             .cache_width = width,
@@ -580,6 +590,8 @@ namespace lfs::vis {
         assert(document_);
         clearElementCache();
         el_panel_ = document_->GetElementById("panel");
+        if (auto* tracks = document_->GetElementById("generic-tracks"))
+            tracks->AddEventListener(Rml::EventId::Click, &transport_listener_);
         el_floating_header_ = document_->GetElementById("floating-header");
         el_ruler_ = document_->GetElementById("ruler");
         el_track_bar_ = document_->GetElementById("track-bar");
@@ -833,6 +845,31 @@ namespace lfs::vis {
 
         const auto& p = lfs::vis::theme().palette;
 
+        if (auto* rows = document_->GetElementById("generic-tracks")) {
+            std::string html;
+            if (const auto* clip = timeline.animationClip()) {
+                auto ids = clip->trackIds();
+                std::sort(ids.begin(), ids.end());
+                for (const auto id : ids) {
+                    const auto* track = clip->getTrack(id);
+                    const auto& path = track->targetPath();
+                    auto label = path;
+                    if (path.starts_with("nodes/")) {
+                        const auto tree_end = path.find('/', 6);
+                        if (tree_end != std::string::npos)
+                            label = path.substr(tree_end + 1);
+                    }
+                    html += "<div class=\"animation-track\" title=\"" + Rml::StringUtilities::EncodeRml(path) +
+                            "\"><span class=\"animation-track-label\">" + Rml::StringUtilities::EncodeRml(label) + "</span>";
+                    for (const auto& key : track->keyframes())
+                        html += fmt::format("<button class=\"animation-key\" data-track=\"{}\" data-time=\"{}\" style=\"left:{:.2f}px;\" title=\"{} s\">◆</button>",
+                                            id, key.time, timeToX(key.time, 0, timeline_width), key.time);
+                    html += "</div>";
+                }
+            }
+            rows->SetInnerRML(html);
+        }
+
         if (count == 0) {
             while (!keyframe_elements_.empty()) {
                 el_keyframes_->RemoveChild(keyframe_elements_.back());
@@ -941,11 +978,13 @@ namespace lfs::vis {
         if (zoom_level_ == last_ruler_zoom_ &&
             pan_offset_ == last_ruler_pan_ &&
             timeline_width == last_ruler_width_ &&
+            cached_dp_ratio_ == last_ruler_dp_ratio_ &&
             display_end_time == last_ruler_display_end_)
             return;
         last_ruler_zoom_ = zoom_level_;
         last_ruler_pan_ = pan_offset_;
         last_ruler_width_ = timeline_width;
+        last_ruler_dp_ratio_ = cached_dp_ratio_;
         last_ruler_display_end_ = display_end_time;
         if (timeline_width <= 0.0f)
             return;
@@ -954,13 +993,14 @@ namespace lfs::vis {
         const float visible_start = pan_offset_;
         const float visible_end = visible_start + visible_duration;
 
-        const float major_interval = sequencer_ui::rulerMajorInterval(visible_duration);
+        const float label_margin = 30.0f * cached_dp_ratio_;
+        // Leave room for the label span and the inward clamp at the ruler's ends.
+        const float major_interval = sequencer_ui::rulerMajorInterval(visible_duration, timeline_width, 2.0f * label_margin);
         const float minor_interval = major_interval / 4.0f;
 
         std::string html;
         html.reserve(2048);
 
-        const float label_margin = 30.0f * cached_dp_ratio_;
         const float half_label = label_margin * 0.5f;
 
         int first_index = static_cast<int>(std::floor(visible_start / minor_interval));
@@ -1204,7 +1244,7 @@ namespace lfs::vis {
             updateTimelineGuides(timeline_pos.x, tl_width, film_strip);
         }
 
-        if (!rml_manager_ || !rml_manager_->getVulkanRenderInterface())
+        if (!rml_manager_ || !rml_manager_->getUiRenderer())
             return;
 
         if (document_) {
@@ -1379,7 +1419,7 @@ namespace lfs::vis {
             char* end = nullptr;
             const float parsed = std::strtof(text.c_str(), &end);
             if (end != text.c_str())
-                controller_.setClipDuration(parsed);
+                controller_.editClipDuration(parsed);
         }
 
         duration_editing_ = false;

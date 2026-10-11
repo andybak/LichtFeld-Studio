@@ -4,6 +4,13 @@
 #include <cuda_fp16.h>
 namespace ops = lfs::core::ops;
 using uint = unsigned int;
+__device__ __forceinline__ uint select_bits(uint predicate, uint yes, uint no) {
+    uint result;
+    asm volatile("{ .reg .pred p; setp.ne.u32 p, %1, 0; selp.b32 %0, %2, %3, p; }"
+                 : "=r"(result)
+                 : "r"(predicate), "r"(yes), "r"(no));
+    return result;
+}
 #define EXPR(name, expression)                                                              \
     extern "C" __device__ __noinline__ uint expr_##name(uint a, uint b, uint c) {           \
         const float x = __uint_as_float(a), y = __uint_as_float(b), z = __uint_as_float(c); \
@@ -43,6 +50,13 @@ EXPR(Add, __float_as_uint(ops::add_op{}(x, y)))
 EXPR(Sub, __float_as_uint(ops::sub_op{}(x, y)))
 EXPR(Mul, __float_as_uint(ops::mul_op{}(x, y)))
 EXPR(Div, __float_as_uint(ops::div_op{}(x, y)))
+// Explicit PTX keeps round-to-nearest and denormals even in a fast-math build.
+__device__ __forceinline__ float precise_divide(float x, float y) {
+    float result;
+    asm("div.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(x), "f"(y));
+    return result;
+}
+EXPR(PreciseDiv, __float_as_uint(precise_divide(x, y)))
 EXPR(Mod, __float_as_uint(ops::mod_op{}(x, y)))
 EXPR(Pow, __float_as_uint(ops::pow_op{}(x, y)))
 EXPR(Min, __float_as_uint(ops::minimum_op{}(x, y)))
@@ -59,7 +73,7 @@ EXPR(Greater, uint(ops::greater_op{}(x, y)))
 EXPR(GreaterEqual, uint(ops::greater_equal_op{}(x, y)))
 EXPR(Fma, __float_as_uint(fmaf(x, y, z)))
 EXPR(Clamp, ops::float_is_nan(x) ? a : __float_as_uint(ops::clamp_ternary_op<float>{}(x, y, z)))
-EXPR(Select, a ? b : c)
+EXPR(Select, select_bits(a, b, c))
 EXPR(LogicalAnd, a != 0 && b != 0)
 EXPR(LogicalOr, a != 0 || b != 0)
 EXPR(LogicalXor, (a != 0) != (b != 0))

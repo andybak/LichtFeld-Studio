@@ -10,6 +10,9 @@
 #include <string_view>
 #include <vector>
 #include <vulkan/vulkan.h>
+#ifdef __APPLE__
+#include <vulkan/vulkan_metal.h>
+#endif
 
 namespace lfs::core {
     // Named here: vulkan_metal.h declares it only under VK_USE_PLATFORM_METAL_EXT.
@@ -46,6 +49,8 @@ namespace lfs::core {
             features.features.shaderInt16 = VK_TRUE;
             features11.storageBuffer16BitAccess = VK_TRUE;
             features12.storageBuffer8BitAccess = VK_TRUE;
+            // The training shaders compute on uint8_t (SPIR-V Int8 capability).
+            features12.shaderInt8 = VK_TRUE;
             features12.timelineSemaphore = VK_TRUE;
             features12.bufferDeviceAddress = VK_TRUE;
             features13.synchronization2 = VK_TRUE;
@@ -181,6 +186,7 @@ namespace lfs::core {
         require(f.features.shaderInt16, "shaderInt16");
         require(f11.storageBuffer16BitAccess, "storageBuffer16BitAccess");
         require(f12.storageBuffer8BitAccess, "storageBuffer8BitAccess");
+        require(f12.shaderInt8, "shaderInt8");
         require(f12.timelineSemaphore, "timelineSemaphore");
         require(f12.bufferDeviceAddress, "bufferDeviceAddress");
         require(f13.synchronization2, "synchronization2");
@@ -258,6 +264,10 @@ namespace lfs::core {
             flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
         }
 #ifdef __APPLE__
+        VkExportMetalObjectCreateInfoEXT export_device{VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT};
+        export_device.pNext = next;
+        export_device.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_DEVICE_BIT_EXT;
+        next = &export_device;
         // Since 1.4.1 MoltenVK places buffers in MTLHeaps, so buffers bound to
         // memory imported from Metal (VK_EXT_metal_objects) would not alias it.
         // Keep buffers on their memory's MTLBuffer, MoltenVK's earlier default.

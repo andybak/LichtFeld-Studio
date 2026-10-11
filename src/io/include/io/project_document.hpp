@@ -27,10 +27,6 @@
 #include <string>
 #include <vector>
 
-namespace lfs::io {
-    struct LoadResult;
-}
-
 namespace lfs::io::project {
 
     // The current SCNG-bound checkpoint is resumable; older CKPT chapters are
@@ -58,6 +54,13 @@ namespace lfs::io::project {
                    const lfs::core::Uuid& snapshot_uuid);
         [[nodiscard]] static lfs::Result<LazyChunkValue>
         from_owned(std::vector<std::byte> bytes,
+                   const lfs::core::Uuid& snapshot_uuid);
+        // Retain immutable contiguous storage supplied by a producer without
+        // copying it into a vector. The span must belong to owner and remain
+        // unchanged throughout the value's lifetime, including share().
+        [[nodiscard]] static lfs::Result<LazyChunkValue>
+        from_owned(std::shared_ptr<const void> owner,
+                   std::span<const std::byte> bytes,
                    const lfs::core::Uuid& snapshot_uuid);
         // Independent owner of the same file-backed or owned bytes. Safe to
         // retain after the source ProjectDocument is closed or replaced.
@@ -118,6 +121,9 @@ namespace lfs::io::project {
         // missing THMB.
         std::span<const std::byte> preview_png;
         bool remove_preview = false;
+        // Save As may omit run metrics from the destination while preserving
+        // the open source document if publication fails.
+        bool omit_metrics = false;
         // When enabled, an ordinary explicit save creates a dataset preview
         // only when the opened source has no THMB.
         bool regenerate_dataset_preview = true;
@@ -260,8 +266,6 @@ namespace lfs::io::project {
 
         [[nodiscard]] const std::optional<std::filesystem::path>&
         source_path() const noexcept;
-        // Keep the source reader for lazy payloads, but report no user path.
-        void forget_source_path() noexcept;
         [[nodiscard]] const ProjectReader* source_reader() const noexcept;
         [[nodiscard]] std::optional<lfs::core::Uuid>
         source_commit_uuid() const noexcept;
@@ -297,6 +301,8 @@ namespace lfs::io::project {
         [[nodiscard]] EditorSessionChapter& edit_editor() noexcept;
         [[nodiscard]] const SequencerSessionChapter& sequencer() const noexcept;
         [[nodiscard]] SequencerSessionChapter& edit_sequencer() noexcept;
+        [[nodiscard]] const NodesSessionChapter& nodes() const noexcept;
+        [[nodiscard]] NodesSessionChapter& edit_nodes() noexcept;
         [[nodiscard]] const MetricsChapter& metrics() const noexcept;
         [[nodiscard]] MetricsChapter& edit_metrics() noexcept;
 
@@ -324,19 +330,22 @@ namespace lfs::io::project {
         [[nodiscard]] std::vector<lfs::core::Uuid>
         dataset_source_uuids() const;
         [[nodiscard]] lfs::Result<ProjectDocumentSaveReport>
-        embed_dataset_batch(const EmbeddedDatasetManifest& manifest,
+        embed_dataset_batch(EmbeddedDatasetManifest manifest,
                             std::span<const DatasetEmbedSource> sources,
-                            const ProjectDocumentSaveOptions& options = {});
+                            const ProjectDocumentSaveOptions& options = {},
+                            std::function<void(float, const std::string&)> progress = {},
+                            std::function<bool()> cancel = {});
 
         [[nodiscard]] const LazyChunkValue*
         find_ppisp(const lfs::core::Uuid& instance_uuid) const noexcept;
         [[nodiscard]] lfs::Result<void>
         set_ppisp(const lfs::core::Uuid& instance_uuid,
                   LazyChunkValue payload);
+        // The single SfM observation chapter (SFMO), or null.
+        [[nodiscard]] const LazyChunkValue* find_sfm_observations() const noexcept;
+        // Replaces the SFMO chapter; nullopt removes it.
         [[nodiscard]] lfs::Result<void>
-        set_georeference(const ProjectGeoreference& value);
-        [[nodiscard]] lfs::Result<void>
-        capture_georeference(const lfs::io::LoadResult& load_result);
+        set_sfm_observations(std::optional<LazyChunkValue> payload);
 
         [[nodiscard]] const SplatChapterPayload*
         find_splat(const lfs::core::Uuid& node_uuid) const noexcept;

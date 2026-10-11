@@ -5,6 +5,7 @@
 <body id="body" data-model="global_context_menu">
   <div id="backdrop"></div>
   <div id="ctx-menu" class="context-menu">
+    <input id="ctx-search" class="context-menu-search" type="text" data-if="searchable" data-attr-placeholder="search_label"/>
     <div data-for="item : items">
       <div class="context-menu-separator" data-if="item.separator_before"></div>
       <div class="context-menu-label" data-if="item.is_label">{{ item.label }}</div>
@@ -14,7 +15,8 @@
               data-class-submenu-item="item.is_submenu_item"
               data-class-active="item.is_active"
               data-class-has-icon="item.icon != ''"
-              data-attr-data-ctx-action="item.action"><img class="context-menu-icon" data-if="item.icon != ''" data-attr-src="item.icon"/><span>{{ item.label }}</span></button>
+              data-class-has-shortcut="item.shortcut != ''"
+              data-attr-data-ctx-action="item.action"><span class="context-menu-check" data-if="item.is_active &amp;&amp; item.shortcut != ''">&#x2713;</span><img class="context-menu-icon" data-if="item.icon != ''" data-attr-src="item.icon"/><span class="context-menu-text">{{ item.label }}</span><span class="context-menu-shortcut" data-if="item.shortcut != ''">{{ item.shortcut }}</span></button>
     </div>
   </div>
 </body>

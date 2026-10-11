@@ -6,7 +6,9 @@ static const uint LFS_PUSH_CONSTANT_SIZE = 160;
 // 2 index_select, 3 scatter assign, 4 scatter add, 5 index_put (flat clamped),
 // 6 index_fill (scatter a constant), 7 deterministic scatter over runs of
 // indices sorted by target (keys and positions from radix.slang),
-// 8 checked Int64-to-Int32 index conversion.
+// 8 checked Int64-to-Int32 index conversion, 9 record the last index position
+// of every target (position + 1, atomic max into keys), 10 scatter assign that
+// only that position writes.
 [SpecializationConstant]
 const uint kMode = 0;
 // Element codes follow DataType: 0 Float32, 1 Float16, 2 Int32, 3 Int64, 4 UInt8, 5 Bool.
@@ -259,7 +261,7 @@ void recordWideFault(uint64_t faultAddress, int64_t index, uint extent)
     }
 }
 
-bool gatherSource(uint64_t tid, uniform Parameters parameters, out uint64_t sourceIndex)
+bool gatherSource(uint tid, uniform Parameters parameters, out uint64_t sourceIndex)
 {
     Ptr<int, Access.Read> indices = (Ptr<int, Access.Read>)parameters.indexAddress;
     sourceIndex = 0;
@@ -324,10 +326,11 @@ bool gatherSource(uint64_t tid, uniform Parameters parameters, out uint64_t sour
         sourceIndex = clampFlat(indices[tid], parameters.inputSize);
         return true;
     }
-    const uint64_t segment = uint64_t(parameters.indexSize) * parameters.inner;
-    const uint outerIndex = uint(tid / segment);
-    const uint position = uint((tid / parameters.inner) % parameters.indexSize);
-    const uint innerIndex = uint(tid % parameters.inner);
+    // total = outer * indexSize * inner fits uint32, so every product does.
+    const uint segment = parameters.indexSize * parameters.inner;
+    const uint outerIndex = tid / segment;
+    const uint position = (tid / parameters.inner) % parameters.indexSize;
+    const uint innerIndex = tid % parameters.inner;
     int selected = indices[position];
     if (kBoundary == 1)
         selected = max(0, min(int(parameters.dimSize) - 1, selected));
@@ -386,7 +389,7 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID, uniform Parameters param
     const uint stride = numWorkgroups.x * LFS_LOCAL_SIZE_X;
     Ptr<int, Access.Read> indices = (Ptr<int, Access.Read>)parameters.indexAddress;
 
-    for (uint64_t tid = dispatchThreadId.x; tid < parameters.total; tid += stride)
+    for (uint tid = dispatchThreadId.x; tid < parameters.total; tid += stride)
     {
         if (kMode <= 2)
         {
@@ -412,10 +415,11 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID, uniform Parameters param
         }
         else if (kMode == 3 || kMode == 4 || kMode == 6)
         {
-            const uint64_t segment = uint64_t(parameters.indexSize) * parameters.inner;
-            const uint outerIndex = uint(tid / segment);
-            const uint position = uint((tid / parameters.inner) % parameters.indexSize);
-            const uint innerIndex = uint(tid % parameters.inner);
+            // total = outer * indexSize * inner fits uint32, so every product does.
+            const uint segment = parameters.indexSize * parameters.inner;
+            const uint outerIndex = tid / segment;
+            const uint position = (tid / parameters.inner) % parameters.indexSize;
+            const uint innerIndex = tid % parameters.inner;
             const int target = indices[position];
             if (target < 0 || target >= int(parameters.dimSize))
             {
@@ -441,14 +445,41 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID, uniform Parameters param
             else
                 addByte(parameters.inputAddress, destinationIndex, loadByte(parameters.valueAddress, tid));
         }
+        else if (kMode == 9)
+        {
+            const int target = indices[tid];
+            if (target < 0 || target >= int(parameters.dimSize))
+            {
+                recordFault(parameters.faultAddress, target, parameters.dimSize, parameters.opId);
+                continue;
+            }
+            uint previous;
+            InterlockedMax(((Ptr<uint, Access.ReadWrite>)parameters.keysAddress)[target], tid + 1u, previous);
+        }
+        else if (kMode == 10)
+        {
+            const uint segment = parameters.indexSize * parameters.inner;
+            const uint outerIndex = tid / segment;
+            const uint position = (tid / parameters.inner) % parameters.indexSize;
+            const uint innerIndex = tid % parameters.inner;
+            const int target = indices[position];
+            // Out-of-range targets were reported by mode 9.
+            if (target < 0 || target >= int(parameters.dimSize) ||
+                ((Ptr<uint, Access.Read>)parameters.keysAddress)[target] != position + 1u)
+                continue;
+            const uint64_t destinationIndex =
+                uint64_t(outerIndex) * parameters.dimSize * parameters.inner +
+                uint64_t(target) * parameters.inner + innerIndex;
+            copyElement(parameters.valueAddress, tid, parameters.inputAddress, destinationIndex);
+        }
         else if (kMode == 7)
         {
             // One thread per (sorted slot, outer, inner); only run starts work.
             Ptr<uint, Access.Read> keys = (Ptr<uint, Access.Read>)parameters.keysAddress;
             Ptr<uint, Access.Read> positions = (Ptr<uint, Access.Read>)parameters.positionsAddress;
-            const uint64_t lanes = uint64_t(parameters.outer) * parameters.inner;
-            const uint slot = uint(tid / lanes);
-            const uint lane = uint(tid - uint64_t(slot) * lanes);
+            const uint lanes = parameters.outer * parameters.inner;
+            const uint slot = tid / lanes;
+            const uint lane = tid - slot * lanes;
             const uint outerIndex = lane / parameters.inner;
             const uint innerIndex = lane - outerIndex * parameters.inner;
             const uint key = keys[slot];

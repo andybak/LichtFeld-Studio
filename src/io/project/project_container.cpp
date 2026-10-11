@@ -15,7 +15,6 @@
 #include <array>
 #include <atomic>
 #include <cassert>
-#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -37,14 +36,6 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-
-#ifdef _WIN32
-#include <memoryapi.h>
-#include <sysinfoapi.h>
-#else
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
 
 namespace lfs::io::project {
 
@@ -83,7 +74,8 @@ namespace lfs::io::project {
         bool is_payload_class_chunk(const ChunkInfo& row) noexcept {
             return (row.flags & TENSOR_PAYLOAD) != 0 ||
                    row.key.fourcc == FOURCC_CKPT ||
-                   row.key.fourcc == FOURCC_PPIS;
+                   row.key.fourcc == FOURCC_PPIS ||
+                   row.key.fourcc == FOURCC_SFMO;
         }
 
         std::optional<std::uint64_t> payload_materialized_bytes_override;
@@ -2740,7 +2732,7 @@ namespace lfs::io::project {
     CapabilitySet supported_reader_capabilities() {
         CapabilitySet result;
         for (std::uint8_t bit = INDEX_ZSTD_V1;
-             bit <= ENCODED_SCENE_ASSETS; ++bit) {
+             bit <= TILESET_REFERENCES; ++bit) {
             result.set(bit);
         }
         return result;
@@ -2834,6 +2826,56 @@ namespace lfs::io::project {
                       .commit_crc32c_echo = found->info.crc32c,
                   };
         return ProjectReader(std::make_shared<Impl>(std::move(state)));
+    }
+
+    lfs::Result<ProjectHeadIdentity>
+    ProjectReader::read_head_identity(const std::filesystem::path& path) {
+        auto file_result = detail::NativeFile::open_read(path);
+        if (!file_result) {
+            return std::move(file_result).error();
+        }
+        const auto file = *file_result;
+        auto size_result = file->size();
+        if (!size_result) {
+            return std::move(size_result).error();
+        }
+        const std::uint64_t physical_size = *size_result;
+        auto superblock = parse_superblock(*file, physical_size);
+        if (!superblock) {
+            return std::move(superblock).error();
+        }
+        std::optional<ProjectHeadIdentity> newest;
+        std::uint64_t newest_sequence = 0;
+        for (std::uint32_t slot_id = 0; slot_id < HEAD_SLOT_OFFSETS.size(); ++slot_id) {
+            auto raw = read_fixed<HEAD_SLOT_BYTES>(
+                *file, HEAD_SLOT_OFFSETS[slot_id], physical_size, physical_size,
+                std::format("head[{}]", slot_id));
+            if (!raw) {
+                continue;
+            }
+            const auto bytes = byte_span(*raw);
+            if (!bytes_equal(bytes, 0, HEAD_MAGIC) ||
+                read_u32(bytes, 4092) != crc32c(0, raw->data(), 4092) ||
+                read_uuid(bytes, 32) != superblock->project_uuid) {
+                continue;
+            }
+            const std::uint64_t sequence = read_u64(bytes, 16);
+            if (newest && sequence <= newest_sequence) {
+                continue;
+            }
+            newest_sequence = sequence;
+            newest = ProjectHeadIdentity{
+                .project_uuid = superblock->project_uuid,
+                .commit_uuid = read_uuid(bytes, 64),
+                .generation = read_u64(bytes, 24),
+            };
+        }
+        if (!newest) {
+            return detail::project_error(lfs::ErrorCode::DataLoss,
+                                         "The project container is corrupt.",
+                                         "no head slot has a valid checksum", path);
+        }
+        return *newest;
     }
 
     OpenClassification
@@ -6255,191 +6297,6 @@ namespace lfs::io::project {
                 impl_->state->file, row.payload_offset, row.stored_bytes,
                 row.block_crc_table),
             row.stored_bytes));
-    }
-
-    struct MappedRegion::Impl {
-        std::shared_ptr<detail::NativeFile> file;
-        void* mapped_base = nullptr;
-        std::size_t mapped_bytes = 0;
-        const std::byte* requested_data = nullptr;
-        std::size_t requested_bytes = 0;
-        std::uint64_t requested_offset = 0;
-#ifdef _WIN32
-        HANDLE mapping = nullptr;
-#endif
-
-        ~Impl() {
-#ifdef _WIN32
-            if (mapped_base != nullptr) {
-                UnmapViewOfFile(mapped_base);
-            }
-            if (mapping != nullptr) {
-                CloseHandle(mapping);
-            }
-#else
-            if (mapped_base != nullptr) {
-                ::munmap(mapped_base, mapped_bytes);
-            }
-#endif
-        }
-    };
-
-    MappedRegion::MappedRegion(std::unique_ptr<Impl> impl)
-        : impl_(std::move(impl)) {}
-
-    MappedRegion::MappedRegion(MappedRegion&&) noexcept = default;
-    MappedRegion& MappedRegion::operator=(MappedRegion&&) noexcept = default;
-    MappedRegion::~MappedRegion() = default;
-
-    std::span<const std::byte> MappedRegion::bytes() const noexcept {
-        return {impl_->requested_data, impl_->requested_bytes};
-    }
-
-    std::uint64_t MappedRegion::file_offset() const noexcept {
-        return impl_->requested_offset;
-    }
-
-    lfs::Result<MappedRegion>
-    ProjectReader::map_stored_range(const ChunkInfo& chunk,
-                                    const std::uint64_t relative_offset,
-                                    const std::uint64_t length) const {
-        if (auto allowed = require_supported_payload_access(*this); !allowed) {
-            return std::move(allowed).error();
-        }
-        auto resolved = resolve_chunk(*impl_->state, chunk);
-        if (!resolved) {
-            return std::move(resolved).error();
-        }
-        const ChunkInfo& row = **resolved;
-        auto range_end = detail::checked_add(relative_offset, length, path(),
-                                             row.payload_offset,
-                                             "mapped_range");
-        if (!range_end) {
-            return std::move(range_end).error();
-        }
-        if (*range_end > row.stored_bytes) {
-            return format_error(
-                path(), row.payload_offset, "mapped_range",
-                std::format("end <= stored bytes {}", row.stored_bytes),
-                std::to_string(*range_end), lfs::ErrorCode::BoundsViolation);
-        }
-        if (row.block_crc_table.has_value()) {
-            if (auto verified =
-                    verify_block_range(*impl_->state, row, relative_offset, length);
-                !verified) {
-                return std::move(verified).error();
-            }
-        } else if (auto verified = verify_chunk(row); !verified) {
-            return std::move(verified).error();
-        }
-
-        auto mapping = std::make_unique<MappedRegion::Impl>();
-        mapping->file = impl_->state->file;
-        mapping->requested_offset = row.payload_offset + relative_offset;
-        if (length == 0) {
-            return MappedRegion(std::move(mapping));
-        }
-        if (length > std::numeric_limits<std::size_t>::max()) {
-            return format_error(path(), mapping->requested_offset, "mapped_range",
-                                "length addressable by this build",
-                                std::to_string(length),
-                                lfs::ErrorCode::BoundsViolation);
-        }
-
-#ifdef _WIN32
-        SYSTEM_INFO system_info{};
-        GetSystemInfo(&system_info);
-        const std::uint64_t granularity = system_info.dwAllocationGranularity;
-        const std::uint64_t mapped_offset =
-            (mapping->requested_offset / granularity) * granularity;
-        const std::uint64_t adjustment = mapping->requested_offset - mapped_offset;
-        auto mapped_length = detail::checked_add(adjustment, length, path(),
-                                                 mapping->requested_offset,
-                                                 "mapped_range.length");
-        if (!mapped_length ||
-            *mapped_length > std::numeric_limits<SIZE_T>::max()) {
-            return !mapped_length
-                       ? lfs::Result<MappedRegion>(std::move(mapped_length).error())
-                       : lfs::Result<MappedRegion>(format_error(
-                             path(), mapping->requested_offset,
-                             "mapped_range.length", "SIZE_T range",
-                             std::to_string(*mapped_length),
-                             lfs::ErrorCode::BoundsViolation));
-        }
-        mapping->mapping = CreateFileMappingW(
-            mapping->file->native_handle(), nullptr, PAGE_READONLY, 0, 0, nullptr);
-        if (mapping->mapping == nullptr) {
-            const DWORD error = GetLastError();
-            return detail::project_error(
-                lfs::ErrorCode::Internal, "The project chunk could not be mapped.",
-                std::format("CreateFileMappingW failed with Windows error {}", error),
-                path(), mapped_offset, "mapped_range",
-                static_cast<std::int64_t>(error), "Win32");
-        }
-        mapping->mapped_base = MapViewOfFile(
-            mapping->mapping, FILE_MAP_READ,
-            static_cast<DWORD>(mapped_offset >> 32),
-            static_cast<DWORD>(mapped_offset & 0xffffffffu),
-            static_cast<SIZE_T>(*mapped_length));
-        if (mapping->mapped_base == nullptr) {
-            const DWORD error = GetLastError();
-            return detail::project_error(
-                lfs::ErrorCode::Internal, "The project chunk could not be mapped.",
-                std::format("MapViewOfFile failed with Windows error {}", error),
-                path(), mapped_offset, "mapped_range",
-                static_cast<std::int64_t>(error), "Win32");
-        }
-        mapping->mapped_bytes = static_cast<std::size_t>(*mapped_length);
-#else
-        const long page_size_result = ::sysconf(_SC_PAGESIZE);
-        const std::uint64_t page_size =
-            page_size_result > 0 ? static_cast<std::uint64_t>(page_size_result) : 4096;
-        const std::uint64_t mapped_offset =
-            (mapping->requested_offset / page_size) * page_size;
-        const std::uint64_t adjustment = mapping->requested_offset - mapped_offset;
-        auto mapped_length = detail::checked_add(adjustment, length, path(),
-                                                 mapping->requested_offset,
-                                                 "mapped_range.length");
-        if (!mapped_length ||
-            *mapped_length > std::numeric_limits<std::size_t>::max() ||
-            mapped_offset >
-                static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
-            return !mapped_length
-                       ? lfs::Result<MappedRegion>(std::move(mapped_length).error())
-                       : lfs::Result<MappedRegion>(format_error(
-                             path(), mapping->requested_offset,
-                             "mapped_range.length", "size_t/off_t range",
-                             std::to_string(*mapped_length),
-                             lfs::ErrorCode::BoundsViolation));
-        }
-        mapping->mapped_base =
-            ::mmap(nullptr, static_cast<std::size_t>(*mapped_length), PROT_READ,
-                   MAP_SHARED, mapping->file->native_handle(),
-                   static_cast<off_t>(mapped_offset));
-        if (mapping->mapped_base == MAP_FAILED) {
-            mapping->mapped_base = nullptr;
-            const int error = errno;
-            return detail::project_error(
-                lfs::ErrorCode::Internal, "The project chunk could not be mapped.",
-                std::format("mmap failed: {}", std::strerror(error)), path(),
-                mapped_offset, "mapped_range", error, std::strerror(error));
-        }
-        mapping->mapped_bytes = static_cast<std::size_t>(*mapped_length);
-#endif
-        const std::size_t adjustment_bytes = static_cast<std::size_t>(
-            mapping->requested_offset -
-            (mapping->requested_offset -
-             (mapping->requested_offset %
-#ifdef _WIN32
-              static_cast<std::uint64_t>(system_info.dwAllocationGranularity)
-#else
-              page_size
-#endif
-                  )));
-        mapping->requested_data =
-            static_cast<const std::byte*>(mapping->mapped_base) + adjustment_bytes;
-        mapping->requested_bytes = static_cast<std::size_t>(length);
-        return MappedRegion(std::move(mapping));
     }
 
 } // namespace lfs::io::project

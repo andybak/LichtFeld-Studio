@@ -23,7 +23,7 @@ LichtFeld Studio lets you train new scenes from COLMAP datasets, resume checkpoi
 
 [**Download Windows (Portal)**](https://portal.lichtfeld.io/) •
 [**Build From Source**](docs/building_and_distribution.md) •
-[**Plugin System**](docs/plugin-system.md) •
+[**Python API and Plugins**](docs/plugins/README.md) •
 [**MCP Guide**](docs/docs/development/mcp/index.md) •
 [**Support Development**](#support-development) •
 [**Join Discord**](https://discord.gg/TbxJST2BbC)
@@ -94,7 +94,8 @@ LichtFeld Studio is free and open source. If it is useful in your research, prod
 Prebuilt Windows binaries are distributed through the [LichtFeld Portal](https://portal.lichtfeld.io/). Access is paid: you register and make a donation of your choosing, which directly funds development, and in return you get the current release plus daily builds. Download the archive, unzip it, and run the executable. Binaries are not published on GitHub Releases.
 
 Building from source is free for everyone under GPLv3, on Windows, Linux and
-macOS Apple Silicon. macOS currently builds the viewer without CUDA training.
+macOS 26 or newer on Apple Silicon. macOS uses native Metal scene rendering
+and MoltenVK presentation, without requiring CUDA.
 
 For building from source and platform-specific notes, see the
 [Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/). Developers can find
@@ -106,7 +107,8 @@ Current project notes:
 - Windows is the primary prebuilt distribution target today
 - Windows and Linux CUDA builds require an NVIDIA GPU with compute capability 7.5 or newer
   (GTX 16-series, RTX 20-series and up) and NVIDIA driver 570 or newer (CUDA 12.8+)
-- The macOS Apple Silicon viewer uses Vulkan through MoltenVK and does not require CUDA
+- The macOS Apple Silicon viewer requires macOS 26 and a Metal 4 GPU; Metal renders
+  scenes and Vulkan through MoltenVK presents the GUI
 - Source builds use modern C++23 toolchains
 
 ## Docs
@@ -114,7 +116,7 @@ Current project notes:
 - [Project Wiki](https://github.com/MrNeRF/LichtFeld-Studio/wiki/)
 - [FAQ](https://github.com/MrNeRF/LichtFeld-Studio/wiki/Frequently-Asked-Questions)
 - [Source Build Guide](docs/building_and_distribution.md)
-- [Plugin System](docs/plugin-system.md)
+- [Python API and Plugins](docs/plugins/README.md)
 - [Plugin Developer Guide](docs/plugins/getting-started.md)
 - [MCP Guide](docs/docs/development/mcp/index.md)
 - [Plugin Examples](docs/plugins/examples/README.md)
@@ -143,7 +145,10 @@ Getting started:
 
 <p>
   <a href="https://www.core11.eu/">
-    <img src="docs/media/core11_multi.svg" alt="Core 11" height="60">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/media/core11-dark.svg">
+      <img src="docs/media/core11.svg" alt="Core 11" height="60">
+    </picture>
   </a>
 </p>
 
@@ -153,7 +158,7 @@ Getting started:
   <a href="https://web.volinga.ai/">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/media/volinga-dark.svg">
-      <img src="docs/media/volinga.svg" alt="Volinga" height="108">
+      <img src="docs/media/volinga.svg" alt="Volinga" height="50">
     </picture>
   </a>
 </p>
@@ -161,14 +166,14 @@ Getting started:
 <br>
 
 <p>
+  <sub>Hardware sponsor</sub>
+  <br>
   <a href="https://www.tersus-gnss.com/">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/media/tersus-dark.svg">
-      <img src="docs/media/tersus.svg" alt="Tersus GNSS" height="80">
+      <img src="docs/media/tersus.svg" alt="Tersus GNSS" height="120">
     </picture>
   </a>
-  <br>
-  <sub>Hardware sponsor</sub>
 </p>
 
 </div>
@@ -186,7 +191,7 @@ Getting started:
 
 ## License
 
-This project is licensed under GPLv3. It includes an additional permission for NVIDIA DLSS; see [LICENSE-EXCEPTION.txt](LICENSE-EXCEPTION.txt) for details.
+This project is licensed under GPLv3. Optional external plugins have separate licenses and distribution terms.
 
 #### _Agents_
 

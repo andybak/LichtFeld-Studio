@@ -1,4 +1,5 @@
 #pragma once
+#include <deque>
 
 #include "gs_pipeline.h"
 
@@ -59,6 +60,7 @@
 // lod_enabled bit 6: projection writes overlay_flags. Clear when the bound
 // buffer is the one-word dummy (raster overlays idle).
 constexpr uint32_t kLodEnabledWriteOverlayFlags = LFS_VK_OVERLAY_WRITE_BIT;
+constexpr uint32_t kLodEnabledDeletedMask = 128u;
 
 PACK_STRUCT(struct VulkanGSRendererUniforms {
     uint32_t image_height;
@@ -73,7 +75,7 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     uint32_t shN_layout_slots;
     uint32_t lod_enabled;
     uint32_t lod_count;
-    uint32_t mip_filter;
+    uint32_t mip_filter; // bit 0 AA, bit 1 exact depth, bit 2 band origin, bit 3 Mac reference transparent alpha
     uint32_t render_origin_x;
     uint32_t render_origin_y;
     uint32_t camera_width;
@@ -160,7 +162,7 @@ PACK_STRUCT(struct VulkanGSSelectionMaskUniforms {
     uint32_t image_height;
     uint32_t image_width;
     uint32_t camera_model;
-    uint32_t pad0;
+    uint32_t deleted_mask_enabled;
     uint32_t pad1;
     float fx;
     float fy;
@@ -211,7 +213,13 @@ public:
         size_t raw_count = 0;
         bool count_overflow = false;
     };
+    struct LodSelectionReadbackIdentity {
+        std::uint32_t target = 0;
+        std::uint64_t model_generation = 0;
+        std::uint64_t tree_generation = 0;
+    };
     struct LodSelectionStats {
+        LodSelectionReadbackIdentity identity{};
         float threshold_scale = 1.0f;
         size_t candidate_count = 0;
         size_t rendered_capacity = 0;
@@ -242,7 +250,8 @@ public:
     void cleanup();
 
     void tagDeferredVisibleCountReadback(VkSemaphore semaphore, std::uint64_t value);
-    void tagDeferredLodSelectionReadback(VkSemaphore semaphore, std::uint64_t value);
+    void tagDeferredLodSelectionReadback(VkSemaphore semaphore, std::uint64_t value,
+                                         LodSelectionReadbackIdentity identity);
     void tagDeferredInstanceCountReadback(VkSemaphore semaphore, std::uint64_t value);
     [[nodiscard]] std::optional<PrimitiveVisibilityStats> pollDeferredPrimitiveVisibilityStats();
     [[nodiscard]] std::optional<LodSelectionStats> pollDeferredLodSelectionStats();
@@ -314,7 +323,8 @@ public:
                                 const _VulkanBuffer& selection_colors,
                                 const _VulkanBuffer& overlay_params,
                                 bool overlays_active,
-                                bool predicate_waves = true);
+                                bool predicate_waves = true,
+                                std::span<const uint32_t> exact_depth_sample_mask = {});
     [[nodiscard]] bool supportsFloat16Storage() const { return supports_float16_storage_; }
     [[nodiscard]] bool supportsConditionalRendering() const {
         return supports_conditional_rendering_;
@@ -430,20 +440,20 @@ protected:
 
     // Binding 8 is unused (legacy write-only radii buffer deleted). Shader
     // binding numbers stay stable so tagged lists keep placeholder slot 8.
-    _ComputePipeline pipeline_projection_forward = _ComputePipeline(vksplatSkipBinding(24, 8));
-    _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(vksplatSkipBinding(24, 8));
+    _ComputePipeline pipeline_projection_forward = _ComputePipeline(vksplatSkipBinding(25, 8));
+    _ComputePipeline pipeline_projection_forward_3dgut = _ComputePipeline(vksplatSkipBinding(25, 8));
     // Canonical quantized LOD pool variants: same binding sets plus the
-    // per-page dequant frames appended last.
-    _ComputePipeline pipeline_projection_forward_quant = _ComputePipeline(vksplatSkipBindings(25, {8}));
-    _ComputePipeline pipeline_projection_forward_quant_3dgut = _ComputePipeline(vksplatSkipBindings(25, {8}));
+    // per-page dequant frames precede the deleted-mask binding.
+    _ComputePipeline pipeline_projection_forward_quant = _ComputePipeline(vksplatSkipBindings(26, {8}));
+    _ComputePipeline pipeline_projection_forward_quant_3dgut = _ComputePipeline(vksplatSkipBindings(26, {8}));
     // IEEE f16 SH rest (standalone PLY/SOG): fp32's 24 bindings minus shN (BDA)
     // and radii (8).
-    _ComputePipeline pipeline_projection_forward_shn_f16 = _ComputePipeline(vksplatSkipBindings(24, {2, 8}));
-    _ComputePipeline pipeline_projection_forward_shn_f16_3dgut = _ComputePipeline(vksplatSkipBindings(24, {2, 8}));
+    _ComputePipeline pipeline_projection_forward_shn_f16 = _ComputePipeline(vksplatSkipBindings(25, {2, 8}));
+    _ComputePipeline pipeline_projection_forward_shn_f16_3dgut = _ComputePipeline(vksplatSkipBindings(25, {2, 8}));
     // Pad-dropped q16 SH rest: 25 bindings minus shN (BDA) and radii (8).
-    _ComputePipeline pipeline_projection_forward_shn_q16 = _ComputePipeline(vksplatSkipBindings(25, {2, 8}));
-    _ComputePipeline pipeline_projection_forward_shn_q16_3dgut = _ComputePipeline(vksplatSkipBindings(25, {2, 8}));
-    _ComputePipeline pipeline_selection_mask = _ComputePipeline(11);
+    _ComputePipeline pipeline_projection_forward_shn_q16 = _ComputePipeline(vksplatSkipBindings(26, {2, 8}));
+    _ComputePipeline pipeline_projection_forward_shn_q16_3dgut = _ComputePipeline(vksplatSkipBindings(26, {2, 8}));
+    _ComputePipeline pipeline_selection_mask = _ComputePipeline(12);
     _ComputePipeline pipeline_selection_polygon_rasterize = _ComputePipeline(2);
     _ComputePipeline pipeline_generate_keys_wave = _ComputePipeline(8);
     _ComputePipeline pipeline_apply_depth_ordering = _ComputePipeline(4);
@@ -460,14 +470,14 @@ protected:
     // Bindings 6 (tiles_touched) and 8 (legacy radii, now unused) are
     // absent from the survivor variant.
     _ComputePipeline pipeline_projection_forward_survivors = _ComputePipeline(std::vector<int>{
-        0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28});
-    _ComputePipeline pipeline_projection_forward_quant_survivors = _ComputePipeline(std::vector<int>{
         0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29});
+    _ComputePipeline pipeline_projection_forward_quant_survivors = _ComputePipeline(std::vector<int>{
+        0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30});
     _ComputePipeline pipeline_projection_forward_shn_f16_survivors = _ComputePipeline(vksplatWithout(
-        {0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28},
+        {0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29},
         2));
     _ComputePipeline pipeline_projection_forward_shn_q16_survivors = _ComputePipeline(vksplatWithout(
-        {0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29},
+        {0, 1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30},
         2));
     _ComputePipeline pipeline_prepare_visible_chain = _ComputePipeline(4);
     _ComputePipeline pipeline_copy_visible_indices = _ComputePipeline(3);
@@ -492,8 +502,12 @@ protected:
     _ComputePipelinePair pipeline_macro_raster_fp32 = _ComputePipelinePair(8);
     _ComputePipelinePair pipeline_macro_raster_overlays = _ComputePipelinePair(14);
     _ComputePipelinePair pipeline_macro_raster_overlays_fp32 = _ComputePipelinePair(14);
-    _ComputePipelinePair pipeline_macro_compose = _ComputePipelinePair(12);
-    _ComputePipelinePair pipeline_macro_compose_overlays = _ComputePipelinePair(18);
+#if defined(LFS_VULKAN_MACOS_REFERENCE)
+    _ComputePipelinePair pipeline_macro_raster_fp32_precise_alpha = _ComputePipelinePair(8);
+    _ComputePipelinePair pipeline_macro_raster_overlays_fp32_precise_alpha = _ComputePipelinePair(14);
+#endif
+    _ComputePipelinePair pipeline_macro_compose = _ComputePipelinePair(13);
+    _ComputePipelinePair pipeline_macro_compose_overlays = _ComputePipelinePair(19);
     bool supports_float16_storage_ = false;
     bool supports_conditional_rendering_ = false;
     PFN_vkCmdBeginConditionalRenderingEXT vk_cmd_begin_conditional_rendering_ = nullptr;
@@ -555,14 +569,20 @@ protected:
     uint32_t* instance_gate_readback_mapped_ = nullptr;
     bool instance_gate_readback_initialized_ = false;
 
-    _VulkanBuffer lod_selection_readback_buffer_{};
-    uint32_t* lod_selection_readback_mapped_ = nullptr;
-    bool lod_selection_readback_initialized_ = false;
-    bool lod_selection_readback_pending_ = false;
-    VkSemaphore lod_selection_readback_signal_ = VK_NULL_HANDLE;
-    std::uint64_t lod_selection_readback_value_ = 0;
-    size_t lod_selection_readback_capacity_ = 0;
-    size_t lod_selection_readback_chunk_capacity_ = 0;
+    struct LodSelectionReadbackSlot {
+        _VulkanBuffer buffer{};
+        uint32_t* mapped = nullptr;
+        bool initialized = false;
+        bool pending = false;
+        VkSemaphore signal = VK_NULL_HANDLE;
+        std::uint64_t value = 0;
+        size_t capacity = 0;
+        size_t chunk_capacity = 0;
+        std::uint64_t order = 0;
+        LodSelectionReadbackIdentity identity{};
+    };
+    std::deque<LodSelectionReadbackSlot> lod_selection_readbacks_{3};
+    std::uint64_t lod_selection_readback_order_ = 0;
 
     void ensureVisibleCountReadback();
     void destroyVisibleCountReadback();
@@ -572,7 +592,7 @@ protected:
     void recordInstanceCountReadback(VulkanGSPipelineBuffers& buffers, size_t armed);
     void ensureInstanceGateReadback();
     void destroyInstanceGateReadback();
-    void ensureLodSelectionReadback(size_t chunk_capacity);
+    void ensureLodSelectionReadback(LodSelectionReadbackSlot& slot, size_t chunk_capacity);
     void destroyLodSelectionReadback();
     void recordLodSelectionReadback(VulkanGSPipelineBuffers& buffers,
                                     size_t rendered_capacity);

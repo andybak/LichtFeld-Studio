@@ -51,6 +51,15 @@ namespace lfs::core::internal {
             default: LFS_ASSERT_MSG(false, "unsupported CUDA index/mask dtype");
             }
         }
+
+        // Masked select and scatter only move elements, so UInt32 moves as Int32.
+        template <class Operation>
+        void dispatch_mask_copy_dtype(const StorageRef storage, Operation&& operation) {
+            if (storage.dtype == DataType::UInt32)
+                operation.template operator()<int32_t>();
+            else
+                dispatch_index_dtype(storage, operation);
+        }
     } // namespace
 
     void CudaBackendOps::index_cast(const StorageRef input, const StorageRef output,
@@ -112,16 +121,6 @@ namespace lfs::core::internal {
         }
     }
 
-    void CudaBackendOps::take(
-        const StorageRef input, const StorageRef indices, const StorageRef output,
-        const IndexProgram& program, const ExecContext context) {
-        LFS_FACADE_TRACE(take);
-        tensor_ops::launch_take(
-            cuda_const_pointer<float>(input), cuda_const_pointer<int>(indices),
-            cuda_pointer<float>(output), program.input_size, program.index_size,
-            context.cuda_stream);
-    }
-
     void CudaBackendOps::index_select(
         const StorageRef input, const StorageRef indices, const StorageRef output,
         const StridedLayout& input_layout, const IndexProgram& program,
@@ -181,6 +180,7 @@ namespace lfs::core::internal {
         switch (output.dtype) {
         case DataType::Float32: launch.template operator()<float>(); break;
         case DataType::Int32: launch.template operator()<int32_t>(); break;
+        case DataType::Int64: launch.template operator()<int64_t>(); break;
         case DataType::UInt8:
         case DataType::Bool: launch.template operator()<uint8_t>(); break;
         default: LFS_ASSERT_MSG(false, "unsupported CUDA index_copy dtype");
@@ -295,7 +295,7 @@ namespace lfs::core::internal {
                 cuda_pointer<T>(output), program.count, program.selected_count,
                 context.cuda_stream);
         };
-        dispatch_index_dtype(input, launch);
+        dispatch_mask_copy_dtype(input, launch);
         LFS_CUDA_CHECK(cudaGetLastError());
         return program.selected_count;
     }
@@ -310,7 +310,7 @@ namespace lfs::core::internal {
                 cuda_const_pointer<T>(source), program.count,
                 program.selected_count, context.cuda_stream);
         };
-        dispatch_index_dtype(output, launch);
+        dispatch_mask_copy_dtype(output, launch);
         LFS_CUDA_CHECK(cudaGetLastError());
     }
 

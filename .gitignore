@@ -12,9 +12,9 @@ output*
 !src/visualizer/rendering/output_image_pool.hpp
 !src/visualizer/rendering/output_image_pool.cpp
 !src/visualizer/rendering/output_slot_ring.hpp
-!src/visualizer/rendering/output_slot_ring.cpp
 results
 .idea
+.DS_Store
 data
 !tests/data/
 tests/data/*
@@ -28,10 +28,13 @@ tests/data/nn/*
 !tests/data/nn/moge2_ref_fixture.json
 !tests/data/nn/romav1_ref_fixture.json
 !tests/data/nn/lpips_ref_fixture.json
+!tests/data/clamped_colour_regression.ply.fixture
 *.pt
 *.py
+!tests/media/test_float_exr.py
 !scripts/lichtfeld_mcp_bridge.py
 !scripts/verify_video_orientation.py
+!scripts/prepare_media_fixtures.py
 !tools/gdb/lfs_pretty_printers.py
 !src/python/_lfs_panel_contract.py
 !src/python/lfs_splat_lod_hierarchy.py
@@ -39,7 +42,13 @@ tests/data/nn/*
 !src/python/scripts/manage_stubs.py
 !tests/real_bicycle_sh_degree_training.py
 !tests/python/**/*.py
+!tests/media/test_fixture_preparation.py
+!tests/media/test_extraction_contracts.py
+!tests/media/test_media_bindings.py
+!tests/media/test_studio_backends.py
+!tests/media/test_mcp_media.py
 !docs/plugins/examples/**/*.py
+!docs/docs/development/node-graph/examples/*.py
 !tools/*.py
 !tools/nn_export/export_lpips_weights.py
 .venv/
@@ -59,6 +68,7 @@ vcpkg_*/**
 vcpkg_*/
 build*/
 build*/**
+dist-macos-portable/
 !tools/build/
 !tools/build/check_build_deps.sh
 
@@ -87,3 +97,5 @@ src/rendering/rasterizer/vulkan/shader/radix_sort/*.spv
 
 /dist
 *.log
+!tests/media/test_ingest_cli.py
+!tests/media/test_ingest_package.py

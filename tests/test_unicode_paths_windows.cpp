@@ -2729,7 +2729,7 @@ TEST_F(UnicodePathTest, ThemeSaveLoad) {
 
     auto theme_path = themes_dir / "カスタムテーマ_custom_theme.json";
 
-    // Simulate saveTheme
+    // Write JSON through a Unicode path
     {
         std::ofstream file;
         // Theme uses string paths, so test utf8_to_path conversion
@@ -3428,7 +3428,7 @@ TEST_F(UnicodePathTest, TensorDumpDiagnostic) {
     }
 }
 
-// Test 62: Fast rasterizer crash dump (fast_rasterizer.cpp fix)
+// Test 62: Fast rasterizer crash dump (fast_rasterizer_cuda.cpp fix)
 TEST_F(UnicodePathTest, RasterizerCrashDump) {
     const auto crash_dir = test_root_ / "クラッシュダンプ_crash_dump_崩溃转储";
     fs::create_directories(crash_dir);

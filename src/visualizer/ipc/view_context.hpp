@@ -4,6 +4,7 @@
 #pragma once
 
 #include "core/export.hpp"
+#include "internal/viewport.hpp"
 #include "visualizer/rendering/rendering_manager.hpp"
 
 #include <array>
@@ -28,6 +29,22 @@ namespace lfs::vis {
         float ortho_scale = 100.0f;
     };
 
+    inline ViewInfo makeViewInfo(const Viewport& viewport, const ViewSettings& settings, const glm::ivec2 size) {
+        ViewInfo info{};
+        const auto& camera = viewport.camera;
+        for (int row = 0; row < 3; ++row)
+            for (int col = 0; col < 3; ++col)
+                info.rotation[row * 3 + col] = camera.R[col][row];
+        info.translation = {camera.t.x, camera.t.y, camera.t.z};
+        info.pivot = {camera.pivot.x, camera.pivot.y, camera.pivot.z};
+        info.width = size.x;
+        info.height = size.y;
+        info.fov = lfs::rendering::focalLengthToVFov(settings.focal_length_mm);
+        info.orthographic = settings.orthographic;
+        info.ortho_scale = settings.ortho_scale;
+        return info;
+    }
+
     struct SetViewParams {
         std::array<float, 3> eye;
         std::array<float, 3> target;
@@ -35,7 +52,6 @@ namespace lfs::vis {
     };
 
     using SetViewCallback = std::function<void(const SetViewParams&)>;
-    using SetViewForPanelCallback = std::function<void(SplitViewPanelId, const SetViewParams&)>;
     using SetFovCallback = std::function<void(float)>;
     using SetOrthoScaleCallback = std::function<void(std::optional<float>)>;
 
@@ -45,25 +61,20 @@ namespace lfs::vis {
     };
 
     using GetViewCallback = std::function<std::optional<ViewInfo>()>;
-    using GetViewForPanelCallback = std::function<std::optional<ViewInfo>(SplitViewPanelId)>;
     using GetViewportRenderCallback = std::function<std::optional<ViewportRender>()>;
     using CaptureViewportRenderCallback = std::function<std::optional<ViewportRender>()>;
 
     LFS_VIS_API void set_view_callback(GetViewCallback callback);
-    LFS_VIS_API void set_view_for_panel_callback(GetViewForPanelCallback callback);
     LFS_VIS_API void set_viewport_render_callback(GetViewportRenderCallback callback);
     LFS_VIS_API void set_capture_viewport_render_callback(CaptureViewportRenderCallback callback);
     [[nodiscard]] LFS_VIS_API std::optional<ViewInfo> get_current_view_info();
-    [[nodiscard]] LFS_VIS_API std::optional<ViewInfo> get_view_info_for_panel(SplitViewPanelId panel);
     [[nodiscard]] LFS_VIS_API std::optional<ViewportRender> get_viewport_render();
     [[nodiscard]] LFS_VIS_API std::optional<ViewportRender> capture_viewport_render();
 
     LFS_VIS_API void set_set_view_callback(SetViewCallback callback);
-    LFS_VIS_API void set_set_view_for_panel_callback(SetViewForPanelCallback callback);
     LFS_VIS_API void set_set_fov_callback(SetFovCallback callback);
     LFS_VIS_API void set_set_ortho_scale_callback(SetOrthoScaleCallback callback);
     LFS_VIS_API void apply_set_view(const SetViewParams& params);
-    LFS_VIS_API void apply_set_view_for_panel(SplitViewPanelId panel, const SetViewParams& params);
     LFS_VIS_API void apply_set_fov(float fov_degrees);
     LFS_VIS_API void apply_set_ortho_scale(std::optional<float> scale);
 
@@ -86,7 +97,8 @@ namespace lfs::vis {
         bool desaturate_cropping = false;
         bool crop_filter_for_selection = false;
         std::array<float, 3> background_color{0.0f, 0.0f, 0.0f};
-        // Display color: tone IDs match none, linear, filmic, hejl, aces, aces2, neutral.
+        // Display color: tone IDs match none, linear, filmic, hejl, aces, aces2,
+        // neutral.
         float color_exposure = 1.0f;
         int color_tonemapping = 0;
         int splat_render_profile = 0; // 0: Studio, 1: standard portal
@@ -113,6 +125,7 @@ namespace lfs::vis {
         bool show_pivot = false;
         int split_view_mode = 0;
         int gt_comparison_mode = 0;
+        bool gt_comparison_actual_size = false;
         float split_position = 0.5f;
         size_t split_view_offset = 0;
         int raster_backend = 2;
@@ -124,7 +137,6 @@ namespace lfs::vis {
         float depth_view_min = lfs::rendering::DEFAULT_DEPTH_VIEW_MIN;
         float depth_view_max = lfs::rendering::DEFAULT_DEPTH_VIEW_MAX;
         int depth_visualization_mode = 0;
-        std::array<float, 3> selection_color_committed{0.859f, 0.325f, 0.325f};
         std::array<float, 3> selection_color_preview{0.0f, 0.871f, 0.298f};
         std::array<float, 3> selection_color_center_marker{0.0f, 0.604f, 0.733f};
         bool depth_clip_enabled = false;
@@ -173,6 +185,22 @@ namespace lfs::vis {
         bool scene_upscaler_explicit = false;
         bool scene_upscaler_preset_explicit = false;
     };
+
+    struct RenderSettingsTarget {
+        ViewId view = kNoView;
+        std::uint64_t screen_epoch = 0;
+    };
+    using CaptureRenderSettingsTargetCallback = std::function<std::optional<RenderSettingsTarget>()>;
+    using GetViewRenderSettingsCallback = std::function<std::optional<RenderSettingsProxy>(RenderSettingsTarget)>;
+    using SetViewRenderSettingsCallback = std::function<std::optional<RenderSettingsProxy>(
+        RenderSettingsTarget, const RenderSettingsProxy&, RenderSettingsUpdateIntent)>;
+    LFS_VIS_API void set_view_render_settings_callbacks(CaptureRenderSettingsTargetCallback capture,
+                                                        GetViewRenderSettingsCallback get,
+                                                        SetViewRenderSettingsCallback set);
+    [[nodiscard]] LFS_VIS_API std::optional<RenderSettingsTarget> capture_render_settings_target();
+    [[nodiscard]] LFS_VIS_API std::optional<RenderSettingsProxy> get_render_settings_for_view(RenderSettingsTarget target);
+    [[nodiscard]] LFS_VIS_API std::optional<RenderSettingsProxy> update_render_settings_for_view(
+        RenderSettingsTarget target, const RenderSettingsProxy& settings, RenderSettingsUpdateIntent intent = {});
 
     using GetRenderSettingsCallback = std::function<std::optional<RenderSettingsProxy>()>;
     using SetRenderSettingsCallback =

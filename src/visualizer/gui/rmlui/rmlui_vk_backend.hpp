@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include "core/export.hpp"
+
 #include <RmlUi/Core/RenderInterface.h>
 
 #include "core/assert.hpp"
@@ -18,6 +20,7 @@
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 0
 #endif
 
+#include "gui/ui_renderer.hpp"
 #include <vk_mem_alloc.h>
 #include <vulkan/vulkan.h>
 
@@ -48,15 +51,47 @@
 #endif
 
 // Your specified API version. Ideally, this will be dynamic in the future.
-#define RMLUI_VK_API_VERSION VK_API_VERSION_1_0
+#define RMLUI_VK_API_VERSION VK_API_VERSION_1_3
 
-class RenderInterface_VK : public Rml::RenderInterface {
+class RenderInterface_VK : public lfs::vis::gui::UiRenderer {
+    friend class RenderInterfaceVKTestAccess;
+
 public:
     static constexpr uint32_t kSwapchainBackBufferCount = 3;
-    static constexpr VkDeviceSize kVideoMemoryForAllocation = 4 * 1024 * 1024; // [bytes]
+    // Retained panel geometry plus three in-flight generations of canvas meshes.
+    static constexpr VkDeviceSize kVideoMemoryForAllocation = 16 * 1024 * 1024; // [bytes]
 
     RenderInterface_VK();
     ~RenderInterface_VK();
+
+    [[nodiscard]] bool initialize(lfs::vis::GraphicsContext& graphics) override;
+    void shutdown() override { ShutdownExternal(); }
+    [[nodiscard]] bool beginFrame(const lfs::vis::GraphicsFrame& frame) override;
+    void endFrame() override { EndExternalFrame(); }
+    void resetContextRenderState() override { ResetContextRenderState(); }
+    void setContextOffset(float x, float y) override { SetContextOffset(x, y); }
+    void setContextClipRect(float x1, float y1, float x2, float y2) override {
+        SetContextClipRect(x1, y1, x2, y2);
+    }
+    void renderTextureQuad(Rml::TextureHandle texture, float x, float y,
+                           float width, float height) override {
+        RenderTextureQuad(texture, x, y, width, height);
+    }
+    [[nodiscard]] bool renderFrostedGlass(
+        std::span<const lfs::vis::gui::UiFrostedGlassRegion> regions) override;
+    void beginCacheCapture(int x, int y, int width, int height) override {
+        BeginCacheCapture(x, y, width, height);
+    }
+    void endCacheCapture() override { EndCacheCapture(); }
+    [[nodiscard]] Rml::TextureHandle saveLayerRegionAsTexture(
+        lfs::vis::gui::UiPixelRect region,
+        Rml::TextureHandle reuse_texture) override;
+    void setTextureDebugName(Rml::TextureHandle texture,
+                             std::string_view name) const override {
+        SetTextureDebugName(texture, name);
+    }
+    [[nodiscard]] lfs::vis::gui::UiRendererMemoryStatistics
+    memoryStatistics() const override;
 
     struct ExternalContext {
         VkInstance instance = VK_NULL_HANDLE;
@@ -130,10 +165,10 @@ public:
 
     /// Called by RmlUi when a texture is required by the library.
     Rml::TextureHandle LoadTexture(Rml::Vector2i& texture_dimensions, const Rml::String& source) override;
-    [[nodiscard]] uint64_t previewTextureGeneration() const {
+    [[nodiscard]] uint64_t previewTextureGeneration() const override {
         return m_preview_texture_generation.load(std::memory_order_acquire);
     }
-    [[nodiscard]] bool currentContextUsedPreviewTexture() const {
+    [[nodiscard]] bool currentContextUsedPreviewTexture() const override {
         return m_current_context_used_preview_texture;
     }
     /// Called by RmlUi when a texture is required to be built from an internally-generated sequence of pixels.
@@ -171,6 +206,7 @@ public:
     void SetTransform(const Rml::Matrix4f* transform) override;
 
 private:
+    lfs::vis::GraphicsContext* m_graphics_context = nullptr;
     enum class shader_type_t : int { Vertex,
                                      Fragment,
                                      Unknown = -1 };
@@ -233,6 +269,13 @@ private:
         bool embedded_project_preview = false;
     };
 
+    class MemoryPool;
+    struct pool_allocation_t {
+        MemoryPool* owner = nullptr;
+        VmaVirtualAllocation handle = nullptr;
+        explicit operator bool() const noexcept { return handle != nullptr; }
+    };
+
     struct geometry_handle_t {
         int m_num_indices;
 
@@ -242,9 +285,9 @@ private:
 
         // @ this is for freeing our logical blocks for VMA
         // see https://gpuopen-librariesandsdks.github.io/VulkanMemoryAllocator/html/virtual_allocator.html
-        VmaVirtualAllocation m_p_vertex_allocation;
-        VmaVirtualAllocation m_p_index_allocation;
-        VmaVirtualAllocation m_p_shader_allocation;
+        pool_allocation_t m_p_vertex_allocation;
+        pool_allocation_t m_p_index_allocation;
+        pool_allocation_t m_p_shader_allocation;
     };
 
     struct buffer_data_t {
@@ -423,14 +466,14 @@ private:
         MemoryPool();
         ~MemoryPool();
 
-        void Initialize(VkDeviceSize byte_size, VkDeviceSize device_min_uniform_alignment, VmaAllocator p_allocator, VkDevice p_device) noexcept;
+        bool Initialize(VkDeviceSize byte_size, VkDeviceSize device_min_uniform_alignment, VmaAllocator p_allocator, VkDevice p_device) noexcept;
         void Shutdown() noexcept;
 
-        bool Alloc_GeneralBuffer(VkDeviceSize size, void** p_data, VkDescriptorBufferInfo* p_out, VmaVirtualAllocation* p_alloc) noexcept;
+        bool Alloc_GeneralBuffer(VkDeviceSize size, void** p_data, VkDescriptorBufferInfo* p_out, pool_allocation_t* p_alloc) noexcept;
         bool Alloc_VertexBuffer(uint32_t number_of_elements, uint32_t stride_in_bytes, void** p_data, VkDescriptorBufferInfo* p_out,
-                                VmaVirtualAllocation* p_alloc) noexcept;
+                                pool_allocation_t* p_alloc) noexcept;
         bool Alloc_IndexBuffer(uint32_t number_of_elements, uint32_t stride_in_bytes, void** p_data, VkDescriptorBufferInfo* p_out,
-                               VmaVirtualAllocation* p_alloc) noexcept;
+                               pool_allocation_t* p_alloc) noexcept;
 
         void SetDescriptorSet(uint32_t binding_index, uint32_t size, VkDescriptorType descriptor_type, VkDescriptorSet p_set) noexcept;
         void SetDescriptorSet(uint32_t binding_index, VkDescriptorBufferInfo* p_info, VkDescriptorType descriptor_type,
@@ -438,10 +481,13 @@ private:
         void SetDescriptorSet(uint32_t binding_index, VkSampler p_sampler, VkImageLayout layout, VkImageView p_view, VkDescriptorType descriptor_type,
                               VkDescriptorSet p_set) noexcept;
 
-        void Free_Allocation(VmaVirtualAllocation allocation) noexcept;
+        void Free_Allocation(pool_allocation_t allocation) noexcept;
         void Free_GeometryHandle(geometry_handle_t* p_valid_geometry_handle) noexcept;
 
     private:
+        friend class RenderInterface_VK;
+        std::unique_ptr<MemoryPool> m_overflow;
+        VkDescriptorSet m_shader_descriptor_set = VK_NULL_HANDLE;
         VkDeviceSize m_memory_total_size;
         VkDeviceSize m_device_min_uniform_alignment;
         char* m_p_data;
@@ -483,8 +529,6 @@ private:
             m_pools.clear();
             m_set_to_pool.clear();
         }
-
-        uint32_t Get_AllocatedDescriptorCount() const noexcept { return m_allocated_descriptor_count; }
 
         bool Alloc_Descriptor(VkDevice p_device, VkDescriptorSetLayout* p_layouts, VkDescriptorSet* p_sets,
                               uint32_t descriptor_count_for_creation = 1) noexcept {
@@ -588,9 +632,9 @@ private:
     void StopPreviewWorkerPool() noexcept;
     void EnqueuePreviewWork(preview_work_t work);
     void QueueTextureForDeferredDeletion(texture_data_t* texture);
-    static async_preview_result_t DecodePreviewTexture(std::filesystem::path path,
-                                                       int max_size,
-                                                       bool embedded_project_preview);
+    LFS_VIS_API static async_preview_result_t DecodePreviewTexture(std::filesystem::path path,
+                                                                   int max_size,
+                                                                   bool embedded_project_preview);
 
     void Initialize_Resources(const VkPhysicalDeviceProperties& physical_device_properties) noexcept;
     void Initialize_Allocator() noexcept;
@@ -652,10 +696,8 @@ private:
     uint32_t ActiveResourceSlot() const noexcept;
 
 private:
-    bool m_is_transform_enabled;
     bool m_is_apply_to_regular_geometry_stencil;
     bool m_is_clip_mask_enabled;
-    bool m_is_transformed_scissor_enabled;
     bool m_is_use_scissor_specified;
     bool m_is_use_stencil_pipeline;
     bool m_external_context = false;
@@ -690,6 +732,7 @@ private:
     VkPipeline m_p_pipeline_stencil_for_regular_geometry_that_applied_to_region_with_textures;
     VkPipeline m_p_pipeline_stencil_for_regular_geometry_that_applied_to_region_without_textures;
     VkDescriptorSet m_p_descriptor_set;
+    std::vector<VkDescriptorSet> m_overflow_shader_descriptor_sets;
     VkSampler m_p_sampler_linear;
     VkSampler m_p_sampler_nearest;
     VkRect2D m_scissor;
@@ -736,7 +779,7 @@ private:
     float m_texture_quad_y = 0.0f;
     float m_texture_quad_w = 0.0f;
     float m_texture_quad_h = 0.0f;
-    Rml::Array<Rml::Vector<VmaVirtualAllocation>, kSwapchainBackBufferCount> m_transient_shader_allocations_by_frame;
+    Rml::Array<Rml::Vector<pool_allocation_t>, kSwapchainBackBufferCount> m_transient_shader_allocations_by_frame;
     VkImage m_external_swapchain_image = VK_NULL_HANDLE;
     VkImageView m_external_swapchain_image_view = VK_NULL_HANDLE;
     VkImageView m_external_depth_stencil_image_view = VK_NULL_HANDLE;

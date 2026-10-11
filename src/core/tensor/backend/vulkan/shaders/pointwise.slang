@@ -3,6 +3,8 @@ static const uint LFS_PUSH_CONSTANT_SIZE = 48;
 #include "half_bits.slangh"
 #include "byte_word.slangh"
 #include "integer_math.slangh"
+#include "hyperbolic_math.slangh"
+#include "power_math.slangh"
 
 [SpecializationConstant]
 const uint kOp = 0;
@@ -114,13 +116,17 @@ float accurateLog1p(float value)
 
 float accurateAsin(float value)
 {
-    const float bounded = clamp(value, -1.0f, 1.0f);
+    if (isnan(value) || abs(value) > 1.0f)
+        return asfloat(0x7fc00000u);
+    const float bounded = value;
     return atan2(bounded, sqrt(max(0.0f, 1.0f - bounded * bounded)));
 }
 
 float accurateAcos(float value)
 {
-    const float bounded = clamp(value, -1.0f, 1.0f);
+    if (isnan(value) || abs(value) > 1.0f)
+        return asfloat(0x7fc00000u);
+    const float bounded = value;
     return atan2(sqrt(max(0.0f, 1.0f - bounded * bounded)), bounded);
 }
 
@@ -130,7 +136,7 @@ float floatBinary(float lhs, float rhs)
     if (kOp == 1 || kOp == 5) return lhs - rhs;
     if (kOp == 2 || kOp == 6) return lhs * rhs;
     if (kOp == 3 || kOp == 7) return lhs / rhs;
-    if (kOp == 8 || kOp == 25) return rhs == 2.0f ? lhs * lhs : pow(lhs, rhs);
+    if (kOp == 8 || kOp == 25) return rhs == 2.0f ? lhs * lhs : cPow(lhs, rhs);
     if (kOp == 9 || kOp == 26) return fmod(lhs, rhs);
     if (kOp == 27 || kOp == 57) return ieeeMaximum(lhs, rhs);
     if (kOp == 28 || kOp == 58) return ieeeMinimum(lhs, rhs);
@@ -167,9 +173,9 @@ float floatUnary(float value, float scalar, bool scalarOnRight)
     if (kOp == 15) return 1.0f / (1.0f + exp(-value));
     if (kOp == 16) return isnan(value) ? value : ieeeMaximum(value, 0.0f);
     if (kOp == 17) return value * value;
-    if (kOp == 18) return tanh(value);
+    if (kOp == 18) return accurateTanh(value);
     if (kOp == 19) return rsqrt(value);
-    if (kOp == 20) return float((value > 0.0f) - (value < 0.0f));
+    if (kOp == 20) return isnan(value) ? value : float((value > 0.0f) - (value < 0.0f));
     if (kOp == 21) return 1.0f / value;
     if (kOp == 22) return floor(value);
     if (kOp == 23) return ceil(value);
@@ -184,13 +190,13 @@ float floatUnary(float value, float scalar, bool scalarOnRight)
     if (kOp == 45) return accurateAsin(value);
     if (kOp == 46) return accurateAcos(value);
     if (kOp == 47) return atan(value);
-    if (kOp == 48) return sinh(value);
+    if (kOp == 48) return accurateSinh(value);
     if (kOp == 49) return cosh(value);
     if (kOp == 50)
     {
         const float inner = sqrt(2.0f / 3.14159265358979323846f) *
                             (value + 0.044715f * value * value * value);
-        return 0.5f * value * (1.0f + tanh(inner));
+        return 0.5f * value * (1.0f + accurateTanh(inner));
     }
     if (kOp == 51) return value / (1.0f + exp(-value));
     if (kOp == 52) return trunc(value);
@@ -222,52 +228,14 @@ float applyChainOp(float value, ChainOp op, uint index)
     if (op.kind == 15) return 1.0f / (1.0f + exp(-value));
     if (op.kind == 16) return isnan(value) ? value : ieeeMaximum(value, 0.0f);
     if (op.kind == 17) return value * value;
-    if (op.kind == 18) return tanh(value);
+    if (op.kind == 18) return accurateTanh(value);
     if (op.kind == 19) return rsqrt(value);
-    if (op.kind == 20) return float((value > 0.0f) - (value < 0.0f));
+    if (op.kind == 20) return isnan(value) ? value : float((value > 0.0f) - (value < 0.0f));
     if (op.kind == 21) return 1.0f / value;
     if (op.kind == 22) return floor(value);
     if (op.kind == 23) return ceil(value);
     if (op.kind == 24) return ieeeRound(value);
     return value;
-}
-
-// Wrap-around integer power; negative exponents follow integer division, so
-// only bases 1 and -1 keep a nonzero result.
-int intPow(int base, int exponent)
-{
-    if (exponent < 0)
-        return base == 1 ? 1 : base == -1 ? ((exponent & 1) != 0 ? -1 : 1) : 0;
-    int result = 1;
-    int factor = base;
-    int remaining = exponent;
-    while (remaining != 0)
-    {
-        if ((remaining & 1) != 0)
-            result *= factor;
-        factor *= factor;
-        remaining >>= 1;
-    }
-    return result;
-}
-
-int64_t int64Pow(int64_t base, int64_t exponent)
-{
-    if (exponent < int64_t(0))
-        return base == int64_t(1) ? int64_t(1)
-             : base == int64_t(-1) ? ((exponent & int64_t(1)) != int64_t(0) ? int64_t(-1) : int64_t(1))
-                                   : int64_t(0);
-    int64_t result = int64_t(1);
-    int64_t factor = base;
-    int64_t remaining = exponent;
-    while (remaining != int64_t(0))
-    {
-        if ((remaining & int64_t(1)) != int64_t(0))
-            result *= factor;
-        factor *= factor;
-        remaining >>= 1;
-    }
-    return result;
 }
 
 int intBinary(int lhs, int rhs)
@@ -409,12 +377,12 @@ void evaluateScalar(uint index, uniform Parameters parameters)
     }
     if (kArity == 5)
     {
-        if (kInputDType == kFloat32)
+        if (kInputDType == kFloat32 || kInputDType == kFloat16)
         {
-            const float value = ((Ptr<float, Access.Read>)parameters.lhsAddress)[index];
+            const float value = loadFloat(parameters.lhsAddress, index);
             const float maximum = asfloat(uint(parameters.scalarInt64));
-            ((Ptr<float, Access.ReadWrite>)parameters.outputAddress)[index] =
-                isnan(value) ? value : min(max(value, parameters.scalarFloat), maximum);
+            const float result = isnan(value) ? value : min(max(value, parameters.scalarFloat), maximum);
+            storeFloat(parameters.outputAddress, index, result);
         }
         else
         {
@@ -466,17 +434,7 @@ void evaluateScalar(uint index, uniform Parameters parameters)
         else if (kOp == 26) result = rhs == 0u ? 0u : lhs % rhs;
         else if (kOp == 27) result = max(lhs, rhs);
         else if (kOp == 28) result = min(lhs, rhs);
-        else if (kOp == 25)
-        {
-            result = 1u;
-            uint factor = lhs, exponent = rhs;
-            while (exponent != 0u)
-            {
-                if ((exponent & 1u) != 0u) result *= factor;
-                factor *= factor;
-                exponent >>= 1u;
-            }
-        }
+        else if (kOp == 25) result = uintPow(lhs, rhs);
         ((Ptr<uint, Access.ReadWrite>)parameters.outputAddress)[index] = result;
     }
 }

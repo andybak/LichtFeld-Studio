@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "metal_context.hpp"
+#include "metal_queue.hpp"
 
 #include "../../internal/expression_emitter.hpp"
 #include "../../internal/point_filter.hpp"
@@ -9,13 +10,19 @@
 #include "core/error.hpp"
 #include "core/gpu_device_info.hpp"
 #include "core/memory_pressure.hpp"
+#include "core/tensor_label.hpp"
+#include "diagnostics/vram_profiler.hpp"
 
 #include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <string>
+#include <unordered_set>
+
+#include <tbb/parallel_for.h>
 
 namespace lfs::core::internal::metal {
 
@@ -61,15 +68,20 @@ namespace lfs::core::internal::metal {
             return source + kKernelSource;
         }
 
-        // Power-of-two size classes keep reuse simple; large blocks round to 2 MiB.
+        // Small power-of-two classes keep reuse dense. Tensor images and model
+        // fields are long-lived and regularly land between powers of two, so use
+        // 1 MiB classes there instead of retaining up to 100% rounding waste.
         constexpr size_t kLargeBlock = size_t{64} << 20;
 
         size_t size_class(const size_t bytes) {
+            constexpr size_t kMediumGranule = size_t{1} << 20;
             constexpr size_t kLargeGranule = size_t{2} << 20;
             if (bytes <= 256)
                 return 256;
-            if (bytes <= kLargeBlock)
+            if (bytes <= kMediumGranule)
                 return std::bit_ceil(bytes);
+            if (bytes <= kLargeBlock)
+                return (bytes + kMediumGranule - 1) / kMediumGranule * kMediumGranule;
             return (bytes + kLargeGranule - 1) / kLargeGranule * kLargeGranule;
         }
 
@@ -98,9 +110,25 @@ namespace lfs::core::internal::metal {
             throw TensorError("Metal fault record allocation failed");
         std::memset(fault_.contents, 0, fault_.length);
         [residency_ addAllocation:fault_];
-        // The cache holds at most a sixteenth of the process budget; the rest
-        // goes back to the system as its last batch completes.
-        cache_limit_ = static_cast<size_t>(device_.recommendedMaxWorkingSetSize) / 16;
+        // Extending the residency set while batches are running can block the
+        // recording thread. Prepare the bounded command/parameter pool before
+        // any GPU work rather than grow it during a training snapshot.
+        frames_.reserve(kMaxFrames);
+        for (size_t index = 0; index < kMaxFrames; ++index) {
+            Frame frame{
+                .allocator = [device_ newCommandAllocator],
+                .params = [device_ newBufferWithLength:kBatchDispatches * kMaxParamsBytes
+                                               options:MTLResourceStorageModeShared],
+            };
+            if (!frame.allocator || !frame.params)
+                throw TensorError("Metal command memory allocation failed");
+            [residency_ addAllocation:frame.params];
+            frames_.push_back(std::move(frame));
+        }
+        // A fixed ceiling prevents large unified-memory machines from retaining
+        // several GiB of one-shot load/refinement buffers.
+        cache_limit_ = std::min(static_cast<size_t>(device_.recommendedMaxWorkingSetSize) / 16,
+                                size_t{128} << 20);
         [residency_ commit];
         [queue_ addResidencySet:residency_];
         context_id_ = next_context_id.fetch_add(1);
@@ -167,6 +195,7 @@ namespace lfs::core::internal::metal {
     }
 
     void Context::dispatch(const std::span<const StorageRef> uses, const Dispatch& dispatch) {
+        check_external_write_failure();
         LFS_ASSERT_MSG(dispatch.buffers.size() + (dispatch.params.empty() ? 0 : 1) <= kArgumentSlots &&
                            dispatch.params.size() <= kMaxParamsBytes,
                        "Metal dispatch exceeds its argument slots");
@@ -188,13 +217,17 @@ namespace lfs::core::internal::metal {
             [arguments_ setAddress:params.gpuAddress + params_used_ atIndex:slot];
             params_used_ += (dispatch.params.size() + kParamsAlignment - 1) / kParamsAlignment * kParamsAlignment;
         }
-        if (dispatch.group_size.width == 0) {
+        if (dispatch.indirect != 0) {
+            [encoder dispatchThreadgroupsWithIndirectBuffer:dispatch.indirect threadsPerThreadgroup:dispatch.group_size];
+        } else if (dispatch.group_size.width == 0) {
             const NSUInteger width = std::min(dispatch.pipeline.maxTotalThreadsPerThreadgroup, kThreadgroupWidth);
             [encoder dispatchThreads:dispatch.grid threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
         } else {
             LFS_ASSERT_MSG(dispatch.group_size.width * dispatch.group_size.height * dispatch.group_size.depth <=
                                dispatch.pipeline.maxTotalThreadsPerThreadgroup,
-                           "Metal threadgroup exceeds its pipeline's limit");
+                           std::format("Metal threadgroup of {}x{}x{} threads exceeds its pipeline's limit of {}",
+                                       dispatch.group_size.width, dispatch.group_size.height,
+                                       dispatch.group_size.depth, dispatch.pipeline.maxTotalThreadsPerThreadgroup));
             [encoder dispatchThreadgroups:dispatch.grid threadsPerThreadgroup:dispatch.group_size];
         }
         for (const StorageRef& use : uses) {
@@ -281,25 +314,9 @@ namespace lfs::core::internal::metal {
             if (frames_[index].serial <= done)
                 return index;
         }
-        if (frames_.size() == kMaxFrames) {
-            const auto oldest = std::ranges::min_element(frames_, {}, &Frame::serial);
-            wait_signaled(oldest->serial);
-            return static_cast<size_t>(oldest - frames_.begin());
-        }
-        Frame frame{
-            .allocator = [device_ newCommandAllocator],
-            .params = [device_ newBufferWithLength:kBatchDispatches * kMaxParamsBytes
-                                           options:MTLResourceStorageModeShared],
-        };
-        if (!frame.allocator || !frame.params)
-            throw TensorError("Metal command memory allocation failed");
-        {
-            std::lock_guard lock(memory_mutex_);
-            [residency_ addAllocation:frame.params];
-            [residency_ commit];
-        }
-        frames_.push_back(frame);
-        return frames_.size() - 1;
+        const auto oldest = std::ranges::min_element(frames_, {}, &Frame::serial);
+        wait_signaled(oldest->serial);
+        return static_cast<size_t>(oldest - frames_.begin());
     }
 
     void Context::commit_locked() {
@@ -319,7 +336,17 @@ namespace lfs::core::internal::metal {
         prepare_locked();
     }
 
+    void Context::record_external_write_failure() noexcept {
+        failure_->external_write_failed.store(true, std::memory_order_release);
+    }
+
+    void Context::check_external_write_failure() const {
+        if (failure_->external_write_failed.load(std::memory_order_acquire))
+            throw TensorError("Native Metal tensor write failed; partial output is quarantined");
+    }
+
     void Context::check_failures() const {
+        check_external_write_failure();
         std::lock_guard lock(failure_->mutex);
         if (!failure_->message.empty())
             throw TensorError(std::format("Metal tensor work failed: {}", failure_->message));
@@ -332,6 +359,7 @@ namespace lfs::core::internal::metal {
     }
 
     uint64_t Context::signal(id<MTLSharedEvent> const event) {
+        check_external_write_failure();
         std::lock_guard lock(encode_mutex_);
         commit_locked();
         const uint64_t serial = submitted_.load(std::memory_order_acquire);
@@ -349,6 +377,23 @@ namespace lfs::core::internal::metal {
         return submitted_.load(std::memory_order_relaxed);
     }
 
+    uint64_t Context::write_timestamp(id<MTL4CounterHeap> const heap, const NSUInteger index) {
+        std::lock_guard lock(encode_mutex_);
+        // An encoder without dispatches writes zero timestamps, so the mark goes
+        // between two encoders; the next one waits for all earlier work again.
+        [open_encoder_locked() endEncoding];
+        [command_buffer_ writeTimestampIntoHeap:heap atIndex:index];
+        encoder_ = [command_buffer_ computeCommandEncoder];
+        [encoder_ barrierAfterQueueStages:MTLStageDispatch
+                             beforeStages:MTLStageDispatch
+                        visibilityOptions:MTL4VisibilityOptionDevice];
+        [encoder_ setArgumentTable:arguments_];
+        const uint64_t serial = open_serial_;
+        if (++open_dispatches_ >= kBatchDispatches || completed() >= submitted_.load(std::memory_order_relaxed))
+            commit_locked();
+        return serial;
+    }
+
     void Context::wait(const uint64_t serial) {
         if (serial == 0)
             return;
@@ -358,6 +403,31 @@ namespace lfs::core::internal::metal {
                 commit_locked();
         }
         wait_signaled(serial);
+    }
+
+    bool Context::ready(const uint64_t serial) {
+        if (completed() >= serial)
+            return true;
+        std::lock_guard lock(encode_mutex_);
+        if (open_dispatches_ > 0 && serial >= open_serial_)
+            commit_locked();
+        return false;
+    }
+
+    void Context::wait_completed(const uint64_t serial) {
+        {
+            std::lock_guard lock(encode_mutex_);
+            if (open_dispatches_ > 0 && serial >= open_serial_)
+                commit_locked();
+        }
+        const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(300);
+        while (completed() < serial && std::chrono::steady_clock::now() < spin_until) {
+        }
+        while (completed() < serial && ![event_ waitUntilSignaledValue:serial timeoutMS:100]) {
+            std::lock_guard lock(failure_->mutex);
+            if (!failure_->message.empty() || failure_->external_write_failed.load(std::memory_order_acquire))
+                return;
+        }
     }
 
     void Context::wait_signaled(const uint64_t serial) {
@@ -427,20 +497,33 @@ namespace lfs::core::internal::metal {
         wait(flush());
     }
 
-    StorageRef Context::allocate(const size_t bytes) {
+    StorageRef Context::allocate(const size_t bytes, const bool host_writable) {
         const size_t capacity = size_class(bytes);
+        const auto scoped_label = current_tensor_label();
+        const auto allocation_label =
+            scoped_label.empty() ? std::string_view{"tensor.storage"} : scoped_label;
         std::lock_guard lock(memory_mutex_);
         Block block;
         // Large requests vary in size, so they also take a cached block up to a
         // quarter larger.
         const size_t reach = capacity > kLargeBlock ? capacity + capacity / 4 : capacity;
+        const uint64_t done = host_writable ? completed() : std::numeric_limits<uint64_t>::max();
+        bool reused = false;
         if (auto found = free_.lower_bound(capacity); found != free_.end() && found->first <= reach) {
-            block = std::move(found->second.back());
-            found->second.pop_back();
-            if (found->second.empty())
-                free_.erase(found);
-            cached_bytes_ -= block.capacity;
-        } else {
+            auto& cached = found->second;
+            for (auto candidate = cached.end(); candidate != cached.begin();) {
+                if ((--candidate)->guard > done)
+                    continue;
+                block = std::move(*candidate);
+                cached.erase(candidate);
+                if (cached.empty())
+                    free_.erase(found);
+                cached_bytes_ -= block.capacity;
+                reused = true;
+                break;
+            }
+        }
+        if (!reused) {
             id<MTLBuffer> buffer = [device_ newBufferWithLength:capacity options:MTLResourceStorageModeShared];
             if (!buffer) {
                 evict_locked(0);
@@ -472,6 +555,7 @@ namespace lfs::core::internal::metal {
             };
         }
         block.meta->pending_value.store(block.guard, std::memory_order_relaxed);
+        block.requested = bytes;
         const StorageRef storage{
             .backend = GpuBackend::Metal,
             .data = reinterpret_cast<void*>(block.address),
@@ -480,6 +564,17 @@ namespace lfs::core::internal::metal {
             .meta = block.meta.get(),
         };
         live_.emplace(block.address, std::move(block));
+        live_requested_bytes_ += bytes;
+        live_capacity_bytes_ += capacity;
+        peak_live_capacity_bytes_ = std::max(peak_live_capacity_bytes_, live_capacity_bytes_);
+        peak_reserved_bytes_ = std::max(peak_reserved_bytes_, live_capacity_bytes_ + cached_bytes_);
+        try {
+            lfs::diagnostics::VramProfiler::instance().recordAllocation(
+                storage.data, capacity, lfs::diagnostics::VramAllocationMethod::Metal,
+                allocation_label);
+        } catch (...) {
+            // Diagnostics must never make a tensor allocation fail.
+        }
         return storage;
     }
 
@@ -490,11 +585,24 @@ namespace lfs::core::internal::metal {
             return;
         Block block = std::move(found->second);
         live_.erase(found);
+        live_requested_bytes_ = block.requested > live_requested_bytes_
+                                    ? 0
+                                    : live_requested_bytes_ - block.requested;
+        live_capacity_bytes_ = block.capacity > live_capacity_bytes_
+                                   ? 0
+                                   : live_capacity_bytes_ - block.capacity;
+        try {
+            lfs::diagnostics::VramProfiler::instance().recordDeallocation(storage.data);
+        } catch (...) {
+            // Diagnostics must never make tensor storage teardown fail.
+        }
         block.guard = newest_serial_.load(std::memory_order_acquire);
+        block.requested = 0;
         cached_bytes_ += block.capacity;
+        peak_reserved_bytes_ = std::max(peak_reserved_bytes_, live_capacity_bytes_ + cached_bytes_);
         free_[block.capacity].push_back(std::move(block));
-        if (cached_bytes_ > cache_limit_)
-            evict_locked(cache_limit_);
+        if (trim_requested_ || cached_bytes_ > cache_limit_)
+            evict_locked(trim_requested_ ? 0 : cache_limit_);
     }
 
     // Returns cached blocks to the system, largest first, until at most limit
@@ -518,11 +626,16 @@ namespace lfs::core::internal::metal {
         }
         if (removed)
             [residency_ commit];
+        // If trim raced a tensor whose last GPU use still owns its handle,
+        // keep the request armed until at least one eligible release arrives.
+        if (trim_requested_ && cached_bytes_ == 0 && removed)
+            trim_requested_ = false;
     }
 
     void Context::trim() {
         flush();
         std::lock_guard lock(memory_mutex_);
+        trim_requested_ = true;
         evict_locked(0);
     }
 
@@ -537,6 +650,20 @@ namespace lfs::core::internal::metal {
         result.allocated_bytes = static_cast<size_t>(device_.currentAllocatedSize);
         result.free_bytes = result.total_bytes > result.allocated_bytes ? result.total_bytes - result.allocated_bytes : 0;
         result.device_id = 0;
+        {
+            std::lock_guard lock(memory_mutex_);
+            result.pool_used_current = live_capacity_bytes_;
+            result.pool_reserved_current = live_capacity_bytes_ + cached_bytes_;
+            result.pool_used_high = peak_live_capacity_bytes_;
+            result.pool_reserved_high = peak_reserved_bytes_;
+            lfs::diagnostics::VramProfiler::instance().updateMetalMemory(
+                result.allocated_bytes,
+                live_requested_bytes_,
+                live_capacity_bytes_,
+                cached_bytes_,
+                peak_live_capacity_bytes_,
+                peak_reserved_bytes_);
+        }
         return result;
     }
 
@@ -593,6 +720,18 @@ namespace lfs::core::internal::metal {
         return std::max(pending(storage), guard);
     }
 
+    void host_copy(std::byte* const destination, const std::byte* const source, const size_t bytes) {
+        constexpr size_t kChunk = size_t{256} << 10;
+        if (bytes < 8 * kChunk) {
+            std::memcpy(destination, source, bytes);
+            return;
+        }
+        tbb::parallel_for(size_t{0}, (bytes + kChunk - 1) / kChunk, [&](const size_t chunk) {
+            const size_t offset = chunk * kChunk;
+            std::memcpy(destination + offset, source + offset, std::min(kChunk, bytes - offset));
+        });
+    }
+
     std::shared_ptr<Context> acquire_context() {
         std::lock_guard lock(context_mutex);
         if (!context_instance)
@@ -645,16 +784,23 @@ namespace lfs::core::internal {
             if (const auto context = metal::live_context()) {
                 // The working set is the process's budget of the unified memory.
                 const auto budget = static_cast<size_t>(context->device().recommendedMaxWorkingSetSize);
+                const auto memory = context->stats();
                 return GpuDeviceInfo{
                     .name = context->device().name.UTF8String,
                     .total_memory_bytes = budget,
                     .supports_process_memory_budget = true,
                     .process_memory_budget_bytes = budget,
-                    .process_memory_used_bytes = static_cast<size_t>(context->device().currentAllocatedSize),
+                    .process_memory_used_bytes = memory.allocated_bytes,
                 };
             }
         }
         return std::nullopt;
+    }
+
+    size_t metal_allocation_bytes(const size_t bytes) {
+        if (@available(macOS 26.0, *))
+            return metal::size_class(bytes);
+        return bytes;
     }
 
     uint64_t metal_flush() {
@@ -687,3 +833,151 @@ namespace lfs::core::internal {
     }
 
 } // namespace lfs::core::internal
+
+namespace lfs::core::internal::metal_queue {
+
+    namespace {
+        std::mutex queue_mutex;
+        std::unordered_set<uint64_t> queues;
+        uint64_t next_queue = 1;
+
+        API_AVAILABLE_BEGIN(macos(26.0))
+
+        class Heap final : public Timestamps {
+        public:
+            Heap(std::shared_ptr<metal::Context> context, id<MTL4CounterHeap> heap, const size_t count)
+                : context_(std::move(context)),
+                  heap_(heap),
+                  ticks_per_ms_(static_cast<double>([context_->device() queryTimestampFrequency]) / 1e3),
+                  written_(count, false) {}
+
+            ~Heap() override { context_->wait_completed(last_); }
+
+            uint64_t write(const size_t index) override {
+                const uint64_t serial = context_->write_timestamp(heap_, index);
+                last_ = std::max(last_, serial);
+                written_[index] = true;
+                return serial;
+            }
+
+            std::optional<float> milliseconds(const size_t begin, const size_t end) override {
+                if (begin >= written_.size() || end >= written_.size() || !written_[begin] || !written_[end] ||
+                    !context_->ready(last_))
+                    return std::nullopt;
+                const auto first = ticks(begin);
+                const auto second = ticks(end);
+                if (!first || !second || *second < *first)
+                    return std::nullopt;
+                return static_cast<float>(static_cast<double>(*second - *first) / ticks_per_ms_);
+            }
+
+            bool ticking() const { return ticks_per_ms_ > 0.0; }
+
+        private:
+            std::optional<uint64_t> ticks(const size_t index) {
+                @autoreleasepool {
+                    NSData* const data = [heap_ resolveCounterRange:NSMakeRange(index, 1)];
+                    if (!data || data.length < sizeof(MTL4TimestampHeapEntry))
+                        return std::nullopt;
+                    const uint64_t value = static_cast<const MTL4TimestampHeapEntry*>(data.bytes)->timestamp;
+                    return value ? std::optional(value) : std::nullopt;
+                }
+            }
+
+            std::shared_ptr<metal::Context> context_;
+            id<MTL4CounterHeap> heap_;
+            double ticks_per_ms_;
+            std::vector<bool> written_;
+            uint64_t last_ = 0;
+        };
+
+        API_AVAILABLE_END
+
+        std::shared_ptr<metal::Context> context_for(const uint64_t serial) API_AVAILABLE(macos(26.0)) {
+            // Serial 0 is complete, and no other serial exists before a context does.
+            return serial == 0 ? nullptr : metal::acquire_context();
+        }
+    } // namespace
+
+    uint64_t create() {
+        if (!metal_backend_available())
+            throw std::runtime_error("Metal tensor queues need macOS 26 and a Metal 4 GPU");
+        std::lock_guard lock(queue_mutex);
+        const uint64_t id = next_queue++;
+        queues.insert(id);
+        return id;
+    }
+
+    void destroy(const uint64_t id) noexcept {
+        std::lock_guard lock(queue_mutex);
+        queues.erase(id);
+    }
+
+    bool valid(const uint64_t id) {
+        std::lock_guard lock(queue_mutex);
+        return id == 0 || queues.contains(id);
+    }
+
+    uint64_t submit() { return metal_flush(); }
+
+    bool ready(const uint64_t serial) {
+        if (@available(macOS 26.0, *)) {
+            const auto context = context_for(serial);
+            return !context || context->ready(serial);
+        }
+        return true;
+    }
+
+    bool completed(const uint64_t serial) {
+        if (@available(macOS 26.0, *)) {
+            const auto context = context_for(serial);
+            return !context || context->completed() >= serial;
+        }
+        return true;
+    }
+
+    void wait(const uint64_t serial) { metal_wait(serial); }
+
+    void wait_completed(const uint64_t serial) {
+        if (@available(macOS 26.0, *)) {
+            if (const auto context = context_for(serial))
+                context->wait_completed(serial);
+        }
+    }
+
+    std::byte* host(const StorageRef& storage) {
+        if (@available(macOS 26.0, *))
+            return metal::acquire_context()->host(storage);
+        throw std::runtime_error("Metal tensors require macOS 26");
+    }
+
+    bool host_copy_if_idle(const StorageRef& destination, const StorageRef& source, const size_t bytes) {
+        if (@available(macOS 26.0, *)) {
+            const auto context = metal::acquire_context();
+            if (bytes > metal::kHostCopyBytes || !context->idle())
+                return false;
+            metal::host_copy(context->host(destination), context->host(source), bytes);
+            return true;
+        }
+        return false;
+    }
+
+    std::unique_ptr<Timestamps> timestamps(const size_t count) {
+        if (@available(macOS 26.0, *)) {
+            if (count == 0 || !metal_backend_available())
+                return nullptr;
+            auto context = metal::acquire_context();
+            MTL4CounterHeapDescriptor* const descriptor = [MTL4CounterHeapDescriptor new];
+            descriptor.type = MTL4CounterHeapTypeTimestamp;
+            descriptor.count = count;
+            NSError* error = nil;
+            id<MTL4CounterHeap> const heap = [context->device() newCounterHeapWithDescriptor:descriptor error:&error];
+            if (!heap)
+                return nullptr;
+            auto result = std::make_unique<Heap>(std::move(context), heap, count);
+            return result->ticking() ? std::move(result) : nullptr;
+        }
+        return nullptr;
+    }
+
+} // namespace lfs::core::internal::metal_queue

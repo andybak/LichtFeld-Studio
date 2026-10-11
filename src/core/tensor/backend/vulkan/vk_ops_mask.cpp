@@ -15,6 +15,7 @@
 #include "vk_recorder.hpp"
 
 #include <array>
+#include <format>
 #include <span>
 
 namespace lfs::core::internal {
@@ -66,6 +67,67 @@ namespace lfs::core::internal {
 
         using vk_index::shader_dims;
         using vk_index::shader_dtype;
+
+        // The where operands right-aligned to the output's rank, with output
+        // axes of size 1 dropped and neighbouring axes merged where every
+        // operand is either full or broadcast along both. Operands that match
+        // the output set a bit of `direct`: they read at the output index.
+        struct WhereShape {
+            std::array<std::array<uint32_t, MAX_TENSOR_RANK>, 4> dims{};
+            uint32_t rank = 0;
+            uint32_t direct = 0;
+        };
+
+        WhereShape collapse_where(const std::array<const StridedLayout*, 3> operands, const StridedLayout& output) {
+            const size_t rank = output.rank;
+            std::array<std::array<size_t, MAX_TENSOR_RANK>, 3> padded{};
+            for (size_t operand = 0; operand < 3; ++operand) {
+                const StridedLayout& layout = *operands[operand];
+                LFS_ASSERT_MSG(layout.rank <= rank,
+                               std::format("where operand rank {} exceeds the output rank {}", layout.rank, rank));
+                for (size_t axis = 0; axis < rank; ++axis) {
+                    const size_t source = axis + layout.rank;
+                    padded[operand][axis] = source >= rank ? layout.dims[source - rank] : 1;
+                }
+            }
+            WhereShape shape;
+            std::array<bool, 3> previous_full{};
+            for (size_t axis = 0; axis < rank; ++axis) {
+                if (output.dims[axis] == 1)
+                    continue;
+                std::array<bool, 3> full{};
+                for (size_t operand = 0; operand < 3; ++operand)
+                    full[operand] = padded[operand][axis] != 1;
+                if (shape.rank > 0 && full == previous_full) {
+                    const uint32_t last = shape.rank - 1;
+                    shape.dims[3][last] = checked_u32(shape.dims[3][last] * output.dims[axis],
+                                                      "Vulkan where extent exceeds uint32");
+                    for (size_t operand = 0; operand < 3; ++operand)
+                        shape.dims[operand][last] = full[operand] ? shape.dims[3][last] : 1u;
+                    continue;
+                }
+                shape.dims[3][shape.rank] = checked_u32(output.dims[axis], "Vulkan where extent exceeds uint32");
+                for (size_t operand = 0; operand < 3; ++operand)
+                    shape.dims[operand][shape.rank] = full[operand] ? shape.dims[3][shape.rank] : 1u;
+                previous_full = full;
+                ++shape.rank;
+            }
+            if (shape.rank == 0) {
+                shape.rank = 1;
+                for (auto& dims : shape.dims)
+                    dims[0] = 1;
+            }
+            for (size_t operand = 0; operand < 3; ++operand) {
+                bool matches = true;
+                for (uint32_t axis = 0; axis < shape.rank; ++axis)
+                    matches = matches && shape.dims[operand][axis] == shape.dims[3][axis];
+                shape.direct |= matches ? 1u << operand : 0u;
+            }
+            return shape;
+        }
+
+        // Compaction moves elements bitwise; UInt32 shares Int32's layout.
+        DataType moved_dtype(const DataType dtype) { return dtype == DataType::UInt32 ? DataType::Int32 : dtype; }
 
         void record_mask(VulkanContext& context, const uint32_t mode, const DataType dtype,
                          const uint32_t predicate, const MaskPush& push,
@@ -206,7 +268,7 @@ namespace lfs::core::internal {
         };
         const std::array reads{input, mask, scan};
         const std::array writes{output};
-        record_mask(*context, kCompactSelectMode, input.dtype, kBytePredicate, push, reads, writes,
+        record_mask(*context, kCompactSelectMode, moved_dtype(input.dtype), kBytePredicate, push, reads, writes,
                     dispatch_groups(*context, program.count));
         context->memory().deallocate(scan);
         // The host sized the output from the same mask; like CUDA the launch trusts it.
@@ -231,7 +293,7 @@ namespace lfs::core::internal {
         };
         const std::array reads{mask, source, scan};
         const std::array writes{output};
-        record_mask(*context, kCompactScatterMode, output.dtype, kBytePredicate, push, reads, writes,
+        record_mask(*context, kCompactScatterMode, moved_dtype(output.dtype), kBytePredicate, push, reads, writes,
                     dispatch_groups(*context, program.count));
         context->memory().deallocate(scan);
     }
@@ -267,24 +329,25 @@ namespace lfs::core::internal {
             return;
         }
         const auto context = acquire_vulkan_context();
+        const WhereShape shape = collapse_where({&condition_layout, &x_layout, &y_layout}, output_layout);
         const WherePush push{
             .condition_address = address(condition),
             .x_address = address(x),
             .y_address = address(y),
             .output_address = address(output),
-            .condition_dims = shader_dims(condition_layout),
-            .x_dims = shader_dims(x_layout),
-            .y_dims = shader_dims(y_layout),
-            .output_dims = shader_dims(output_layout),
-            .condition_rank = static_cast<uint32_t>(condition_layout.rank),
-            .x_rank = static_cast<uint32_t>(x_layout.rank),
-            .y_rank = static_cast<uint32_t>(y_layout.rank),
-            .output_rank = static_cast<uint32_t>(output_layout.rank),
+            .condition_dims = shape.dims[0],
+            .x_dims = shape.dims[1],
+            .y_dims = shape.dims[2],
+            .output_dims = shape.dims[3],
+            .condition_rank = shape.rank,
+            .x_rank = shape.rank,
+            .y_rank = shape.rank,
+            .output_rank = shape.rank,
             .count = checked_u32(output_layout.element_count, "Vulkan where count exceeds uint32"),
         };
         const VulkanPipeline& pipeline =
             context->pipelines().specialized("where", sizeof(WherePush),
-                                             std::array{static_cast<uint32_t>(output.dtype)});
+                                             std::array{static_cast<uint32_t>(output.dtype), shape.direct});
         const std::array reads{condition, x, y};
         const std::array writes{output};
         context->recorders().record(

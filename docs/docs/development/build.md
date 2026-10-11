@@ -56,9 +56,10 @@ training commands. Saved models, project metadata, dataset viewing, appearance
 settings and video export still use their shared application code.
 
 On Windows and Linux, this flag alone does not remove CUDA from the viewer
-dependencies. The macOS Apple Silicon viewer runs without CUDA: by default on
-the Metal tensor backend with macOS 26 and a Metal 4 GPU, else on the Vulkan
-tensor backend. Use the `macos-release` preset described below. With
+dependencies. The macOS Apple Silicon viewer requires macOS 26 or newer and
+a Metal 4 GPU. Native Metal scene rendering reads either Metal or Vulkan tensor
+storage; Vulkan through MoltenVK handles presentation. The build runs without
+CUDA. Use the `macos-release` preset described below. With
 `BUILD_TESTS=ON`, the build without training provides `lichtfeld_viewer_tests`;
 the full build retains `lichtfeld_tests`.
 
@@ -110,7 +111,11 @@ cmake --build --preset macos-release
 ./build-macos-release/LichtFeld-Studio
 ```
 
-This viewer build does not require CUDA. The macOS preset disables tests and
+This viewer build requires macOS 26 or newer, Apple Silicon and Xcode 26 or
+newer. Its deployment target is explicitly 26.0, including when the build host
+uses a newer SDK. The macOS GPU CI uses macos-26 with stable Xcode 26 and checks
+Metal 4 before running tests; required-device contracts fail if it is unavailable.
+This build does not require CUDA. The macOS preset disables tests and
 limits both vcpkg and Ninja to two concurrent jobs. The application selects
 Homebrew's MoltenVK manifest automatically unless a Vulkan driver variable is
 already set.
@@ -315,6 +320,11 @@ Tests remain opt-in, keeping test-only package restore and target generation
 out of the normal application loop without changing any shipped feature. The
 canonical [source build guide](../../building_and_distribution.md#tests)
 documents the test build targets, CTest tiers, and required real-data layout.
+
+`BUILD_VISUALIZER_TESTS` defaults to `OFF`. When enabled, its visualizer test
+executable is included in the default full build, so the usual app build also
+compiles the enabled regression tests. Normal app and packaging builds with this
+option disabled do not build that executable.
 
 Before a complete MSVC build, use the
 [Windows build preflight](windows-build-preflight) to check Windows-specific

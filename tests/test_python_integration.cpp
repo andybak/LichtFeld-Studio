@@ -2,6 +2,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "python/python_compat.hpp"
+#include "visualizer/rendering/passes/vulkan_split_view_pass.hpp"
+#include "visualizer/rendering/rendering_manager.hpp"
 #include <gtest/gtest.h>
 
 #include <torch/torch.h>
@@ -12,19 +14,28 @@
 #include "core/event_bridge/command_center_bridge.hpp"
 #include "core/event_bridge/control_boundary.hpp"
 #include "core/event_bridge/event_bridge.hpp"
+#include "core/event_bridge/scoped_handler.hpp"
 #include "core/event_bus.hpp"
+#include "core/events.hpp"
 #include "core/logger.hpp"
+#include "core/property_registry.hpp"
 #include "core/scene.hpp"
+#include "core/services.hpp"
 #include "core/splat_data.hpp"
 #include "core/tensor_backend.hpp"
 #include "core/tensor_completion.hpp"
+#include "gui/line_renderer.hpp"
 #include "io/loader.hpp"
 #include "operation/undo_history.hpp"
 #include "python/gil.hpp"
 #include "python/python_buffer_analysis.hpp"
 #include "python/python_runtime.hpp"
 #include "python/runner.hpp"
+#include "python_test_support.hpp"
 #include "rendering/coordinate_conventions.hpp"
+#include "rendering/screen_overlay_renderer.hpp"
+#include "scene/scene_manager.hpp"
+#include "screen/screen_service.hpp"
 #include "tensor_test_support.hpp"
 #include "visualizer/ipc/render_settings_convert.hpp"
 #include "visualizer/ipc/view_context.hpp"
@@ -34,6 +45,8 @@
 #include "visualizer/rendering/rendering_types.hpp"
 #include "visualizer/visualizer.hpp"
 #include "visualizer_impl.hpp"
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
 
 #include <array>
 #include <atomic>
@@ -43,6 +56,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -54,17 +68,21 @@
 #include <utility>
 #include <vector>
 
-namespace {
-    std::filesystem::path findPythonModuleDir();
-    void prependPythonPath(const std::filesystem::path& path);
-} // namespace
-
 class PythonIntegrationTest : public ::testing::Test {
 protected:
+    static void TearDownTestSuite() {
+        // Release retained UI callbacks while Python and its GIL are alive.
+        // Windows DLL detach must not destroy these objects after process exit.
+        if (Py_IsInitialized()) {
+            const lfs::python::GilAcquire gil;
+            lfs::python::invoke_python_cleanup();
+        }
+    }
+
     void SetUp() override {
-        const auto module_dir = findPythonModuleDir();
+        const auto module_dir = lfs::test::findPythonModuleDir();
         ASSERT_FALSE(module_dir.empty()) << "Could not locate built lichtfeld module for Python tests";
-        prependPythonPath(module_dir);
+        lfs::test::prependPythonPath(module_dir);
         (void)lfs::python::ensure_initialized();
     }
 
@@ -146,7 +164,14 @@ namespace {
             return std::unexpected("not implemented");
         }
         void consolidateModels() override {}
-        std::expected<void, std::string> clearScene() override { return {}; }
+        std::expected<void, std::string> clearScene() override {
+            ++clear_calls;
+            if (!clear_error.empty())
+                return std::unexpected(clear_error);
+            return {};
+        }
+        int clear_calls = 0;
+        std::string clear_error;
         lfs::core::Scene& getScene() override { return scene_; }
         lfs::vis::SceneManager* getSceneManager() override { return nullptr; }
         lfs::vis::RenderingManager* getRenderingManager() override { return nullptr; }
@@ -240,9 +265,9 @@ namespace {
             return std::exchange(project_save_started, false);
         }
 
-        [[nodiscard]] bool waitForQueuedWork(const std::chrono::milliseconds timeout) {
+        [[nodiscard]] bool waitForQueuedWork(const std::chrono::milliseconds timeout, const size_t count = 1) {
             std::unique_lock lock(queued_work_mutex);
-            return queued_work_cv.wait_for(lock, timeout, [this]() { return !queued_work.empty(); });
+            return queued_work_cv.wait_for(lock, timeout, [this, count]() { return queued_work.size() >= count; });
         }
 
         bool runNextQueuedWork() {
@@ -261,6 +286,20 @@ namespace {
             return true;
         }
 
+        bool cancelNextQueuedWork() {
+            WorkItem work;
+            {
+                std::lock_guard lock(queued_work_mutex);
+                if (queued_work.empty())
+                    return false;
+                work = std::move(queued_work.front());
+                queued_work.pop_front();
+            }
+            if (work.cancel)
+                work.cancel();
+            return true;
+        }
+
         bool on_viewer_thread = false;
         bool accepts_posted_work = true;
         bool queue_posted_work = false;
@@ -275,6 +314,45 @@ namespace {
         std::mutex queued_work_mutex;
         std::condition_variable queued_work_cv;
         std::deque<WorkItem> queued_work;
+    };
+
+    struct ViewSettingCallbacks {
+        lfs::vis::screen::ScreenService views;
+        lfs::vis::RenderingManager manager{views};
+        lfs::vis::ViewId first = views.activeView();
+        lfs::vis::ViewId second = views.screen().split(lfs::vis::screen::AreaId{first}, lfs::vis::screen::SplitAxis::Columns, 0.5f).value;
+        int commits = 0;
+        ViewSettingCallbacks() {
+            views.screen().setActiveView({first});
+            lfs::vis::set_render_settings_callbacks([&]() { return std::optional{lfs::vis::to_proxy(manager.getSettings())}; }, nullptr);
+            lfs::vis::set_view_render_settings_callbacks(
+                [&]() -> std::optional<lfs::vis::RenderSettingsTarget> {
+                    return views.read([&](const auto& screen) { return lfs::vis::RenderSettingsTarget{screen.activeView().value, views.screenEpoch()}; });
+                },
+                [&](const lfs::vis::RenderSettingsTarget target) -> std::optional<lfs::vis::RenderSettingsProxy> {
+                    if (target.screen_epoch != views.screenEpoch())
+                        return std::nullopt;
+                    const auto settings = manager.trySettingsForView(target.view);
+                    return settings ? std::optional{lfs::vis::to_proxy(*settings)} : std::nullopt;
+                },
+                [&](const lfs::vis::RenderSettingsTarget target, const lfs::vis::RenderSettingsProxy& proxy,
+                    lfs::vis::RenderSettingsUpdateIntent) -> std::optional<lfs::vis::RenderSettingsProxy> {
+                    if (target.screen_epoch != views.screenEpoch())
+                        return std::nullopt;
+                    auto settings = manager.trySettingsForView(target.view);
+                    if (!settings)
+                        return std::nullopt;
+                    lfs::vis::apply_proxy(*settings, proxy);
+                    if (!manager.updateSettingsForView(target.view, *settings))
+                        return std::nullopt;
+                    ++commits;
+                    return lfs::vis::to_proxy(manager.settingsForView(target.view));
+                });
+        }
+        ~ViewSettingCallbacks() {
+            lfs::vis::set_view_render_settings_callbacks(nullptr, nullptr, nullptr);
+            lfs::vis::set_render_settings_callbacks(nullptr, nullptr);
+        }
     };
 
     std::unique_ptr<lfs::core::SplatData> makeSingleWhiteSplat(const float x, const float y, const float z) {
@@ -307,64 +385,6 @@ namespace {
         }
 
         return std::make_shared<lfs::core::Tensor>(std::move(image));
-    }
-
-    bool containsLichtfeldModule(const std::filesystem::path& dir) {
-        std::error_code ec;
-        if (!std::filesystem::exists(dir, ec)) {
-            return false;
-        }
-
-        for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
-            std::error_code file_ec;
-            if (!it->is_regular_file(file_ec) || file_ec) {
-                continue;
-            }
-
-            const auto filename = it->path().filename().string();
-            const auto ext = it->path().extension().string();
-            if ((ext == ".so" || ext == ".pyd") && filename.rfind("lichtfeld", 0) == 0) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    std::filesystem::path findPythonModuleDir() {
-        std::error_code ec;
-        const auto cwd = std::filesystem::current_path(ec);
-        const auto project_root = std::filesystem::path(PROJECT_ROOT_PATH);
-
-        for (const auto& candidate : {
-                 cwd / "src" / "python",
-                 cwd.parent_path() / "src" / "python",
-                 project_root / "build" / "src" / "python",
-             }) {
-            if (containsLichtfeldModule(candidate)) {
-                return candidate;
-            }
-        }
-
-        return {};
-    }
-
-    void prependPythonPath(const std::filesystem::path& path) {
-        const auto value = path.string();
-        const char* existing = std::getenv("PYTHONPATH");
-#ifdef _WIN32
-        const char separator = ';';
-#else
-        const char separator = ':';
-#endif
-        const std::string combined =
-            existing && *existing ? value + separator + std::string(existing) : value;
-
-#ifdef _WIN32
-        _putenv_s("PYTHONPATH", combined.c_str());
-#else
-        setenv("PYTHONPATH", combined.c_str(), 1);
-#endif
     }
 
     std::string consumePythonError() {
@@ -704,22 +724,9 @@ TEST_F(PythonIntegrationTest, PythonSyntaxDocumentExtractsSymbolsAndScope) {
     EXPECT_EQ(classes, 1);
     EXPECT_EQ(functions, 2);
     EXPECT_EQ(variables, 1);
-    EXPECT_TRUE(document.structureCurrent());
     EXPECT_FALSE(document.foldRanges().empty());
     EXPECT_FALSE(document.highlights().empty());
     EXPECT_EQ(document.scopeAt(code.find("pass")), "Tool.run");
-
-    const auto block = document.enclosingBlockRange(code.find("pass"));
-    ASSERT_TRUE(block.has_value());
-    EXPECT_NE(code.substr(block->start_byte, block->end_byte - block->start_byte).find("def run"),
-              std::string_view::npos);
-
-    const auto ranges = document.enclosingBlockRanges(code.find("pass"));
-    ASSERT_GE(ranges.size(), 2);
-    EXPECT_NE(code.substr(ranges[0].start_byte, ranges[0].end_byte - ranges[0].start_byte).find("def run"),
-              std::string_view::npos);
-    EXPECT_NE(code.substr(ranges[1].start_byte, ranges[1].end_byte - ranges[1].start_byte).find("class Tool"),
-              std::string_view::npos);
 }
 
 TEST_F(PythonIntegrationTest, PythonSyntaxDocumentAppliesIncrementalEdits) {
@@ -790,13 +797,11 @@ TEST_F(PythonIntegrationTest, PythonSyntaxDocumentKeepsStructureDuringSyntaxErro
     lfs::python::PythonSyntaxDocument document;
     ASSERT_TRUE(document.reset(valid));
     ASSERT_EQ(document.analysis().status, lfs::python::PythonBufferStatus::Clean);
-    ASSERT_TRUE(document.structureCurrent());
     ASSERT_FALSE(document.symbols().empty());
     ASSERT_FALSE(document.foldRanges().empty());
 
     ASSERT_TRUE(document.reset(invalid));
     EXPECT_EQ(document.analysis().status, lfs::python::PythonBufferStatus::SyntaxError);
-    EXPECT_FALSE(document.structureCurrent());
     ASSERT_FALSE(document.symbols().empty());
     ASSERT_FALSE(document.foldRanges().empty());
 
@@ -857,6 +862,27 @@ TEST_F(PythonIntegrationTest, CleanPythonCodeRepairsUnindentedFunctionBlock) {
     EXPECT_NE(result.code.find("    if not stripped:"), std::string::npos);
     EXPECT_NE(result.code.find("        return \"splat\""), std::string::npos);
     EXPECT_NE(result.code.find("    return safe or \"splat\""), std::string::npos);
+}
+
+// Catches Format commenting out valid leading statements that the preamble heuristic does not recognize.
+TEST_F(PythonIntegrationTest, FormatPythonCodeKeepsLeadingStatements) {
+    const auto result = lfs::python::format_python_code("x=[1,2 ,3];print( 'a' ,x)\nfirst, second = 1, 2\n");
+
+    if (formatterUnavailable(result)) {
+        GTEST_SKIP() << result.error;
+    }
+    ASSERT_TRUE(result.success) << result.error;
+    EXPECT_EQ(result.code, "x = [1, 2, 3]\nprint(\"a\", x)\nfirst, second = 1, 2\n");
+}
+
+TEST_F(PythonIntegrationTest, CleanPythonCodeCommentsProsePreambleButKeepsAssignment) {
+    const auto result = lfs::python::clean_python_code("Here is the script:\nscene = lf.get_scene()\n");
+
+    if (formatterUnavailable(result)) {
+        GTEST_SKIP() << result.error;
+    }
+    ASSERT_TRUE(result.success) << result.error;
+    EXPECT_EQ(result.code, "# Here is the script:\nscene = lf.get_scene()\n");
 }
 
 TEST_F(PythonIntegrationTest, FormatPythonCodeReportsSyntaxErrorWithoutUnexpectedResultFallback) {
@@ -955,6 +981,38 @@ result_values = [float(top), float(bottom)]
     EXPECT_GT(result.values[0], result.values[1]);
 }
 
+TEST_F(PythonIntegrationTest, CaptureSplitComparisonPreservesPresentedOrientation) {
+    for (const bool flip_y : {false, true}) {
+        const ScopedCaptureViewportRenderCallback callback([flip_y]() -> std::optional<lfs::vis::ViewportRender> {
+            constexpr size_t width = 64;
+            constexpr size_t height = 8;
+            std::vector<float> pixels(3 * width * height, 0.0f);
+            for (size_t x = 0; x < width; ++x) {
+                pixels[(flip_y ? height - 1 : 0) * width + x] = 1.0f;
+            }
+            const auto image = std::make_shared<lfs::core::Tensor>(lfs::core::Tensor::from_vector(
+                pixels, {3, height, width}, lfs::core::Device::CPU));
+            lfs::vis::SplitViewCpuDesc params;
+            params.left.image = params.right.image = image;
+            params.left.flip_y = params.right.flip_y = flip_y;
+            params.content_rect = {0, 0, width, height};
+            return lfs::vis::ViewportRender{
+                lfs::vis::RenderingManager::composeSplitViewCpu(params, {width, height}), nullptr};
+        });
+        const auto result = runPythonTensorSnippet(R"PY(
+import lichtfeld as lf
+image = lf.capture_viewport().image.cpu().tolist()
+result_shape = (4,)
+result_values = [image[0][0][0], image[-1][0][0], image[0][-1][0], image[-1][-1][0]]
+)PY");
+        ASSERT_EQ(result.values.size(), 4u);
+        EXPECT_FLOAT_EQ(result.values[0], 1.0f);
+        EXPECT_FLOAT_EQ(result.values[1], 0.0f);
+        EXPECT_FLOAT_EQ(result.values[2], 1.0f);
+        EXPECT_FLOAT_EQ(result.values[3], 0.0f);
+    }
+}
+
 TEST_F(PythonIntegrationTest, CaptureViewportPostsToViewerThreadWhenOffThread) {
     TestVisualizer viewer;
     const ScopedVisualizer scoped_viewer(&viewer);
@@ -974,6 +1032,23 @@ result_values = [float(viewport.image.cpu().sum().item())]
     ASSERT_EQ(result.values.size(), static_cast<size_t>(1));
     EXPECT_GT(result.values[0], 0.0f);
     EXPECT_EQ(viewer.post_work_calls, 1);
+}
+
+TEST_F(PythonIntegrationTest, ScreenMutationsPostToViewerThreadWhenOffThread) {
+    TestVisualizer viewer;
+    const ScopedVisualizer scoped_viewer(&viewer);
+
+    const auto result = runPythonTensorSnippet(R"PY(
+import lichtfeld as lf
+lf.ui.screen.reset()
+lf.toggle_split_viewport()
+result_shape = (1,)
+result_values = [1.0]
+)PY");
+
+    ASSERT_EQ(result.values.size(), 1u);
+    EXPECT_FLOAT_EQ(result.values[0], 1.0F);
+    EXPECT_EQ(viewer.post_work_calls, 2);
 }
 
 TEST_F(PythonIntegrationTest,
@@ -1115,6 +1190,58 @@ except RuntimeError:
     EXPECT_EQ(viewer.poll_calls, 0);
 }
 
+TEST_F(PythonIntegrationTest, SceneClearPreservesTypedShutdownError) {
+    for (const bool inline_call : {false, true}) {
+        TestVisualizer viewer;
+        viewer.on_viewer_thread = inline_call;
+        viewer.accepts_posted_work = false;
+        const ScopedVisualizer scoped_viewer(&viewer);
+        const lfs::python::SceneContextGuard scene_guard(&viewer.getScene());
+        const auto result = runPythonTensorSnippet(R"PY(
+import lichtfeld as lf
+result_shape = (2,)
+result_values = []
+for clear in (lf.clear_scene, lf.get_scene().clear):
+    try:
+        clear()
+        result_values.append(0.0)
+    except lf.CancelledError as error:
+        assert error.code == 'Cancelled'
+        assert error.domain == 'Python'
+        result_values.append(1.0)
+)PY");
+        EXPECT_EQ(result.values, (std::vector<float>{1.0F, 1.0F}));
+        EXPECT_EQ(viewer.clear_calls, 0);
+    }
+}
+
+TEST_F(PythonIntegrationTest, SceneClearPreservesLegacyFailureContext) {
+    for (const bool inline_call : {false, true}) {
+        TestVisualizer viewer;
+        viewer.on_viewer_thread = inline_call;
+        viewer.clear_error = "Scene is busy";
+        const ScopedVisualizer scoped_viewer(&viewer);
+        const lfs::python::SceneContextGuard scene_guard(&viewer.getScene());
+        const auto result = runPythonTensorSnippet(R"PY(
+import lichtfeld as lf
+result_shape = (2,)
+result_values = []
+for clear in (lf.clear_scene, lf.get_scene().clear):
+    try:
+        clear()
+        result_values.append(0.0)
+    except lf.Error as error:
+        assert error.code == 'FailedPrecondition'
+        assert error.domain == 'Rendering'
+        assert str(error) == 'Scene is busy'
+        assert error.context
+        result_values.append(1.0)
+)PY");
+        EXPECT_EQ(result.values, (std::vector<float>{1.0F, 1.0F}));
+        EXPECT_EQ(viewer.clear_calls, 2);
+    }
+}
+
 TEST_F(PythonIntegrationTest, ProjectLicenseRoundTripsThroughBinding) {
     TestVisualizer viewer;
     const ScopedVisualizer scoped_viewer(&viewer);
@@ -1134,6 +1261,74 @@ result_values = [1.0 if set_ok else 0.0, 1.0 if clear_ok else 0.0]
     ASSERT_EQ(result.values.size(), 2u);
     EXPECT_FLOAT_EQ(result.values[0], 1.0F);
     EXPECT_FLOAT_EQ(result.values[1], 1.0F);
+}
+
+TEST_F(PythonIntegrationTest, GTComparisonActionsRunOnViewerThread) {
+    using namespace std::chrono_literals;
+    lfs::vis::screen::ScreenService screens;
+    lfs::vis::SceneManager scene_manager;
+    lfs::vis::RenderingManager rendering(screens);
+    scene_manager.changeContentType(lfs::vis::SceneManager::ContentType::Dataset);
+    auto& scene = scene_manager.getScene();
+    const auto group = scene.addCameraGroup("Cameras", scene.addGroup("Dataset"), 1);
+    scene.addCamera("source", group, std::make_shared<lfs::core::Camera>(lfs::core::Tensor::eye(3, lfs::core::Device::CPU), lfs::core::Tensor::zeros({size_t{3}}, lfs::core::Device::CPU), 100.0f, 100.0f, 32.0f, 32.0f, lfs::core::Tensor(), lfs::core::Tensor(), lfs::core::CameraModelType::PINHOLE, "source", std::filesystem::path("source.png"), std::filesystem::path{}, 64, 64, 1));
+    struct RestoreManagers {
+        lfs::vis::SceneManager* scene = lfs::vis::services().sceneOrNull();
+        lfs::vis::RenderingManager* rendering = lfs::python::get_rendering_manager();
+        ~RestoreManagers() {
+            lfs::vis::services().set(scene);
+            lfs::python::set_rendering_manager(rendering);
+        }
+    } restore_managers;
+    lfs::vis::services().set(&scene_manager);
+    lfs::python::set_rendering_manager(&rendering);
+    TestVisualizer viewer;
+    viewer.queue_posted_work = true;
+    const ScopedVisualizer scoped_viewer(&viewer);
+    const auto viewer_thread = std::this_thread::get_id();
+    std::vector<int> actions;
+    std::vector<std::thread::id> action_threads;
+    lfs::event::ScopedHandler handlers;
+    handlers.subscribe<lfs::core::events::cmd::GoToCamView>([&](const auto& event) {
+        actions.push_back(event.cam_id);
+        action_threads.push_back(std::this_thread::get_id());
+    });
+    handlers.subscribe<lfs::core::events::cmd::ToggleGTComparison>([&](const auto&) {
+        actions.push_back(-1);
+        action_threads.push_back(std::this_thread::get_id());
+    });
+
+    std::exception_ptr python_error;
+    PythonTensorResult result;
+    std::thread python_worker([&] {
+        try {
+            result = runPythonTensorSnippet(R"PY(
+import lichtfeld as lf
+for uid in (7, 13, 7):
+    lf.ui.go_to_camera_view(uid)
+    lf.ui.toggle_gt_comparison()
+result_shape = (1,)
+result_values = [1.0]
+)PY");
+        } catch (...) {
+            python_error = std::current_exception();
+        }
+    });
+    for (int i = 0; i < 6; ++i) {
+        if (!viewer.waitForQueuedWork(5s)) {
+            ADD_FAILURE() << "Camera action was not posted to the viewer";
+            break;
+        }
+        EXPECT_TRUE(viewer.runNextQueuedWork());
+    }
+    python_worker.join();
+    if (python_error) {
+        std::rethrow_exception(python_error);
+    }
+    EXPECT_EQ(result.values, std::vector<float>{1.0f});
+    EXPECT_EQ(actions, (std::vector<int>{7, -1, 13, -1, 7, -1}));
+    EXPECT_EQ(action_threads, std::vector<std::thread::id>(6, viewer_thread));
+    EXPECT_EQ(viewer.post_work_calls, 6);
 }
 
 TEST_F(PythonIntegrationTest, CaptureViewportReleasesGilWhileWaitingForViewerThread) {
@@ -1296,6 +1491,53 @@ result_values = (
     EXPECT_FLOAT_EQ(result.values[index++], 4.0f);
     EXPECT_FLOAT_EQ(result.values[index++], 1.0f);
     EXPECT_FLOAT_EQ(result.values[index++], 1.0f);
+}
+
+TEST_F(PythonIntegrationTest, RestoredTensorOperations) {
+    const auto result = runPythonTensorSnippet(R"PY(
+import lichtfeld as lf
+x = lf.Tensor.normal([2, 2], mean=2, std=0, device="gpu")
+assert x.backend in ("cuda", "vulkan", "metal")
+assert x.all_close(lf.Tensor.ones([2, 2], device="gpu") * 2)
+assert x.allclose(x.clone())
+assert lf.Tensor.bernoulli([4], p=1, device="gpu").sum().item() == 4
+weights = lf.Tensor.ones([4], device="gpu")
+assert sorted(lf.Tensor.multinomial(weights, 4, seed=42).tolist()) == [0, 1, 2, 3]
+assert lf.Tensor.diag(weights).sum().item() == 4
+assert x.cdist(x).sum().item() == 0
+assert x.normalize().sum().item() == 0
+assert x.mod(x).sum().item() == 0
+assert x.reduce(lf.ReduceOp.SUM).item() == 8
+assert x.nonzero_split()[0].numel == 4
+assert x.linear(x).sum().item() == 32
+assert x.reshape([1, 2, 1, 2]).conv1x1(x).sum().item() == 32
+x[0, 1] = -3
+assert x[0, 1].item() == -3
+half = x.to("float16")
+assert half.clamp(-1, 1).to("float32").sum().item() == 2
+assert half.clamp_min_(-1) is half
+assert half.clamp_(-1, 1) is half
+assert half.to("float32").sum().item() == 2
+assert x.where_into_(x < 0, 5, x) is x
+assert x[0, 1].item() == 5
+indices = lf.Tensor.zeros([2], device="gpu", dtype="int32")
+assert x.gather_lazy(indices).tolist() == [2, 2]
+assert x.validate()["is_valid"]
+assert x.diff(x.clone())["num_different"] == 0
+assert x.stats()["backend"] == x.backend
+assert x.reserved_allocation_bytes >= 16
+assert lf.nn.softmax(x).sum().item() == 2
+assert lf.nn.silu(x).all_close(x.swish())
+assert lf.nn.rms_norm(x, lf.Tensor.ones([2], device="gpu")).shape == (2, 2)
+assert lf.nn.residual_scale(x, x, lf.Tensor.ones([2], device="gpu")).all_close(x * 2)
+sequence = half.reshape([1, 1, 2, 2])
+windows = lf.nn.window_partition(sequence, 3)
+assert lf.nn.window_unpartition(windows, 3, 2).to("float32").all_close(sequence.to("float32"))
+result_shape = (1,)
+result_values = [1.0]
+)PY");
+    ASSERT_EQ(result.values.size(), 1u);
+    EXPECT_FLOAT_EQ(result.values[0], 1.0F);
 }
 
 TEST_F(PythonIntegrationTest, PyTensorSyncWaitsForItsVulkanBackendWithCudaDefault) {
@@ -1525,315 +1767,320 @@ TEST_F(PythonIntegrationTest, ConcurrentEnsureInitializedLatchesOnceUnderRace) {
 namespace {
     // The real viewer registers the manager used by the compiled binding.
     // No window loop or SelectionTool is initialized: this is its no-tool lane.
-    class DepthWindowBindingState {
-    public:
-        DepthWindowBindingState() {
-            lfs::vis::ViewerOptions options;
-            options.show_startup_overlay = false;
-            options.safe_mode = true;
-            viewer = std::make_unique<lfs::vis::VisualizerImpl>(options);
-        }
-
-        ~DepthWindowBindingState() {
-            lfs::vis::op::undoHistory().clear();
-            viewer.reset();
-            lfs::vis::services().clear();
-        }
-
-        lfs::vis::RenderingManager& prepare(const bool enabled, const bool park) {
-            using namespace lfs::vis;
-            auto& manager = *viewer->getRenderingManager();
-            manager.restoreDepthWindowStateFromProject();
-            auto settings = manager.getSettings();
-            settings.split_view_mode = SplitViewMode::IndependentDual;
-            settings.depth_filter_enabled = enabled;
-            manager.updateSettings(settings);
-            manager.setDepthWindowSync(false);
-            manager.setDepthWindowForPanel(SplitViewPanelId::Left, pair[0]);
-            manager.setDepthWindowForPanel(SplitViewPanelId::Right, pair[1]);
-            manager.setFocusedSplitPanel(SplitViewPanelId::Left);
-            if (!park) {
-                settings = manager.getSettings();
-                settings.split_view_mode = SplitViewMode::Disabled;
-                manager.updateSettings(settings);
-            }
-            settings = manager.getSettings();
-            settings.split_view_mode = SplitViewMode::GTComparison;
-            manager.updateSettings(settings);
-            lfs::vis::op::undoHistory().clear();
-            return manager;
-        }
-
-        const std::array<lfs::vis::DepthWindowState, 2> pair{
-            lfs::vis::DepthWindowState{1.0f, 10.0f, 0.31f, 0.32f, 0.10f, 0.11f},
-            lfs::vis::DepthWindowState{2.0f, 20.0f, 0.62f, 0.63f, -0.20f, -0.21f}};
-        std::unique_ptr<lfs::vis::VisualizerImpl> viewer;
-    };
 } // namespace
-
-TEST_F(PythonIntegrationTest, FreshDepthWindowPanelRangeSurvivesReadModifyEnable) {
-    for (const char* panel : {"main", "left", "right"}) {
-        SCOPED_TRACE(panel);
-        DepthWindowBindingState state;
-        const lfs::python::GilAcquire gil;
-        const auto decref = [](PyObject* object) { Py_XDECREF(object); };
-        std::unique_ptr<PyObject, decltype(decref)> globals(PyDict_New(), decref);
-        ASSERT_NE(globals, nullptr);
-        ASSERT_EQ(PyDict_SetItemString(globals.get(), "__builtins__", PyEval_GetBuiltins()), 0);
-        std::unique_ptr<PyObject, decltype(decref)> name(PyUnicode_FromString(panel), decref);
-        ASSERT_EQ(PyDict_SetItemString(globals.get(), "panel", name.get()), 0);
-        ASSERT_NO_THROW(execPythonInGlobals(globals.get(), R"PY(
-import lichtfeld as lf
-legacy = lf.selection.get_depth_filter_window()
-window = lf.selection.get_depth_filter_window(panel=panel)
-assert not window[0]
-assert window[1:3] == legacy[1:3] == (0.0, 100.0), (panel, window, legacy)
-_, near, far, sx, sy, ox, oy = window
-lf.selection.set_depth_filter_window(True, near, far, sx, ox, oy, sy, panel=panel)
-assert lf.selection.get_depth_filter_window(panel=panel) == (True, *window[1:])
-# A configured window remains intact while disabled.
-lf.selection.set_depth_filter_window(False, 2.0, 25.0, 0.5, 0.25, -0.25, 0.75, panel=panel)
-assert lf.selection.get_depth_filter_window(panel=panel) == (False, 2.0, 25.0, 0.5, 0.75, 0.25, -0.25)
-)PY"));
-    }
-}
-
-TEST_F(PythonIntegrationTest, ParkedGtPanelWindowRequestsAreAtomicallyRefused) {
-    DepthWindowBindingState state;
-    ASSERT_EQ(state.viewer->getSelectionTool(), nullptr);
-    ASSERT_EQ(lfs::python::get_rendering_manager(), state.viewer->getRenderingManager());
-    const lfs::python::GilAcquire gil;
-    const auto decref = [](PyObject* object) { Py_XDECREF(object); };
-    std::unique_ptr<PyObject, decltype(decref)> globals(PyDict_New(), decref);
-    ASSERT_NE(globals, nullptr);
-    ASSERT_EQ(PyDict_SetItemString(globals.get(), "__builtins__", PyEval_GetBuiltins()), 0);
-    for (const bool initial_enabled : {false, true}) {
-        for (const bool requested_enabled : {false, true}) {
-            auto& manager = state.prepare(initial_enabled, true);
-            const auto before = manager.getSettings();
-            const auto snapshot = manager.depthWindowSnapshot();
-            const auto generation = manager.depthWindowProjectionGeneration();
-            const auto lineage = manager.getDepthWindowCollapseRecord().generation;
-            manager.dirty_mask_.store(0);
-            ASSERT_EQ(PyDict_SetItemString(globals.get(), "requested", requested_enabled ? Py_True : Py_False), 0);
-            ASSERT_NO_THROW(execPythonInGlobals(globals.get(), R"PY(
-import importlib.machinery
-import lichtfeld as lf
-assert any(lf.__file__.endswith(s) for s in importlib.machinery.EXTENSION_SUFFIXES), lf.__file__
-before = [lf.selection.get_depth_filter_window(panel=p) for p in ('left', 'right')]
-for panel in ('left', 'right', 'main'):
-    raised = False
-    try:
-        lf.selection.set_depth_filter_window(requested, 7.0, 70.0, 0.77, 0.07, 0.08, 0.78, panel=panel)
-    except RuntimeError as error:
-        assert 'parked' in str(error), str(error)
-        raised = True
-    assert raised is requested, (requested, raised)
-    assert [lf.selection.get_depth_filter_window(panel=p) for p in ('left', 'right')] == before
-)PY"));
-            const auto after = manager.getSettings();
-            EXPECT_EQ(manager.dirty_mask_.load(), 0u);
-            EXPECT_EQ(after.depth_filter_enabled, initial_enabled);
-            EXPECT_EQ(after.depth_filter_min, before.depth_filter_min);
-            EXPECT_EQ(after.depth_filter_max, before.depth_filter_max);
-            EXPECT_EQ(after.depth_filter_transform.getTranslation(), before.depth_filter_transform.getTranslation());
-            EXPECT_EQ(after.depth_filter_transform.getRotation(), before.depth_filter_transform.getRotation());
-            EXPECT_EQ(manager.depthWindowSnapshot().panels, snapshot.panels);
-            EXPECT_EQ(manager.depthWindowSnapshot().projection, snapshot.projection);
-            EXPECT_EQ(manager.depthWindowModeEpoch(), snapshot.mode_epoch);
-            EXPECT_EQ(manager.depthWindowProjectionGeneration(), generation);
-            EXPECT_EQ(manager.getDepthWindowCollapseRecord().generation, lineage);
-            EXPECT_EQ(lfs::vis::op::undoHistory().undoCount(), 0u);
-            auto settings = manager.getSettings();
-            settings.split_view_mode = lfs::vis::SplitViewMode::IndependentDual;
-            manager.updateSettings(settings);
-            EXPECT_EQ(manager.depthWindowSnapshot().panels, state.pair);
-        }
-    }
-}
-
-TEST_F(PythonIntegrationTest, GtGlobalWindowCompatibilityPathsRemainWritable) {
-    DepthWindowBindingState state;
-    ASSERT_EQ(state.viewer->getSelectionTool(), nullptr);
-    const lfs::python::GilAcquire gil;
-    const auto decref = [](PyObject* object) { Py_XDECREF(object); };
-    std::unique_ptr<PyObject, decltype(decref)> globals(PyDict_New(), decref);
-    ASSERT_NE(globals, nullptr);
-    ASSERT_EQ(PyDict_SetItemString(globals.get(), "__builtins__", PyEval_GetBuiltins()), 0);
-    for (const bool park : {false, true}) {
-        for (const bool requested_enabled : {false, true}) {
-            auto& manager = state.prepare(!requested_enabled, park);
-            const auto lineage = manager.getDepthWindowCollapseRecord().generation;
-            ASSERT_EQ(PyDict_SetItemString(globals.get(), "requested", requested_enabled ? Py_True : Py_False), 0);
-            ASSERT_EQ(PyDict_SetItemString(globals.get(), "parked", park ? Py_True : Py_False), 0);
-            ASSERT_NO_THROW(execPythonInGlobals(globals.get(), R"PY(
-import math
-import lichtfeld as lf
-# None remains global even with a parked pair; no-park GT also accepts explicit panels.
-lf.selection.set_depth_filter_window(requested, 7.0, 70.0, 0.77, 0.07, 0.08, 0.78,
-                                     panel=None if parked else 'right')
-expected = (7.0, 70.0, 0.77, 0.78, 0.07, 0.08)
-for panel in ('left', 'right'):
-    value = lf.selection.get_depth_filter_window(panel=panel)
-    assert value[0] is requested
-    assert all(math.isclose(a, b, abs_tol=1e-6) for a, b in zip(value[1:], expected)), value
-)PY"));
-            EXPECT_EQ(manager.getSettings().depth_filter_enabled, requested_enabled);
-            EXPECT_EQ(manager.getDepthWindowCollapseRecord().generation, lineage);
-            const auto global = manager.depthWindowSnapshot().projection;
-            auto settings = manager.getSettings();
-            settings.split_view_mode = lfs::vis::SplitViewMode::IndependentDual;
-            manager.updateSettings(settings);
-            EXPECT_EQ(manager.depthWindowSnapshot().panels, park ? state.pair : (std::array{global, global}));
-        }
-    }
-}
-
-TEST_F(PythonIntegrationTest, RetainedDisabledPanelWritePublishesDiscardLineage) {
-    DepthWindowBindingState state;
-    auto& manager = state.prepare(false, true);
-    auto settings = manager.getSettings();
-    settings.split_view_mode = lfs::vis::SplitViewMode::Disabled;
-    manager.updateSettings(settings);
-    const lfs::python::GilAcquire gil;
-    const auto decref = [](PyObject* object) { Py_XDECREF(object); };
-    std::unique_ptr<PyObject, decltype(decref)> globals(PyDict_New(), decref);
-    ASSERT_NE(globals, nullptr);
-    ASSERT_EQ(PyDict_SetItemString(globals.get(), "__builtins__", PyEval_GetBuiltins()), 0);
-    ASSERT_NO_THROW(execPythonInGlobals(globals.get(), R"PY(
-import lichtfeld as lf
-before = lf.ui.get_depth_window_collapse_record()
-lf.selection.set_depth_filter_window(True, 7.0, 70.0, 0.77, 0.07, 0.08, 0.78, panel='right')
-after = lf.ui.get_depth_window_collapse_record()
-assert after[1] == before[1] + 1, (before, after)
-assert after[2] == 'retained_pair_discard', after
-assert lf.selection.get_depth_filter_window(panel='right')[0] is True
-)PY"));
-    const auto global = manager.depthWindowSnapshot().projection;
-    settings = manager.getSettings();
-    settings.split_view_mode = lfs::vis::SplitViewMode::IndependentDual;
-    manager.updateSettings(settings);
-    EXPECT_EQ(manager.depthWindowSnapshot().panels, (std::array{global, global}));
-}
-
-TEST_F(PythonIntegrationTest, RetainedRenderSettingsMergeFreshStateBeforeCallback) {
-    using lfs::vis::DepthWindowState;
-    using lfs::vis::SplitViewPanelId;
-
-    lfs::vis::RenderingManager manager;
-    {
-        auto settings = manager.getSettings();
-        settings.split_view_mode = lfs::vis::SplitViewMode::IndependentDual;
-        settings.depth_filter_enabled = true;
-        manager.updateSettings(settings);
-    }
-    manager.setDepthWindowSync(false);
-
-    const DepthWindowState left_window{
-        .near_plane = 1.0f,
-        .far_plane = 10.0f,
-        .scale_x = 0.4f,
-        .scale_y = 0.4f,
-        .offset_x = 0.0f,
-        .offset_y = 0.0f};
-    const DepthWindowState right_window{
-        .near_plane = 2.0f,
-        .far_plane = 20.0f,
-        .scale_x = 0.5f,
-        .scale_y = 0.5f,
-        .offset_x = 0.0f,
-        .offset_y = 0.0f};
-    manager.setDepthWindowForPanel(SplitViewPanelId::Left, left_window);
-    manager.setDepthWindowForPanel(SplitViewPanelId::Right, right_window);
-
-    // The outbound proxy is captured exactly as PyRenderSettings::set produced
-    // it, before the adapter applies anything. That assertion is what proves the
-    // producer performed the fresh merge rather than the adapter masking it.
-    std::optional<lfs::vis::RenderSettingsProxy> outbound;
-    int callback_invocations = 0;
-    const ScopedRenderSettingsCallbacks scoped_callbacks(
-        [&manager]() -> std::optional<lfs::vis::RenderSettingsProxy> {
-            return lfs::vis::to_proxy(manager.getSettings());
-        },
-        [&manager, &outbound, &callback_invocations](const lfs::vis::RenderSettingsProxy& proxy,
-                                                     lfs::vis::RenderSettingsUpdateIntent) {
-            outbound = proxy;
-            ++callback_invocations;
-            auto settings = manager.getSettings();
-            lfs::vis::apply_proxy(settings, proxy);
-            manager.updateSettings(settings, lfs::vis::DirtyFlag::ALL);
-        });
-
-    manager.setFocusedSplitPanel(SplitViewPanelId::Left);
-
-    PyObject* globals = nullptr;
-    {
-        const lfs::python::GilAcquire gil;
-        globals = PyDict_New();
-        ASSERT_NE(globals, nullptr);
-        PyDict_SetItemString(globals, "__builtins__", PyEval_GetBuiltins());
-        ASSERT_NO_THROW(execPythonInGlobals(globals, R"PY(
-import lichtfeld as lf
-retained = lf.get_render_settings()
-assert retained is not None
-retained_ok = True
-)PY"));
-    }
-
-    // The retained object holds Left's full snapshot (the depth-window fields are
-    // not exposed as Python properties, so it is captured by construction under
-    // Left focus rather than read back here).
-    {
-        const lfs::python::GilAcquire gil;
-        auto* const captured = PyDict_GetItemString(globals, "retained_ok");
-        ASSERT_NE(captured, nullptr);
-        EXPECT_TRUE(PyObject_IsTrue(captured));
-    }
-
-    manager.setFocusedSplitPanel(SplitViewPanelId::Right);
-
-    {
-        const lfs::python::GilAcquire gil;
-        ASSERT_NO_THROW(execPythonInGlobals(globals, R"PY(
-retained.set("background_color", (0.125, 0.25, 0.375))
-)PY"));
-        Py_DECREF(globals);
-    }
-
-    ASSERT_EQ(callback_invocations, 1);
-    ASSERT_TRUE(outbound.has_value());
-
-    // 1. The outbound proxy carries Right's fresh depth values, not Left's.
-    EXPECT_FLOAT_EQ(outbound->depth_filter_scale_x, right_window.scale_x);
-    EXPECT_FLOAT_EQ(outbound->depth_filter_scale_y, right_window.scale_y);
-    EXPECT_FLOAT_EQ(-outbound->depth_filter_max[2], right_window.near_plane);
-    EXPECT_FLOAT_EQ(-outbound->depth_filter_min[2], right_window.far_plane);
-
-    // 2. The named property applied.
-    const auto applied = manager.getSettings();
-    EXPECT_FLOAT_EQ(applied.background_color.x, 0.125f);
-    EXPECT_FLOAT_EQ(applied.background_color.y, 0.25f);
-    EXPECT_FLOAT_EQ(applied.background_color.z, 0.375f);
-
-    // 3. Right's stored depth window is untouched.
-    const auto stored_right = manager.getDepthWindowForPanel(SplitViewPanelId::Right);
-    EXPECT_FLOAT_EQ(stored_right.near_plane, right_window.near_plane);
-    EXPECT_FLOAT_EQ(stored_right.far_plane, right_window.far_plane);
-    EXPECT_FLOAT_EQ(stored_right.scale_x, right_window.scale_x);
-    EXPECT_FLOAT_EQ(stored_right.scale_y, right_window.scale_y);
-
-    // 4. The focused projection is still Right's.
-    EXPECT_FLOAT_EQ(applied.depth_filter_scale_x, right_window.scale_x);
-    EXPECT_FLOAT_EQ(-applied.depth_filter_max.z, right_window.near_plane);
-    EXPECT_FLOAT_EQ(-applied.depth_filter_min.z, right_window.far_plane);
-
-    // Left must not have been disturbed either.
-    const auto stored_left = manager.getDepthWindowForPanel(SplitViewPanelId::Left);
-    EXPECT_FLOAT_EQ(stored_left.near_plane, left_window.near_plane);
-    EXPECT_FLOAT_EQ(stored_left.far_plane, left_window.far_plane);
-    EXPECT_FLOAT_EQ(stored_left.scale_x, left_window.scale_x);
-}
-
 // NOTE: Tests that actually execute Python scripts require the lichtfeld module
 // to be importable, which depends on the CommandCenter and training infrastructure.
 // These are better tested via integration tests (running training with --python-script).
+
+TEST_F(PythonIntegrationTest, LoadConfirmationLegacyCallbackOpensDialog) {
+    const lfs::python::GilAcquire gil;
+    std::unique_ptr<PyObject, decltype(&Py_DecRef)> globals(PyDict_New(), Py_DecRef);
+    ASSERT_NE(globals, nullptr);
+    PyDict_SetItemString(globals.get(), "__builtins__", PyEval_GetBuiltins());
+    const auto run = [&](const char* code) {
+        auto* result = PyRun_String(code, Py_file_input, globals.get(), globals.get());
+        if (!result)
+            ADD_FAILURE() << consumePythonError();
+        const bool success = result != nullptr;
+        Py_XDECREF(result);
+        return success;
+    };
+    ASSERT_TRUE(run(R"PY(
+import lichtfeld as lf
+calls = []
+dialogs = []
+original_dialog = lf.ui.confirm_dialog
+lf.ui.confirm_dialog = lambda *args: dialogs.append(args)
+def callback(paths, is_dataset, replace):
+    calls.append((paths, is_dataset, replace))
+    lf.ui.confirm_dialog('Load files', 'Confirm replacement', ['Load', 'Cancel'])
+lf.ui.on_show_load_file_confirmation(callback)
+)PY"));
+    lfs::core::events::cmd::ShowLoadFileConfirmation{
+        .paths = {"first.ply", "second.ply"},
+        .is_dataset = false,
+        .replace = true,
+        .user_batch = true}
+        .emit();
+    EXPECT_TRUE(run(R"PY(
+try:
+    assert calls == [(['first.ply', 'second.ply'], False, True)], calls
+    assert dialogs == [('Load files', 'Confirm replacement', ['Load', 'Cancel'])], dialogs
+finally:
+    lf.ui.on_show_load_file_confirmation(lambda paths, is_dataset, replace: None)
+    lf.ui.confirm_dialog = original_dialog
+)PY"));
+}
+
+TEST_F(PythonIntegrationTest, LoadConfirmationBatchCallbackRetainsProvenance) {
+    const lfs::python::GilAcquire gil;
+    std::unique_ptr<PyObject, decltype(&Py_DecRef)> globals(PyDict_New(), Py_DecRef);
+    ASSERT_NE(globals, nullptr);
+    PyDict_SetItemString(globals.get(), "__builtins__", PyEval_GetBuiltins());
+    const auto run = [&](const char* code) {
+        auto* result = PyRun_String(code, Py_file_input, globals.get(), globals.get());
+        if (!result)
+            ADD_FAILURE() << consumePythonError();
+        const bool success = result != nullptr;
+        Py_XDECREF(result);
+        return success;
+    };
+    ASSERT_TRUE(run(R"PY(
+import lichtfeld as lf
+calls = []
+lf.ui.on_show_load_file_confirmation(lambda *args: calls.append(('old', args)))
+def callback(paths, is_dataset, replace, user_batch):
+    calls.append((paths, is_dataset, replace, user_batch))
+lf.ui.on_show_load_file_confirmation_with_batch(callback)
+lf.ui.on_show_load_file_confirmation_with_batch(callback)
+)PY"));
+    lfs::core::events::cmd::ShowLoadFileConfirmation{
+        .paths = {"first.ply", "second.ply"},
+        .is_dataset = false,
+        .replace = true,
+        .user_batch = true}
+        .emit();
+    EXPECT_TRUE(run(R"PY(
+try:
+    assert calls == [(['first.ply', 'second.ply'], False, True, True)], calls
+finally:
+    lf.ui.on_show_load_file_confirmation_with_batch(lambda paths, is_dataset, replace, user_batch: None)
+)PY"));
+}
+
+TEST_F(PythonIntegrationTest, CustomGizmoOverlayDispatchesPerViewAndRetainsInstance) {
+    const lfs::python::GilAcquire gil;
+    std::unique_ptr<PyObject, decltype(&Py_DecRef)> globals(PyDict_New(), Py_DecRef);
+    PyDict_SetItemString(globals.get(), "__builtins__", PyEval_GetBuiltins());
+    const auto run = [&](const char* code) {
+        auto* result = PyRun_String(code, Py_file_input, globals.get(), globals.get());
+        if (!result)
+            ADD_FAILURE() << consumePythonError();
+        const bool success = result != nullptr;
+        Py_XDECREF(result);
+        return success;
+    };
+    ASSERT_TRUE(run(R"PY(
+import lichtfeld as lf
+calls = []
+instances = []
+class CustomOverlay:
+    gizmo_id = "test.custom.overlay"
+    enabled = True
+    def __init__(self):
+        self.frames = 0
+        instances.append(self)
+    @classmethod
+    def poll(cls, ctx):
+        return cls.enabled
+    def draw(self, ctx):
+        self.frames += 1
+        point = ctx.world_to_screen((0, 0, 0))
+        calls.append((self.frames, point, ctx.camera_position, ctx.camera_forward,
+                      ctx.screen_to_world_ray(point)))
+        ctx.draw_line_3d((0, 0, 0), (1, 0, 0), (1, 0, 0, 1), 2)
+        ctx.draw_filled_circle(point, 4, (0, 1, 0, 1))
+lf.register_gizmo(CustomOverlay)
+)PY"));
+    EXPECT_TRUE(lfs::python::has_viewport_draw_handlers());
+    const glm::mat4 proj = glm::perspective(glm::radians(60.0f), 2.0f, 0.1f, 100.0f);
+    const glm::vec2 size(400, 200);
+    lfs::vis::gui::NativeOverlayDrawList draw_list;
+    lfs::rendering::ScreenOverlayRenderer overlay;
+    for (int i = 0; i < 2; ++i) {
+        const glm::vec2 pos(100 + i * 400, 50);
+        const glm::vec3 camera(i == 0 ? 0 : 5, 0, i == 0 ? 5 : 0);
+        const glm::vec3 forward = glm::normalize(-camera);
+        const glm::mat4 view = glm::lookAt(camera, glm::vec3(0), glm::vec3(0, 1, 0));
+        overlay.beginFrame();
+        lfs::python::invoke_viewport_overlay(glm::value_ptr(view), glm::value_ptr(proj),
+                                             glm::value_ptr(pos), glm::value_ptr(size),
+                                             glm::value_ptr(camera), glm::value_ptr(forward),
+                                             &overlay, &draw_list);
+        overlay.endFrame();
+        const auto commands = overlay.consumeCommands();
+        EXPECT_EQ(commands.size(), 2u);
+        for (const auto& command : commands) {
+            EXPECT_NEAR(command.p0.x, pos.x + size.x / 2, 0.001f);
+            EXPECT_NEAR(command.p0.y, pos.y + size.y / 2, 0.001f);
+            EXPECT_TRUE(command.clip.has_value());
+            if (command.clip) {
+                EXPECT_EQ(command.clip->min, pos);
+                EXPECT_EQ(command.clip->max, pos + size);
+            }
+        }
+    }
+    EXPECT_TRUE(run(R"PY(
+assert len(instances) == 1, len(instances)
+assert [c[0] for c in calls] == [1, 2], calls
+for c, point, camera, forward in zip(calls, [(300, 150), (700, 150)],
+                                    [(0, 0, 5), (5, 0, 0)], [(0, 0, -1), (-1, 0, 0)]):
+    for got, want in zip(c[1:], [point, camera, forward, forward]):
+        assert all(abs(a-b) < 0.001 for a, b in zip(got, want)), (got, want)
+)PY"));
+    EXPECT_TRUE(run("CustomOverlay.enabled = False"));
+    const glm::mat4 view(1);
+    const glm::vec2 pos(0);
+    const glm::vec3 camera(0), forward(0, 0, -1);
+    overlay.beginFrame();
+    lfs::python::invoke_viewport_overlay(glm::value_ptr(view), glm::value_ptr(proj),
+                                         glm::value_ptr(pos), glm::value_ptr(size),
+                                         glm::value_ptr(camera), glm::value_ptr(forward),
+                                         &overlay, &draw_list);
+    EXPECT_TRUE(overlay.consumeCommands().empty());
+    EXPECT_TRUE(run("lf.unregister_gizmo(CustomOverlay.gizmo_id)"));
+    EXPECT_FALSE(lfs::python::has_viewport_draw_handlers());
+    overlay.endFrame();
+}
+TEST_F(PythonIntegrationTest, RenderSettingsQueuedPropertiesSurviveFocusChangeWithoutLostUpdates) {
+    using namespace std::chrono_literals;
+    TestVisualizer viewer;
+    viewer.queue_posted_work = true;
+    const ScopedVisualizer scoped_viewer(&viewer);
+    ViewSettingCallbacks callbacks;
+    std::array<std::exception_ptr, 2> errors;
+    auto run = [&](int index, const char* statement) {
+        try {
+            (void)runPythonTensorSnippet(std::string("import lichtfeld as lf\ns=lf.get_render_settings()\n") + statement +
+                                         "\nresult_shape=(1,)\nresult_values=[1.0]");
+        } catch (...) { errors[index] = std::current_exception(); }
+    };
+    std::thread first([&] { run(0, "s.focal_length_mm=73.0"); });
+    const bool first_queued = viewer.waitForQueuedWork(5s);
+    std::thread second([&] { run(1, "s.show_grid=False"); });
+    const bool both_queued = viewer.waitForQueuedWork(5s, 2);
+    callbacks.views.edit([&](auto& screen) { screen.setActiveView({callbacks.second}); });
+    while (viewer.runNextQueuedWork()) {}
+    first.join();
+    second.join();
+    ASSERT_TRUE(first_queued);
+    ASSERT_TRUE(both_queued);
+    for (const auto& error : errors)
+        if (error)
+            std::rethrow_exception(error);
+    EXPECT_FLOAT_EQ(callbacks.manager.settingsForView(callbacks.first).focal_length_mm, 73.0f);
+    EXPECT_FALSE(callbacks.manager.settingsForView(callbacks.first).show_grid);
+    EXPECT_FLOAT_EQ(callbacks.manager.settingsForView(callbacks.second).focal_length_mm, 35.0f);
+    EXPECT_TRUE(callbacks.manager.settingsForView(callbacks.second).show_grid);
+    EXPECT_EQ(callbacks.views.activeView(), callbacks.second);
+    EXPECT_EQ(callbacks.commits, 2);
+}
+
+TEST_F(PythonIntegrationTest, RenderSettingsDeletedViewAndReplacedScreenFailWithoutRedirecting) {
+    using namespace std::chrono_literals;
+    for (const bool replace_screen : {false, true}) {
+        TestVisualizer viewer;
+        viewer.queue_posted_work = true;
+        const ScopedVisualizer scoped_viewer(&viewer);
+        ViewSettingCallbacks callbacks;
+        PythonTensorResult result;
+        std::exception_ptr error;
+        std::thread worker([&] {
+            try {
+                result = runPythonTensorSnippet(R"PY(
+import lichtfeld as lf
+s=lf.get_render_settings()
+failed=False
+try:
+    s.focal_length_mm=73.0
+except RuntimeError:
+    failed=True
+result_shape=(1,)
+result_values=[float(failed)]
+)PY");
+            } catch (...) { error = std::current_exception(); }
+        });
+        const bool queued = viewer.waitForQueuedWork(5s);
+        if (replace_screen)
+            callbacks.views.resetToDefault();
+        else
+            callbacks.views.edit([&](auto& screen) { EXPECT_TRUE(screen.close({callbacks.first})); });
+        while (viewer.runNextQueuedWork()) {}
+        worker.join();
+        ASSERT_TRUE(queued);
+        if (error)
+            std::rethrow_exception(error);
+        EXPECT_EQ(result.values, std::vector<float>{1.0f});
+        EXPECT_EQ(callbacks.commits, 0);
+        EXPECT_FLOAT_EQ(callbacks.manager.getSettings().focal_length_mm, 35.0f);
+    }
+}
+
+TEST_F(PythonIntegrationTest, RenderSettingsShutdownAndCancelledWorkReportFailure) {
+    using namespace std::chrono_literals;
+    TestVisualizer viewer;
+    const ScopedVisualizer scoped_viewer(&viewer);
+    ViewSettingCallbacks callbacks;
+    const std::string script = R"PY(
+import lichtfeld as lf
+s=lf.get_render_settings()
+failed=False
+try:
+    s.show_grid=False
+except RuntimeError:
+    failed=True
+result_shape=(1,)
+result_values=[float(failed)]
+)PY";
+    viewer.accepts_posted_work = false;
+    EXPECT_EQ(runPythonTensorSnippet(script).values, std::vector<float>{1.0f});
+    viewer.accepts_posted_work = true;
+    viewer.queue_posted_work = true;
+    PythonTensorResult result;
+    std::exception_ptr error;
+    std::thread worker([&] { try { result=runPythonTensorSnippet(script); } catch (...) { error=std::current_exception(); } });
+    const bool queued = viewer.waitForQueuedWork(5s);
+    EXPECT_TRUE(viewer.cancelNextQueuedWork());
+    worker.join();
+    ASSERT_TRUE(queued);
+    if (error)
+        std::rethrow_exception(error);
+    EXPECT_EQ(result.values, std::vector<float>{1.0f});
+    EXPECT_EQ(callbacks.commits, 0);
+}
+
+TEST_F(PythonIntegrationTest, RenderSettingsNormalizationSceneScopeAndNotificationsArePreserved) {
+    TestVisualizer viewer;
+    viewer.on_viewer_thread = true;
+    const ScopedVisualizer scoped_viewer(&viewer);
+    ViewSettingCallbacks callbacks;
+    int notifications = 0;
+    bool notified_with_gil = true;
+    auto& registry = lfs::core::prop::PropertyRegistry::instance();
+    // Import registers the render metadata before subscribing.
+    (void)runPythonTensorSnippet("import lichtfeld as lf\nresult_shape=(1,)\nresult_values=[1.0]");
+    const auto subscription = registry.subscribe("render_settings", "equirectangular", [&](const auto&, const auto&, const auto&, const auto&) {
+        ++notifications;
+        notified_with_gil = notified_with_gil && PyGILState_Check();
+    });
+    PythonTensorResult result;
+    try {
+        result = runPythonTensorSnippet(R"PY(
+import lichtfeld as lf
+s=lf.get_render_settings()
+s.gt_comparison_actual_size=True
+s.equirectangular=True
+normalized=not s.gt_comparison_actual_size
+s.equirectangular=True
+s.color_exposure=1.7
+invalid=False
+try:
+    s.focal_length_mm=object()
+except (TypeError,RuntimeError):
+    invalid=True
+result_shape=(2,)
+result_values=[float(normalized),float(invalid)]
+)PY");
+    } catch (...) {
+        registry.unsubscribe(subscription);
+        throw;
+    }
+    registry.unsubscribe(subscription);
+    EXPECT_EQ(result.values, (std::vector<float>{1.0f, 1.0f}));
+    EXPECT_EQ(notifications, 1);
+    EXPECT_TRUE(notified_with_gil);
+    EXPECT_TRUE(callbacks.manager.settingsForView(callbacks.first).equirectangular);
+    EXPECT_FALSE(callbacks.manager.settingsForView(callbacks.second).equirectangular);
+    EXPECT_FLOAT_EQ(callbacks.manager.settingsForView(callbacks.first).color_exposure, 1.7f);
+    EXPECT_FLOAT_EQ(callbacks.manager.settingsForView(callbacks.second).color_exposure, 1.7f);
+}

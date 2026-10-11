@@ -27,6 +27,9 @@ class _BindingModelStub:
     def bind_event(self, _name, _handler):
         pass
 
+    def bind_record_list(self, _name):
+        pass
+
     def get_handle(self):
         return self.handle
 
@@ -232,7 +235,7 @@ def test_rendering_panel_reacts_to_native_scene_generation(rendering_panel_modul
     panel = module.RenderingPanel()
 
     assert module.RenderingPanel.update_policy == "dirty"
-    assert "update_interval_ms" not in module.RenderingPanel.__dict__
+    assert module.RenderingPanel.update_interval_ms is None
 
     panel.on_bind_model(_BindingContextStub(model))
     panel._subscribe_reactive_state()

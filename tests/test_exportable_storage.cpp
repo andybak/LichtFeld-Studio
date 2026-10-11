@@ -1080,10 +1080,6 @@ TEST_F(SplatExportableStorageTest, MigrateFloatSwizzledShNFallsBackToQ16AtFullCa
     }
 }
 
-// The reported failure: dataset init with init_points > 0.75 x max_cap and
-// SH degree 1 threw from the exportable allocator inside
-// init_model_from_pointcloud. The float shN must come back as an
-// out-of-block workspace instead.
 TEST_F(SplatExportableStorageTest, InitModelFromPointcloudSucceedsAtFullExportableCapacitySh1) {
 
     constexpr std::size_t kCap = 1000;
@@ -1110,10 +1106,58 @@ TEST_F(SplatExportableStorageTest, InitModelFromPointcloudSucceedsAtFullExportab
                                             storage.make_allocator());
     ASSERT_TRUE(model.has_value()) << model.error();
     EXPECT_EQ(model->size(), kCap);
-    EXPECT_EQ(model->shN_raw().dtype(), DataType::Float32);
+    EXPECT_TRUE(model->shN_value_quantized());
+    EXPECT_EQ(model->shN_raw().dtype(), DataType::Float16);
     EXPECT_EQ(static_cast<std::size_t>(model->shN_raw().numel()),
-              sh_swizzled_float_count(kCap, sh_rest_coefficients_for_degree(1)));
+              sh_value_quant::sh_value_u16_count(kCap, sh_rest_coefficients_for_degree(1)));
+    const auto codes = model->shN_raw().cpu();
+    const auto bounds = model->shN_value_bounds().cpu();
+    const auto* code_values = reinterpret_cast<const std::uint16_t*>(codes.data_ptr());
+    for (std::size_t i = 0; i < codes.numel(); ++i)
+        EXPECT_EQ(code_values[i], 0);
+    for (std::size_t i = 0; i < bounds.numel(); ++i)
+        EXPECT_FLOAT_EQ(bounds.ptr<float>()[i], 0.0f);
     EXPECT_EQ(model->means_raw().external_storage_kind(), "splat.exportable");
+    EXPECT_EQ(model->shN_raw().external_storage_kind(), "splat.exportable");
+}
+
+TEST_F(SplatExportableStorageTest, RandomInitializationKeepsConfiguredWorldBounds) {
+    constexpr std::size_t kCount = 1000;
+    constexpr float kExtent = 0.5f;
+    constexpr std::array<float, 3> kOrigin{10.0f, -7.0f, 4.0f};
+
+    auto storage_result = SplatExportableStorage::create(
+        kCount, /*sh_degree=*/1, 0, kCount);
+    ASSERT_TRUE(storage_result.has_value()) << storage_result.error();
+    auto storage = std::move(*storage_result);
+
+    lfs::core::param::TrainingParameters params;
+    params.optimization.sh_degree = 1;
+    params.optimization.max_cap = static_cast<int>(kCount);
+    params.optimization.random = true;
+    params.optimization.init_num_pts = static_cast<int>(kCount);
+    params.optimization.init_extent = kExtent;
+    params.optimization.init_origin_x = kOrigin[0];
+    params.optimization.init_origin_y = kOrigin[1];
+    params.optimization.init_origin_z = kOrigin[2];
+
+    auto model = init_model_from_pointcloud(
+        params,
+        Tensor::zeros({3}, Device::CPU),
+        PointCloud{},
+        static_cast<int>(kCount),
+        storage.make_allocator());
+    ASSERT_TRUE(model.has_value()) << model.error();
+    ASSERT_GT(model->get_scene_scale(), 1.0f);
+
+    Tensor means = model->means_raw().cpu();
+    auto values = means.accessor<float, 2>();
+    for (std::size_t point = 0; point < kCount; ++point) {
+        for (std::size_t axis = 0; axis < kOrigin.size(); ++axis) {
+            EXPECT_GE(values(point, axis), kOrigin[axis] - kExtent);
+            EXPECT_LE(values(point, axis), kOrigin[axis] + kExtent);
+        }
+    }
 }
 
 // A failed capacity ensure must abort before mutation and leave all parameter

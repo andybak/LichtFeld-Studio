@@ -252,10 +252,6 @@ namespace lfs::sequencer {
         return interpolateSpline(keyframes_, time);
     }
 
-    std::vector<glm::vec3> Timeline::generatePath(const int samples_per_segment) const {
-        return generatePathPoints(keyframes_, samples_per_segment);
-    }
-
     std::vector<glm::vec3> Timeline::generatePathAtTimeStep(const float sample_step_seconds) const {
         if (keyframes_.size() < 2) {
             return keyframes_.empty() ? std::vector<glm::vec3>{}
@@ -290,7 +286,9 @@ namespace lfs::sequencer {
     }
 
     void Timeline::sortKeyframes() {
-        std::sort(keyframes_.begin(), keyframes_.end());
+        // Equal-time keys keep their current order.
+        if (!std::is_sorted(keyframes_.begin(), keyframes_.end()))
+            std::stable_sort(keyframes_.begin(), keyframes_.end());
     }
 
     nlohmann::json Timeline::saveToJson() const {
@@ -400,7 +398,13 @@ namespace lfs::sequencer {
                         AnimationClip::fromJson(json["animation_clip"]));
             }
 
-            std::sort(loaded_keyframes.begin(), loaded_keyframes.end());
+            // IDs were assigned in file order, so use them to preserve ties
+            // without allocating a second keyframe buffer for a stable sort.
+            if (!std::is_sorted(loaded_keyframes.begin(), loaded_keyframes.end()))
+                std::sort(loaded_keyframes.begin(), loaded_keyframes.end(),
+                          [](const Keyframe& a, const Keyframe& b) {
+                              return a.time < b.time || (a.time == b.time && a.id < b.id);
+                          });
             float loaded_duration = DEFAULT_CLIP_DURATION_SECONDS;
             if (json.contains("clip_duration")) {
                 loaded_duration =

@@ -2,13 +2,15 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "lfs/training/perf_bench.hpp"
+#include "lfs/training/ops/registry.hpp"
 
 #include "core/alloc_counter.hpp"
-#include "core/detail/tensor_impl.hpp"
 #include "core/gpu_device_runtime.hpp"
 #include "core/logger.hpp"
 #include "core/pinned_allocator_stats.hpp"
+#include "core/tensor.hpp"
 #include "core/tensor_backend.hpp"
+#include "core/tensor_upload.hpp"
 #include "diagnostics/vram_ledger_model.hpp"
 
 #include <algorithm>
@@ -170,8 +172,16 @@ namespace lfs::training {
         destroy_phase_event_pool();
     }
 
-    void PerfBenchCollector::set_timing_stream(const cudaStream_t stream) {
-        timing_stream_ = stream;
+    void PerfBenchCollector::name_queues(const core::TensorWorkQueue& training,
+                                         const core::TensorWorkQueue& callback,
+                                         const core::TensorWorkQueue& metrics) {
+        core::TensorExecutionTarget(training).set_name("lfs.train");
+        core::TensorExecutionTarget(callback).set_name("lfs.train.callback");
+        core::TensorExecutionTarget(metrics).set_name("lfs.metrics");
+    }
+
+    void PerfBenchCollector::set_timing_queue(const core::TensorWorkQueue& queue) {
+        timing_queue_ = core::TensorExecutionTarget(queue);
     }
 
     void PerfBenchCollector::destroy_phase_event_pool() {
@@ -186,8 +196,10 @@ namespace lfs::training {
         const std::size_t n =
             static_cast<std::size_t>(kPhaseSampleCap) *
             static_cast<std::size_t>(kPhaseBoundaryCount);
-        phase_timer_ = std::make_unique<lfs::core::GpuElapsed>(
-            lfs::core::GpuBackend::CUDA, n);
+        const auto timing_backend = timing_queue_
+                                        ? timing_queue_->backend()
+                                        : lfs::core::default_gpu_backend();
+        phase_timer_ = std::make_unique<lfs::core::GpuElapsed>(timing_backend, n);
         if (!phase_timer_->ready()) {
             destroy_phase_event_pool();
             LOG_WARN("PerfBench: failed to allocate phase event pool; phase timings disabled");
@@ -220,7 +232,10 @@ namespace lfs::training {
             static_cast<std::size_t>(phase_current_index_) *
                 static_cast<std::size_t>(kPhaseBoundaryCount) +
             static_cast<std::size_t>(bi);
-        if (!phase_timer_->mark(ev_idx, timing_stream_)) {
+        const auto timing_backend = timing_queue_
+                                        ? timing_queue_->backend()
+                                        : lfs::core::default_gpu_backend();
+        if (!phase_timer_->mark(ev_idx, timing_queue_.value_or(core::TensorExecutionTarget::default_queue(timing_backend)))) {
             return;
         }
         sample.seen_mask |= (1u << bi);
@@ -231,22 +246,20 @@ namespace lfs::training {
         if (!enable) {
             phase_active_iter_ = 0;
         }
-        if (warmup > 0) {
-            g_perf_bench_warmup.store(warmup, std::memory_order_relaxed);
-        }
+        g_perf_bench_warmup.store(warmup, std::memory_order_relaxed);
         // Prefer main.cpp's early device baseline (post primary-context, pre-model).
         // Fall back to a configure-time sample when the profiler baseline is unset
         // (unit tests / non-main entry points).
         if (enable) {
             auto& c = instance();
             const auto early =
-                diagnostics::VramProfiler::instance().cudaDeviceBaselineBytes();
+                training_session_ops().device_baseline_bytes();
             if (early > 0) {
                 c.baseline_cuda_used_ = early;
             } else {
                 std::size_t used = 0;
                 std::size_t total = 0;
-                sample_cuda_used(lfs::core::gpu_backend_memory_info(lfs::core::GpuBackend::CUDA), used, total);
+                sample_cuda_used(lfs::core::gpu_backend_memory_info(lfs::core::default_gpu_backend()), used, total);
                 c.baseline_cuda_used_ = used;
                 (void)total;
             }
@@ -396,7 +409,7 @@ namespace lfs::training {
 
         // Refresh process snapshot so pool_bucket_cache / exportable are current.
         auto& profiler = diagnostics::VramProfiler::instance();
-        profiler.sampleCudaMemory();
+        training_session_ops().sample_memory();
         const auto snap = profiler.snapshot();
         const auto cover = detail::collect_perf_peak_cover_sample(snap);
         peak_pool_bucket_cache_ = cover.pool_bucket_cache_bytes;
@@ -419,23 +432,23 @@ namespace lfs::training {
         std::size_t raster_live = 0;
         peak_rows_.clear();
         for (const auto& row : snap.rows) {
-            if (row.live_bytes == 0 && row.peak_bytes == 0) {
+            if (row.live_bytes == 0) {
                 continue;
             }
             if (row.label == "arena.capacity" ||
                 row.label.find("arena.capacity") != std::string::npos) {
-                arena_cap = std::max(arena_cap, std::max(row.live_bytes, row.peak_bytes));
+                arena_cap = std::max(arena_cap, row.live_bytes);
             }
             if (row.label.find("per_primitive_buffers") != std::string::npos ||
                 row.label.find("per_tile_buffers") != std::string::npos ||
                 row.label.find("sorted_indices") != std::string::npos ||
                 row.label.find("sort_workspace_arena") != std::string::npos) {
-                raster_live += std::max(row.live_bytes, row.peak_bytes);
+                raster_live += row.live_bytes;
             }
             diagnostics::PeakSubsystemLine line;
             line.name = row.scope.empty() ? row.label : (row.scope + "." + row.label);
             line.owner = "vram_profiler";
-            line.bytes = std::max(row.live_bytes, row.peak_bytes);
+            line.bytes = row.live_bytes;
             line.state = diagnostics::AttributionState::Nested;
             peak_rows_.push_back(std::move(line));
         }
@@ -445,11 +458,12 @@ namespace lfs::training {
             peak_fastgs_raster_live_ = std::max(peak_fastgs_raster_live_, raster_live);
         }
 
-        // Keep the largest rows for the JSON ledger (top 12 by bytes).
+        // Keep enough live rows to make the peak actionable without turning
+        // the benchmark report into a full profiler dump.
         std::sort(peak_rows_.begin(), peak_rows_.end(),
                   [](const auto& a, const auto& b) { return a.bytes > b.bytes; });
-        if (peak_rows_.size() > 12) {
-            peak_rows_.resize(12);
+        if (peak_rows_.size() > 24) {
+            peak_rows_.resize(24);
         }
     }
 
@@ -466,7 +480,7 @@ namespace lfs::training {
 
         std::size_t used = 0;
         std::size_t total = 0;
-        const auto memory = lfs::core::gpu_backend_memory_info(lfs::core::GpuBackend::CUDA, true);
+        const auto memory = lfs::core::gpu_backend_memory_info(lfs::core::default_gpu_backend(), true);
         sample_cuda_used(memory, used, total);
         if (used > peak_cuda_used_) {
             capture_peak_snapshot(iter, used, total, memory);
@@ -728,8 +742,8 @@ namespace lfs::training {
 
         if (phase_pool_ready_ && phase_sample_count_ > 0) {
             // Bench-end only: the training loop has finished; make events readable.
-            if (timing_stream_ != nullptr) {
-                static_cast<void>(phase_timer_->wait_queue(timing_stream_));
+            if (timing_queue_ && !timing_queue_->is_default_queue()) {
+                static_cast<void>(phase_timer_->wait_queue(*timing_queue_));
             }
 
             std::vector<char> sample_ok(static_cast<std::size_t>(phase_sample_count_), 0);

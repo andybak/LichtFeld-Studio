@@ -24,7 +24,7 @@
 namespace lfs::core::internal {
     namespace {
         constexpr VkDeviceSize kMib = 1024ull * 1024ull;
-        constexpr VkDeviceSize kPoolBlockSize = 64ull * kMib;
+        constexpr VkDeviceSize kMaxExportSize = 64ull * kMib;
         constexpr VkDeviceSize kInitialStagingSize = 64ull * kMib;
         constexpr size_t kTransferChunk = 8 * 1024 * 1024;
         static_assert(kInitialStagingSize >= 2 * kTransferChunk);
@@ -35,6 +35,7 @@ namespace lfs::core::internal {
         constexpr VkBufferUsageFlags kStorageUsage =
             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
             VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
@@ -65,7 +66,9 @@ namespace lfs::core::internal {
                 return align_up(bytes, 256);
             }
             if (bytes < kDirectLimit) {
-                return std::bit_ceil(bytes);
+                // Reuse nearby image/workspace sizes without rounding each
+                // multi-megabyte buffer up to the next power of two.
+                return align_up(bytes, 256 * 1024);
             }
             // Byte shaders RMW the aligned uint32 covering the last logical
             // byte; the VkBuffer must include that word.
@@ -113,6 +116,15 @@ namespace lfs::core::internal {
             bool operator==(const Access&) const = default;
         };
 
+        struct PrivatePool {
+            VmaAllocator allocator;
+            VmaPool pool = VK_NULL_HANDLE;
+            ~PrivatePool() {
+                if (pool != VK_NULL_HANDLE)
+                    vmaDestroyPool(allocator, pool);
+            }
+        };
+        std::unique_ptr<PrivatePool> private_pool;
         VkBuffer buffer = VK_NULL_HANDLE;
         VmaAllocation allocation = VK_NULL_HANDLE;
         VkDeviceSize requested_size = 0;
@@ -122,6 +134,11 @@ namespace lfs::core::internal {
         // Each key starts a byte range; state survives cache reuse of the VkBuffer.
         std::map<VkDeviceSize, Access> accesses{{0, {}}};
         bool cacheable = false;
+        // A direct-range buffer that a freed-memory hold may keep.
+        bool holdable = false;
+        // Its block was handed to another API (a CUDA view or a Metal reader), whose work the tensor queue
+        // does not order; until then only the tensor queue uses the buffer.
+        bool shared_outside_queue = false;
         bool host_visible = false;
         std::byte* mapped = nullptr;
         StorageMeta descriptor_owner;
@@ -138,7 +155,8 @@ namespace lfs::core::internal {
         : context_(context) {
         try {
             create_pool();
-            ensure_staging(kInitialStagingSize);
+            // Availability probes also construct a context. Allocate the ring
+            // on the first upload, when acquire_staging holds its mutex.
         } catch (...) {
             shutdown();
             throw;
@@ -194,7 +212,7 @@ namespace lfs::core::internal {
         vk_check(&context_, find_result, "vmaFindMemoryTypeIndexForBufferInfo");
         VmaPoolCreateInfo pool_info{};
         pool_info.memoryTypeIndex = memory_type;
-        pool_info.blockSize = kPoolBlockSize;
+        pool_info.blockSize = kDirectLimit;
         if (want_export && buffer_info.pNext != nullptr) {
 #if LFS_HAS_CUDA
             export_alloc_info_.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
@@ -204,6 +222,13 @@ namespace lfs::core::internal {
             exports_memory_ = true;
 #endif
         }
+#ifdef __APPLE__
+        if (context_.caps().metal_objects) {
+            metal_export_info_.exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_BUFFER_BIT_EXT;
+            metal_export_info_.pNext = pool_info.pMemoryAllocateNext;
+            pool_info.pMemoryAllocateNext = &metal_export_info_;
+        }
+#endif
         VkResult pool_result = vmaCreatePool(context_.allocator(), &pool_info, &device_pool_);
         if (exports_memory_ && pool_result != VK_SUCCESS) {
             LOG_WARN("Exportable Vulkan tensor pool failed (VkResult {}); using a non-exportable pool",
@@ -213,6 +238,25 @@ namespace lfs::core::internal {
             pool_result = vmaCreatePool(context_.allocator(), &pool_info, &device_pool_);
         }
         vk_check(&context_, pool_result, "vmaCreatePool");
+#ifdef __APPLE__
+        if (context_.caps().metal_objects) {
+            VmaAllocationCreateInfo host_info{};
+            host_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                              VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            host_info.usage = VMA_MEMORY_USAGE_AUTO;
+            host_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            uint32_t host_type = 0;
+            vk_check(&context_, vmaFindMemoryTypeIndexForBufferInfo(context_.allocator(), &buffer_info, &host_info, &host_type),
+                     "Find exportable host pool memory type");
+            VmaPoolCreateInfo host_pool_info{};
+            host_pool_info.memoryTypeIndex = host_type;
+            host_pool_info.blockSize = 0; // Let VMA size blocks for the requested host allocation.
+            host_pool_info.pMemoryAllocateNext = &metal_export_info_;
+            vk_check(&context_, vmaCreatePool(context_.allocator(), &host_pool_info, &host_pool_),
+                     "Create exportable host-visible tensor pool");
+        }
+#endif
         if (exports_memory_) {
             LOG_INFO("Tensor Vulkan backend exports device-local memory for CUDA views");
         }
@@ -236,15 +280,38 @@ namespace lfs::core::internal {
         buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                             VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        // Upload workers write sequentially through the device mapping while
+        // training runs. The queued copy then reads local device memory. A
+        // dedicated allocation bounds this ring to its requested size.
         VmaAllocationCreateInfo allocation_info{};
-        allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                VMA_ALLOCATION_CREATE_MAPPED_BIT;
-        allocation_info.usage = VMA_MEMORY_USAGE_AUTO;
+        allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                VMA_ALLOCATION_CREATE_MAPPED_BIT |
+                                VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+        allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
         allocation_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        uint32_t memory_type = 0;
+        VkResult result = vmaFindMemoryTypeIndexForBufferInfo(
+            context_.allocator(), &buffer_info, &allocation_info, &memory_type);
         VmaAllocationInfo info{};
-        vk_check(&context_, vmaCreateBuffer(context_.allocator(), &buffer_info, &allocation_info, &staging_buffer_, &staging_allocation_, &info),
-                 "vmaCreateBuffer(staging)");
+        if (result == VK_SUCCESS) {
+            result = vmaCreateBuffer(context_.allocator(), &buffer_info, &allocation_info,
+                                     &staging_buffer_, &staging_allocation_, &info);
+        }
+        if (result == VK_ERROR_FEATURE_NOT_PRESENT || result == VK_ERROR_MEMORY_MAP_FAILED ||
+            result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+            // Preserve ordinary host staging on devices without a usable
+            // coherent device mapping, including an exhausted mapping heap.
+            allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                                    VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            allocation_info.usage = VMA_MEMORY_USAGE_AUTO;
+            allocation_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            result = vmaCreateBuffer(context_.allocator(), &buffer_info, &allocation_info,
+                                     &staging_buffer_, &staging_allocation_, &info);
+        }
+        vk_check(&context_, result, "vmaCreateBuffer(staging)");
         staging_mapped_ = static_cast<std::byte*>(info.pMappedData);
         LFS_ASSERT_MSG(staging_mapped_ != nullptr,
                        "Vulkan staging allocation was not mapped");
@@ -320,6 +387,14 @@ namespace lfs::core::internal {
         copy_mapped(storage, destination, bytes);
     }
 
+    std::byte* VulkanMemory::mapped_pointer(const StorageRef storage) const {
+        std::lock_guard lock(allocations_mutex_);
+        const AllocationRecord& record = allocation_for(storage);
+        LFS_ASSERT_MSG(record.host_visible && record.mapped != nullptr,
+                       "mapped_pointer requires host-visible Vulkan storage");
+        return record.mapped + storage.byte_offset;
+    }
+
     void VulkanMemory::copy_mapped(StorageRef storage, void* destination, size_t bytes) {
         const std::byte* source = nullptr;
         {
@@ -352,6 +427,7 @@ namespace lfs::core::internal {
         // Freed buffers of kDirectLimit and above go back to the driver: a cached
         // one pins its whole pool block while it waits for a same-size request.
         const bool cacheable = host_visible || (!direct_class && !direct);
+        const bool holdable = direct && !direct_class;
         std::unique_ptr<AllocationRecord> record;
         if (cacheable) {
             std::lock_guard lock(allocations_mutex_);
@@ -362,11 +438,26 @@ namespace lfs::core::internal {
                 record = std::move(free_iterator->second.back());
                 free_iterator->second.pop_back();
             }
+        } else if (holdable) {
+            std::lock_guard lock(allocations_mutex_);
+            collect_retired_locked(context_.completed_timeline());
+            // Take the smallest held buffer within an eighth of the request, of
+            // the same export class, so reuse wastes little and keeps interop.
+            // A held buffer may still be in flight: it keeps last_use and its
+            // access state, so record() submits its earlier users first and
+            // prepare_accesses orders the new writes after them on the queue.
+            const auto held = held_.lower_bound(bucket_size);
+            if (held != held_.end() && held->first <= bucket_size + bucket_size / 8 &&
+                (held->first <= kMaxExportSize) == (bucket_size <= kMaxExportSize)) {
+                record = std::move(held->second);
+                held_.erase(held);
+            }
         }
         if (!record) {
             record = std::make_unique<AllocationRecord>();
             record->allocated_size = bucket_size;
             record->cacheable = cacheable;
+            record->holdable = holdable;
             record->host_visible = host_visible;
 
 #if LFS_HAS_CUDA
@@ -382,7 +473,7 @@ namespace lfs::core::internal {
             buffer_info.queueFamilyIndexCount = families.size() > 1 ? families.size() : 0;
             buffer_info.pQueueFamilyIndices = families.data();
             const bool pooled_export =
-                exports_memory_ && !host_visible && record->allocated_size <= kPoolBlockSize;
+                exports_memory_ && !host_visible && record->allocated_size <= kMaxExportSize;
             if (pooled_export) {
 #if LFS_HAS_CUDA
                 buffer_info.pNext = &external_buffer;
@@ -394,17 +485,65 @@ namespace lfs::core::internal {
                 allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
                                         VMA_ALLOCATION_CREATE_MAPPED_BIT;
                 allocation_info.usage = VMA_MEMORY_USAGE_AUTO;
+#ifdef __APPLE__
+                if (!direct)
+                    allocation_info.pool = host_pool_;
+#endif
                 allocation_info.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
             } else {
                 allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
                 allocation_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-                // A custom VMA pool cannot hold an allocation above its block
-                // size and the driver refuses dedicated exportable memory, so
-                // only allocations that fit a block are pooled (and exportable);
-                // larger ones stay direct and are not exportable.
-                if (!direct || pooled_export) {
+                if (!direct)
                     allocation_info.pool = device_pool_;
+            }
+#ifdef __APPLE__
+            // Private blocks must declare native export too; this includes large
+            // scene attributes and host-visible scalar/readback allocations.
+            const bool metal_export = context_.caps().metal_objects;
+            if (direct) {
+                if (!pooled_export && !metal_export) {
+#else
+            if (direct) {
+                if (!pooled_export) {
+#endif
+                    allocation_info.pool = VK_NULL_HANDLE;
+                    allocation_info.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+                } else {
+                    // Exportable buffers need ordinary memory rather than Vulkan's
+                    // dedicated-allocation chain. Give this large buffer one block
+                    // sized to its requirements, released with the allocation.
+                    const auto check_setup = [&](const VkResult result, const char* operation) {
+                        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
+                            result == VK_ERROR_OUT_OF_HOST_MEMORY ||
+                            result == VK_ERROR_OUT_OF_POOL_MEMORY ||
+                            result == VK_ERROR_FRAGMENTED_POOL)
+                            throw_storage_allocation_error(bytes, alignment, context, result);
+                        vk_check(&context_, result, operation);
+                    };
+                    VkBuffer probe = VK_NULL_HANDLE;
+                    check_setup(vkCreateBuffer(context_.device(), &buffer_info, nullptr, &probe),
+                                "vkCreateBuffer(export requirements)");
+                    VkMemoryRequirements requirements{};
+                    vkGetBufferMemoryRequirements(context_.device(), probe, &requirements);
+                    vkDestroyBuffer(context_.device(), probe, nullptr);
+                    VmaPoolCreateInfo pool_info{};
+                    check_setup(vmaFindMemoryTypeIndexForBufferInfo(
+                                    context_.allocator(), &buffer_info, &allocation_info,
+                                    &pool_info.memoryTypeIndex),
+                                "vmaFindMemoryTypeIndexForBufferInfo(export block)");
+                    pool_info.blockSize = align_up(requirements.size, std::max<VkDeviceSize>(requirements.alignment, 65536));
+                    pool_info.maxBlockCount = 1;
+#ifdef __APPLE__
+                    pool_info.pMemoryAllocateNext = metal_export ? &metal_export_info_ : static_cast<void*>(&export_alloc_info_);
+#else
+                    pool_info.pMemoryAllocateNext = &export_alloc_info_;
+#endif
+                    record->private_pool = std::make_unique<AllocationRecord::PrivatePool>();
+                    record->private_pool->allocator = context_.allocator();
+                    check_setup(vmaCreatePool(context_.allocator(), &pool_info, &record->private_pool->pool),
+                                "vmaCreatePool(export block)");
+                    allocation_info.pool = record->private_pool->pool;
                 }
             }
             VkResult result = vmaCreateBuffer(
@@ -418,7 +557,7 @@ namespace lfs::core::internal {
                 {
                     std::lock_guard lock(allocations_mutex_);
                     collect_retired_locked(context_.completed_timeline());
-                    destroy_free_locked();
+                    destroy_free_when_idle_locked();
                 }
                 result = vmaCreateBuffer(
                     context_.allocator(), &buffer_info, &allocation_info,
@@ -447,7 +586,8 @@ namespace lfs::core::internal {
                            "vkGetBufferDeviceAddress returned zero for tensor storage");
         }
         record->requested_size = bytes;
-        record->last_use = 0;
+        if (!record->holdable)
+            record->last_use = 0;
         record->descriptor_owner.backend = GpuBackend::Vulkan;
         record->descriptor_owner.pending_recorder.store(0, std::memory_order_relaxed);
         record->descriptor_owner.pending_value.store(0, std::memory_order_relaxed);
@@ -504,12 +644,13 @@ namespace lfs::core::internal {
         if (storage.meta == nullptr || storage.backend != GpuBackend::Vulkan) {
             return std::nullopt;
         }
-        const AllocationRecord& record = allocation_for(storage);
+        AllocationRecord& record = allocation_for(storage);
         VmaAllocationInfo2 info{};
         vmaGetAllocationInfo2(context_.allocator(), record.allocation, &info);
         if (info.allocationInfo.deviceMemory == VK_NULL_HANDLE || info.blockSize == 0) {
             return std::nullopt;
         }
+        record.shared_outside_queue = true;
         return CudaBlockInfo{
             .memory = info.allocationInfo.deviceMemory,
             .allocation_offset = info.allocationInfo.offset,
@@ -517,7 +658,7 @@ namespace lfs::core::internal {
             .dedicated = info.dedicatedMemory == VK_TRUE,
             .host_visible = record.host_visible,
             .exportable = exports_memory_ && !record.host_visible &&
-                          record.allocated_size <= kPoolBlockSize,
+                          record.allocated_size <= kMaxExportSize,
         };
     }
 
@@ -790,21 +931,18 @@ namespace lfs::core::internal {
     }
 
     void VulkanMemory::collect_retired_locked(const uint64_t completed) {
-#ifdef __APPLE__
-        // MoltenVK makes all device memory resident for every command buffer
-        // it submits without keeping that memory alive, so freeing memory also
-        // waits for work that never used it.
-        const bool idle = completed >= context_.submitted_timeline();
-#else
-        constexpr bool idle = true;
-#endif
+        std::vector<std::unique_ptr<AllocationRecord>> released;
         std::erase_if(retired_, [&](auto& record) {
-            if (record->last_use > completed || (!record->cacheable && !idle)) {
+            const bool done = record->last_use <= completed;
+            if (record->holdable && freed_memory_holds_ != 0 && (done || !record->shared_outside_queue)) {
+                held_.emplace(record->allocated_size, std::move(record));
+                return true;
+            }
+            if (!done) {
                 return false;
             }
             if (!record->cacheable) {
-                vmaDestroyBuffer(context_.allocator(), record->buffer,
-                                 record->allocation);
+                released.push_back(std::move(record));
             } else if (record->host_visible) {
                 readback_free_lists_[record->allocated_size].push_back(std::move(record));
             } else {
@@ -812,9 +950,50 @@ namespace lfs::core::internal {
             }
             return true;
         });
+        if (released.empty()) {
+            return;
+        }
+        const auto destroy = [&] {
+            for (auto& record : released) {
+                vmaDestroyBuffer(context_.allocator(), record->buffer,
+                                 record->allocation);
+            }
+            released.clear();
+        };
+#ifdef __APPLE__
+        // See run_while_queue_idle: memory is freed only with nothing in flight.
+        if (!context_.run_while_queue_idle(destroy)) {
+            for (auto& record : released) {
+                retired_.push_back(std::move(record));
+            }
+        }
+#else
+        destroy();
+#endif
+    }
+
+    void VulkanMemory::destroy_free_when_idle_locked() {
+#ifdef __APPLE__
+        // See run_while_queue_idle; pooled blocks stay cached when work is in flight.
+        (void)context_.run_while_queue_idle([&] { destroy_free_locked(); });
+#else
+        destroy_free_locked();
+#endif
     }
 
     void VulkanMemory::destroy_free_locked() {
+        const uint64_t completed = context_.completed_timeline();
+        for (auto& [size, record] : held_) {
+            (void)size;
+            if (shutting_down_ || record->last_use <= completed) {
+                vmaDestroyBuffer(context_.allocator(), record->buffer, record->allocation);
+            } else {
+                // Still in flight: destroy it once its last use completes.
+                record->holdable = false;
+                retired_.push_back(std::move(record));
+            }
+        }
+        held_.clear();
         for (auto* lists : {&free_lists_, &readback_free_lists_}) {
             for (auto& [size, records] : *lists) {
                 (void)size;
@@ -865,7 +1044,32 @@ namespace lfs::core::internal {
 #endif
         std::lock_guard lock(allocations_mutex_);
         collect_retired_locked(context_.completed_timeline());
-        destroy_free_locked();
+        // A trim also discards buffers whose last GPU use is still pending.
+        // Reclaim them after completion instead of repopulating the cache.
+        for (auto& record : retired_) {
+            record->cacheable = false;
+            record->holdable = false;
+        }
+        destroy_free_when_idle_locked();
+    }
+
+    void VulkanMemory::hold_freed(const bool hold) {
+        std::lock_guard lock(allocations_mutex_);
+        if (hold) {
+            ++freed_memory_holds_;
+            return;
+        }
+        if (freed_memory_holds_ == 0 || --freed_memory_holds_ != 0)
+            return;
+        // Held buffers retire like any other freed direct buffer: destroyed once
+        // their last use completes (and, on Apple, while the queue is idle).
+        for (auto& [size, record] : held_) {
+            (void)size;
+            record->holdable = false;
+            retired_.push_back(std::move(record));
+        }
+        held_.clear();
+        collect_retired_locked(context_.completed_timeline());
     }
 
     MemoryInfo VulkanMemory::stats() const {
@@ -891,6 +1095,10 @@ namespace lfs::core::internal {
     size_t VulkanMemory::cached_bytes() const noexcept {
         std::lock_guard lock(allocations_mutex_);
         size_t result = 0;
+        for (const auto& [size, record] : held_) {
+            (void)record;
+            result += static_cast<size_t>(size);
+        }
         for (const auto* lists : {&free_lists_, &readback_free_lists_}) {
             for (const auto& [size, records] : *lists) {
                 result += static_cast<size_t>(size) * records.size();
@@ -908,7 +1116,7 @@ namespace lfs::core::internal {
                 free_count += records.size();
             }
         }
-        return allocations_.size() + retired_.size() + free_count +
+        return allocations_.size() + retired_.size() + held_.size() + free_count +
                (staging_buffer_ != VK_NULL_HANDLE ? 1 : 0);
     }
 
@@ -920,6 +1128,22 @@ namespace lfs::core::internal {
             return address >= record->address &&
                    address < record->address + record->requested_size;
         });
+    }
+
+    StorageRef VulkanMemory::borrow_address(const void* pointer, const size_t bytes) const {
+        const uint64_t address = reinterpret_cast<uintptr_t>(pointer);
+        std::lock_guard lock(allocations_mutex_);
+        for (const auto& [key, record] : allocations_) {
+            if (address >= record->address && address - record->address <= record->requested_size &&
+                bytes <= record->requested_size - (address - record->address)) {
+                return {.backend = GpuBackend::Vulkan,
+                        .data = reinterpret_cast<void*>(record->address),
+                        .byte_offset = static_cast<size_t>(address - record->address),
+                        .dtype = DataType::UInt8,
+                        .meta = &record->descriptor_owner};
+            }
+        }
+        throw std::invalid_argument("Vulkan tensor view is outside a live allocation");
     }
 
     void VulkanMemory::shutdown() {
@@ -949,6 +1173,12 @@ namespace lfs::core::internal {
             staging_allocation_ = VK_NULL_HANDLE;
             staging_mapped_ = nullptr;
         }
+#ifdef __APPLE__
+        if (host_pool_ != VK_NULL_HANDLE) {
+            vmaDestroyPool(context_.allocator(), host_pool_);
+            host_pool_ = VK_NULL_HANDLE;
+        }
+#endif
         if (device_pool_ != VK_NULL_HANDLE) {
             vmaDestroyPool(context_.allocator(), device_pool_);
             device_pool_ = VK_NULL_HANDLE;

@@ -18,20 +18,18 @@ namespace lfs::gpu_ops {
         float eps = 1e-15f;
     };
 
-    // Invalid bindings are absent. raw_scales and far_mask feed the per-splat
-    // mean step, screen_share the scale hinge.
+    // Invalid bindings are absent.
     struct AdamMasks {
-        In frozen, crop_damping, raw_scales, far_mask, screen_share;
+        In frozen, crop_damping, screen_share;
+        Tensor mean_step_scales, mean_step_far;
     };
 
     struct AdamModifiers {
         float frozen_lr_scale = 0.f;
         float cropbox_lr_scale = 1.f;
-        float median_extent = 0.f;
-        float r_min = 1.f;
-        float r_max = 300.f;
         float screen_share_limit = 0.f;
         float screen_share_penalty = 0.f;
+        float mean_step_median_extent = 0.f;
     };
 
     // One contiguous [primitives, attributes] parameter with its packed joint
@@ -45,8 +43,8 @@ namespace lfs::gpu_ops {
         float lr = 0.f;
         float bc1_rcp = 1.f;
         float bc2_sqrt_rcp = 1.f;
-        bool apply_mean_step = false;
         bool apply_screen_share = false;
+        bool apply_mean_step = false;
     };
 
     // value_bits is 0 for float32 values and 16 for half or block-quantized
@@ -71,6 +69,7 @@ namespace lfs::gpu_ops {
     };
 
     struct AdamOps {
+
         // One update over every present step. A step whose parameter binding is
         // invalid is absent.
         void (*step_batch)(

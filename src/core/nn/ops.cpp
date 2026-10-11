@@ -6,9 +6,9 @@
 #include "core/nn/models/romav1.hpp"
 #endif
 
+#include "backend_kernels.hpp"
 #include "core/cuda_error.hpp"
 #include "core/tensor.hpp"
-#include "core/tensor/backend/gpu_backend_ops.hpp"
 #include "core/tensor_backend.hpp"
 #include "core/tensor_cuda_interop.hpp"
 #include "nn_kernels.hpp"
@@ -27,6 +27,15 @@ namespace lfs::core::nn::models {
             });
         }
     } // namespace
+
+    std::size_t RomaV1::weights_bytes() const {
+        std::size_t bytes = 0;
+        for (const auto& [name, tensor] : weights_)
+            bytes += tensor.bytes();
+        for (const auto& [name, tensor] : weight_taps_)
+            bytes += tensor.bytes();
+        return bytes;
+    }
 
     lfs::Result<RomaV1> RomaV1::load(const std::filesystem::path&, Device,
                                      std::optional<DataType>, int) {
@@ -62,24 +71,18 @@ namespace lfs::core::nn {
             return gpu_backend_of(tensor) != GpuBackend::CUDA;
         }
 
-        // Linear layers, attention and norms run on the backend's own kernels
-        // where it has them.
+        // Linear layers, attention, norms and convolutions run on the
+        // backend's own kernels where it has them.
         bool runs_backend_kernels(const Tensor& tensor) {
-            return internal::backend_ops_for(tensor).nn_kernels();
-        }
-
-        std::optional<internal::StorageRef> optional_storage(const Tensor* tensor) {
-            if (tensor == nullptr)
-                return std::nullopt;
-            return internal::storage_ref(*tensor);
+            return tensor.device() == Device::GPU && dedicated::available(tensor);
         }
 
         void require_nn_tensor(const Tensor& tensor, const std::string_view op,
-                               const std::string_view role) {
+                               const std::string_view role, const bool allow_cpu = false) {
             tensor_contract::require_valid(tensor, op, role, LFS_SOURCE_SITE_CURRENT());
             tensor_contract::require_dtype(tensor, {DataType::Float32, DataType::Float16}, op,
                                            role, LFS_SOURCE_SITE_CURRENT());
-            LFS_ASSERT_MSG(tensor.device() == Device::GPU,
+            LFS_ASSERT_MSG(allow_cpu || tensor.device() == Device::GPU,
                            std::format("{} requires GPU {} (device={})", op, role,
                                        device_name(tensor.device())));
         }
@@ -217,15 +220,9 @@ namespace lfs::core::nn {
         }
 
         if (runs_backend_kernels(a_c)) {
-            auto out = empty_like_shape(a_c, TensorShape(out_dims));
-            internal::backend_ops_for(a_c).nn_linear(
-                internal::storage_ref(a_c), internal::storage_ref(b_c), optional_storage(bias_c),
-                optional_storage(scale_c), optional_storage(residual_c), internal::storage_ref(out),
-                {.batch = batch_a, .m = static_cast<std::size_t>(m), .n = static_cast<std::size_t>(n),
-                 .k = static_cast<std::size_t>(ka), .trans_b = trans_b, .batched_b = batch_b != 1,
-                 .activation = static_cast<int>(activation)},
-                {});
-            return out;
+            return dedicated::linear(a_c, b_c, bias_c, scale_c, residual_c, TensorShape(out_dims), batch_a,
+                                     static_cast<std::size_t>(m), static_cast<std::size_t>(n),
+                                     static_cast<std::size_t>(ka), trans_b, batch_b != 1, activation);
         }
         if (runs_portable(a_c)) {
             return portable::gemm(a_c, b_c, trans_b, bias_c, activation, residual_c, scale_c);
@@ -288,12 +285,8 @@ namespace lfs::core::nn {
             for (std::size_t i = 0; i < input.ndim(); ++i)
                 shape.push_back(input.shape()[i]);
             shape.back() = n;
-            auto out = empty_like_shape(in_c, TensorShape(shape));
-            internal::backend_ops_for(in_c).nn_linear(
-                internal::storage_ref(in_2d), internal::storage_ref(w_c), optional_storage(bias_c), std::nullopt,
-                optional_storage(residual_c), internal::storage_ref(out),
-                {.m = m, .n = n, .k = k, .trans_b = true, .activation = static_cast<int>(activation)}, {});
-            return out;
+            return dedicated::linear(in_2d, w_c, bias_c, nullptr, residual_c, TensorShape(shape), 1, m, n, k, true,
+                                     false, activation);
         }
         if (runs_portable(in_c)) {
             auto out = portable::gemm(in_2d, w_c, true, bias_c, activation, residual_c);
@@ -342,13 +335,7 @@ namespace lfs::core::nn {
         const Tensor w_c = weight.contiguous();
         const Tensor b_c = bias.contiguous();
         if (runs_backend_kernels(in_c)) {
-            auto out = empty_like_shape(in_c, in_c.shape());
-            internal::backend_ops_for(in_c).nn_norm(
-                internal::storage_ref(in_c), internal::storage_ref(w_c), internal::storage_ref(b_c),
-                internal::storage_ref(out), {.rows = in_c.numel() / static_cast<std::size_t>(cols),
-                                             .cols = static_cast<std::size_t>(cols), .eps = eps},
-                {});
-            return out;
+            return dedicated::norm(in_c, w_c, &b_c, eps);
         }
         if (runs_portable(in_c)) {
             return portable::norm(in_c, w_c, &b_c, eps);
@@ -364,22 +351,19 @@ namespace lfs::core::nn {
     }
 
     Tensor rms_norm(const Tensor& input, const Tensor& weight, float eps) {
-        require_nn_tensor(input, "rms_norm", "input");
-        require_nn_tensor(weight, "rms_norm", "weight");
+        require_nn_tensor(input, "rms_norm", "input", true);
+        require_nn_tensor(weight, "rms_norm", "weight", true);
         require_same_dtype_device(input, weight, "rms_norm", "input", "weight");
+        LFS_ASSERT_MSG(input.ndim() > 0 && input.shape()[input.ndim() - 1] > 0,
+                       "rms_norm requires a nonempty last dimension");
         const int cols = static_cast<int>(input.shape()[input.ndim() - 1]);
         LFS_ASSERT_MSG(weight.numel() == static_cast<std::size_t>(cols),
                        "rms_norm weight must match the last dim");
+        LFS_ASSERT_MSG(std::isfinite(eps) && eps > 0.0f, "rms_norm epsilon must be finite and positive");
         const Tensor in_c = input.contiguous();
-        const Tensor w_c = weight.contiguous();
+        const Tensor w_c = weight.contiguous().reshape(TensorShape{weight.numel()});
         if (runs_backend_kernels(in_c)) {
-            auto out = empty_like_shape(in_c, in_c.shape());
-            internal::backend_ops_for(in_c).nn_norm(
-                internal::storage_ref(in_c), internal::storage_ref(w_c), std::nullopt, internal::storage_ref(out),
-                {.rows = in_c.numel() / static_cast<std::size_t>(cols), .cols = static_cast<std::size_t>(cols),
-                 .eps = eps},
-                {});
-            return out;
+            return dedicated::norm(in_c, w_c, nullptr, eps);
         }
         if (runs_portable(in_c)) {
             return portable::norm(in_c, w_c, nullptr, eps);
@@ -394,7 +378,9 @@ namespace lfs::core::nn {
     }
 
     Tensor softmax(const Tensor& input, const Tensor* mask) {
-        require_nn_tensor(input, "softmax", "input");
+        require_nn_tensor(input, "softmax", "input", true);
+        LFS_ASSERT_MSG(input.ndim() > 0 && input.shape()[input.ndim() - 1] > 0,
+                       "softmax requires a nonempty last dimension");
         const Tensor in_c = input.contiguous();
         const int cols = static_cast<int>(in_c.shape()[in_c.ndim() - 1]);
         const int rows = static_cast<int>(in_c.numel() / static_cast<std::size_t>(cols));
@@ -403,26 +389,19 @@ namespace lfs::core::nn {
         long long msr = cols;
         long long msc = 1;
         if (mask != nullptr && mask->is_valid()) {
-            require_nn_tensor(*mask, "softmax", "mask");
+            require_nn_tensor(*mask, "softmax", "mask", true);
             require_same_dtype_device(in_c, *mask, "softmax", "input", "mask");
-            mask_s = mask->contiguous();
+            LFS_ASSERT_MSG(mask->can_broadcast_to(in_c.shape()), "softmax mask must broadcast to input");
+            mask_s = mask->broadcast_to(in_c.shape()).contiguous();
             mask_c = &mask_s;
-            if (mask_c->ndim() == in_c.ndim()) {
-                msr = static_cast<long long>(mask_c->shape()[mask_c->ndim() - 1] == 1
-                                                 ? 0
-                                                 : mask_c->shape()[mask_c->ndim() - 1]);
-                msc = mask_c->shape()[mask_c->ndim() - 1] == 1 ? 0 : 1;
-            } else if (mask_c->ndim() == 1) {
-                msr = 0;
-                msc = 1;
-            }
         }
         if (runs_portable(in_c)) {
             return portable::softmax(in_c, mask_c);
         }
         auto out = empty_like_shape(in_c, in_c.shape());
         pin_operands({&in_c});
-        const cudaStream_t stream = prepare_inputs_for_stream({&in_c}, out.stream());
+        const cudaStream_t stream = mask_c ? prepare_inputs_for_stream({&in_c, mask_c}, out.stream())
+                                           : prepare_inputs_for_stream({&in_c}, out.stream());
         out.set_stream(stream);
         kernels::softmax(raw(in_c), mask_c ? raw(*mask_c) : nullptr, raw_mut(out), rows, cols, msr,
                          msc, mask_c != nullptr, in_c.dtype(), stream);
@@ -484,16 +463,7 @@ namespace lfs::core::nn {
         }
 
         if (runs_backend_kernels(q_c)) {
-            auto out = empty_like_shape(q_c, q_c.shape());
-            internal::backend_ops_for(q_c).nn_attention(
-                internal::storage_ref(q_c), internal::storage_ref(k_c), internal::storage_ref(v_c), optional_storage(m_c),
-                internal::storage_ref(out),
-                {.groups = static_cast<std::size_t>(b) * static_cast<std::size_t>(h),
-                 .heads = static_cast<std::size_t>(h), .queries = static_cast<std::size_t>(n_q),
-                 .keys = static_cast<std::size_t>(n_k), .dim = static_cast<std::size_t>(d), .scale = used_scale,
-                 .mask_strides = {sb, sh, sq, sk}},
-                {});
-            return out;
+            return dedicated::attention(q_c, k_c, v_c, m_c, used_scale, {sb, sh, sq, sk});
         }
         if (runs_portable(q_c)) {
             return portable::attention(q_c, k_c, v_c, m_c, used_scale);
@@ -509,7 +479,7 @@ namespace lfs::core::nn {
     }
 
     Tensor window_partition(const Tensor& input, int window_size) {
-        require_nn_tensor(input, "window_partition", "input");
+        require_nn_tensor(input, "window_partition", "input", true);
         LFS_ASSERT_MSG(input.ndim() == 4, "window_partition expects [B, H, N, d]");
         LFS_ASSERT_MSG(window_size > 0, "window_size must be positive");
         const Tensor in_c = input.contiguous();
@@ -521,13 +491,14 @@ namespace lfs::core::nn {
         const int pad = n_win * window_size - n;
         Tensor seq = in_c;
         if (pad > 0) {
-            auto z = Tensor::zeros(
-                TensorShape{std::vector<std::size_t>{static_cast<std::size_t>(b),
-                                                     static_cast<std::size_t>(h),
-                                                     static_cast<std::size_t>(pad),
-                                                     static_cast<std::size_t>(d)}},
-                in_c.device(), in_c.dtype());
+            auto z = Tensor::empty_like(in_c,
+                                        TensorShape{std::vector<std::size_t>{static_cast<std::size_t>(b),
+                                                                             static_cast<std::size_t>(h),
+                                                                             static_cast<std::size_t>(pad),
+                                                                             static_cast<std::size_t>(d)}},
+                                        in_c.dtype());
             z.set_stream(in_c.stream());
+            z.zero_();
             seq = Tensor::cat({in_c, z}, 2);
         }
         auto viewed = seq.reshape(TensorShape{std::vector<std::size_t>{
@@ -542,9 +513,10 @@ namespace lfs::core::nn {
     }
 
     Tensor window_unpartition(const Tensor& windows, int window_size, int original_n) {
-        require_nn_tensor(windows, "window_unpartition", "windows");
+        require_nn_tensor(windows, "window_unpartition", "windows", true);
         LFS_ASSERT_MSG(windows.ndim() == 4, "window_unpartition expects [B*n_win, H, W, d]");
         LFS_ASSERT_MSG(window_size > 0 && original_n >= 0, "window_unpartition sizes invalid");
+        LFS_ASSERT_MSG(windows.shape()[2] == static_cast<size_t>(window_size), "window_unpartition window dimension mismatch");
         const Tensor w_c = windows.contiguous();
         const int n_win = (original_n + window_size - 1) / window_size;
         LFS_ASSERT_MSG(n_win > 0 && w_c.shape()[0] % static_cast<std::size_t>(n_win) == 0,
@@ -755,25 +727,7 @@ namespace lfs::core::nn {
         }
 
         if (runs_backend_kernels(in_c)) {
-            auto out = empty_like_shape(
-                in_c, TensorShape{std::vector<std::size_t>{static_cast<std::size_t>(n),
-                                                           static_cast<std::size_t>(cout),
-                                                           static_cast<std::size_t>(out_h),
-                                                           static_cast<std::size_t>(out_w)}});
-            internal::backend_ops_for(in_c).nn_conv2d(
-                internal::storage_ref(in_c), internal::storage_ref(w_c), optional_storage(b_c),
-                internal::storage_ref(out),
-                {.batch = static_cast<std::size_t>(n),
-                 .out_channels = static_cast<std::size_t>(cout),
-                 .groups = static_cast<std::size_t>(params.groups),
-                 .geometry = {.channels = cin_g, .height = h, .width = w, .out_height = out_h, .out_width = out_w,
-                              .kernel_h = kh, .kernel_w = kw, .stride_h = params.stride_h,
-                              .stride_w = params.stride_w, .pad_h = params.pad_h, .pad_w = params.pad_w,
-                              .dilation_h = params.dilation_h, .dilation_w = params.dilation_w,
-                              .mode = static_cast<int32_t>(params.pad_mode)},
-                 .activation = static_cast<int>(params.activation)},
-                {});
-            return out;
+            return dedicated::conv2d(in_c, w_c, b_c, params, out_h, out_w, false);
         }
         if (runs_portable(in_c)) {
             return portable::conv(in_c, w_c, b_c, params);
@@ -928,27 +882,7 @@ namespace lfs::core::nn {
                 b_s = b_c->to(in_c.dtype());
                 b_c = &b_s;
             }
-            auto out = empty_like_shape(
-                in_c, TensorShape{std::vector<std::size_t>{static_cast<std::size_t>(n),
-                                                           static_cast<std::size_t>(cout),
-                                                           static_cast<std::size_t>(out_h),
-                                                           static_cast<std::size_t>(out_w)}});
-            // Each group's [in][out * kh * kw] weights become [out * kh * kw][in].
-            const Tensor w_t = w_c.reshape({params.groups, cin_g, cout_g * kh * kw}).transpose(1, 2).contiguous();
-            internal::backend_ops_for(in_c).nn_conv2d(
-                internal::storage_ref(in_c), internal::storage_ref(w_t), optional_storage(b_c),
-                internal::storage_ref(out),
-                {.batch = static_cast<std::size_t>(n),
-                 .out_channels = static_cast<std::size_t>(cout),
-                 .groups = static_cast<std::size_t>(params.groups),
-                 .transpose = true,
-                 .geometry = {.channels = cin_g, .height = hin, .width = win, .out_height = out_h, .out_width = out_w,
-                              .kernel_h = kh, .kernel_w = kw, .stride_h = params.stride_h,
-                              .stride_w = params.stride_w, .pad_h = params.pad_h, .pad_w = params.pad_w,
-                              .dilation_h = params.dilation_h, .dilation_w = params.dilation_w},
-                 .activation = static_cast<int>(params.activation)},
-                {});
-            return out;
+            return dedicated::conv2d(in_c, w_c, b_c, params, out_h, out_w, true);
         }
         if (runs_portable(in_c)) {
             return portable::conv(in_c, w_c, b_c, params, true);
@@ -1126,8 +1060,10 @@ namespace lfs::core::nn {
     }
 
     Tensor silu(const Tensor& input) {
-        require_nn_tensor(input, "silu", "input");
+        require_nn_tensor(input, "silu", "input", true);
         const Tensor in_c = input.contiguous();
+        if (in_c.device() == Device::CPU)
+            return in_c.to(DataType::Float32).swish().to(in_c.dtype());
         if (runs_portable(in_c)) {
             return portable::activate(in_c, Activation::Silu);
         }
@@ -1472,18 +1408,20 @@ namespace lfs::core::nn {
     }
 
     Tensor residual_scale(const Tensor& x, const Tensor& hidden, const Tensor& gamma) {
-        require_nn_tensor(x, "residual_scale", "x");
-        require_nn_tensor(hidden, "residual_scale", "hidden");
-        require_nn_tensor(gamma, "residual_scale", "gamma");
+        require_nn_tensor(x, "residual_scale", "x", true);
+        require_nn_tensor(hidden, "residual_scale", "hidden", true);
+        require_nn_tensor(gamma, "residual_scale", "gamma", true);
         require_same_dtype_device(x, hidden, "residual_scale", "x", "hidden");
         require_same_dtype_device(x, gamma, "residual_scale", "x", "gamma");
         LFS_ASSERT_MSG(x.shape() == hidden.shape(), "residual_scale x/hidden shape mismatch");
+        LFS_ASSERT_MSG(x.ndim() > 0 && x.shape()[x.ndim() - 1] > 0,
+                       "residual_scale requires a nonempty last dimension");
         const int cols = static_cast<int>(x.shape()[x.ndim() - 1]);
         LFS_ASSERT_MSG(gamma.numel() == static_cast<std::size_t>(cols),
                        "residual_scale gamma must match the last dim");
         const Tensor x_c = x.contiguous();
         const Tensor h_c = hidden.contiguous();
-        const Tensor g_c = gamma.contiguous();
+        const Tensor g_c = gamma.contiguous().reshape(TensorShape{gamma.numel()});
         if (runs_portable(x_c)) {
             return x_c.to(DataType::Float32).add(h_c.to(DataType::Float32).mul(g_c.to(DataType::Float32))).to(x_c.dtype());
         }

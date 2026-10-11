@@ -5,10 +5,10 @@
 #pragma once
 
 #include "adam_api.h"
-#include "lfs/core/warp_reduce.cuh"
-#include "lfs/training/joint_adam_codec.cuh"
 #include "lfs/training/mean_step_scale.cuh"
 #include "lfs/training/screen_share.cuh"
+#include "training/kernels/joint_adam_codec.cuh"
+#include "training/kernels/warp_reduce.cuh"
 
 #include <cstdint>
 
@@ -23,7 +23,7 @@ namespace fast_lfs::optimizer::kernels::adam {
     // (matches fused preprocess_backward / joint_adam::kBlockSizeDevice).
     // Frozen / crop-damped rows with zero lr skip the Adam update but still
     // re-encode under the new block bounds (same as fused adam_step_row_joint).
-    template <int BITS>
+    template <int BITS, bool MEAN_STEP_ENABLED = true>
     __global__ void adam_step_joint_contiguous_batched_cu(
         const __grid_constant__ JointContiguousBatch batch,
         const bool* frozen_mask,
@@ -38,8 +38,6 @@ namespace fast_lfs::optimizer::kernels::adam {
         const float* mean_step_scale_raw,
         const int mean_step_scale_n,
         const float mean_step_median_extent,
-        const float mean_step_r_min,
-        const float mean_step_r_max,
         const bool* mean_step_far_mask,
         const int mean_step_far_mask_n,
         const float* screen_share_max,
@@ -81,18 +79,18 @@ namespace fast_lfs::optimizer::kernels::adam {
             else
                 row_lr *= cropbox_lr_scale;
         }
-        if (ent.apply_mean_step && mean_step_scale_raw != nullptr &&
-            mean_step_far_mask != nullptr && prim < mean_step_far_mask_n &&
-            mean_step_far_mask[prim]) {
-            const int sb = prim * 3;
-            if (sb + 2 < mean_step_scale_n) {
-                row_lr *= lfs::training::per_splat_mean_step_ratio(
-                    mean_step_scale_raw[sb],
-                    mean_step_scale_raw[sb + 1],
-                    mean_step_scale_raw[sb + 2],
-                    mean_step_median_extent,
-                    mean_step_r_min,
-                    mean_step_r_max);
+        if constexpr (MEAN_STEP_ENABLED) {
+            if (ent.apply_mean_step && mean_step_scale_raw != nullptr &&
+                mean_step_far_mask != nullptr && prim < mean_step_far_mask_n &&
+                mean_step_far_mask[prim]) {
+                const int sb = prim * 3;
+                if (sb + 2 < mean_step_scale_n) {
+                    row_lr *= lfs::training::per_splat_mean_step_ratio(
+                        mean_step_scale_raw[sb],
+                        mean_step_scale_raw[sb + 1],
+                        mean_step_scale_raw[sb + 2],
+                        mean_step_median_extent);
+                }
             }
         }
 
@@ -117,14 +115,15 @@ namespace fast_lfs::optimizer::kernels::adam {
                 float m = mv.x;
                 float v = mv.y;
                 if (apply_step) {
-                    float grad = param_grad[static_cast<int64_t>(prim) * n_attr + i];
+                    const float grad = param_grad[static_cast<int64_t>(prim) * n_attr + i];
+                    float hinge = 0.0f;
                     if (ent.apply_screen_share && screen_share_max != nullptr &&
                         prim < screen_share_n) {
-                        grad += lfs::training::screen_share_hinge_extra_grad(
+                        hinge = lfs::training::screen_share_hinge_extra_grad(
                             screen_share_max[prim], screen_share_limit, screen_share_penalty,
                             mv.y, bias_correction2_sqrt_rcp, eps);
                     }
-                    m = beta1 * mv.x + beta1_comp * grad;
+                    m = beta1 * mv.x + beta1_comp * (grad + hinge);
                     v = beta2 * mv.y + beta2_comp * grad * grad;
                     const float denom = sqrtf(v) * bias_correction2_sqrt_rcp + eps;
                     param[static_cast<int64_t>(prim) * n_attr + i] -= step_size * m / denom;
